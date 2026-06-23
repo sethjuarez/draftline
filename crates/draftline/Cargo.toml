@@ -1,0 +1,18 @@
+[package]
+name = "draftline"
+version = "0.1.0"
+description = "Git-native versioning for creative content workflows."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[dependencies]
+git2 = { version = "0.20", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
