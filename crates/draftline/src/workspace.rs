@@ -701,10 +701,11 @@ impl Workspace {
         let remote_ref = format!("refs/remotes/{remote}/{variation}");
 
         let Ok(remote_oid) = self.repo.refname_to_id(&remote_ref) else {
+            let ahead = self.local_version_count(local)?;
             return Ok(SyncStatus {
                 remote,
                 variation,
-                ahead: 0,
+                ahead,
                 behind: 0,
                 state: SyncState::NoRemoteVersion,
                 incoming: Vec::new(),
@@ -755,7 +756,18 @@ impl Workspace {
         let variation = self.current_variation_unchecked()?;
         let mut remote = self.repo.find_remote(&remote_name)?;
         let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
-        remote.push(&[refspec.as_str()], None)?;
+        if let Err(error) = remote.push(&[refspec.as_str()], None) {
+            self.fetch_remote_unchecked(&remote_name)?;
+            let refreshed = self.sync_status(&remote_name)?;
+            if matches!(
+                refreshed.state,
+                SyncState::IncomingAvailable | SyncState::NeedsMerge
+            ) {
+                return Err(DraftlineError::SyncNeedsMerge(Box::new(refreshed)));
+            }
+
+            return Err(error.into());
+        }
 
         Ok(PublishResult {
             remote: remote_name,
@@ -906,6 +918,12 @@ impl Workspace {
         }
 
         Ok(versions)
+    }
+
+    fn local_version_count(&self, local: Oid) -> Result<usize> {
+        let mut walk = self.repo.revwalk()?;
+        walk.push(local)?;
+        Ok(walk.count())
     }
 
     fn workspace_signature(&self) -> Result<Signature<'_>> {
@@ -1400,7 +1418,7 @@ mod tests {
         workspace.save_version("Initial version").unwrap();
 
         let published = workspace.publish_changes("origin").unwrap();
-        assert_eq!(published.published_versions, 0);
+        assert_eq!(published.published_versions, 1);
 
         workspace.fetch_remote("origin").unwrap();
         let status = workspace.sync_status("origin").unwrap();
