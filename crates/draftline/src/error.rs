@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::{PreflightReport, RecoveryState};
+use crate::{PreflightReport, RecoveryState, SyncStatus};
 
 /// Result type used by Draftline APIs.
 pub type Result<T> = std::result::Result<T, DraftlineError>;
@@ -54,4 +54,7 @@ pub enum DraftlineError {
 
     #[error("invalid content policy path: {0}")]
     InvalidContentPolicyPath(PathBuf),
+
+    #[error("remote has incoming changes that need an explicit merge plan")]
+    SyncNeedsMerge(Box<SyncStatus>),
 }

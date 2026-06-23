@@ -15,7 +15,9 @@ pub mod workspace;
 pub use content_policy::ContentPolicy;
 pub use error::{DraftlineError, Result};
 pub use recovery::{RecoveryOperation, RecoveryState};
-pub use remote::RemoteEndpoint;
+pub use remote::{
+    Contributor, PublishResult, RemoteEndpoint, RemoteVersionSummary, SyncState, SyncStatus,
+};
 pub use workspace::{
     ChangeKind, ChangeSet, ChangedFile, PreflightReport, PreviewFile, SwitchPolicy, Variation,
     VariationId, Version, VersionId, VersionPreview, Workspace,
