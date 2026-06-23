@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use git2::{
-    build::CheckoutBuilder, BranchType, DiffFormat, DiffOptions, ObjectType, Oid, Repository,
-    Signature, Status, StatusOptions, Tree,
+    build::CheckoutBuilder, BranchType, Commit, DiffFormat, DiffOptions, ObjectType, Oid,
+    Repository, Signature, Status, StatusOptions, Tree,
 };
 
 use crate::recovery::RecoveryOperation;
 use crate::{
-    path::normalize_workspace_relative, ContentPolicy, DraftlineError, RecoveryState,
-    RemoteEndpoint, Result,
+    path::normalize_workspace_relative, ContentPolicy, Contributor, DraftlineError, PublishResult,
+    RecoveryState, RemoteEndpoint, RemoteVersionSummary, Result, SyncState, SyncStatus,
 };
 
 /// A folder-backed content workspace.
@@ -25,6 +25,8 @@ pub struct Workspace {
 pub struct Version {
     id: VersionId,
     pub label: String,
+    pub author: Contributor,
+    pub saved_by: Contributor,
     pub time_seconds: i64,
 }
 
@@ -212,6 +214,31 @@ impl Workspace {
         .initialize())
     }
 
+    /// Clones a shared workspace from a remote endpoint.
+    pub fn clone_workspace(remote_url: impl AsRef<str>, path: impl AsRef<Path>) -> Result<Self> {
+        Self::clone_workspace_with_policy(remote_url, path, ContentPolicy::default())
+    }
+
+    /// Clones a shared workspace from a remote endpoint with an explicit content policy.
+    pub fn clone_workspace_with_policy(
+        remote_url: impl AsRef<str>,
+        path: impl AsRef<Path>,
+        content_policy: ContentPolicy,
+    ) -> Result<Self> {
+        let repo = Repository::clone(remote_url.as_ref(), path.as_ref())?;
+        let root = repo
+            .workdir()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.as_ref().to_path_buf());
+
+        Ok(Self {
+            root,
+            repo,
+            content_policy,
+        }
+        .initialize())
+    }
+
     /// Returns the root content folder for this workspace.
     pub fn root(&self) -> &Path {
         &self.root
@@ -272,7 +299,7 @@ impl Workspace {
 
         let tree_id = index.write_tree()?;
         let tree = self.repo.find_tree(tree_id)?;
-        let signature = Signature::now("Draftline", "draftline@example.invalid")?;
+        let signature = self.workspace_signature()?;
         let parent = self
             .repo
             .head()
@@ -299,11 +326,7 @@ impl Workspace {
             )?,
         };
 
-        Ok(Version {
-            id: VersionId::from(oid),
-            label: label.as_ref().to_string(),
-            time_seconds: self.repo.find_commit(oid)?.time().seconds(),
-        })
+        Ok(version_from_commit(&self.repo.find_commit(oid)?))
     }
 
     /// Lists versions reachable from the current variation, newest first.
@@ -317,11 +340,7 @@ impl Workspace {
         walk.map(|oid| {
             let oid = oid?;
             let commit = self.repo.find_commit(oid)?;
-            Ok(Version {
-                id: VersionId::from(oid),
-                label: commit.summary().unwrap_or_default().to_string(),
-                time_seconds: commit.time().seconds(),
-            })
+            Ok(version_from_commit(&commit))
         })
         .collect()
     }
@@ -561,7 +580,7 @@ impl Workspace {
 
         let commit = self.find_version_commit(version)?;
         let tree = commit.tree()?;
-        let signature = Signature::now("Draftline", "draftline@example.invalid")?;
+        let signature = self.workspace_signature()?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             Some("HEAD"),
@@ -583,11 +602,7 @@ impl Workspace {
             completed: true,
         })?;
 
-        Ok(Version {
-            id: VersionId::from(oid),
-            label: label.as_ref().to_string(),
-            time_seconds: self.repo.find_commit(oid)?.time().seconds(),
-        })
+        Ok(version_from_commit(&self.repo.find_commit(oid)?))
     }
 
     /// Reads a version without mutating the live workspace.
@@ -658,6 +673,107 @@ impl Workspace {
 
         remotes.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(remotes)
+    }
+
+    /// Fetches remote version metadata without changing local content.
+    pub fn fetch_remote(&self, remote: impl AsRef<str>) -> Result<()> {
+        self.ensure_no_pending_recovery()?;
+        self.fetch_remote_unchecked(remote)
+    }
+
+    fn fetch_remote_unchecked(&self, remote: impl AsRef<str>) -> Result<()> {
+        let variation = self.current_variation_unchecked()?;
+        let mut remote = self.repo.find_remote(remote.as_ref())?;
+        if let Err(error) = remote.fetch(&[variation.as_str()], None, None) {
+            if error.code() != git2::ErrorCode::NotFound {
+                return Err(error.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns collaboration status for the current variation.
+    pub fn sync_status(&self, remote: impl AsRef<str>) -> Result<SyncStatus> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref().to_string();
+        let variation = self.current_variation_unchecked()?;
+        let local = self.repo.head()?.peel_to_commit()?.id();
+        let remote_ref = format!("refs/remotes/{remote}/{variation}");
+
+        let Ok(remote_oid) = self.repo.refname_to_id(&remote_ref) else {
+            let ahead = self.local_version_count(local)?;
+            return Ok(SyncStatus {
+                remote,
+                variation,
+                ahead,
+                behind: 0,
+                state: SyncState::NoRemoteVersion,
+                incoming: Vec::new(),
+            });
+        };
+
+        let (ahead, behind) = self.repo.graph_ahead_behind(local, remote_oid)?;
+        let state = match (ahead, behind) {
+            (0, 0) => SyncState::UpToDate,
+            (_, 0) => SyncState::LocalAhead,
+            (0, _) => SyncState::IncomingAvailable,
+            _ => SyncState::NeedsMerge,
+        };
+
+        Ok(SyncStatus {
+            remote,
+            variation,
+            ahead,
+            behind,
+            state,
+            incoming: self.incoming_versions(local, remote_oid)?,
+        })
+    }
+
+    /// Publishes local versions for the current variation when doing so will not overwrite remote work.
+    pub fn publish_changes(&self, remote: impl AsRef<str>) -> Result<PublishResult> {
+        self.ensure_no_pending_recovery()?;
+        let report = preflight_report(
+            "publish_changes",
+            false,
+            self.changed_files_unchecked()?,
+            None,
+        );
+        if !report.can_proceed {
+            return Err(DraftlineError::PreflightFailed(Box::new(report)));
+        }
+
+        let remote_name = remote.as_ref().to_string();
+        self.fetch_remote_unchecked(&remote_name)?;
+        let status = self.sync_status(&remote_name)?;
+        if matches!(
+            status.state,
+            SyncState::IncomingAvailable | SyncState::NeedsMerge
+        ) {
+            return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
+        }
+
+        let variation = self.current_variation_unchecked()?;
+        let mut remote = self.repo.find_remote(&remote_name)?;
+        let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
+        if let Err(error) = remote.push(&[refspec.as_str()], None) {
+            self.fetch_remote_unchecked(&remote_name)?;
+            let refreshed = self.sync_status(&remote_name)?;
+            if matches!(
+                refreshed.state,
+                SyncState::IncomingAvailable | SyncState::NeedsMerge
+            ) {
+                return Err(DraftlineError::SyncNeedsMerge(Box::new(refreshed)));
+            }
+
+            return Err(error.into());
+        }
+
+        Ok(PublishResult {
+            remote: remote_name,
+            variation,
+            published_versions: status.ahead,
+        })
     }
 
     fn diff_unsaved_text(&self) -> Result<String> {
@@ -751,7 +867,7 @@ impl Workspace {
 
         let tree_id = index.write_tree()?;
         let tree = self.repo.find_tree(tree_id)?;
-        let signature = Signature::now("Draftline", "draftline@example.invalid")?;
+        let signature = self.workspace_signature()?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             None,
@@ -787,6 +903,34 @@ impl Workspace {
         })?;
 
         Ok(())
+    }
+
+    fn incoming_versions(&self, local: Oid, remote: Oid) -> Result<Vec<RemoteVersionSummary>> {
+        let mut walk = self.repo.revwalk()?;
+        walk.push(remote)?;
+        walk.hide(local)?;
+
+        let mut versions = Vec::new();
+        for oid in walk {
+            let oid = oid?;
+            let commit = self.repo.find_commit(oid)?;
+            versions.push(remote_summary_from_commit(&commit));
+        }
+
+        Ok(versions)
+    }
+
+    fn local_version_count(&self, local: Oid) -> Result<usize> {
+        let mut walk = self.repo.revwalk()?;
+        walk.push(local)?;
+        Ok(walk.count())
+    }
+
+    fn workspace_signature(&self) -> Result<Signature<'_>> {
+        match self.repo.signature() {
+            Ok(signature) => Ok(signature),
+            Err(_) => Ok(Signature::now("Draftline", "draftline@example.invalid")?),
+        }
     }
 }
 
@@ -927,6 +1071,32 @@ fn collect_preview_files(
     Ok(())
 }
 
+fn contributor_from_signature(signature: &git2::Signature<'_>) -> Contributor {
+    Contributor {
+        name: signature.name().unwrap_or("Unknown").to_string(),
+        email: signature.email().map(ToString::to_string),
+    }
+}
+
+fn version_from_commit(commit: &Commit<'_>) -> Version {
+    Version {
+        id: VersionId::from(commit.id()),
+        label: commit.summary().unwrap_or_default().to_string(),
+        author: contributor_from_signature(&commit.author()),
+        saved_by: contributor_from_signature(&commit.committer()),
+        time_seconds: commit.time().seconds(),
+    }
+}
+
+fn remote_summary_from_commit(commit: &Commit<'_>) -> RemoteVersionSummary {
+    RemoteVersionSummary {
+        id: commit.id().to_string(),
+        label: commit.summary().unwrap_or_default().to_string(),
+        author: contributor_from_signature(&commit.author()),
+        time_seconds: commit.time().seconds(),
+    }
+}
+
 fn new_operation_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -981,18 +1151,26 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
+    fn configure_identity(workspace: &Workspace, name: &str, email: &str) {
+        let mut config = workspace.repo.config().unwrap();
+        config.set_str("user.name", name).unwrap();
+        config.set_str("user.email", email).unwrap();
+    }
+
     #[test]
     fn saves_and_lists_versions() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
 
         write_file(workspace.root(), "post.md", b"# Hello");
+        configure_identity(&workspace, "Seth", "seth@example.com");
         let saved = workspace.save_version("Homepage draft").unwrap();
 
         let versions = workspace.versions().unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].id(), saved.id());
         assert_eq!(versions[0].label, "Homepage draft");
+        assert_eq!(versions[0].author.name, "Seth");
     }
 
     #[test]
@@ -1223,5 +1401,120 @@ mod tests {
                 url: "https://example.invalid/content.git".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn publishes_and_reports_up_to_date_with_local_bare_remote() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(local.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+
+        write_file(workspace.root(), "post.md", b"hello");
+        workspace.save_version("Initial version").unwrap();
+
+        let published = workspace.publish_changes("origin").unwrap();
+        assert_eq!(published.published_versions, 1);
+
+        workspace.fetch_remote("origin").unwrap();
+        let status = workspace.sync_status("origin").unwrap();
+        assert_eq!(status.state, SyncState::UpToDate);
+    }
+
+    #[test]
+    fn fetch_reports_incoming_versions_and_who_changed_them() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"one");
+        first_workspace.save_version("One").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_workspace, "Maria", "maria@example.com");
+        write_file(second_workspace.root(), "post.md", b"two");
+        second_workspace.save_version("Two").unwrap();
+        second_workspace.publish_changes("origin").unwrap();
+
+        first_workspace.fetch_remote("origin").unwrap();
+        let status = first_workspace.sync_status("origin").unwrap();
+
+        assert_eq!(status.state, SyncState::IncomingAvailable);
+        assert_eq!(status.behind, 1);
+        assert_eq!(status.incoming[0].label, "Two");
+        assert_eq!(status.incoming[0].author.name, "Maria");
+    }
+
+    #[test]
+    fn publish_refuses_when_remote_has_incoming_changes() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"one");
+        first_workspace.save_version("One").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_workspace, "Maria", "maria@example.com");
+        write_file(second_workspace.root(), "post.md", b"two");
+        second_workspace.save_version("Two").unwrap();
+        second_workspace.publish_changes("origin").unwrap();
+
+        write_file(first_workspace.root(), "post.md", b"local two");
+        first_workspace.save_version("Local two").unwrap();
+        first_workspace.fetch_remote("origin").unwrap();
+
+        let err = first_workspace.publish_changes("origin").unwrap_err();
+        assert!(matches!(err, DraftlineError::SyncNeedsMerge(_)));
+    }
+
+    #[test]
+    fn publish_refreshes_remote_before_deciding_safety() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"one");
+        first_workspace.save_version("One").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_workspace, "Maria", "maria@example.com");
+        write_file(second_workspace.root(), "post.md", b"two");
+        second_workspace.save_version("Two").unwrap();
+        second_workspace.publish_changes("origin").unwrap();
+
+        write_file(first_workspace.root(), "post.md", b"local two");
+        first_workspace.save_version("Local two").unwrap();
+
+        let err = first_workspace.publish_changes("origin").unwrap_err();
+        assert!(matches!(err, DraftlineError::SyncNeedsMerge(_)));
     }
 }
