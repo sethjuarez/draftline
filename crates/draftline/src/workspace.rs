@@ -234,6 +234,12 @@ pub struct PreviewFile {
 /// Collects all state a host UI needs to render the workspace panel — active
 /// variation, version history, pending changes, and any interrupted-operation
 /// context — in a single, allocation-bounded call.
+///
+/// When [`recovery`](WorkspaceSummary::recovery) is `Some`, the workspace may
+/// be mid-operation.  Check
+/// [`state_may_be_inconsistent`](WorkspaceSummary::state_may_be_inconsistent)
+/// before trusting the `versions` / `dirty_files` snapshot; render a recovery
+/// prompt instead of a normal history view in that case.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSummary {
     /// The variation that is currently checked out.
@@ -248,6 +254,10 @@ pub struct WorkspaceSummary {
     pub is_dirty: bool,
     /// Incomplete operation state if a prior Draftline operation was interrupted.
     pub recovery: Option<crate::RecoveryState>,
+    /// `true` when a pending recovery means `versions` and `dirty_files` may
+    /// describe two different Git states simultaneously and should not be
+    /// rendered as a coherent history view.
+    pub state_may_be_inconsistent: bool,
 }
 
 /// A version annotated with variation-tip context for timeline/graph rendering.
@@ -283,8 +293,12 @@ pub struct VariationSummary {
     pub variation: Variation,
     /// The tip (newest) version of this variation, or `None` for an empty workspace.
     pub head_version: Option<Version>,
-    /// Total number of versions reachable from this variation's tip.
-    pub version_count: usize,
+    /// Number of commits reachable from this variation's tip, including all
+    /// shared ancestor history.  This is **not** the number of commits
+    /// exclusive to this variation — shared ancestry is counted for every
+    /// variation that can reach those commits.  Use this for a total-depth
+    /// indicator; do not label it "commits on this branch."
+    pub reachable_version_count: usize,
 }
 
 /// Preflight report for applying incoming changes from a remote.
@@ -952,6 +966,7 @@ impl Workspace {
         let versions = self.versions_unchecked().unwrap_or_default();
         let dirty_files = self.changed_files_unchecked().unwrap_or_default();
         let is_dirty = !dirty_files.is_empty();
+        let state_may_be_inconsistent = recovery.is_some();
 
         Ok(WorkspaceSummary {
             active_variation,
@@ -960,6 +975,7 @@ impl Workspace {
             dirty_files,
             is_dirty,
             recovery,
+            state_may_be_inconsistent,
         })
     }
 
@@ -1053,9 +1069,9 @@ impl Workspace {
     /// let workspace = Workspace::open("my-content")?;
     /// for summary in workspace.variation_summaries()? {
     ///     println!(
-    ///         "{}: {} version(s)",
+    ///         "{}: {} version(s) reachable",
     ///         summary.variation.display_label(),
-    ///         summary.version_count
+    ///         summary.reachable_version_count
     ///     );
     /// }
     /// # Ok::<(), draftline::DraftlineError>(())
@@ -1073,7 +1089,7 @@ impl Workspace {
             let metadata = self.read_variation_metadata(name)?;
             let variation = variation_from_name(name.to_string(), current.as_ref(), metadata);
 
-            let (head_version, version_count) = match branch.get().peel_to_commit() {
+            let (head_version, reachable_version_count) = match branch.get().peel_to_commit() {
                 Ok(tip) => {
                     let head_version = Some(version_from_commit(&tip));
                     let mut walk = self.repo.revwalk()?;
@@ -1087,7 +1103,7 @@ impl Workspace {
             summaries.push(VariationSummary {
                 variation,
                 head_version,
-                version_count,
+                reachable_version_count,
             });
         }
 
@@ -1098,9 +1114,13 @@ impl Workspace {
     /// Preflights applying incoming changes from a remote without mutating the workspace.
     ///
     /// Call this before [`Workspace::apply_incoming`] to let the host UI
-    /// display a summary of what would happen.  The preflight fetches remote
-    /// metadata and checks workspace cleanliness; it does **not** modify any
-    /// files or Git refs.
+    /// display a summary of what would happen.  It checks workspace cleanliness
+    /// and evaluates the **cached** remote-tracking state; it does **not** fetch
+    /// or modify any files or Git refs.
+    ///
+    /// **Important:** call [`Workspace::fetch_remote`] first to ensure
+    /// `sync_status` reflects the current remote state.  Stale remote-tracking
+    /// refs will cause an inaccurate `is_fast_forward` / `can_proceed` result.
     ///
     /// ```no_run
     /// use draftline::Workspace;
@@ -1155,6 +1175,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<ApplyIncomingResult> {
         self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path())?;
 
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
@@ -1187,6 +1208,9 @@ impl Workspace {
         let remote_commit = self.repo.find_commit(remote_oid)?;
         let branch_ref = format!("refs/heads/{variation}");
 
+        // Save the original OID so we can roll back if checkout fails.
+        let original_oid = self.repo.refname_to_id(&branch_ref).ok();
+
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -1200,11 +1224,21 @@ impl Workspace {
         self.repo
             .reference(&branch_ref, remote_oid, true, "apply_incoming fast-forward")?;
 
-        // Bring the working directory up to the new tree.
-        self.repo.checkout_tree(
+        // Bring the working directory up to the new tree.  Roll back the ref if
+        // checkout fails so the repo is not left with a moved branch and stale tree.
+        if let Err(checkout_err) = self.repo.checkout_tree(
             remote_commit.tree()?.as_object(),
             Some(CheckoutBuilder::new().force()),
-        )?;
+        ) {
+            if let Some(orig) = original_oid {
+                let _ = self
+                    .repo
+                    .reference(&branch_ref, orig, true, "apply_incoming rollback");
+            }
+            let _ = self.acknowledge_recovery();
+            return Err(checkout_err.into());
+        }
+
         self.repo.set_head(&branch_ref)?;
 
         self.write_recovery_state(&RecoveryState {
@@ -1240,6 +1274,7 @@ impl Workspace {
     /// ```
     pub fn squash_versions(&self, count: usize, label: impl AsRef<str>) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path())?;
 
         if count < 2 {
             return Err(DraftlineError::InvalidSquashCount(count));
@@ -1391,6 +1426,11 @@ impl Workspace {
     fn current_variation_unchecked(&self) -> Result<String> {
         match self.repo.head() {
             Ok(head) => {
+                // Reject detached HEAD — the resolved reference must be a local branch
+                // (name starts with "refs/heads/") so callers can safely rewrite it.
+                if !head.is_branch() {
+                    return Err(DraftlineError::NoCurrentVariation);
+                }
                 let Some(name) = head.shorthand() else {
                     return Err(DraftlineError::NoCurrentVariation);
                 };
@@ -3072,14 +3112,14 @@ mod tests {
             .find(|s| s.variation.name == "side")
             .unwrap();
 
-        assert_eq!(master.version_count, 2);
+        assert_eq!(master.reachable_version_count, 2);
         assert_eq!(
             master.head_version.as_ref().map(|v| v.id()),
             Some(second.id())
         );
 
         // "side" branches from "Base" — the earliest commit — so 1 version.
-        assert_eq!(side.version_count, 1);
+        assert_eq!(side.reachable_version_count, 1);
         assert!(side.head_version.is_some());
     }
 
@@ -3094,7 +3134,7 @@ mod tests {
 
         let summaries = workspace.variation_summaries().unwrap();
         let json = serde_json::to_string(&summaries).unwrap();
-        assert!(json.contains("version_count"));
+        assert!(json.contains("reachable_version_count"));
     }
 
     // ── preflight_apply_incoming ──────────────────────────────────────────────
