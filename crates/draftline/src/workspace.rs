@@ -51,8 +51,12 @@ impl VersionId {
     }
 
     /// Parses a version identifier from a canonical 40-character hex SHA string.
+    /// Returns an error if the string is not a valid full-length (40-character) hex OID.
     ///
-    /// Returns an error if the string is not a valid OID.
+    /// Abbreviated OIDs are intentionally rejected.  The method is named
+    /// `from_canonical_string` because it accepts only the unambiguous, fully
+    /// spelled-out form that round-trips safely across process boundaries and
+    /// storage layers.
     ///
     /// ```no_run
     /// use draftline::VersionId;
@@ -61,6 +65,12 @@ impl VersionId {
     /// ```
     pub fn from_canonical_string(s: impl AsRef<str>) -> crate::Result<Self> {
         let s = s.as_ref();
+        // Require exactly 40 lowercase hex characters — the full SHA-1 OID.
+        // git2::Oid::from_str accepts abbreviated prefixes, so we enforce the
+        // length constraint here before delegating format validation.
+        if s.len() != 40 || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(crate::DraftlineError::VersionNotFound(s.to_string()));
+        }
         Oid::from_str(s).map_err(|_| crate::DraftlineError::VersionNotFound(s.to_string()))?;
         Ok(Self(s.to_string()))
     }
@@ -2965,6 +2975,23 @@ mod tests {
     #[test]
     fn version_id_from_canonical_string_rejects_invalid_hex() {
         let err = VersionId::from_canonical_string("not-a-sha").unwrap_err();
+        assert!(matches!(err, DraftlineError::VersionNotFound(_)));
+    }
+
+    #[test]
+    fn version_id_from_canonical_string_rejects_abbreviated_prefix() {
+        // git2::Oid::from_str accepts short prefixes — from_canonical_string must not.
+        let abbreviated = "0123456789abcdef"; // 16 chars, valid hex but not 40
+        let err = VersionId::from_canonical_string(abbreviated).unwrap_err();
+        assert!(matches!(err, DraftlineError::VersionNotFound(_)));
+    }
+
+    #[test]
+    fn version_id_from_canonical_string_rejects_uppercase_hex() {
+        // Canonical OIDs are lowercase; uppercase should be rejected so IDs
+        // always compare equal as strings without case-folding.
+        let upper = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
+        let err = VersionId::from_canonical_string(upper).unwrap_err();
         assert!(matches!(err, DraftlineError::VersionNotFound(_)));
     }
 
