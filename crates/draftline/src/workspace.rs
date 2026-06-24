@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,6 +8,7 @@ use git2::{
     BranchType, Commit, DiffFormat, DiffOptions, ObjectType, Oid, Repository, Signature, Status,
     StatusOptions, Tree,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::recovery::RecoveryOperation;
 use crate::{
@@ -23,7 +25,7 @@ pub struct Workspace {
 }
 
 /// A named version of the workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Version {
     id: VersionId,
     pub label: String,
@@ -39,12 +41,28 @@ impl Version {
 }
 
 /// Identifier for a version.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct VersionId(String);
 
 impl VersionId {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Parses a version identifier from a canonical 40-character hex SHA string.
+    ///
+    /// Returns an error if the string is not a valid OID.
+    ///
+    /// ```no_run
+    /// use draftline::VersionId;
+    ///
+    /// let id = VersionId::from_canonical_string("a1b2c3d4e5f6...").unwrap();
+    /// ```
+    pub fn from_canonical_string(s: impl AsRef<str>) -> crate::Result<Self> {
+        let s = s.as_ref();
+        Oid::from_str(s).map_err(|_| crate::DraftlineError::VersionNotFound(s.to_string()))?;
+        Ok(Self(s.to_string()))
     }
 }
 
@@ -61,7 +79,7 @@ impl From<Oid> for VersionId {
 }
 
 /// An alternate direction for workspace content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Variation {
     id: VariationId,
     pub name: String,
@@ -83,7 +101,7 @@ impl Variation {
 ///
 /// Draftline persists this metadata alongside the variation but does not use it
 /// to name Git refs or enforce product-specific uniqueness rules.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VariationMetadata {
     /// Optional user-facing name. When omitted, [`Variation::display_label`]
     /// falls back to the variation's stored name.
@@ -112,7 +130,8 @@ impl VariationMetadata {
 }
 
 /// Identifier for a variation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct VariationId(String);
 
 impl VariationId {
@@ -140,7 +159,7 @@ impl From<&str> for VariationId {
 }
 
 /// A changed file in the workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedFile {
     pub path: PathBuf,
     pub kind: ChangeKind,
@@ -149,7 +168,7 @@ pub struct ChangedFile {
 }
 
 /// High-level kind of file change.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeKind {
     Added,
     Modified,
@@ -160,7 +179,7 @@ pub enum ChangeKind {
 }
 
 /// A content-workflow view of workspace changes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeSet {
     pub files: Vec<ChangedFile>,
     pub diff: Option<String>,
@@ -173,7 +192,7 @@ impl ChangeSet {
 }
 
 /// Policy for switching variations when unsaved work exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwitchPolicy {
     AbortIfDirty,
     SaveFirst { label: String },
@@ -182,7 +201,7 @@ pub enum SwitchPolicy {
 }
 
 /// Dry-run report for a risky operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightReport {
     pub operation: String,
     pub will_write_files: bool,
@@ -196,18 +215,116 @@ pub struct PreflightReport {
 }
 
 /// Read-only view of a version.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionPreview {
     pub id: VersionId,
     pub files: Vec<PreviewFile>,
 }
 
 /// File content from a read-only version preview.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewFile {
     pub path: PathBuf,
     pub content: Option<String>,
     pub is_binary: bool,
+}
+
+/// Comprehensive UI snapshot returned by [`Workspace::workspace_summary`].
+///
+/// Collects all state a host UI needs to render the workspace panel — active
+/// variation, version history, pending changes, and any interrupted-operation
+/// context — in a single, allocation-bounded call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSummary {
+    /// The variation that is currently checked out.
+    pub active_variation: Variation,
+    /// All local variations, sorted by name.
+    pub variations: Vec<Variation>,
+    /// Versions reachable from the current variation, newest first.
+    pub versions: Vec<Version>,
+    /// Files with unsaved changes in the workspace.
+    pub dirty_files: Vec<ChangedFile>,
+    /// `true` when `dirty_files` is non-empty.
+    pub is_dirty: bool,
+    /// Incomplete operation state if a prior Draftline operation was interrupted.
+    pub recovery: Option<crate::RecoveryState>,
+}
+
+/// A version annotated with variation-tip context for timeline/graph rendering.
+///
+/// Host UIs can render a simple history list or a branch graph by iterating
+/// [`HistoryEntry`] values returned from [`Workspace::history`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// The version at this position in the history walk.
+    pub version: Version,
+    /// Identifiers of any variations whose tip commit is this exact version.
+    ///
+    /// A non-empty slice means this version is the current tip of one or more
+    /// variations and can be used as a branch-point indicator in a graph UI.
+    pub variation_tips: Vec<VariationId>,
+    /// `true` when this version is the current `HEAD` of the active variation.
+    pub is_head: bool,
+    /// Identifiers of the parent version(s) of this version.
+    ///
+    /// Most versions have exactly one parent.  The initial version has no
+    /// parents.  Merge commits have multiple parents, but Draftline
+    /// discourages merge commits in favour of sequential saves.
+    pub parent_ids: Vec<VersionId>,
+}
+
+/// Per-variation snapshot with head version and total version count.
+///
+/// Returned by [`Workspace::variation_summaries`].  Provides the information
+/// a host UI needs to render a variation picker without switching variations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VariationSummary {
+    /// The variation this summary describes.
+    pub variation: Variation,
+    /// The tip (newest) version of this variation, or `None` for an empty workspace.
+    pub head_version: Option<Version>,
+    /// Total number of versions reachable from this variation's tip.
+    pub version_count: usize,
+}
+
+/// Preflight report for applying incoming changes from a remote.
+///
+/// Returned by [`Workspace::preflight_apply_incoming`].  Lets host UIs show
+/// a "safe to apply" indicator before committing to the apply operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyIncomingReport {
+    /// Sync status at the time of the preflight check.
+    pub sync_status: SyncStatus,
+    /// Files with unsaved changes that would block the apply.
+    pub dirty_files: Vec<ChangedFile>,
+    /// `true` when the apply can be done as a fast-forward (no three-way merge needed).
+    pub is_fast_forward: bool,
+    /// `true` when it is safe to call [`Workspace::apply_incoming`] immediately.
+    pub can_proceed: bool,
+}
+
+/// Result of a successful [`Workspace::apply_incoming`] call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyIncomingResult {
+    /// Number of versions fast-forwarded into the local variation.
+    pub applied_count: usize,
+}
+
+/// Diff between two versions or between a version and the current workspace.
+///
+/// Returned by [`Workspace::diff_versions`] and
+/// [`Workspace::diff_version_to_workspace`].  When `to_version` is `None`
+/// the diff is against the live workspace files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionDiff {
+    /// Base version for this diff.
+    pub from_version: Option<VersionId>,
+    /// Target version, or `None` when diffing against live workspace files.
+    pub to_version: Option<VersionId>,
+    /// Files that changed between the two points, sorted by path.
+    pub files: Vec<ChangedFile>,
+    /// Unified diff patch text, or `None` when there are no text changes.
+    pub patch: Option<String>,
 }
 
 impl Workspace {
@@ -797,6 +914,474 @@ impl Workspace {
         }))
     }
 
+    /// Returns a comprehensive UI snapshot of this workspace.
+    ///
+    /// Unlike individual accessor methods, `workspace_summary` succeeds even
+    /// when a prior operation left an incomplete recovery record — the
+    /// `recovery` field of the returned struct will carry the state, so the
+    /// host UI can surface a recovery prompt without needing a separate call.
+    ///
+    /// ```no_run
+    /// use draftline::Workspace;
+    ///
+    /// let workspace = Workspace::open("my-content")?;
+    /// let summary = workspace.workspace_summary()?;
+    /// println!("on variation: {}", summary.active_variation.name);
+    /// println!("versions: {}", summary.versions.len());
+    /// println!("dirty: {}", summary.is_dirty);
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
+    pub fn workspace_summary(&self) -> Result<WorkspaceSummary> {
+        let recovery = self.recovery_state()?;
+        let variations = self.variations_unchecked().unwrap_or_default();
+        let active_variation = variations
+            .iter()
+            .find(|v| v.is_current)
+            .cloned()
+            .or_else(|| {
+                self.current_variation_unchecked()
+                    .ok()
+                    .map(|name| Variation {
+                        id: VariationId::from(name.clone()),
+                        name,
+                        metadata: VariationMetadata::default(),
+                        is_current: true,
+                    })
+            })
+            .ok_or(DraftlineError::NoCurrentVariation)?;
+        let versions = self.versions_unchecked().unwrap_or_default();
+        let dirty_files = self.changed_files_unchecked().unwrap_or_default();
+        let is_dirty = !dirty_files.is_empty();
+
+        Ok(WorkspaceSummary {
+            active_variation,
+            variations,
+            versions,
+            dirty_files,
+            is_dirty,
+            recovery,
+        })
+    }
+
+    /// Returns the version history for the current variation with variation-tip annotations.
+    ///
+    /// Each entry carries the version metadata plus the list of variation IDs
+    /// whose tip commit is exactly that version — useful for rendering a branch
+    /// graph or timeline where multiple variations share common ancestors.
+    ///
+    /// ```no_run
+    /// use draftline::Workspace;
+    ///
+    /// let workspace = Workspace::open("my-content")?;
+    /// for entry in workspace.history()? {
+    ///     println!("{} {:?}", entry.version.label, entry.variation_tips);
+    /// }
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
+    pub fn history(&self) -> Result<Vec<HistoryEntry>> {
+        self.ensure_no_pending_recovery()?;
+        let tips = self.variation_tips_map()?;
+        let head_oid = self.repo.head().ok().and_then(|h| h.target());
+
+        let mut walk = self.repo.revwalk()?;
+        if walk.push_head().is_err() {
+            return Ok(Vec::new());
+        }
+
+        walk.map(|oid| {
+            let oid = oid?;
+            let commit = self.repo.find_commit(oid)?;
+            history_entry_from_commit(&commit, &tips, head_oid)
+        })
+        .collect()
+    }
+
+    /// Returns the combined version history across **all** local variations.
+    ///
+    /// Unlike [`Workspace::history`], which only walks the current variation,
+    /// this method pushes all variation tips into the revwalk so every commit
+    /// reachable from any variation appears exactly once, ordered
+    /// topologically (children before parents) then by time.
+    ///
+    /// Each [`HistoryEntry`] carries:
+    /// - `variation_tips` — which variation(s) point at this exact version
+    /// - `parent_ids` — the parent version IDs for graph-edge rendering
+    /// - `is_head` — whether this is the current `HEAD` commit
+    ///
+    /// ```no_run
+    /// use draftline::Workspace;
+    ///
+    /// let workspace = Workspace::open("my-content")?;
+    /// for entry in workspace.full_history()? {
+    ///     let tips: Vec<&str> = entry.variation_tips.iter().map(|id| id.as_str()).collect();
+    ///     println!("{} [{}]", entry.version.label, tips.join(", "));
+    /// }
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
+    pub fn full_history(&self) -> Result<Vec<HistoryEntry>> {
+        self.ensure_no_pending_recovery()?;
+        let tips = self.variation_tips_map()?;
+        let head_oid = self.repo.head().ok().and_then(|h| h.target());
+
+        let mut walk = self.repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+
+        for branch in self.repo.branches(Some(BranchType::Local))? {
+            let (branch, _) = branch?;
+            if let Ok(tip) = branch.get().peel_to_commit() {
+                walk.push(tip.id())?;
+            }
+        }
+
+        walk.map(|oid| {
+            let oid = oid?;
+            let commit = self.repo.find_commit(oid)?;
+            history_entry_from_commit(&commit, &tips, head_oid)
+        })
+        .collect()
+    }
+
+    /// Returns a per-variation snapshot with head version and total version count.
+    ///
+    /// This is the primary entry point for a variation picker UI that needs to
+    /// show, for every variation, its display name, tip version label, and how
+    /// many versions it contains — without switching to each variation.
+    ///
+    /// ```no_run
+    /// use draftline::Workspace;
+    ///
+    /// let workspace = Workspace::open("my-content")?;
+    /// for summary in workspace.variation_summaries()? {
+    ///     println!(
+    ///         "{}: {} version(s)",
+    ///         summary.variation.display_label(),
+    ///         summary.version_count
+    ///     );
+    /// }
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
+    pub fn variation_summaries(&self) -> Result<Vec<VariationSummary>> {
+        self.ensure_no_pending_recovery()?;
+        let current = self.current_variation_unchecked().ok();
+        let mut summaries = Vec::new();
+
+        for branch in self.repo.branches(Some(BranchType::Local))? {
+            let (branch, _) = branch?;
+            let Some(name) = branch.name()? else {
+                continue;
+            };
+            let metadata = self.read_variation_metadata(name)?;
+            let variation = variation_from_name(name.to_string(), current.as_ref(), metadata);
+
+            let (head_version, version_count) = match branch.get().peel_to_commit() {
+                Ok(tip) => {
+                    let head_version = Some(version_from_commit(&tip));
+                    let mut walk = self.repo.revwalk()?;
+                    walk.push(tip.id())?;
+                    let count = walk.count();
+                    (head_version, count)
+                }
+                Err(_) => (None, 0),
+            };
+
+            summaries.push(VariationSummary {
+                variation,
+                head_version,
+                version_count,
+            });
+        }
+
+        summaries.sort_by(|a, b| a.variation.name.cmp(&b.variation.name));
+        Ok(summaries)
+    }
+
+    /// Preflights applying incoming changes from a remote without mutating the workspace.
+    ///
+    /// Call this before [`Workspace::apply_incoming`] to let the host UI
+    /// display a summary of what would happen.  The preflight fetches remote
+    /// metadata and checks workspace cleanliness; it does **not** modify any
+    /// files or Git refs.
+    ///
+    /// ```no_run
+    /// use draftline::Workspace;
+    ///
+    /// let workspace = Workspace::open("my-content")?;
+    /// let report = workspace.preflight_apply_incoming("origin")?;
+    /// if report.can_proceed {
+    ///     println!("{} version(s) incoming", report.sync_status.behind);
+    /// }
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
+    pub fn preflight_apply_incoming(&self, remote: impl AsRef<str>) -> Result<ApplyIncomingReport> {
+        self.ensure_no_pending_recovery()?;
+        let sync_status = self.sync_status(remote)?;
+        let dirty_files = self.changed_files_unchecked()?;
+
+        let is_fast_forward = matches!(sync_status.state, SyncState::IncomingAvailable);
+        let can_proceed = dirty_files.is_empty() && is_fast_forward;
+
+        Ok(ApplyIncomingReport {
+            sync_status,
+            dirty_files,
+            is_fast_forward,
+            can_proceed,
+        })
+    }
+
+    /// Applies incoming changes from a remote using a fast-forward when possible.
+    ///
+    /// This method is safe to call when [`ApplyIncomingReport::can_proceed`] is
+    /// `true`.  It fetches the latest remote state, then fast-forwards the local
+    /// variation to match.
+    ///
+    /// Returns [`DraftlineError::SyncNeedsMerge`] when the histories have
+    /// diverged (`NeedsMerge`); in that case the host UI should surface an
+    /// explicit conflict-resolution flow rather than calling this method.
+    ///
+    /// The workspace must be clean (no unsaved changes) before calling.
+    ///
+    /// ```no_run
+    /// use draftline::{RemoteOptions, Workspace};
+    ///
+    /// let workspace = Workspace::open("my-content")?;
+    /// let mut options = RemoteOptions::new();
+    /// let result = workspace.apply_incoming("origin", &mut options)?;
+    /// println!("{} version(s) applied", result.applied_count);
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
+    pub fn apply_incoming(
+        &self,
+        remote: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<ApplyIncomingResult> {
+        self.ensure_no_pending_recovery()?;
+
+        let dirty_files = self.changed_files_unchecked()?;
+        if !dirty_files.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "apply_incoming",
+                true,
+                dirty_files,
+                None,
+            ))));
+        }
+
+        let remote_name = remote.as_ref().to_string();
+        self.fetch_remote_unchecked(&remote_name, options)?;
+        let status = self.sync_status(&remote_name)?;
+
+        match status.state {
+            SyncState::UpToDate | SyncState::LocalAhead | SyncState::NoRemoteVersion => {
+                return Ok(ApplyIncomingResult { applied_count: 0 });
+            }
+            SyncState::NeedsMerge => {
+                return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
+            }
+            SyncState::IncomingAvailable => {}
+        }
+
+        let applied_count = status.behind;
+        let variation = self.current_variation_unchecked()?;
+        let remote_ref = format!("refs/remotes/{remote_name}/{variation}");
+        let remote_oid = self.repo.refname_to_id(&remote_ref)?;
+        let remote_commit = self.repo.find_commit(remote_oid)?;
+        let branch_ref = format!("refs/heads/{variation}");
+
+        let operation_id = new_operation_id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::ApplyIncoming,
+            original_variation: Some(variation.clone()),
+            target: Some(remote_oid.to_string()),
+            completed: false,
+        })?;
+
+        // Fast-forward the local branch ref.
+        self.repo
+            .reference(&branch_ref, remote_oid, true, "apply_incoming fast-forward")?;
+
+        // Bring the working directory up to the new tree.
+        self.repo.checkout_tree(
+            remote_commit.tree()?.as_object(),
+            Some(CheckoutBuilder::new().force()),
+        )?;
+        self.repo.set_head(&branch_ref)?;
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::ApplyIncoming,
+            original_variation: None,
+            target: Some(remote_oid.to_string()),
+            completed: true,
+        })?;
+
+        Ok(ApplyIncomingResult { applied_count })
+    }
+
+    /// Squashes the last `count` versions into a single new version.
+    ///
+    /// The new version has the same tree as the current `HEAD` but is parented
+    /// directly on the commit that preceded the squashed range, collapsing
+    /// `count` intermediate commits into one.
+    ///
+    /// Requires:
+    /// - `count >= 2`
+    /// - The workspace must be clean (no unsaved changes).
+    /// - The current variation must have at least `count + 1` versions (so
+    ///   there is a parent commit outside the squash range to attach to).
+    ///
+    /// ```no_run
+    /// use draftline::Workspace;
+    ///
+    /// let workspace = Workspace::open("my-content")?;
+    /// let squashed = workspace.squash_versions(3, "Squashed three drafts")?;
+    /// println!("squashed → {}", squashed.label);
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
+    pub fn squash_versions(&self, count: usize, label: impl AsRef<str>) -> Result<Version> {
+        self.ensure_no_pending_recovery()?;
+
+        if count < 2 {
+            return Err(DraftlineError::InvalidSquashCount(count));
+        }
+
+        let dirty_files = self.changed_files_unchecked()?;
+        if !dirty_files.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "squash_versions",
+                false,
+                dirty_files,
+                None,
+            ))));
+        }
+
+        let mut walk = self.repo.revwalk()?;
+        walk.push_head()?;
+        let commit_oids: Vec<Oid> = walk
+            .take(count)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        if commit_oids.len() < count {
+            return Err(DraftlineError::NotEnoughVersionsToSquash {
+                needed: count,
+                available: commit_oids.len(),
+            });
+        }
+
+        let head_commit = self.repo.find_commit(commit_oids[0])?;
+        let oldest_commit = self.repo.find_commit(commit_oids[count - 1])?;
+
+        // The squash commit's parent is the commit that precedes the squash range.
+        let squash_parent =
+            oldest_commit
+                .parent(0)
+                .map_err(|_| DraftlineError::NotEnoughVersionsToSquash {
+                    needed: count + 1,
+                    available: count,
+                })?;
+
+        let tree = head_commit.tree()?;
+        let signature = self.workspace_signature()?;
+
+        // Create the squash commit without touching any ref yet — git2 would
+        // reject Some("HEAD") here because squash_parent is not the current tip.
+        let oid = self.repo.commit(
+            None,
+            &signature,
+            &signature,
+            label.as_ref(),
+            &tree,
+            &[&squash_parent],
+        )?;
+
+        // Force the current branch to point at the new squash commit.
+        let variation = self.current_variation_unchecked()?;
+        let branch_ref = format!("refs/heads/{variation}");
+        self.repo
+            .reference(&branch_ref, oid, true, "squash_versions")?;
+
+        Ok(version_from_commit(&self.repo.find_commit(oid)?))
+    }
+
+    /// Returns a diff between two specific versions.
+    ///
+    /// The patch field contains a unified diff suitable for display.  When both
+    /// versions are identical the patch is `None` and `files` is empty.
+    ///
+    /// ```no_run
+    /// use draftline::Workspace;
+    ///
+    /// let workspace = Workspace::open("my-content")?;
+    /// let versions = workspace.versions()?;
+    /// if versions.len() >= 2 {
+    ///     let diff = workspace.diff_versions(versions[1].id(), versions[0].id())?;
+    ///     println!("{} file(s) changed", diff.files.len());
+    /// }
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
+    pub fn diff_versions(&self, from: &VersionId, to: &VersionId) -> Result<VersionDiff> {
+        self.ensure_no_pending_recovery()?;
+        let from_commit = self.find_version_commit(from)?;
+        let to_commit = self.find_version_commit(to)?;
+        let from_tree = from_commit.tree()?;
+        let to_tree = to_commit.tree()?;
+
+        let mut opts = DiffOptions::new();
+        let diff =
+            self.repo
+                .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))?;
+
+        let files = diff_deltas_to_changed_files(&diff);
+        let patch = diff_to_patch_text(&diff)?;
+
+        Ok(VersionDiff {
+            from_version: Some(from.clone()),
+            to_version: Some(to.clone()),
+            files,
+            patch: if patch.is_empty() { None } else { Some(patch) },
+        })
+    }
+
+    /// Returns a diff between a version and the current workspace files.
+    ///
+    /// This is similar to [`Workspace::changes`] but lets the host UI diff any
+    /// historical version against the live workspace, not just `HEAD`.  The
+    /// content policy is applied: files excluded by the policy are omitted.
+    ///
+    /// ```no_run
+    /// use draftline::Workspace;
+    ///
+    /// let workspace = Workspace::open("my-content")?;
+    /// let versions = workspace.versions()?;
+    /// if let Some(version) = versions.last() {
+    ///     let diff = workspace.diff_version_to_workspace(version.id())?;
+    ///     println!("{} file(s) differ from version", diff.files.len());
+    /// }
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
+    pub fn diff_version_to_workspace(&self, version: &VersionId) -> Result<VersionDiff> {
+        self.ensure_no_pending_recovery()?;
+        let commit = self.find_version_commit(version)?;
+        let tree = commit.tree()?;
+
+        let mut opts = DiffOptions::new();
+        opts.include_untracked(true).recurse_untracked_dirs(true);
+        let diff = self
+            .repo
+            .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts))?;
+
+        let files =
+            diff_deltas_to_changed_files_with_policy(&diff, &self.root, &self.content_policy)?;
+        let patch = diff_to_patch_text(&diff)?;
+
+        Ok(VersionDiff {
+            from_version: Some(version.clone()),
+            to_version: None,
+            files,
+            patch: if patch.is_empty() { None } else { Some(patch) },
+        })
+    }
+
     /// Returns the current variation name when the workspace is on a normal variation.
     pub fn current_variation(&self) -> Result<String> {
         self.ensure_no_pending_recovery()?;
@@ -804,12 +1389,25 @@ impl Workspace {
     }
 
     fn current_variation_unchecked(&self) -> Result<String> {
-        let head = self.repo.head()?;
-        let Some(name) = head.shorthand() else {
-            return Err(DraftlineError::NoCurrentVariation);
-        };
-
-        Ok(name.to_string())
+        match self.repo.head() {
+            Ok(head) => {
+                let Some(name) = head.shorthand() else {
+                    return Err(DraftlineError::NoCurrentVariation);
+                };
+                Ok(name.to_string())
+            }
+            Err(error) if error.code() == git2::ErrorCode::UnbornBranch => {
+                // New repository with no commits — derive the intended initial branch
+                // name from the HEAD symbolic reference (e.g. refs/heads/master → "master").
+                self.repo
+                    .find_reference("HEAD")
+                    .ok()
+                    .and_then(|r| r.symbolic_target().map(str::to_string))
+                    .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_string))
+                    .ok_or(DraftlineError::NoCurrentVariation)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Adds or updates a remote endpoint for sharing/backing up this workspace.
@@ -1177,6 +1775,54 @@ impl Workspace {
             Err(_) => Ok(Signature::now("Draftline", "draftline@example.invalid")?),
         }
     }
+
+    fn versions_unchecked(&self) -> Result<Vec<Version>> {
+        let mut walk = self.repo.revwalk()?;
+        if walk.push_head().is_err() {
+            return Ok(Vec::new());
+        }
+        walk.map(|oid| {
+            let oid = oid?;
+            let commit = self.repo.find_commit(oid)?;
+            Ok(version_from_commit(&commit))
+        })
+        .collect()
+    }
+
+    fn variations_unchecked(&self) -> Result<Vec<Variation>> {
+        let current = self.current_variation_unchecked().ok();
+        let mut paths = Vec::new();
+        for branch in self.repo.branches(Some(BranchType::Local))? {
+            let (branch, _) = branch?;
+            let Some(name) = branch.name()? else {
+                continue;
+            };
+            let metadata = self.read_variation_metadata(name)?;
+            paths.push(variation_from_name(
+                name.to_string(),
+                current.as_ref(),
+                metadata,
+            ));
+        }
+        paths.sort_by(|l, r| l.name.cmp(&r.name));
+        Ok(paths)
+    }
+
+    fn variation_tips_map(&self) -> Result<HashMap<Oid, Vec<VariationId>>> {
+        let mut map: HashMap<Oid, Vec<VariationId>> = HashMap::new();
+        for branch in self.repo.branches(Some(BranchType::Local))? {
+            let (branch, _) = branch?;
+            let Some(name) = branch.name()? else {
+                continue;
+            };
+            if let Ok(tip) = branch.get().peel_to_commit() {
+                map.entry(tip.id())
+                    .or_default()
+                    .push(VariationId::from(name));
+            }
+        }
+        Ok(map)
+    }
 }
 
 fn validate_variation_name(name: &str) -> Result<String> {
@@ -1375,6 +2021,27 @@ fn version_from_commit(commit: &Commit<'_>) -> Version {
     }
 }
 
+fn history_entry_from_commit(
+    commit: &Commit<'_>,
+    tips: &HashMap<Oid, Vec<VariationId>>,
+    head_oid: Option<Oid>,
+) -> Result<HistoryEntry> {
+    let oid = commit.id();
+    let version = version_from_commit(commit);
+    let mut variation_tips = tips.get(&oid).cloned().unwrap_or_default();
+    variation_tips.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let is_head = head_oid == Some(oid);
+    let parent_ids = (0..commit.parent_count())
+        .map(|i| commit.parent_id(i).map(VersionId::from))
+        .collect::<std::result::Result<Vec<_>, git2::Error>>()?;
+    Ok(HistoryEntry {
+        version,
+        variation_tips,
+        is_head,
+        parent_ids,
+    })
+}
+
 fn remote_summary_from_commit(commit: &Commit<'_>) -> RemoteVersionSummary {
     RemoteVersionSummary {
         id: commit.id().to_string(),
@@ -1390,6 +2057,99 @@ fn new_operation_id() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     format!("op-{nanos}")
+}
+
+/// Converts a libgit2 `Delta` status to a [`ChangeKind`].
+fn git2_delta_to_change_kind(status: git2::Delta) -> ChangeKind {
+    match status {
+        git2::Delta::Added | git2::Delta::Copied | git2::Delta::Untracked => ChangeKind::Added,
+        git2::Delta::Deleted => ChangeKind::Deleted,
+        git2::Delta::Renamed => ChangeKind::Renamed,
+        git2::Delta::Typechange => ChangeKind::TypeChanged,
+        git2::Delta::Conflicted => ChangeKind::Conflicted,
+        _ => ChangeKind::Modified,
+    }
+}
+
+/// Collects [`ChangedFile`] entries from a tree-to-tree diff.
+///
+/// `is_large` is always `false` because size thresholds are not meaningful
+/// for historical object comparisons.
+fn diff_deltas_to_changed_files(diff: &git2::Diff<'_>) -> Vec<ChangedFile> {
+    let mut files = Vec::new();
+    for delta in diff.deltas() {
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(PathBuf::from)
+            .unwrap_or_default();
+
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+
+        let kind = git2_delta_to_change_kind(delta.status());
+        let is_binary = delta.flags().contains(git2::DiffFlags::BINARY);
+
+        files.push(ChangedFile {
+            path,
+            kind,
+            is_binary,
+            is_large: false,
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+/// Collects [`ChangedFile`] entries from a tree-to-workdir diff, filtered by
+/// `content_policy`.  `is_large` and `is_binary` are derived from the actual
+/// workspace file, matching the behaviour of [`Workspace::changed_files`].
+fn diff_deltas_to_changed_files_with_policy(
+    diff: &git2::Diff<'_>,
+    root: &Path,
+    policy: &ContentPolicy,
+) -> Result<Vec<ChangedFile>> {
+    let mut files = Vec::new();
+    for delta in diff.deltas() {
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(PathBuf::from)
+            .unwrap_or_default();
+
+        if path.as_os_str().is_empty() || !policy.tracks(&path)? {
+            continue;
+        }
+
+        let kind = git2_delta_to_change_kind(delta.status());
+        let full_path = root.join(&path);
+        let is_binary = file_is_binary(&full_path)?;
+        let is_large = file_is_large(&full_path, policy.large_file_threshold_bytes())?;
+
+        files.push(ChangedFile {
+            path,
+            kind,
+            is_binary,
+            is_large,
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// Renders a diff as a unified patch string.
+fn diff_to_patch_text(diff: &git2::Diff<'_>) -> Result<String> {
+    let mut text = String::new();
+    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        if let Ok(content) = std::str::from_utf8(line.content()) {
+            text.push_str(content);
+        }
+        true
+    })?;
+    Ok(text)
 }
 
 struct OperationLock {
@@ -1936,5 +2696,606 @@ mod tests {
 
         let err = first_workspace.publish_changes("origin").unwrap_err();
         assert!(matches!(err, DraftlineError::SyncNeedsMerge(_)));
+    }
+
+    // ── workspace_summary ────────────────────────────────────────────────────
+
+    #[test]
+    fn workspace_summary_returns_active_variation_and_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("Draft one").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        workspace.save_version("Draft two").unwrap();
+
+        let summary = workspace.workspace_summary().unwrap();
+
+        assert_eq!(summary.active_variation.name, "master");
+        assert!(summary.active_variation.is_current);
+        assert_eq!(summary.versions.len(), 2);
+        assert_eq!(summary.versions[0].label, "Draft two");
+        assert!(!summary.is_dirty);
+        assert!(summary.dirty_files.is_empty());
+        assert!(summary.recovery.is_none());
+    }
+
+    #[test]
+    fn workspace_summary_reports_dirty_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "post.md", b"unsaved");
+
+        let summary = workspace.workspace_summary().unwrap();
+
+        assert!(summary.is_dirty);
+        assert_eq!(summary.dirty_files.len(), 1);
+        assert_eq!(summary.dirty_files[0].path, PathBuf::from("post.md"));
+    }
+
+    #[test]
+    fn workspace_summary_includes_recovery_state_without_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::SwitchVariation,
+                original_variation: Some("master".to_string()),
+                target: Some("alternate".to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        // summary must succeed even when recovery is pending
+        let summary = workspace.workspace_summary().unwrap();
+        assert!(summary.recovery.is_some());
+        let state = summary.recovery.unwrap();
+        assert_eq!(state.operation_id, "interrupted");
+    }
+
+    #[test]
+    fn workspace_summary_lists_all_variations() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        workspace.create_variation("alt-a").unwrap();
+        workspace.create_variation("alt-b").unwrap();
+
+        let summary = workspace.workspace_summary().unwrap();
+
+        assert_eq!(summary.variations.len(), 3);
+        let names: Vec<&str> = summary.variations.iter().map(|v| v.name.as_str()).collect();
+        assert!(names.contains(&"master"));
+        assert!(names.contains(&"alt-a"));
+        assert!(names.contains(&"alt-b"));
+    }
+
+    // ── history ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn history_marks_variation_tips_at_correct_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"first");
+        workspace.save_version("First").unwrap();
+        // create a variation that diverges at this point
+        workspace.create_variation("feature").unwrap();
+
+        write_file(workspace.root(), "post.md", b"second");
+        workspace.save_version("Second").unwrap();
+
+        let history = workspace.history().unwrap();
+        assert_eq!(history.len(), 2);
+
+        // HEAD (newest) should be marked as the tip of "master"
+        let head_entry = &history[0];
+        assert!(head_entry.is_head);
+        assert!(head_entry
+            .variation_tips
+            .iter()
+            .any(|id| id.as_str() == "master"));
+
+        // older version should show "feature" as a tip
+        let older_entry = &history[1];
+        assert!(!older_entry.is_head);
+        assert!(older_entry
+            .variation_tips
+            .iter()
+            .any(|id| id.as_str() == "feature"));
+    }
+
+    #[test]
+    fn history_returns_empty_for_brand_new_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        let history = workspace.history().unwrap();
+        assert!(history.is_empty());
+    }
+
+    // ── diff_versions ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn diff_versions_reports_changed_files_and_patch() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"hello");
+        let v1 = workspace.save_version("v1").unwrap();
+
+        write_file(workspace.root(), "post.md", b"hello world");
+        let v2 = workspace.save_version("v2").unwrap();
+
+        let diff = workspace.diff_versions(v1.id(), v2.id()).unwrap();
+
+        assert_eq!(diff.from_version.as_ref(), Some(v1.id()));
+        assert_eq!(diff.to_version.as_ref(), Some(v2.id()));
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].path, PathBuf::from("post.md"));
+        assert_eq!(diff.files[0].kind, ChangeKind::Modified);
+        assert!(diff.patch.is_some());
+    }
+
+    #[test]
+    fn diff_versions_empty_when_identical() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"same");
+        let v1 = workspace.save_version("v1").unwrap();
+
+        // save again without changes
+        let v2 = workspace.save_version("v2").unwrap();
+
+        let diff = workspace.diff_versions(v1.id(), v2.id()).unwrap();
+
+        assert!(diff.files.is_empty());
+        assert!(diff.patch.is_none());
+    }
+
+    // ── diff_version_to_workspace ─────────────────────────────────────────────
+
+    #[test]
+    fn diff_version_to_workspace_detects_uncommitted_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"saved");
+        let version = workspace.save_version("Saved").unwrap();
+
+        write_file(workspace.root(), "post.md", b"modified in workspace");
+
+        let diff = workspace.diff_version_to_workspace(version.id()).unwrap();
+
+        assert_eq!(diff.from_version.as_ref(), Some(version.id()));
+        assert!(diff.to_version.is_none());
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].kind, ChangeKind::Modified);
+        assert!(diff.patch.is_some());
+    }
+
+    #[test]
+    fn diff_version_to_workspace_applies_content_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = ContentPolicy::new().include_extension("md").unwrap();
+        let workspace = Workspace::init_with_policy(temp.path(), policy).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"saved");
+        let version = workspace.save_version("Saved").unwrap();
+
+        // policy-excluded file should not appear in the diff
+        write_file(workspace.root(), "state.json", b"{}");
+        write_file(workspace.root(), "post.md", b"modified");
+
+        let diff = workspace.diff_version_to_workspace(version.id()).unwrap();
+
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].path, PathBuf::from("post.md"));
+    }
+
+    // ── VersionId::from_canonical_string ─────────────────────────────────────
+
+    #[test]
+    fn version_id_round_trips_through_canonical_string() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"hello");
+        let version = workspace.save_version("Draft").unwrap();
+
+        let parsed = VersionId::from_canonical_string(version.id().as_str()).unwrap();
+        assert_eq!(&parsed, version.id());
+    }
+
+    #[test]
+    fn version_id_from_canonical_string_rejects_invalid_hex() {
+        let err = VersionId::from_canonical_string("not-a-sha").unwrap_err();
+        assert!(matches!(err, DraftlineError::VersionNotFound(_)));
+    }
+
+    // ── serde round-trips ─────────────────────────────────────────────────────
+
+    #[test]
+    fn version_id_serializes_as_plain_string() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"hello");
+        let version = workspace.save_version("Draft").unwrap();
+
+        let json = serde_json::to_string(version.id()).unwrap();
+        // should be a plain JSON string, not an object
+        assert!(json.starts_with('"'));
+        let parsed: VersionId = serde_json::from_str(&json).unwrap();
+        assert_eq!(&parsed, version.id());
+    }
+
+    #[test]
+    fn workspace_summary_is_serializable() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"hello");
+        workspace.save_version("Draft").unwrap();
+
+        let summary = workspace.workspace_summary().unwrap();
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("active_variation"));
+        assert!(json.contains("versions"));
+    }
+
+    // ── parent_ids in history ─────────────────────────────────────────────────
+
+    #[test]
+    fn history_entries_carry_parent_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"v1");
+        let v1 = workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+
+        let history = workspace.history().unwrap();
+        assert_eq!(history.len(), 2);
+
+        // Newest (v2): should have v1 as its sole parent
+        assert_eq!(history[0].version.id(), v2.id());
+        assert_eq!(history[0].parent_ids.len(), 1);
+        assert_eq!(&history[0].parent_ids[0], v1.id());
+
+        // Initial (v1): no parents
+        assert_eq!(history[1].version.id(), v1.id());
+        assert!(history[1].parent_ids.is_empty());
+    }
+
+    // ── full_history ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn full_history_includes_commits_from_all_variations() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+
+        // Diverge a variation; switch to it and add an exclusive commit.
+        workspace
+            .create_variation_from(base.id(), "feature")
+            .unwrap();
+        workspace
+            .switch_variation(&VariationId::from("feature"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"feature work");
+        let feature_v = workspace.save_version("Feature commit").unwrap();
+
+        // Switch back and add a commit on master too.
+        workspace
+            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"main work");
+        let main_v = workspace.save_version("Main commit").unwrap();
+
+        let all = workspace.full_history().unwrap();
+        let all_ids: Vec<&VersionId> = all.iter().map(|e| e.version.id()).collect();
+
+        assert!(all_ids.contains(&base.id()), "base missing");
+        assert!(all_ids.contains(&feature_v.id()), "feature commit missing");
+        assert!(all_ids.contains(&main_v.id()), "main commit missing");
+    }
+
+    #[test]
+    fn full_history_parent_ids_form_valid_dag() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"v1");
+        let v1 = workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+
+        let entries = workspace.full_history().unwrap();
+        let v2_entry = entries.iter().find(|e| e.version.id() == v2.id()).unwrap();
+        let v1_entry = entries.iter().find(|e| e.version.id() == v1.id()).unwrap();
+
+        assert_eq!(v2_entry.parent_ids.len(), 1);
+        assert_eq!(&v2_entry.parent_ids[0], v1.id());
+        assert!(v1_entry.parent_ids.is_empty());
+    }
+
+    // ── variation_summaries ───────────────────────────────────────────────────
+
+    #[test]
+    fn variation_summaries_reports_head_and_count_per_variation() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"second");
+        let second = workspace.save_version("Second").unwrap();
+
+        // Create a variation that branches off at "Base" (2 commits on master,
+        // 1 commit on the new variation).
+        workspace
+            .create_variation_from(workspace.versions().unwrap().last().unwrap().id(), "side")
+            .unwrap();
+
+        let summaries = workspace.variation_summaries().unwrap();
+        let master = summaries
+            .iter()
+            .find(|s| s.variation.name == "master")
+            .unwrap();
+        let side = summaries
+            .iter()
+            .find(|s| s.variation.name == "side")
+            .unwrap();
+
+        assert_eq!(master.version_count, 2);
+        assert_eq!(
+            master.head_version.as_ref().map(|v| v.id()),
+            Some(second.id())
+        );
+
+        // "side" branches from "Base" — the earliest commit — so 1 version.
+        assert_eq!(side.version_count, 1);
+        assert!(side.head_version.is_some());
+    }
+
+    #[test]
+    fn variation_summaries_is_serializable() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"hello");
+        workspace.save_version("Draft").unwrap();
+
+        let summaries = workspace.variation_summaries().unwrap();
+        let json = serde_json::to_string(&summaries).unwrap();
+        assert!(json.contains("version_count"));
+    }
+
+    // ── preflight_apply_incoming ──────────────────────────────────────────────
+
+    #[test]
+    fn preflight_apply_incoming_reports_fast_forward_available() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_ws = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_ws, "Seth", "seth@example.com");
+        first_ws
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_ws.root(), "post.md", b"one");
+        first_ws.save_version("One").unwrap();
+        first_ws.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_ws =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_ws, "Maria", "maria@example.com");
+        write_file(second_ws.root(), "post.md", b"two");
+        second_ws.save_version("Two").unwrap();
+        second_ws.publish_changes("origin").unwrap();
+
+        // first_ws is behind — preflight should see IncomingAvailable
+        first_ws.fetch_remote("origin").unwrap();
+        let report = first_ws.preflight_apply_incoming("origin").unwrap();
+
+        assert!(report.is_fast_forward);
+        assert!(report.can_proceed);
+        assert!(report.dirty_files.is_empty());
+        assert_eq!(report.sync_status.behind, 1);
+    }
+
+    #[test]
+    fn preflight_apply_incoming_blocks_when_workspace_dirty() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_ws = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_ws, "Seth", "seth@example.com");
+        first_ws
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_ws.root(), "post.md", b"one");
+        first_ws.save_version("One").unwrap();
+        first_ws.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_ws =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_ws, "Maria", "maria@example.com");
+        write_file(second_ws.root(), "post.md", b"two");
+        second_ws.save_version("Two").unwrap();
+        second_ws.publish_changes("origin").unwrap();
+
+        first_ws.fetch_remote("origin").unwrap();
+        // dirty workspace should prevent proceed
+        write_file(first_ws.root(), "post.md", b"unsaved");
+        let report = first_ws.preflight_apply_incoming("origin").unwrap();
+
+        assert!(!report.can_proceed);
+        assert!(!report.dirty_files.is_empty());
+    }
+
+    // ── apply_incoming ────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_incoming_fast_forwards_local_variation() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_ws = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_ws, "Seth", "seth@example.com");
+        first_ws
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_ws.root(), "post.md", b"one");
+        first_ws.save_version("One").unwrap();
+        first_ws.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_ws =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_ws, "Maria", "maria@example.com");
+        write_file(second_ws.root(), "post.md", b"two");
+        second_ws.save_version("Two").unwrap();
+        second_ws.publish_changes("origin").unwrap();
+
+        let mut options = RemoteOptions::new();
+        let result = first_ws.apply_incoming("origin", &mut options).unwrap();
+
+        assert_eq!(result.applied_count, 1);
+        // workspace file should reflect the applied version
+        let content = std::fs::read_to_string(first_ws.root().join("post.md")).unwrap();
+        assert_eq!(content, "two");
+        assert!(first_ws.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_incoming_returns_zero_when_already_up_to_date() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let local = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(local.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"hello");
+        workspace.save_version("Hello").unwrap();
+        workspace.publish_changes("origin").unwrap();
+
+        // already up to date
+        let mut options = RemoteOptions::new();
+        let result = workspace.apply_incoming("origin", &mut options).unwrap();
+        assert_eq!(result.applied_count, 0);
+    }
+
+    // ── squash_versions ───────────────────────────────────────────────────────
+
+    #[test]
+    fn squash_versions_collapses_commits_and_produces_single_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        workspace.save_version("v3").unwrap();
+
+        let squashed = workspace.squash_versions(2, "Squashed v2+v3").unwrap();
+
+        assert_eq!(squashed.label, "Squashed v2+v3");
+        // after squash: 2 commits — v1 (base) + squash commit
+        let versions = workspace.versions().unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].label, "Squashed v2+v3");
+        assert_eq!(versions[1].label, "v1");
+        // workspace files must still reflect v3 content
+        let content = std::fs::read_to_string(workspace.root().join("post.md")).unwrap();
+        assert_eq!(content, "v3");
+    }
+
+    #[test]
+    fn squash_versions_rejects_count_less_than_two() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+
+        let err = workspace.squash_versions(1, "Single").unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidSquashCount(1)));
+    }
+
+    #[test]
+    fn squash_versions_rejects_dirty_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        workspace.save_version("v2").unwrap();
+        // leave v3 unsaved
+        write_file(workspace.root(), "post.md", b"unsaved");
+
+        let err = workspace.squash_versions(2, "Squashed").unwrap_err();
+        assert!(matches!(err, DraftlineError::PreflightFailed(_)));
+    }
+
+    #[test]
+    fn squash_versions_rejects_when_not_enough_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        // Only 2 commits, trying to squash 2 requires a parent outside the range
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        workspace.save_version("v2").unwrap();
+
+        let err = workspace
+            .squash_versions(2, "Squash everything")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DraftlineError::NotEnoughVersionsToSquash { .. }
+        ));
     }
 }

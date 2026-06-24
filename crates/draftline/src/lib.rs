@@ -89,6 +89,7 @@ pub use remote::{
     RemoteOptions, RemoteVersionSummary, SyncState, SyncStatus,
 };
 pub use workspace::{
-    ChangeKind, ChangeSet, ChangedFile, PreflightReport, PreviewFile, SwitchPolicy, Variation,
-    VariationId, VariationMetadata, Version, VersionId, VersionPreview, Workspace,
+    ApplyIncomingReport, ApplyIncomingResult, ChangeKind, ChangeSet, ChangedFile, HistoryEntry,
+    PreflightReport, PreviewFile, SwitchPolicy, Variation, VariationId, VariationMetadata,
+    VariationSummary, Version, VersionDiff, VersionId, VersionPreview, Workspace, WorkspaceSummary,
 };

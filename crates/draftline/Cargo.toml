@@ -1,6 +1,6 @@
 [package]
 name = "draftline"
-version = "0.1.4"
+version = "0.1.5"
 description = "Git-native versioning for creative content workflows."
 edition.workspace = true
 license.workspace = true

@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 /// Input passed to a semantic merge resolver.
 #[derive(Debug, Clone, Copy)]
 pub struct MergeInput<'a> {
@@ -10,7 +12,7 @@ pub struct MergeInput<'a> {
 }
 
 /// Result of a semantic merge attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeOutcome {
     pub merged: Option<String>,
     pub conflicts: Vec<MergeConflict>,
@@ -37,7 +39,7 @@ impl MergeOutcome {
 }
 
 /// A human-resolvable content conflict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeConflict {
     pub path: PathBuf,
     pub field_path: Option<String>,
@@ -49,7 +51,7 @@ pub struct MergeConflict {
 }
 
 /// Suggested shape of resolution a UI or caller can present.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolutionKind {
     Choose,
     Edit,

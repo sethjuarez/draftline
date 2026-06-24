@@ -16,4 +16,5 @@ pub enum RecoveryOperation {
     SwitchVariation,
     RestoreVersionAsNewSave,
     ShelveChanges,
+    ApplyIncoming,
 }
