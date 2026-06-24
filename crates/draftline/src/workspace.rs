@@ -3,14 +3,16 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use git2::{
-    build::CheckoutBuilder, BranchType, Commit, DiffFormat, DiffOptions, ObjectType, Oid,
-    Repository, Signature, Status, StatusOptions, Tree,
+    build::{CheckoutBuilder, RepoBuilder},
+    BranchType, Commit, DiffFormat, DiffOptions, ObjectType, Oid, Repository, Signature, Status,
+    StatusOptions, Tree,
 };
 
 use crate::recovery::RecoveryOperation;
 use crate::{
     path::normalize_workspace_relative, ContentPolicy, Contributor, DraftlineError, PublishResult,
-    RecoveryState, RemoteEndpoint, RemoteVersionSummary, Result, SyncState, SyncStatus,
+    RecoveryState, RemoteEndpoint, RemoteOptions, RemoteVersionSummary, Result, SyncState,
+    SyncStatus,
 };
 
 /// A folder-backed content workspace.
@@ -63,12 +65,40 @@ impl From<Oid> for VersionId {
 pub struct Variation {
     id: VariationId,
     pub name: String,
+    pub metadata: VariationMetadata,
     pub is_current: bool,
 }
 
 impl Variation {
     pub fn id(&self) -> &VariationId {
         &self.id
+    }
+
+    pub fn display_label(&self) -> &str {
+        self.metadata.label.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// Host-provided display metadata for a variation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VariationMetadata {
+    pub label: Option<String>,
+    pub slug: Option<String>,
+}
+
+impl VariationMetadata {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = normalize_optional_metadata(label.into());
+        self
+    }
+
+    pub fn with_slug(mut self, slug: impl Into<String>) -> Self {
+        self.slug = normalize_optional_metadata(slug.into());
+        self
     }
 }
 
@@ -91,6 +121,12 @@ impl std::fmt::Display for VariationId {
 impl From<String> for VariationId {
     fn from(value: String) -> Self {
         Self(value)
+    }
+}
+
+impl From<&str> for VariationId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
     }
 }
 
@@ -225,7 +261,42 @@ impl Workspace {
         path: impl AsRef<Path>,
         content_policy: ContentPolicy,
     ) -> Result<Self> {
-        let repo = Repository::clone(remote_url.as_ref(), path.as_ref())?;
+        let mut options = RemoteOptions::new();
+        Self::clone_workspace_with_policy_and_options(
+            remote_url,
+            path,
+            content_policy,
+            &mut options,
+        )
+    }
+
+    /// Clones a shared workspace from a remote endpoint with explicit remote options.
+    pub fn clone_workspace_with_options(
+        remote_url: impl AsRef<str>,
+        path: impl AsRef<Path>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<Self> {
+        Self::clone_workspace_with_policy_and_options(
+            remote_url,
+            path,
+            ContentPolicy::default(),
+            options,
+        )
+    }
+
+    /// Clones a shared workspace with explicit content policy and remote options.
+    pub fn clone_workspace_with_policy_and_options(
+        remote_url: impl AsRef<str>,
+        path: impl AsRef<Path>,
+        content_policy: ContentPolicy,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<Self> {
+        let mut builder = RepoBuilder::new();
+        if options.has_credentials() {
+            let fetch_options = options.clone_fetch_options();
+            builder.fetch_options(fetch_options);
+        }
+        let repo = builder.clone(remote_url.as_ref(), path.as_ref())?;
         let root = repo
             .workdir()
             .map(Path::to_path_buf)
@@ -425,14 +496,25 @@ impl Workspace {
 
     /// Creates a new variation from the current version.
     pub fn create_variation(&self, name: impl AsRef<str>) -> Result<Variation> {
+        self.create_variation_with_metadata(name, VariationMetadata::default())
+    }
+
+    /// Creates a new variation with display metadata from the current version.
+    pub fn create_variation_with_metadata(
+        &self,
+        name: impl AsRef<str>,
+        metadata: VariationMetadata,
+    ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(name.as_ref())?;
         let head = self.repo.head()?.peel_to_commit()?;
         self.repo.branch(&name, &head, false)?;
+        self.write_variation_metadata(&name, &metadata)?;
 
         Ok(variation_from_name(
             name,
             self.current_variation().ok().as_ref(),
+            metadata,
         ))
     }
 
@@ -442,14 +524,26 @@ impl Workspace {
         version: &VersionId,
         name: impl AsRef<str>,
     ) -> Result<Variation> {
+        self.create_variation_from_with_metadata(version, name, VariationMetadata::default())
+    }
+
+    /// Creates a variation with display metadata from an older version without switching to it.
+    pub fn create_variation_from_with_metadata(
+        &self,
+        version: &VersionId,
+        name: impl AsRef<str>,
+        metadata: VariationMetadata,
+    ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(name.as_ref())?;
         let commit = self.find_version_commit(version)?;
         self.repo.branch(&name, &commit, false)?;
+        self.write_variation_metadata(&name, &metadata)?;
 
         Ok(variation_from_name(
             name,
             self.current_variation().ok().as_ref(),
+            metadata,
         ))
     }
 
@@ -465,11 +559,42 @@ impl Workspace {
                 continue;
             };
 
-            paths.push(variation_from_name(name.to_string(), current.as_ref()));
+            let metadata = self.read_variation_metadata(name)?;
+            paths.push(variation_from_name(
+                name.to_string(),
+                current.as_ref(),
+                metadata,
+            ));
         }
 
         paths.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(paths)
+    }
+
+    /// Returns display metadata for a local variation.
+    pub fn variation_metadata(&self, variation: &VariationId) -> Result<VariationMetadata> {
+        self.ensure_no_pending_recovery()?;
+        self.repo
+            .find_branch(variation.as_str(), BranchType::Local)?;
+        self.read_variation_metadata(variation.as_str())
+    }
+
+    /// Adds, updates, or clears display metadata for a local variation.
+    pub fn set_variation_metadata(
+        &self,
+        variation: &VariationId,
+        metadata: VariationMetadata,
+    ) -> Result<Variation> {
+        self.ensure_no_pending_recovery()?;
+        self.repo
+            .find_branch(variation.as_str(), BranchType::Local)?;
+        self.write_variation_metadata(variation.as_str(), &metadata)?;
+
+        Ok(variation_from_name(
+            variation.as_str().to_string(),
+            self.current_variation().ok().as_ref(),
+            metadata,
+        ))
     }
 
     /// Switches to a variation with an explicit safety policy.
@@ -524,7 +649,9 @@ impl Workspace {
         self.repo
             .set_head(&format!("refs/heads/{}", variation.as_str()))?;
 
-        let result = variation_from_name(variation.as_str().to_string(), Some(&variation.0));
+        let metadata = self.read_variation_metadata(variation.as_str())?;
+        let result =
+            variation_from_name(variation.as_str().to_string(), Some(&variation.0), metadata);
         self.write_recovery_state(&RecoveryState {
             operation_id,
             operation: RecoveryOperation::SwitchVariation,
@@ -720,13 +847,34 @@ impl Workspace {
     /// Fetches remote version metadata without changing local content.
     pub fn fetch_remote(&self, remote: impl AsRef<str>) -> Result<()> {
         self.ensure_no_pending_recovery()?;
-        self.fetch_remote_unchecked(remote)
+        let mut options = RemoteOptions::new();
+        self.fetch_remote_unchecked(remote, &mut options)
     }
 
-    fn fetch_remote_unchecked(&self, remote: impl AsRef<str>) -> Result<()> {
+    /// Fetches remote version metadata with explicit remote options.
+    pub fn fetch_remote_with_options(
+        &self,
+        remote: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<()> {
+        self.ensure_no_pending_recovery()?;
+        self.fetch_remote_unchecked(remote, options)
+    }
+
+    fn fetch_remote_unchecked(
+        &self,
+        remote: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<()> {
         let variation = self.current_variation_unchecked()?;
         let mut remote = self.repo.find_remote(remote.as_ref())?;
-        if let Err(error) = remote.fetch(&[variation.as_str()], None, None) {
+        let fetch_result = if options.has_credentials() {
+            let mut fetch_options = options.fetch_options();
+            remote.fetch(&[variation.as_str()], Some(&mut fetch_options), None)
+        } else {
+            remote.fetch(&[variation.as_str()], None, None)
+        };
+        if let Err(error) = fetch_result {
             if error.code() != git2::ErrorCode::NotFound {
                 return Err(error.into());
             }
@@ -774,6 +922,16 @@ impl Workspace {
 
     /// Publishes local versions for the current variation when doing so will not overwrite remote work.
     pub fn publish_changes(&self, remote: impl AsRef<str>) -> Result<PublishResult> {
+        let mut options = RemoteOptions::new();
+        self.publish_changes_with_options(remote, &mut options)
+    }
+
+    /// Publishes local versions with explicit remote options.
+    pub fn publish_changes_with_options(
+        &self,
+        remote: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<PublishResult> {
         self.ensure_no_pending_recovery()?;
         let report = preflight_report(
             "publish_changes",
@@ -786,7 +944,7 @@ impl Workspace {
         }
 
         let remote_name = remote.as_ref().to_string();
-        self.fetch_remote_unchecked(&remote_name)?;
+        self.fetch_remote_unchecked(&remote_name, options)?;
         let status = self.sync_status(&remote_name)?;
         if matches!(
             status.state,
@@ -798,8 +956,14 @@ impl Workspace {
         let variation = self.current_variation_unchecked()?;
         let mut remote = self.repo.find_remote(&remote_name)?;
         let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
-        if let Err(error) = remote.push(&[refspec.as_str()], None) {
-            self.fetch_remote_unchecked(&remote_name)?;
+        let push_result = if options.has_credentials() {
+            let mut push_options = options.push_options();
+            remote.push(&[refspec.as_str()], Some(&mut push_options))
+        } else {
+            remote.push(&[refspec.as_str()], None)
+        };
+        if let Err(error) = push_result {
+            self.fetch_remote_unchecked(&remote_name, options)?;
             let refreshed = self.sync_status(&remote_name)?;
             if matches!(
                 refreshed.state,
@@ -816,6 +980,36 @@ impl Workspace {
             variation,
             published_versions: status.ahead,
         })
+    }
+
+    fn read_variation_metadata(&self, variation: &str) -> Result<VariationMetadata> {
+        let config = self.repo.config()?;
+
+        Ok(VariationMetadata {
+            label: read_optional_config(&config, &variation_metadata_key(variation, "label"))?,
+            slug: read_optional_config(&config, &variation_metadata_key(variation, "slug"))?,
+        })
+    }
+
+    fn write_variation_metadata(
+        &self,
+        variation: &str,
+        metadata: &VariationMetadata,
+    ) -> Result<()> {
+        let mut config = self.repo.config()?;
+
+        write_optional_config(
+            &mut config,
+            &variation_metadata_key(variation, "label"),
+            metadata.label.as_deref(),
+        )?;
+        write_optional_config(
+            &mut config,
+            &variation_metadata_key(variation, "slug"),
+            metadata.slug.as_deref(),
+        )?;
+
+        Ok(())
     }
 
     fn diff_unsaved_text(&self) -> Result<String> {
@@ -994,9 +1188,46 @@ fn validate_variation_name(name: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn variation_from_name(name: String, current: Option<&String>) -> Variation {
+fn normalize_optional_metadata(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn variation_metadata_key(variation: &str, name: &str) -> String {
+    format!("branch.{variation}.draftline-{name}")
+}
+
+fn read_optional_config(config: &git2::Config, key: &str) -> Result<Option<String>> {
+    match config.get_string(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_optional_config(config: &mut git2::Config, key: &str, value: Option<&str>) -> Result<()> {
+    match value.and_then(|value| normalize_optional_metadata(value.to_string())) {
+        Some(value) => config.set_str(key, &value)?,
+        None => {
+            if let Err(error) = config.remove(key) {
+                if error.code() != git2::ErrorCode::NotFound {
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn variation_from_name(
+    name: String,
+    current: Option<&String>,
+    metadata: VariationMetadata,
+) -> Variation {
     Variation {
         id: VariationId::from(name.clone()),
+        metadata,
         is_current: current.map(|current| current == &name).unwrap_or(false),
         name,
     }
@@ -1468,6 +1699,65 @@ mod tests {
     }
 
     #[test]
+    fn stores_and_lists_variation_display_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "post.md", b"first");
+        workspace.save_version("First").unwrap();
+
+        let metadata = VariationMetadata::new()
+            .with_label("Launch timeline")
+            .with_slug("launch-timeline");
+        let variation = workspace
+            .create_variation_with_metadata("timeline-launch", metadata.clone())
+            .unwrap();
+
+        assert_eq!(variation.metadata, metadata);
+        assert_eq!(variation.display_label(), "Launch timeline");
+        assert_eq!(
+            workspace.variation_metadata(variation.id()).unwrap(),
+            metadata
+        );
+
+        let listed = workspace
+            .variations()
+            .unwrap()
+            .into_iter()
+            .find(|variation| variation.name == "timeline-launch")
+            .unwrap();
+        assert_eq!(listed.metadata.label.as_deref(), Some("Launch timeline"));
+        assert_eq!(listed.metadata.slug.as_deref(), Some("launch-timeline"));
+    }
+
+    #[test]
+    fn updates_and_clears_variation_display_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "post.md", b"first");
+        workspace.save_version("First").unwrap();
+        let variation = workspace.create_variation("alternate").unwrap();
+
+        let updated = workspace
+            .set_variation_metadata(
+                variation.id(),
+                VariationMetadata::new().with_label("Human label"),
+            )
+            .unwrap();
+        assert_eq!(updated.display_label(), "Human label");
+
+        let cleared = workspace
+            .set_variation_metadata(variation.id(), VariationMetadata::default())
+            .unwrap();
+        assert_eq!(cleared.display_label(), "alternate");
+        assert_eq!(
+            workspace.variation_metadata(variation.id()).unwrap(),
+            VariationMetadata::default()
+        );
+    }
+
+    #[test]
     fn adds_and_lists_remote_endpoints() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
@@ -1506,6 +1796,44 @@ mod tests {
         workspace.fetch_remote("origin").unwrap();
         let status = workspace.sync_status("origin").unwrap();
         assert_eq!(status.state, SyncState::UpToDate);
+    }
+
+    #[test]
+    fn remote_options_work_for_clone_fetch_and_publish() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(local.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+
+        write_file(workspace.root(), "post.md", b"hello");
+        workspace.save_version("Initial version").unwrap();
+
+        let mut publish_options = RemoteOptions::new();
+        workspace
+            .publish_changes_with_options("origin", &mut publish_options)
+            .unwrap();
+
+        let clone = tempfile::tempdir().unwrap();
+        let mut clone_options = RemoteOptions::new();
+        let cloned = Workspace::clone_workspace_with_options(
+            remote.path().to_str().unwrap(),
+            clone.path(),
+            &mut clone_options,
+        )
+        .unwrap();
+
+        let mut fetch_options = RemoteOptions::new();
+        cloned
+            .fetch_remote_with_options("origin", &mut fetch_options)
+            .unwrap();
+        assert_eq!(
+            cloned.sync_status("origin").unwrap().state,
+            SyncState::UpToDate
+        );
     }
 
     #[test]
