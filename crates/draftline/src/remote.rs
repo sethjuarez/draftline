@@ -1,16 +1,18 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::Result;
 
 /// A configured place where a workspace can be shared or backed up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEndpoint {
     pub name: String,
     pub url: String,
 }
 
 /// Collaboration status between the current variation and a remote endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncStatus {
     pub remote: String,
     pub variation: String,
@@ -21,7 +23,7 @@ pub struct SyncStatus {
 }
 
 /// High-level sync state for product workflows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncState {
     UpToDate,
     LocalAhead,
@@ -31,7 +33,7 @@ pub enum SyncState {
 }
 
 /// Summary of a version available from a remote.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteVersionSummary {
     pub id: String,
     pub label: String,
@@ -40,7 +42,7 @@ pub struct RemoteVersionSummary {
 }
 
 /// Result of publishing local versions to a remote.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishResult {
     pub remote: String,
     pub variation: String,
@@ -48,7 +50,7 @@ pub struct PublishResult {
 }
 
 /// Attribution metadata from version history.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contributor {
     pub name: String,
     pub email: Option<String>,

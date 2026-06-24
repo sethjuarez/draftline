@@ -60,4 +60,10 @@ pub enum DraftlineError {
 
     #[error("remote has incoming changes that need an explicit merge plan")]
     SyncNeedsMerge(Box<SyncStatus>),
+
+    #[error("squash requires at least 2 versions, got {0}")]
+    InvalidSquashCount(usize),
+
+    #[error("not enough versions to squash: need {needed}, available {available}")]
+    NotEnoughVersionsToSquash { needed: usize, available: usize },
 }
