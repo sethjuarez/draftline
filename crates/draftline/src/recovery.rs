@@ -17,4 +17,6 @@ pub enum RecoveryOperation {
     RestoreVersionAsNewSave,
     ShelveChanges,
     ApplyIncoming,
+    DiscardChanges,
+    DiscardFile,
 }

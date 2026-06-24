@@ -58,6 +58,9 @@ pub enum DraftlineError {
     #[error("invalid content policy extension: {0}")]
     InvalidContentPolicyExtension(String),
 
+    #[error("path is outside tracked content policy: {0}")]
+    PathOutsideContentPolicy(PathBuf),
+
     #[error("remote has incoming changes that need an explicit merge plan")]
     SyncNeedsMerge(Box<SyncStatus>),
 

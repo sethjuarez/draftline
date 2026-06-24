@@ -625,6 +625,109 @@ impl Workspace {
         })
     }
 
+    /// Preflights discarding all unsaved tracked content changes without mutating files.
+    pub fn preflight_discard_changes(&self) -> Result<PreflightReport> {
+        self.ensure_no_pending_recovery()?;
+        Ok(discard_preflight_report(
+            "discard_changes",
+            self.changed_files_unchecked()?,
+        ))
+    }
+
+    /// Discards all unsaved changes tracked by the active content policy.
+    ///
+    /// Files excluded by [`ContentPolicy`] are preserved. Added tracked files are
+    /// removed; modified, deleted, renamed, type-changed, and conflicted tracked
+    /// files are restored from the current `HEAD`.
+    pub fn discard_changes(&self) -> Result<ChangeSet> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path())?;
+        let changed_files = self.changed_files_unchecked()?;
+        if changed_files.is_empty() {
+            return Ok(ChangeSet {
+                files: Vec::new(),
+                diff: None,
+            });
+        }
+
+        let operation_id = new_operation_id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::DiscardChanges,
+            original_variation: self.current_variation_unchecked().ok(),
+            target: None,
+            completed: false,
+        })?;
+
+        self.discard_changed_files(&changed_files)?;
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::DiscardChanges,
+            original_variation: None,
+            target: None,
+            completed: true,
+        })?;
+
+        Ok(ChangeSet {
+            files: changed_files,
+            diff: None,
+        })
+    }
+
+    /// Preflights discarding one workspace-relative tracked content file.
+    pub fn preflight_discard_file(&self, path: impl AsRef<Path>) -> Result<PreflightReport> {
+        self.ensure_no_pending_recovery()?;
+        let path = self.normalize_tracked_content_path(path)?;
+        let changed_files = self
+            .changed_files_unchecked()?
+            .into_iter()
+            .filter(|changed| changed.path == path)
+            .collect();
+
+        Ok(discard_preflight_report("discard_file", changed_files))
+    }
+
+    /// Discards one changed tracked content file by workspace-relative path.
+    ///
+    /// The path is normalized and must stay inside the workspace and inside the
+    /// active content policy. Excluded runtime files are rejected instead of
+    /// being reset.
+    pub fn discard_file(&self, path: impl AsRef<Path>) -> Result<Option<ChangedFile>> {
+        self.ensure_no_pending_recovery()?;
+        let path = self.normalize_tracked_content_path(path)?;
+        let _lock = OperationLock::acquire(&self.lock_path())?;
+        let changed_file = self
+            .changed_files_unchecked()?
+            .into_iter()
+            .find(|changed| changed.path == path);
+
+        let Some(changed_file) = changed_file else {
+            return Ok(None);
+        };
+
+        let operation_id = new_operation_id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::DiscardFile,
+            original_variation: self.current_variation_unchecked().ok(),
+            target: Some(path.to_string_lossy().into_owned()),
+            completed: false,
+        })?;
+
+        self.discard_changed_files(std::slice::from_ref(&changed_file))?;
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::DiscardFile,
+            original_variation: None,
+            target: Some(path.to_string_lossy().into_owned()),
+            completed: true,
+        })?;
+
+        Ok(Some(changed_file))
+    }
+
     /// Preflights switching to another variation without mutating workspace files.
     pub fn preflight_switch_variation(&self, variation: &VariationId) -> Result<PreflightReport> {
         self.ensure_no_pending_recovery()?;
@@ -1731,6 +1834,96 @@ impl Workspace {
         Ok(())
     }
 
+    fn normalize_tracked_content_path(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
+        let path = normalize_workspace_relative(path)?;
+        if path.as_os_str().is_empty() || !self.content_policy.tracks(&path)? {
+            return Err(DraftlineError::PathOutsideContentPolicy(path));
+        }
+
+        Ok(path)
+    }
+
+    fn discard_changed_files(&self, changed_files: &[ChangedFile]) -> Result<()> {
+        let mut index = self.repo.index()?;
+        let mut checkout = CheckoutBuilder::new();
+        checkout.force();
+        let mut paths_to_reset = Vec::new();
+        let mut paths_to_remove_after_checkout = Vec::new();
+
+        for changed in changed_files {
+            match changed.kind {
+                ChangeKind::Added => {
+                    if let Err(error) = index.remove_path(&changed.path) {
+                        if error.code() != git2::ErrorCode::NotFound {
+                            return Err(error.into());
+                        }
+                    }
+                    remove_workspace_path_if_exists(&self.root.join(&changed.path))?;
+                }
+                ChangeKind::Renamed => {
+                    if let Some(target) = self.staged_rename_target_for_path(&changed.path)? {
+                        checkout.path(&target);
+                        paths_to_reset.push(target.clone());
+                        paths_to_remove_after_checkout.push(target);
+                    }
+                    checkout.path(&changed.path);
+                    paths_to_reset.push(changed.path.clone());
+                }
+                ChangeKind::Modified
+                | ChangeKind::Deleted
+                | ChangeKind::Conflicted
+                | ChangeKind::TypeChanged => {
+                    checkout.path(&changed.path);
+                    paths_to_reset.push(changed.path.clone());
+                }
+            }
+        }
+
+        index.write()?;
+        drop(index);
+
+        if !paths_to_reset.is_empty() {
+            let head = self.repo.head()?.peel(ObjectType::Commit)?;
+            self.repo
+                .reset_default(Some(&head), paths_to_reset.iter().map(PathBuf::as_path))?;
+            self.repo.checkout_head(Some(&mut checkout))?;
+        }
+
+        for path in paths_to_remove_after_checkout {
+            remove_workspace_path_if_exists(&self.root.join(path))?;
+        }
+
+        Ok(())
+    }
+
+    fn staged_rename_target_for_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+        let mut options = StatusOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .renames_head_to_index(true);
+
+        let statuses = self.repo.statuses(Some(&mut options))?;
+        for entry in statuses.iter() {
+            if !entry.status().is_index_renamed() || entry.path().map(Path::new) != Some(path) {
+                continue;
+            }
+
+            let Some(target) = entry
+                .head_to_index()
+                .and_then(|delta| delta.new_file().path().map(PathBuf::from))
+            else {
+                return Ok(None);
+            };
+
+            if target != path {
+                return Ok(Some(target));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn shelve_changes_unchecked(&self, name: &str) -> Result<()> {
         let safe_name = validate_variation_name(name)?;
         let operation_id = new_operation_id();
@@ -1995,6 +2188,44 @@ fn preflight_report(
     }
 }
 
+fn discard_preflight_report(
+    operation: impl Into<String>,
+    dirty_files: Vec<ChangedFile>,
+) -> PreflightReport {
+    let untracked_assets = dirty_files
+        .iter()
+        .filter(|file| file.kind == ChangeKind::Added)
+        .map(|file| file.path.clone())
+        .collect();
+    let unresolved_conflicts = dirty_files
+        .iter()
+        .filter(|file| file.kind == ChangeKind::Conflicted)
+        .map(|file| file.path.clone())
+        .collect();
+    let large_files = dirty_files
+        .iter()
+        .filter(|file| file.is_large)
+        .map(|file| file.path.clone())
+        .collect();
+    let binary_files = dirty_files
+        .iter()
+        .filter(|file| file.is_binary)
+        .map(|file| file.path.clone())
+        .collect();
+
+    PreflightReport {
+        operation: operation.into(),
+        will_write_files: true,
+        dirty_files,
+        untracked_assets,
+        unresolved_conflicts,
+        large_files,
+        binary_files,
+        variation_divergence: None,
+        can_proceed: true,
+    }
+}
+
 fn file_is_large(path: &Path, threshold: u64) -> Result<bool> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(metadata.is_file() && metadata.len() > threshold),
@@ -2011,6 +2242,22 @@ fn file_is_binary(path: &Path) -> Result<bool> {
     };
 
     Ok(bytes.contains(&0) || std::str::from_utf8(&bytes).is_err())
+}
+
+fn remove_workspace_path_if_exists(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+
+    Ok(())
 }
 
 fn collect_preview_files(
@@ -2313,6 +2560,183 @@ mod tests {
         assert_eq!(changes.files[0].path, PathBuf::from("post.md"));
         assert_eq!(changes.files[0].kind, ChangeKind::Added);
         assert!(!changes.files[0].is_binary);
+    }
+
+    #[test]
+    fn discard_changes_restores_tracked_content_and_preserves_excluded_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = ContentPolicy::new().include("content").unwrap();
+        let workspace = Workspace::init_with_policy(temp.path(), policy).unwrap();
+
+        write_file(workspace.root(), "content/modified.md", b"base");
+        write_file(workspace.root(), "content/deleted.md", b"delete me");
+        workspace.save_version("Base").unwrap();
+
+        write_file(workspace.root(), "content/modified.md", b"dirty");
+        fs::remove_file(workspace.root().join("content").join("deleted.md")).unwrap();
+        write_file(workspace.root(), "content/added.md", b"new");
+        write_file(workspace.root(), "ui-state/panel.json", b"keep me");
+
+        let report = workspace.preflight_discard_changes().unwrap();
+        assert_eq!(report.operation, "discard_changes");
+        assert!(report.can_proceed);
+        assert_eq!(report.dirty_files.len(), 3);
+
+        let discarded = workspace.discard_changes().unwrap();
+
+        assert_eq!(discarded.files.len(), 3);
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("content").join("modified.md")).unwrap(),
+            "base"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("content").join("deleted.md")).unwrap(),
+            "delete me"
+        );
+        assert!(!workspace.root().join("content").join("added.md").exists());
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("ui-state").join("panel.json")).unwrap(),
+            "keep me"
+        );
+        assert!(workspace.changed_files().unwrap().is_empty());
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn discard_file_restores_only_the_requested_tracked_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = ContentPolicy::new().include("content").unwrap();
+        let workspace = Workspace::init_with_policy(temp.path(), policy).unwrap();
+
+        write_file(workspace.root(), "content/one.md", b"one");
+        write_file(workspace.root(), "content/two.md", b"two");
+        workspace.save_version("Base").unwrap();
+
+        write_file(workspace.root(), "content/one.md", b"dirty one");
+        write_file(workspace.root(), "content/two.md", b"dirty two");
+
+        let report = workspace
+            .preflight_discard_file("./content/one.md")
+            .unwrap();
+        assert_eq!(report.operation, "discard_file");
+        assert_eq!(
+            report.dirty_files[0].path,
+            PathBuf::from("content").join("one.md")
+        );
+
+        let discarded = workspace.discard_file("./content/one.md").unwrap().unwrap();
+
+        assert_eq!(discarded.path, PathBuf::from("content").join("one.md"));
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("content").join("one.md")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("content").join("two.md")).unwrap(),
+            "dirty two"
+        );
+        assert_eq!(
+            workspace.changed_files().unwrap()[0].path,
+            PathBuf::from("content").join("two.md")
+        );
+    }
+
+    #[test]
+    fn discard_file_removes_added_tracked_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = ContentPolicy::new().include("content").unwrap();
+        let workspace = Workspace::init_with_policy(temp.path(), policy).unwrap();
+
+        write_file(workspace.root(), "content/base.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "content/added.md", b"new");
+
+        let discarded = workspace.discard_file("content/added.md").unwrap().unwrap();
+
+        assert_eq!(discarded.kind, ChangeKind::Added);
+        assert!(!workspace.root().join("content").join("added.md").exists());
+        assert!(workspace.changed_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn discard_file_restores_staged_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = ContentPolicy::new().include("content").unwrap();
+        let workspace = Workspace::init_with_policy(temp.path(), policy).unwrap();
+
+        write_file(workspace.root(), "content/old.md", b"old");
+        workspace.save_version("Base").unwrap();
+
+        fs::rename(
+            workspace.root().join("content").join("old.md"),
+            workspace.root().join("content").join("new.md"),
+        )
+        .unwrap();
+        let mut index = workspace.repo.index().unwrap();
+        index
+            .remove_path(Path::new("content").join("old.md").as_path())
+            .unwrap();
+        index
+            .add_path(Path::new("content").join("new.md").as_path())
+            .unwrap();
+        index.write().unwrap();
+
+        let changed = workspace.changed_files().unwrap();
+        assert_eq!(changed[0].kind, ChangeKind::Renamed);
+
+        workspace.discard_file("content/old.md").unwrap().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("content").join("old.md")).unwrap(),
+            "old"
+        );
+        assert!(!workspace.root().join("content").join("new.md").exists());
+        assert!(workspace.changed_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn discard_file_rejects_paths_outside_workspace_or_content_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = ContentPolicy::new().include("content").unwrap();
+        let workspace = Workspace::init_with_policy(temp.path(), policy).unwrap();
+
+        let err = workspace.discard_file("../secret.md").unwrap_err();
+        assert!(matches!(err, DraftlineError::PathEscapesWorkspace(_)));
+
+        let err = workspace.discard_file("ui-state/panel.json").unwrap_err();
+        assert!(matches!(err, DraftlineError::PathOutsideContentPolicy(_)));
+    }
+
+    #[test]
+    fn discard_operations_respect_recovery_and_operation_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"dirty");
+
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::DiscardChanges,
+                original_variation: Some("master".to_string()),
+                target: None,
+                completed: false,
+            })
+            .unwrap();
+
+        let err = workspace.discard_changes().unwrap_err();
+        assert!(matches!(err, DraftlineError::RecoveryRequired(_)));
+
+        workspace.acknowledge_recovery().unwrap();
+        fs::write(workspace.lock_path(), b"locked").unwrap();
+
+        let err = workspace.discard_file("post.md").unwrap_err();
+        assert!(matches!(err, DraftlineError::WorkspaceLocked));
+
+        fs::remove_file(workspace.lock_path()).unwrap();
+        assert!(workspace.discard_changes().is_ok());
     }
 
     #[test]
