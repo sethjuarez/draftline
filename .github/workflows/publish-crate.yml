@@ -36,6 +36,14 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
       - name: Read crate metadata
         id: metadata
         run: |

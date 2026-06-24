@@ -80,9 +80,18 @@ impl Variation {
 }
 
 /// Host-provided display metadata for a variation.
+///
+/// Draftline persists this metadata alongside the variation but does not use it
+/// to name Git refs or enforce product-specific uniqueness rules.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VariationMetadata {
+    /// Optional user-facing name. When omitted, [`Variation::display_label`]
+    /// falls back to the variation's stored name.
     pub label: Option<String>,
+    /// Optional host-owned slug for URLs, routing, or app integration.
+    ///
+    /// This is stored as display metadata only; it is not derived from the
+    /// variation name and does not affect the underlying Git branch name.
     pub slug: Option<String>,
 }
 

@@ -60,6 +60,9 @@ pub enum RemoteCredential {
     /// Ask libgit2 to use its default credential behavior.
     Default,
     /// Authenticate with a username and password or token.
+    ///
+    /// GitHub HTTPS token flows can use username `x-access-token` and the token
+    /// as the password.
     UsernamePassword { username: String, password: String },
     /// Authenticate with an SSH key loaded by the local agent.
     SshAgent { username: String },
@@ -85,16 +88,36 @@ pub struct RemoteCredentialRequest<'a> {
 /// Options for remote operations such as clone, fetch, and publish.
 #[derive(Default)]
 pub struct RemoteOptions<'callbacks> {
-    credentials: Option<
-        Box<dyn FnMut(RemoteCredentialRequest<'_>) -> Result<RemoteCredential> + 'callbacks>,
-    >,
+    credentials: Option<Box<RemoteCredentialCallback<'callbacks>>>,
 }
+
+type RemoteCredentialCallback<'callbacks> =
+    dyn FnMut(RemoteCredentialRequest<'_>) -> Result<RemoteCredential> + 'callbacks;
 
 impl<'callbacks> RemoteOptions<'callbacks> {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Supplies credentials to clone, fetch, and publish operations.
+    ///
+    /// ```no_run
+    /// use draftline::{RemoteCredential, RemoteOptions};
+    ///
+    /// let token = std::env::var("GITHUB_TOKEN").unwrap();
+    /// let mut options = RemoteOptions::new().with_credentials(move |request| {
+    ///     if request.allows_username_password {
+    ///         Ok(RemoteCredential::UsernamePassword {
+    ///             username: "x-access-token".to_string(),
+    ///             password: token.clone(),
+    ///         })
+    ///     } else {
+    ///         Ok(RemoteCredential::Default)
+    ///     }
+    /// });
+    /// # let _ = &mut options;
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
     pub fn with_credentials(
         mut self,
         callback: impl FnMut(RemoteCredentialRequest<'_>) -> Result<RemoteCredential> + 'callbacks,
