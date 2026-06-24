@@ -27,19 +27,58 @@ impl ContentPolicy {
         Self::default()
     }
 
+    /// Tracks content at one workspace-relative path.
     pub fn include(mut self, path: impl AsRef<Path>) -> Result<Self> {
         self.includes.push(normalize_policy_path(path)?);
         Ok(self)
     }
 
+    /// Tracks content under multiple workspace-relative paths.
+    pub fn include_paths<I, P>(mut self, paths: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        for path in paths {
+            self = self.include(path)?;
+        }
+        Ok(self)
+    }
+
+    /// Ignores content at one workspace-relative path.
     pub fn exclude(mut self, path: impl AsRef<Path>) -> Result<Self> {
         self.excludes.push(normalize_policy_path(path)?);
         Ok(self)
     }
 
+    /// Ignores content under multiple workspace-relative paths.
+    pub fn exclude_paths<I, P>(mut self, paths: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        for path in paths {
+            self = self.exclude(path)?;
+        }
+        Ok(self)
+    }
+
+    /// Tracks files with one extension, anywhere in the workspace.
     pub fn include_extension(mut self, extension: impl AsRef<str>) -> Result<Self> {
         self.include_extensions
             .push(normalize_extension(extension.as_ref())?);
+        Ok(self)
+    }
+
+    /// Tracks files with any of the provided extensions, anywhere in the workspace.
+    pub fn include_extensions<I, S>(mut self, extensions: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for extension in extensions {
+            self = self.include_extension(extension)?;
+        }
         Ok(self)
     }
 
@@ -137,6 +176,34 @@ mod tests {
         assert!(policy.tracks("idea.sk").unwrap());
         assert!(policy.tracks("notes/brief.md").unwrap());
         assert!(!policy.tracks("ui-state/panel.json").unwrap());
+    }
+
+    #[test]
+    fn include_paths_and_extensions_can_be_added_in_batches() {
+        let policy = ContentPolicy::new()
+            .include_paths(["visuals", "screenshots"])
+            .unwrap()
+            .include_extensions(["sk", "sb", "md"])
+            .unwrap();
+
+        assert!(policy.tracks("visuals/storyboard.json").unwrap());
+        assert!(policy.tracks("screenshots/scene.png").unwrap());
+        assert!(policy.tracks("notes/script.SK").unwrap());
+        assert!(policy.tracks("boards/shot.sb").unwrap());
+        assert!(!policy.tracks("app/ui-state.json").unwrap());
+    }
+
+    #[test]
+    fn exclude_paths_can_be_added_in_batches() {
+        let policy = ContentPolicy::new()
+            .include_extensions(["md", "sk"])
+            .unwrap()
+            .exclude_paths(["private", "scratch"])
+            .unwrap();
+
+        assert!(policy.tracks("public/notes.md").unwrap());
+        assert!(!policy.tracks("private/notes.md").unwrap());
+        assert!(!policy.tracks("scratch/idea.sk").unwrap());
     }
 
     #[test]
