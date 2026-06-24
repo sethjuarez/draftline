@@ -611,12 +611,54 @@ impl Workspace {
         let commit = self.find_version_commit(version)?;
         let tree = commit.tree()?;
         let mut files = Vec::new();
-        collect_preview_files(&self.repo, &tree, Path::new(""), &mut files)?;
+        collect_preview_files(
+            &self.repo,
+            &tree,
+            Path::new(""),
+            &mut files,
+            &self.content_policy,
+        )?;
 
         Ok(VersionPreview {
             id: version.clone(),
             files,
         })
+    }
+
+    /// Reads one file from a version without mutating the live workspace.
+    pub fn preview_version_file(
+        &self,
+        version: &VersionId,
+        path: impl AsRef<Path>,
+    ) -> Result<Option<PreviewFile>> {
+        self.ensure_no_pending_recovery()?;
+        let path = normalize_workspace_relative(path)?;
+        if !self.content_policy.tracks(&path)? {
+            return Ok(None);
+        }
+
+        let commit = self.find_version_commit(version)?;
+        let tree = commit.tree()?;
+        let entry = match tree.get_path(&path) {
+            Ok(entry) => entry,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+
+        if entry.kind() != Some(ObjectType::Blob) {
+            return Ok(None);
+        }
+
+        let blob = self.repo.find_blob(entry.id())?;
+        let content = std::str::from_utf8(blob.content())
+            .ok()
+            .map(ToString::to_string);
+
+        Ok(Some(PreviewFile {
+            path,
+            is_binary: content.is_none(),
+            content,
+        }))
     }
 
     /// Returns the current variation name when the workspace is on a normal variation.
@@ -1040,6 +1082,7 @@ fn collect_preview_files(
     tree: &Tree<'_>,
     prefix: &Path,
     files: &mut Vec<PreviewFile>,
+    content_policy: &ContentPolicy,
 ) -> Result<()> {
     for entry in tree.iter() {
         let Some(name) = entry.name() else {
@@ -1049,6 +1092,10 @@ fn collect_preview_files(
 
         match entry.kind() {
             Some(ObjectType::Blob) => {
+                if !content_policy.tracks(&path)? {
+                    continue;
+                }
+
                 let blob = repo.find_blob(entry.id())?;
                 let content = std::str::from_utf8(blob.content())
                     .ok()
@@ -1061,7 +1108,7 @@ fn collect_preview_files(
             }
             Some(ObjectType::Tree) => {
                 let child = repo.find_tree(entry.id())?;
-                collect_preview_files(repo, &child, &path, files)?;
+                collect_preview_files(repo, &child, &path, files, content_policy)?;
             }
             _ => {}
         }
@@ -1176,19 +1223,32 @@ mod tests {
     #[test]
     fn content_policy_excludes_runtime_state_from_changes_and_versions() {
         let temp = tempfile::tempdir().unwrap();
-        let policy = ContentPolicy::new().include("content").unwrap();
+        let policy = ContentPolicy::new()
+            .include("content")
+            .unwrap()
+            .include_extension("draft")
+            .unwrap();
         let workspace = Workspace::init_with_policy(temp.path(), policy).unwrap();
 
         write_file(workspace.root(), "content/post.md", b"# Hello");
+        write_file(workspace.root(), "root-note.draft", br#"{"title":"Root"}"#);
         write_file(workspace.root(), "ui-state/panel.json", br#"{"open":true}"#);
         let version = workspace.save_version("Content only").unwrap();
 
         let preview = workspace.preview_version(version.id()).unwrap();
-        assert_eq!(preview.files.len(), 1);
-        assert_eq!(
-            preview.files[0].path,
-            PathBuf::from("content").join("post.md")
-        );
+        assert_eq!(preview.files.len(), 2);
+        assert!(preview
+            .files
+            .iter()
+            .any(|file| file.path == PathBuf::from("content").join("post.md")));
+        assert!(preview
+            .files
+            .iter()
+            .any(|file| file.path == Path::new("root-note.draft")));
+        assert!(preview
+            .files
+            .iter()
+            .all(|file| file.path != PathBuf::from("ui-state").join("panel.json")));
     }
 
     #[test]
@@ -1337,6 +1397,29 @@ mod tests {
             fs::read_to_string(workspace.root().join("post.md")).unwrap(),
             "second"
         );
+    }
+
+    #[test]
+    fn previews_one_version_file_without_reading_whole_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = ContentPolicy::new().include_extension("md").unwrap();
+        let workspace = Workspace::init_with_policy(temp.path(), policy).unwrap();
+
+        write_file(workspace.root(), "post.md", b"hello");
+        write_file(workspace.root(), "ui-state.json", b"ignore me");
+        let version = workspace.save_version("Post").unwrap();
+
+        let preview = workspace
+            .preview_version_file(version.id(), "post.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview.path, PathBuf::from("post.md"));
+        assert_eq!(preview.content.as_deref(), Some("hello"));
+
+        assert!(workspace
+            .preview_version_file(version.id(), "ui-state.json")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
