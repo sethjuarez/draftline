@@ -185,8 +185,8 @@ Required results:
 
 | API | Purpose |
 |---|---|
-| `Workspace::preflight_merge_incoming()` | Compute merge base, file hazards, and semantic conflicts. |
-| `Workspace::merge_incoming(token, resolutions)` | Write merge result as a new version. |
+| `Workspace::preflight_merge_incoming()` | Compute merge base, file hazards, and semantic conflicts. Implemented. |
+| `Workspace::merge_incoming(token, label)` | Write a clean semantic merge result as a new two-parent version. Implemented for clean merges; explicit conflict resolutions remain future work. |
 
 Merge is file-writing and ref-moving. It must use operation locks, recovery state, target-tree collision preflight, and semantic conflict results.
 
@@ -214,8 +214,9 @@ Recovery support refs are hidden from normal views but not private from collabor
 | API | Purpose |
 |---|---|
 | `Workspace::list_support_refs(scope)` | List local and remote-tracking support refs. |
-| `Workspace::publish_support_refs(token)` | Create-only push of recovery support refs. |
-| `Workspace::fetch_support_refs(remote)` | Fetch into a remote-tracking support namespace without overwriting local refs. |
+| `Workspace::preflight_publish_support_refs(remote)` | Plan create-only publication of local recovery support refs. Implemented. |
+| `Workspace::publish_support_refs(token)` | Create-only push of recovery support refs. Implemented. |
+| `Workspace::fetch_support_refs(remote)` | Fetch into a remote-tracking support namespace without overwriting local refs. Implemented. |
 | `Workspace::preflight_restore_support_ref(id)` | Plan restore as a new visible variation. |
 | `Workspace::restore_support_ref_as_variation(token, name)` | Restore without overwriting existing visible refs. |
 | `Workspace::preflight_expire_support_refs(ids)` | Retention cleanup preflight. |

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,7 +10,9 @@ use git2::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::merge::{MergeConflict, MergeInput, ResolverRegistry};
 use crate::recovery::RecoveryOperation;
+use crate::remote::PushRefExpectation;
 use crate::{
     path::normalize_workspace_relative, ContentPolicy, Contributor, DraftlineError,
     PublishPreflight, PublishResult, PublishToken, RecoveryState, RemoteEndpoint, RemoteOptions,
@@ -404,6 +406,7 @@ pub struct RecoveryRepairResult {
     pub operation_id: String,
     pub operation: RecoveryOperation,
     pub completed: bool,
+    /// True when repair or rollback changed files or refs beyond the recovery ledger.
     pub changed_workspace: bool,
     pub safe_next_actions: Vec<SafeNextAction>,
 }
@@ -444,6 +447,32 @@ pub struct SupportRef {
     pub source_variation: Option<String>,
     pub target_oid: String,
     pub scope: SupportRefScope,
+}
+
+/// One support ref captured for create-only publishing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SupportRefPublishItem {
+    pub ref_name: String,
+    pub target_oid: String,
+}
+
+/// Read-only plan for publishing hidden support refs to a shared remote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SupportRefPublishPreflight {
+    pub remote: String,
+    pub support_refs: Vec<SupportRef>,
+    pub token: SupportRefPublishToken,
+    pub can_publish: bool,
+}
+
+/// Opaque token tying support-ref publication to a preflighted local state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SupportRefPublishToken {
+    pub remote: String,
+    pub refs: Vec<SupportRefPublishItem>,
 }
 
 /// Structured, read-only safety snapshot for hosts and agents.
@@ -643,8 +672,45 @@ pub struct MergeIncomingReport {
     pub sync_status: SyncStatus,
     pub dirty_files: Vec<ChangedFile>,
     pub file_hazards: Vec<FileHazard>,
+    pub conflicts: Vec<MergeConflict>,
+    pub token: Option<MergeIncomingToken>,
     pub can_merge_cleanly: bool,
     pub changed_workspace: bool,
+}
+
+/// Opaque token tying merge execution to a clean merge preflight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MergeIncomingToken {
+    pub remote: String,
+    pub variation: String,
+    pub local_oid: String,
+    pub remote_oid: String,
+    pub merge_base_oid: String,
+}
+
+/// Result of writing a clean incoming merge as a new version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MergeIncomingResult {
+    pub version: Version,
+    pub merged_files: Vec<PathBuf>,
+}
+
+struct IncomingMergeInput<'repo> {
+    local_commit: Commit<'repo>,
+    remote_commit: Commit<'repo>,
+    base_commit: Commit<'repo>,
+}
+
+struct CleanMergePlan {
+    files: Vec<MergeFileChange>,
+    conflicts: Vec<MergeConflict>,
+}
+
+struct MergeFileChange {
+    path: PathBuf,
+    content: Option<Vec<u8>>,
 }
 
 /// Preflight for removing a visible variation from a shared remote.
@@ -1012,7 +1078,7 @@ impl Workspace {
             apply_incoming: true,
             stale_lock_repair: true,
             target_tree_collision_preflight: true,
-            support_ref_sync: false,
+            support_ref_sync: true,
             agent_cli_facade: false,
         }
     }
@@ -1189,20 +1255,191 @@ impl Workspace {
         Ok(())
     }
 
-    /// Entry point for operation-specific recovery repair.
-    ///
-    /// This slice exposes the typed repair surface and reports the interrupted
-    /// operation. Operation-specific mutation is added by later recovery work.
+    /// Repairs an interrupted operation when the recovery ledger has enough
+    /// state to finish the operation safely.
     pub fn repair_recovery(&self, operation_id: impl AsRef<str>) -> Result<RecoveryRepairResult> {
-        self.recovery_skeleton(operation_id.as_ref())
+        self.clear_stale_lock()?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "repair_recovery")?;
+        let state = self.pending_recovery(operation_id.as_ref())?;
+
+        match state.operation {
+            RecoveryOperation::SwitchVariation => {
+                let Some(target) = state.target.as_deref() else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let changed_workspace =
+                    self.current_variation_unchecked().ok().as_deref() != Some(target);
+                self.checkout_variation_unchecked(target)?;
+                self.complete_recovery(state, changed_workspace)
+            }
+            RecoveryOperation::ApplyIncoming => {
+                let (Some(variation), Some(target)) =
+                    (state.original_variation.as_deref(), state.target.as_deref())
+                else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let oid = Oid::from_str(target)
+                    .map_err(|_| DraftlineError::VersionNotFound(target.to_string()))?;
+                let commit = self.repo.find_commit(oid)?;
+                let branch_ref = format!("refs/heads/{}", validate_variation_name(variation)?);
+                self.repo
+                    .reference(&branch_ref, oid, true, "repair apply_incoming")?;
+                self.repo.checkout_tree(
+                    commit.tree()?.as_object(),
+                    Some(CheckoutBuilder::new().force()),
+                )?;
+                self.repo.set_head(&branch_ref)?;
+                self.complete_recovery(state, true)
+            }
+            RecoveryOperation::DiscardChanges => {
+                let changed_files = self.changed_files_unchecked()?;
+                let changed_workspace = !changed_files.is_empty();
+                if changed_workspace {
+                    self.discard_changed_files(&changed_files)?;
+                }
+                self.complete_recovery(state, changed_workspace)
+            }
+            RecoveryOperation::DiscardFile => {
+                let Some(target) = state.target.as_deref() else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let target = PathBuf::from(target);
+                let changed_file = self
+                    .changed_files_unchecked()?
+                    .into_iter()
+                    .find(|changed| changed.path == target);
+                let changed_workspace = changed_file.is_some();
+                if let Some(changed_file) = changed_file {
+                    self.discard_changed_files(std::slice::from_ref(&changed_file))?;
+                }
+                self.complete_recovery(state, changed_workspace)
+            }
+            RecoveryOperation::DeleteVariation => {
+                if state.original_variation.is_none() || state.target.is_none() {
+                    return Ok(self.recovery_unavailable(state));
+                }
+                self.repair_delete_variation_recovery(&state)?;
+                self.complete_recovery(state, true)
+            }
+            RecoveryOperation::ApplyShelf => {
+                let Some(target) = state.target.as_deref() else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let (_id, commit) = self.find_shelf_commit(target)?;
+                self.repo.checkout_tree(
+                    commit.tree()?.as_object(),
+                    Some(CheckoutBuilder::new().force()),
+                )?;
+                self.complete_recovery(state, true)
+            }
+            RecoveryOperation::ExpireSupportRefs => {
+                if let Some(target) = state.target.as_deref() {
+                    for id in target.split(',').filter(|id| !id.is_empty()) {
+                        if let Ok(mut reference) = self.repo.find_reference(id) {
+                            reference.delete()?;
+                        }
+                    }
+                }
+                self.complete_recovery(state, true)
+            }
+            RecoveryOperation::ShelveChanges => {
+                let shelf_exists = state
+                    .target
+                    .as_deref()
+                    .is_some_and(|target| self.find_shelf_commit(target).is_ok());
+                if shelf_exists && self.changed_files_unchecked()?.is_empty() {
+                    self.complete_recovery(state, false)
+                } else {
+                    Ok(self.recovery_unavailable(state))
+                }
+            }
+            RecoveryOperation::SquashVersions => Ok(self.recovery_unavailable(state)),
+            RecoveryOperation::RestoreVersionAsNewSave
+            | RecoveryOperation::DeleteRemoteVariation
+            | RecoveryOperation::MergeIncoming => Ok(self.recovery_unavailable(state)),
+        }
     }
 
-    /// Entry point for operation-specific recovery rollback.
-    ///
-    /// This slice exposes the typed rollback surface and reports the interrupted
-    /// operation. Operation-specific mutation is added by later recovery work.
+    /// Rolls back an interrupted operation when the recovery ledger captured the
+    /// prior state needed for a safe rollback.
     pub fn rollback_recovery(&self, operation_id: impl AsRef<str>) -> Result<RecoveryRepairResult> {
-        self.recovery_skeleton(operation_id.as_ref())
+        self.clear_stale_lock()?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "rollback_recovery")?;
+        let state = self.pending_recovery(operation_id.as_ref())?;
+
+        match state.operation {
+            RecoveryOperation::SwitchVariation => {
+                let Some(original) = state.original_variation.as_deref() else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let changed_workspace =
+                    self.current_variation_unchecked().ok().as_deref() != Some(original);
+                self.checkout_variation_unchecked(original)?;
+                self.complete_recovery(state, changed_workspace)
+            }
+            RecoveryOperation::DeleteVariation => {
+                let (Some(variation), Some(target)) =
+                    (state.original_variation.as_deref(), state.target.as_deref())
+                else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let oid = Oid::from_str(target)
+                    .map_err(|_| DraftlineError::VersionNotFound(target.to_string()))?;
+                let branch_ref = format!("refs/heads/{}", validate_variation_name(variation)?);
+                self.repo
+                    .reference(&branch_ref, oid, true, "rollback recovery")?;
+                if self.current_variation_unchecked().ok().as_deref() == Some(variation) {
+                    let commit = self.repo.find_commit(oid)?;
+                    self.repo.checkout_tree(
+                        commit.tree()?.as_object(),
+                        Some(CheckoutBuilder::new().force()),
+                    )?;
+                    self.repo.set_head(&branch_ref)?;
+                }
+                let archive_ref = archive_ref("deleted-variations", variation, &state.operation_id);
+                if let Ok(mut reference) = self.repo.find_reference(&archive_ref) {
+                    reference.delete()?;
+                }
+                self.complete_recovery(state, true)
+            }
+            RecoveryOperation::SquashVersions => {
+                let (Some(variation), Some(target)) =
+                    (state.original_variation.as_deref(), state.target.as_deref())
+                else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let oid = Oid::from_str(target)
+                    .map_err(|_| DraftlineError::VersionNotFound(target.to_string()))?;
+                let branch_ref = format!("refs/heads/{}", validate_variation_name(variation)?);
+                self.repo
+                    .reference(&branch_ref, oid, true, "rollback recovery")?;
+                if self.current_variation_unchecked().ok().as_deref() == Some(variation) {
+                    let commit = self.repo.find_commit(oid)?;
+                    self.repo.checkout_tree(
+                        commit.tree()?.as_object(),
+                        Some(CheckoutBuilder::new().force()),
+                    )?;
+                    self.repo.set_head(&branch_ref)?;
+                }
+                self.complete_recovery(state, true)
+            }
+            RecoveryOperation::ApplyShelf => {
+                let changed_files = self.changed_files_unchecked()?;
+                let changed_workspace = !changed_files.is_empty();
+                if changed_workspace {
+                    self.discard_changed_files(&changed_files)?;
+                }
+                self.complete_recovery(state, changed_workspace)
+            }
+            RecoveryOperation::ShelveChanges
+            | RecoveryOperation::ApplyIncoming
+            | RecoveryOperation::RestoreVersionAsNewSave
+            | RecoveryOperation::DiscardChanges
+            | RecoveryOperation::DiscardFile
+            | RecoveryOperation::DeleteRemoteVariation
+            | RecoveryOperation::ExpireSupportRefs
+            | RecoveryOperation::MergeIncoming => Ok(self.recovery_unavailable(state)),
+        }
     }
 
     /// Acknowledges an incomplete recovery record and allows normal operations again.
@@ -1836,8 +2073,151 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         match scope {
             SupportRefScope::Local => self.list_local_support_refs(),
-            SupportRefScope::RemoteTracking => Ok(Vec::new()),
+            SupportRefScope::RemoteTracking => self.list_remote_tracking_support_refs(),
         }
+    }
+
+    /// Fetches hidden support refs into a remote-tracking support namespace.
+    pub fn fetch_support_refs(&self, remote: impl AsRef<str>) -> Result<()> {
+        let mut options = RemoteOptions::new();
+        self.fetch_support_refs_with_options(remote, &mut options)
+    }
+
+    /// Fetches hidden support refs with explicit remote options.
+    pub fn fetch_support_refs_with_options(
+        &self,
+        remote: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<()> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref();
+        let mut git_remote = self.repo.find_remote(remote)?;
+        let refspecs = [
+            format!(
+                "+refs/draftline/deleted-variations/*:refs/remotes/{remote}/draftline/deleted-variations/*"
+            ),
+            format!(
+                "+refs/draftline/rewrites/squash/*:refs/remotes/{remote}/draftline/rewrites/squash/*"
+            ),
+        ];
+        let refspec_refs = refspecs.iter().map(String::as_str).collect::<Vec<_>>();
+        if options.has_credentials() {
+            let mut fetch_options = options.fetch_options();
+            git_remote.fetch(&refspec_refs, Some(&mut fetch_options), None)?;
+        } else {
+            git_remote.fetch(&refspec_refs, None, None)?;
+        }
+        Ok(())
+    }
+
+    /// Plans create-only publication of all local support refs to a shared remote.
+    pub fn preflight_publish_support_refs(
+        &self,
+        remote: impl AsRef<str>,
+    ) -> Result<SupportRefPublishPreflight> {
+        let mut options = RemoteOptions::new();
+        self.preflight_publish_support_refs_with_options(remote, &mut options)
+    }
+
+    /// Plans create-only support-ref publication with explicit remote options.
+    pub fn preflight_publish_support_refs_with_options(
+        &self,
+        remote: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<SupportRefPublishPreflight> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref().to_string();
+        self.repo.find_remote(&remote)?;
+        self.fetch_support_refs_with_options(&remote, options)?;
+        let local_support_refs = self.list_local_support_refs()?;
+        let remote_support_refs = self.list_remote_tracking_support_refs()?;
+        let mut remote_by_local_ref = HashMap::new();
+        for remote_ref in remote_support_refs {
+            if let Some(local_ref_name) =
+                local_support_ref_from_remote_tracking(&remote, &remote_ref.ref_name)
+            {
+                remote_by_local_ref.insert(local_ref_name, remote_ref.target_oid);
+            }
+        }
+
+        let mut support_refs = Vec::new();
+        for support_ref in local_support_refs {
+            match remote_by_local_ref.get(&support_ref.ref_name) {
+                Some(remote_oid) if remote_oid == &support_ref.target_oid => continue,
+                Some(remote_oid) => {
+                    return Err(DraftlineError::RemoteRace {
+                        remote,
+                        variation: support_ref.ref_name,
+                        expected: Some(support_ref.target_oid),
+                        actual: Some(remote_oid.clone()),
+                    });
+                }
+                None => support_refs.push(support_ref),
+            }
+        }
+
+        let token = SupportRefPublishToken {
+            remote: remote.clone(),
+            refs: support_refs
+                .iter()
+                .map(|support_ref| SupportRefPublishItem {
+                    ref_name: support_ref.ref_name.clone(),
+                    target_oid: support_ref.target_oid.clone(),
+                })
+                .collect(),
+        };
+        let can_publish = !support_refs.is_empty();
+
+        Ok(SupportRefPublishPreflight {
+            remote,
+            support_refs,
+            token,
+            can_publish,
+        })
+    }
+
+    /// Publishes preflighted support refs using create-only remote updates.
+    pub fn publish_support_refs(&self, token: SupportRefPublishToken) -> Result<()> {
+        let mut options = RemoteOptions::new();
+        self.publish_support_refs_with_options(token, &mut options)
+    }
+
+    /// Publishes preflighted support refs with explicit remote options.
+    pub fn publish_support_refs_with_options(
+        &self,
+        token: SupportRefPublishToken,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<()> {
+        self.ensure_no_pending_recovery()?;
+        self.repo.find_remote(&token.remote)?;
+        for item in token.refs {
+            if !is_restorable_support_ref(&item.ref_name) {
+                return Err(DraftlineError::VersionNotFound(item.ref_name));
+            }
+            let reference = self.repo.find_reference(&item.ref_name)?;
+            let actual_oid = reference
+                .target()
+                .ok_or_else(|| DraftlineError::VersionNotFound(item.ref_name.clone()))?
+                .to_string();
+            if actual_oid != item.target_oid {
+                return Err(DraftlineError::LocalStateChanged {
+                    expected: format!("{}@{}", item.ref_name, item.target_oid),
+                    actual: format!("{}@{actual_oid}", item.ref_name),
+                });
+            }
+
+            self.push_refspec(
+                &token.remote,
+                &format!("{}:{}", item.ref_name, item.ref_name),
+                vec![PushRefExpectation {
+                    dst_refname: item.ref_name.clone(),
+                    expected_old_oid: None,
+                    expected_new_oid: Some(item.target_oid),
+                }],
+                options,
+            )?;
+        }
+        Ok(())
     }
 
     /// Restores an archive support ref as a new visible variation.
@@ -1945,11 +2325,21 @@ impl Workspace {
         self.push_refspec(
             &token.remote,
             &format!("{}:{}", token.support_ref, token.support_ref),
+            vec![PushRefExpectation {
+                dst_refname: token.support_ref.clone(),
+                expected_old_oid: None,
+                expected_new_oid: Some(token.expected_remote_oid.clone()),
+            }],
             options,
         )?;
         self.push_refspec(
             &token.remote,
             &format!(":refs/heads/{variation_name}"),
+            vec![PushRefExpectation {
+                dst_refname: format!("refs/heads/{variation_name}"),
+                expected_old_oid: Some(token.expected_remote_oid.clone()),
+                expected_new_oid: None,
+            }],
             options,
         )?;
 
@@ -2546,13 +2936,175 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let sync_status = self.sync_status(remote)?;
         let dirty_files = self.changed_files_unchecked()?;
+        let mut file_hazards = Vec::new();
+        let mut conflicts = Vec::new();
+        let mut token = None;
+
+        if matches!(sync_status.state, SyncState::NeedsMerge) {
+            let merge_input = self.merge_input_for_status(&sync_status)?;
+            file_hazards = self.target_tree_hazards(&merge_input.remote_commit.tree()?)?;
+            let plan = self.plan_clean_merge(
+                &merge_input.base_commit.tree()?,
+                &merge_input.local_commit.tree()?,
+                &merge_input.remote_commit.tree()?,
+            )?;
+            conflicts = plan.conflicts;
+            if dirty_files.is_empty() && file_hazards.is_empty() && conflicts.is_empty() {
+                token = Some(MergeIncomingToken {
+                    remote: sync_status.remote.clone(),
+                    variation: sync_status.variation.clone(),
+                    local_oid: merge_input.local_commit.id().to_string(),
+                    remote_oid: merge_input.remote_commit.id().to_string(),
+                    merge_base_oid: merge_input.base_commit.id().to_string(),
+                });
+            }
+        }
+        let can_merge_cleanly = token.is_some();
 
         Ok(MergeIncomingReport {
             sync_status,
             dirty_files,
-            file_hazards: Vec::new(),
-            can_merge_cleanly: false,
+            file_hazards,
+            conflicts,
+            token,
+            can_merge_cleanly,
             changed_workspace: false,
+        })
+    }
+
+    /// Writes a clean incoming merge as a new two-parent version.
+    pub fn merge_incoming(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<MergeIncomingResult> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "merge_incoming")?;
+        let dirty_files = self.changed_files_unchecked()?;
+        if !dirty_files.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "merge_incoming",
+                true,
+                dirty_files,
+                Vec::new(),
+                None,
+            ))));
+        }
+
+        let variation = self.current_variation_unchecked()?;
+        let local_oid = self.repo.head()?.peel_to_commit()?.id().to_string();
+        if variation != token.variation || local_oid != token.local_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{}", token.variation, token.local_oid),
+                actual: format!("{variation}@{local_oid}"),
+            });
+        }
+
+        self.fetch_remote_unchecked(&token.remote, options)?;
+        let status = self.sync_status(&token.remote)?;
+        if status.state != SyncState::NeedsMerge {
+            return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
+        }
+        let remote_oid = remote_tracking_oid(&self.repo, &token.remote, &token.variation);
+        if remote_oid.as_deref() != Some(token.remote_oid.as_str()) {
+            return Err(DraftlineError::RemoteRace {
+                remote: token.remote,
+                variation: token.variation,
+                expected: Some(token.remote_oid),
+                actual: remote_oid,
+            });
+        }
+
+        let merge_input = self.merge_input_for_status(&status)?;
+        if merge_input.base_commit.id().to_string() != token.merge_base_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: token.merge_base_oid,
+                actual: merge_input.base_commit.id().to_string(),
+            });
+        }
+
+        let remote_tree = merge_input.remote_commit.tree()?;
+        let file_hazards = self.target_tree_hazards(&remote_tree)?;
+        if !file_hazards.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "merge_incoming",
+                true,
+                Vec::new(),
+                file_hazards,
+                None,
+            ))));
+        }
+
+        let plan = self.plan_clean_merge(
+            &merge_input.base_commit.tree()?,
+            &merge_input.local_commit.tree()?,
+            &remote_tree,
+        )?;
+        if !plan.conflicts.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "merge_incoming",
+                true,
+                Vec::new(),
+                Vec::new(),
+                Some(plan.conflicts[0].label.clone()),
+            ))));
+        }
+
+        let operation_id = new_operation_id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::MergeIncoming,
+            original_variation: Some(variation),
+            target: Some(token.remote_oid.clone()),
+            completed: false,
+        })?;
+
+        let mut index = self.repo.index()?;
+        for change in &plan.files {
+            let full_path = self.root.join(&change.path);
+            match &change.content {
+                Some(content) => {
+                    if let Some(parent) = full_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&full_path, content)?;
+                    index.add_path(&change.path)?;
+                }
+                None => {
+                    remove_workspace_path_if_exists(&full_path)?;
+                    if let Err(error) = index.remove_path(&change.path) {
+                        if error.code() != git2::ErrorCode::NotFound {
+                            return Err(error.into());
+                        }
+                    }
+                }
+            }
+        }
+        index.write()?;
+        let tree_id = index.write_tree()?;
+        let tree = self.repo.find_tree(tree_id)?;
+        let signature = self.workspace_signature()?;
+        let oid = self.repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            label.as_ref(),
+            &tree,
+            &[&merge_input.local_commit, &merge_input.remote_commit],
+        )?;
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::MergeIncoming,
+            original_variation: None,
+            target: Some(oid.to_string()),
+            completed: true,
+        })?;
+
+        Ok(MergeIncomingResult {
+            version: version_from_commit(&self.repo.find_commit(oid)?),
+            merged_files: plan.files.into_iter().map(|file| file.path).collect(),
         })
     }
 
@@ -2937,7 +3489,7 @@ impl Workspace {
         Ok(remotes)
     }
 
-    fn recovery_skeleton(&self, operation_id: &str) -> Result<RecoveryRepairResult> {
+    fn pending_recovery(&self, operation_id: &str) -> Result<RecoveryState> {
         let Some(state) = self.recovery_state()? else {
             return Err(DraftlineError::RecoveryNotFound(operation_id.to_string()));
         };
@@ -2946,13 +3498,74 @@ impl Workspace {
             return Err(DraftlineError::RecoveryNotFound(operation_id.to_string()));
         }
 
+        Ok(state)
+    }
+
+    fn complete_recovery(
+        &self,
+        state: RecoveryState,
+        changed_workspace: bool,
+    ) -> Result<RecoveryRepairResult> {
+        let completed_state = RecoveryState {
+            operation_id: state.operation_id.clone(),
+            operation: state.operation.clone(),
+            original_variation: None,
+            target: state.target,
+            completed: true,
+        };
+        self.write_recovery_state(&completed_state)?;
+
         Ok(RecoveryRepairResult {
+            operation_id: state.operation_id,
+            operation: state.operation,
+            completed: true,
+            changed_workspace,
+            safe_next_actions: vec![SafeNextAction::NormalWork],
+        })
+    }
+
+    fn recovery_unavailable(&self, state: RecoveryState) -> RecoveryRepairResult {
+        RecoveryRepairResult {
             operation_id: state.operation_id,
             operation: state.operation,
             completed: false,
             changed_workspace: false,
             safe_next_actions: vec![SafeNextAction::RepairRecovery],
-        })
+        }
+    }
+
+    fn checkout_variation_unchecked(&self, variation: &str) -> Result<()> {
+        let safe_variation = validate_variation_name(variation)?;
+        let branch = self.repo.find_branch(&safe_variation, BranchType::Local)?;
+        let reference = branch.into_reference();
+        let target = reference.peel(ObjectType::Commit)?;
+        self.repo
+            .checkout_tree(&target, Some(CheckoutBuilder::new().force()))?;
+        self.repo
+            .set_head(&format!("refs/heads/{safe_variation}"))?;
+        Ok(())
+    }
+
+    fn repair_delete_variation_recovery(&self, state: &RecoveryState) -> Result<()> {
+        let (Some(variation), Some(target)) =
+            (state.original_variation.as_deref(), state.target.as_deref())
+        else {
+            return Ok(());
+        };
+        let safe_variation = validate_variation_name(variation)?;
+        let oid = Oid::from_str(target)
+            .map_err(|_| DraftlineError::VersionNotFound(target.to_string()))?;
+        let archive_ref = archive_ref("deleted-variations", &safe_variation, &state.operation_id);
+        if self.repo.find_reference(&archive_ref).is_err() {
+            self.repo
+                .reference(&archive_ref, oid, false, "repair deleted variation archive")?;
+        }
+        if let Ok(mut branch) = self.repo.find_branch(&safe_variation, BranchType::Local) {
+            if branch.get().target() == Some(oid) {
+                branch.delete()?;
+            }
+        }
+        Ok(())
     }
 
     fn push_current_variation_with_options(
@@ -2961,14 +3574,30 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<()> {
         let variation = self.current_variation_unchecked()?;
+        let old_oid = remote_tracking_oid(&self.repo, remote_name, &variation);
+        let new_oid = self
+            .repo
+            .refname_to_id(&format!("refs/heads/{variation}"))?
+            .to_string();
+        self.push_current_variation_with_lease(remote_name, old_oid, new_oid, options)
+    }
+
+    fn push_current_variation_with_lease(
+        &self,
+        remote_name: &str,
+        expected_old_oid: Option<String>,
+        expected_new_oid: String,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<()> {
+        let variation = self.current_variation_unchecked()?;
         let mut remote = self.repo.find_remote(remote_name)?;
         let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
-        if options.has_credentials() {
-            let mut push_options = options.push_options();
-            remote.push(&[refspec.as_str()], Some(&mut push_options))?;
-        } else {
-            remote.push(&[refspec.as_str()], None)?;
-        }
+        let mut push_options = options.push_options_with_expectations(vec![PushRefExpectation {
+            dst_refname: format!("refs/heads/{variation}"),
+            expected_old_oid,
+            expected_new_oid: Some(expected_new_oid),
+        }]);
+        remote.push(&[refspec.as_str()], Some(&mut push_options))?;
 
         Ok(())
     }
@@ -2977,15 +3606,12 @@ impl Workspace {
         &self,
         remote_name: &str,
         refspec: &str,
+        expectations: Vec<PushRefExpectation>,
         options: &mut RemoteOptions<'_>,
     ) -> Result<()> {
         let mut remote = self.repo.find_remote(remote_name)?;
-        if options.has_credentials() {
-            let mut push_options = options.push_options();
-            remote.push(&[refspec], Some(&mut push_options))?;
-        } else {
-            remote.push(&[refspec], None)?;
-        }
+        let mut push_options = options.push_options_with_expectations(expectations);
+        remote.push(&[refspec], Some(&mut push_options))?;
 
         Ok(())
     }
@@ -3040,12 +3666,35 @@ impl Workspace {
             "refs/draftline/deleted-variations/*/*",
             SupportRefKind::DeletedVariation,
             "refs/draftline/deleted-variations/",
+            SupportRefScope::Local,
             &mut support_refs,
         )?;
         self.collect_support_refs(
             "refs/draftline/rewrites/squash/*/*",
             SupportRefKind::Rewrite,
             "refs/draftline/rewrites/squash/",
+            SupportRefScope::Local,
+            &mut support_refs,
+        )?;
+
+        support_refs.sort_by(|left, right| left.ref_name.cmp(&right.ref_name));
+        Ok(support_refs)
+    }
+
+    fn list_remote_tracking_support_refs(&self) -> Result<Vec<SupportRef>> {
+        let mut support_refs = Vec::new();
+        self.collect_support_refs(
+            "refs/remotes/*/draftline/deleted-variations/*/*",
+            SupportRefKind::DeletedVariation,
+            "draftline/deleted-variations/",
+            SupportRefScope::RemoteTracking,
+            &mut support_refs,
+        )?;
+        self.collect_support_refs(
+            "refs/remotes/*/draftline/rewrites/squash/*/*",
+            SupportRefKind::Rewrite,
+            "draftline/rewrites/squash/",
+            SupportRefScope::RemoteTracking,
             &mut support_refs,
         )?;
 
@@ -3058,6 +3707,7 @@ impl Workspace {
         glob: &str,
         kind: SupportRefKind,
         prefix: &str,
+        scope: SupportRefScope,
         support_refs: &mut Vec<SupportRef>,
     ) -> Result<()> {
         for reference in self.repo.references_glob(glob)? {
@@ -3076,7 +3726,7 @@ impl Workspace {
                 kind: kind.clone(),
                 source_variation,
                 target_oid: target_oid.to_string(),
-                scope: SupportRefScope::Local,
+                scope: scope.clone(),
             });
         }
 
@@ -3289,7 +3939,14 @@ impl Workspace {
             return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
         }
 
-        self.push_current_variation_with_options(&token.remote, options)?;
+        if status.ahead > 0 {
+            self.push_current_variation_with_lease(
+                &token.remote,
+                token.expected_remote_oid.clone(),
+                token.local_oid.clone(),
+                options,
+            )?;
+        }
 
         Ok(PublishResult {
             remote: token.remote,
@@ -3327,18 +3984,20 @@ impl Workspace {
         }
 
         let variation = self.current_variation_unchecked()?;
-        let push_result = self.push_current_variation_with_options(&remote_name, options);
-        if let Err(error) = push_result {
-            self.fetch_remote_unchecked(&remote_name, options)?;
-            let refreshed = self.sync_status(&remote_name)?;
-            if matches!(
-                refreshed.state,
-                SyncState::IncomingAvailable | SyncState::NeedsMerge
-            ) {
-                return Err(DraftlineError::SyncNeedsMerge(Box::new(refreshed)));
-            }
+        if status.ahead > 0 {
+            let push_result = self.push_current_variation_with_options(&remote_name, options);
+            if let Err(error) = push_result {
+                self.fetch_remote_unchecked(&remote_name, options)?;
+                let refreshed = self.sync_status(&remote_name)?;
+                if matches!(
+                    refreshed.state,
+                    SyncState::IncomingAvailable | SyncState::NeedsMerge
+                ) {
+                    return Err(DraftlineError::SyncNeedsMerge(Box::new(refreshed)));
+                }
 
-            return Err(error);
+                return Err(error);
+            }
         }
 
         Ok(PublishResult {
@@ -3610,6 +4269,98 @@ impl Workspace {
         }
 
         Ok(versions)
+    }
+
+    fn merge_input_for_status(&self, status: &SyncStatus) -> Result<IncomingMergeInput<'_>> {
+        let local_oid = self.repo.head()?.peel_to_commit()?.id();
+        let remote_ref = format!("refs/remotes/{}/{}", status.remote, status.variation);
+        let remote_oid = self.repo.refname_to_id(&remote_ref)?;
+        let base_oid = self.repo.merge_base(local_oid, remote_oid)?;
+
+        Ok(IncomingMergeInput {
+            local_commit: self.repo.find_commit(local_oid)?,
+            remote_commit: self.repo.find_commit(remote_oid)?,
+            base_commit: self.repo.find_commit(base_oid)?,
+        })
+    }
+
+    fn plan_clean_merge(
+        &self,
+        base_tree: &Tree<'_>,
+        local_tree: &Tree<'_>,
+        remote_tree: &Tree<'_>,
+    ) -> Result<CleanMergePlan> {
+        let mut paths = BTreeSet::new();
+        self.collect_tracked_tree_paths(base_tree, Path::new(""), &mut paths)?;
+        self.collect_tracked_tree_paths(local_tree, Path::new(""), &mut paths)?;
+        self.collect_tracked_tree_paths(remote_tree, Path::new(""), &mut paths)?;
+
+        let registry = ResolverRegistry::with_default_resolvers();
+        let mut files = Vec::new();
+        let mut conflicts = Vec::new();
+
+        for path in paths {
+            let base = self.tree_blob_bytes(base_tree, &path)?;
+            let ours = self.tree_blob_bytes(local_tree, &path)?;
+            let theirs = self.tree_blob_bytes(remote_tree, &path)?;
+            let merged = match merge_blob_contents(&registry, &path, base, ours, theirs) {
+                Ok(content) => content,
+                Err(conflict) => {
+                    conflicts.push(conflict);
+                    continue;
+                }
+            };
+
+            if merged != self.tree_blob_bytes(local_tree, &path)? {
+                files.push(MergeFileChange {
+                    path,
+                    content: merged,
+                });
+            }
+        }
+
+        Ok(CleanMergePlan { files, conflicts })
+    }
+
+    fn collect_tracked_tree_paths(
+        &self,
+        tree: &Tree<'_>,
+        prefix: &Path,
+        paths: &mut BTreeSet<PathBuf>,
+    ) -> Result<()> {
+        for entry in tree.iter() {
+            let Some(name) = entry.name() else {
+                continue;
+            };
+            let path = prefix.join(name);
+            match entry.kind() {
+                Some(ObjectType::Blob) => {
+                    if self.content_policy.tracks(&path)? {
+                        paths.insert(path);
+                    }
+                }
+                Some(ObjectType::Tree) => {
+                    let child = self.repo.find_tree(entry.id())?;
+                    self.collect_tracked_tree_paths(&child, &path, paths)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn tree_blob_bytes(&self, tree: &Tree<'_>, path: &Path) -> Result<Option<Vec<u8>>> {
+        let entry = match tree.get_path(path) {
+            Ok(entry) => entry,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+
+        if entry.kind() != Some(ObjectType::Blob) {
+            return Ok(None);
+        }
+
+        Ok(Some(self.repo.find_blob(entry.id())?.content().to_vec()))
     }
 
     fn local_version_count(&self, local: Oid) -> Result<usize> {
@@ -4091,9 +4842,92 @@ fn remote_tracking_oid(repo: &Repository, remote: &str, variation: &str) -> Opti
 }
 
 fn source_variation_from_support_ref(ref_name: &str, prefix: &str) -> Option<String> {
-    let remainder = ref_name.strip_prefix(prefix)?;
+    let remainder = if let Some(remainder) = ref_name.strip_prefix(prefix) {
+        remainder
+    } else {
+        let marker = format!("/{prefix}");
+        ref_name.split_once(&marker)?.1
+    };
     let (source_variation, _operation_id) = remainder.rsplit_once('/')?;
     Some(source_variation.to_string())
+}
+
+fn local_support_ref_from_remote_tracking(remote: &str, ref_name: &str) -> Option<String> {
+    let prefix = format!("refs/remotes/{remote}/draftline/");
+    let remainder = ref_name.strip_prefix(&prefix)?;
+    Some(format!("refs/draftline/{remainder}"))
+}
+
+fn merge_blob_contents(
+    registry: &ResolverRegistry,
+    path: &Path,
+    base: Option<Vec<u8>>,
+    ours: Option<Vec<u8>>,
+    theirs: Option<Vec<u8>>,
+) -> std::result::Result<Option<Vec<u8>>, MergeConflict> {
+    if ours == theirs {
+        return Ok(ours);
+    }
+
+    if base == ours {
+        return Ok(theirs);
+    }
+
+    if base == theirs {
+        return Ok(ours);
+    }
+
+    let (Some(base), Some(ours), Some(theirs)) = (base, ours, theirs) else {
+        return Err(MergeConflict {
+            path: path.to_path_buf(),
+            field_path: None,
+            label: "File was changed and deleted across versions".to_string(),
+            base: None,
+            ours: None,
+            theirs: None,
+            resolution: crate::merge::ResolutionKind::Choose,
+        });
+    };
+
+    let (Ok(base), Ok(ours), Ok(theirs)) = (
+        std::str::from_utf8(&base),
+        std::str::from_utf8(&ours),
+        std::str::from_utf8(&theirs),
+    ) else {
+        return Err(MergeConflict {
+            path: path.to_path_buf(),
+            field_path: None,
+            label: "Binary content changed in both versions".to_string(),
+            base: None,
+            ours: None,
+            theirs: None,
+            resolution: crate::merge::ResolutionKind::Choose,
+        });
+    };
+
+    let outcome = registry.merge(MergeInput {
+        path,
+        base,
+        ours,
+        theirs,
+    });
+    if let Some(merged) = outcome.merged {
+        Ok(Some(merged.into_bytes()))
+    } else {
+        Err(outcome
+            .conflicts
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| MergeConflict {
+                path: path.to_path_buf(),
+                field_path: None,
+                label: "Content changed in both versions".to_string(),
+                base: Some(base.to_string()),
+                ours: Some(ours.to_string()),
+                theirs: Some(theirs.to_string()),
+                resolution: crate::merge::ResolutionKind::Edit,
+            }))
+    }
 }
 
 fn is_restorable_support_ref(ref_name: &str) -> bool {
@@ -5190,7 +6024,7 @@ mod tests {
         assert!(capabilities.apply_incoming);
         assert!(capabilities.stale_lock_repair);
         assert!(capabilities.target_tree_collision_preflight);
-        assert!(!capabilities.support_ref_sync);
+        assert!(capabilities.support_ref_sync);
         assert!(!capabilities.agent_cli_facade);
     }
 
@@ -5258,34 +6092,224 @@ mod tests {
     }
 
     #[test]
-    fn repair_and_rollback_recovery_skeletons_report_unavailable_actions() {
+    fn repair_recovery_finishes_discard_changes() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"dirty");
         workspace
             .write_recovery_state(&RecoveryState {
                 operation_id: "interrupted".to_string(),
-                operation: RecoveryOperation::ApplyIncoming,
+                operation: RecoveryOperation::DiscardChanges,
                 original_variation: Some("master".to_string()),
-                target: Some("origin/master".to_string()),
+                target: None,
                 completed: false,
             })
             .unwrap();
 
         let repair = workspace.repair_recovery("interrupted").unwrap();
+
         assert_eq!(repair.operation_id, "interrupted");
-        assert_eq!(repair.operation, RecoveryOperation::ApplyIncoming);
+        assert_eq!(repair.operation, RecoveryOperation::DiscardChanges);
+        assert!(repair.completed);
+        assert!(repair.changed_workspace);
+        assert_eq!(repair.safe_next_actions, vec![SafeNextAction::NormalWork]);
+        assert!(workspace.changed_files().unwrap().is_empty());
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn repair_recovery_completes_apply_incoming_fast_forward() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"incoming");
+        let incoming = workspace.save_version("Incoming").unwrap();
+        let base_oid = Oid::from_str(base.id().as_str()).unwrap();
+        workspace
+            .repo
+            .reference(
+                "refs/heads/master",
+                base_oid,
+                true,
+                "simulate interrupted apply",
+            )
+            .unwrap();
+        workspace
+            .repo
+            .checkout_head(Some(CheckoutBuilder::new().force()))
+            .unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::ApplyIncoming,
+                original_variation: Some("master".to_string()),
+                target: Some(incoming.id().as_str().to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        let repair = workspace.repair_recovery("interrupted").unwrap();
+
+        assert!(repair.completed);
+        assert!(repair.changed_workspace);
+        assert_eq!(workspace.current_variation().unwrap(), "master");
+        assert_eq!(
+            workspace.repo.head().unwrap().target().unwrap().to_string(),
+            incoming.id().as_str()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "incoming"
+        );
+    }
+
+    #[test]
+    fn rollback_recovery_restores_deleted_variation() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        let variation = VariationId::from("old-option");
+        workspace.create_variation(variation.as_str()).unwrap();
+        workspace
+            .repo
+            .find_branch(variation.as_str(), BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+        let archive_ref = archive_ref("deleted-variations", variation.as_str(), "interrupted");
+        workspace
+            .repo
+            .reference(
+                &archive_ref,
+                Oid::from_str(base.id().as_str()).unwrap(),
+                false,
+                "simulate interrupted delete archive",
+            )
+            .unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::DeleteVariation,
+                original_variation: Some(variation.as_str().to_string()),
+                target: Some(base.id().as_str().to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        let rollback = workspace.rollback_recovery("interrupted").unwrap();
+
+        assert!(rollback.completed);
+        assert!(rollback.changed_workspace);
+        assert!(workspace
+            .repo
+            .find_branch(variation.as_str(), BranchType::Local)
+            .is_ok());
+        assert!(workspace.repo.find_reference(&archive_ref).is_err());
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn rollback_recovery_reports_unavailable_when_metadata_is_insufficient() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::DeleteVariation,
+                original_variation: None,
+                target: Some("0000000000000000000000000000000000000000".to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        let rollback = workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(rollback.operation_id, "interrupted");
+        assert_eq!(rollback.operation, RecoveryOperation::DeleteVariation);
+        assert!(!rollback.completed);
+        assert!(!rollback.changed_workspace);
+        assert_eq!(
+            rollback.safe_next_actions,
+            vec![SafeNextAction::RepairRecovery]
+        );
+    }
+
+    #[test]
+    fn rollback_restore_recovery_reports_unavailable_without_original_oid() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"restored");
+        let advanced = workspace.save_version("Restored").unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::RestoreVersionAsNewSave,
+                original_variation: Some("master".to_string()),
+                target: Some(base.id().as_str().to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        let rollback = workspace.rollback_recovery("interrupted").unwrap();
+
+        assert!(!rollback.completed);
+        assert!(!rollback.changed_workspace);
+        assert_eq!(
+            rollback.safe_next_actions,
+            vec![SafeNextAction::RepairRecovery]
+        );
+        assert_eq!(
+            workspace.repo.head().unwrap().target().unwrap().to_string(),
+            advanced.id().as_str()
+        );
+    }
+
+    #[test]
+    fn repair_squash_recovery_reports_unavailable_even_when_archive_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"one");
+        workspace.save_version("One").unwrap();
+        write_file(workspace.root(), "post.md", b"two");
+        let original_tip = workspace.save_version("Two").unwrap();
+        let archive_ref = archive_ref("rewrites/squash", "master", "interrupted");
+        workspace
+            .repo
+            .reference(
+                &archive_ref,
+                Oid::from_str(original_tip.id().as_str()).unwrap(),
+                false,
+                "simulate interrupted squash archive",
+            )
+            .unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::SquashVersions,
+                original_variation: Some("master".to_string()),
+                target: Some(original_tip.id().as_str().to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        let repair = workspace.repair_recovery("interrupted").unwrap();
+
         assert!(!repair.completed);
         assert!(!repair.changed_workspace);
         assert_eq!(
             repair.safe_next_actions,
             vec![SafeNextAction::RepairRecovery]
         );
-
-        let rollback = workspace.rollback_recovery("interrupted").unwrap();
-        assert_eq!(rollback.operation_id, "interrupted");
-        assert_eq!(rollback.operation, RecoveryOperation::ApplyIncoming);
-        assert!(!rollback.completed);
-        assert!(!rollback.changed_workspace);
+        assert_eq!(
+            workspace.repo.head().unwrap().target().unwrap().to_string(),
+            original_tip.id().as_str()
+        );
     }
 
     #[test]
@@ -5635,6 +6659,99 @@ mod tests {
     }
 
     #[test]
+    fn merge_incoming_writes_clean_two_parent_version() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "base.md", b"base");
+        first_workspace.save_version("Base").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_workspace, "Maria", "maria@example.com");
+
+        write_file(first_workspace.root(), "remote.md", b"remote");
+        first_workspace.save_version("Remote").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        write_file(second_workspace.root(), "local.md", b"local");
+        second_workspace.save_version("Local").unwrap();
+        second_workspace.fetch_remote("origin").unwrap();
+
+        let report = second_workspace.preflight_merge_incoming("origin").unwrap();
+        assert!(report.can_merge_cleanly);
+        assert!(report.conflicts.is_empty());
+        let token = report.token.unwrap();
+        let mut options = RemoteOptions::new();
+        let result = second_workspace
+            .merge_incoming(token, "Merge remote work", &mut options)
+            .unwrap();
+
+        assert!(result
+            .merged_files
+            .iter()
+            .any(|path| path == Path::new("remote.md")));
+        assert_eq!(
+            fs::read_to_string(second_workspace.root().join("local.md")).unwrap(),
+            "local"
+        );
+        assert_eq!(
+            fs::read_to_string(second_workspace.root().join("remote.md")).unwrap(),
+            "remote"
+        );
+        let commit = second_workspace
+            .repo
+            .find_commit(Oid::from_str(result.version.id().as_str()).unwrap())
+            .unwrap();
+        assert_eq!(commit.parent_count(), 2);
+        assert!(second_workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn preflight_merge_incoming_reports_semantic_conflicts() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"base");
+        first_workspace.save_version("Base").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_workspace, "Maria", "maria@example.com");
+
+        write_file(first_workspace.root(), "post.md", b"remote");
+        first_workspace.save_version("Remote").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        write_file(second_workspace.root(), "post.md", b"local");
+        second_workspace.save_version("Local").unwrap();
+        second_workspace.fetch_remote("origin").unwrap();
+
+        let report = second_workspace.preflight_merge_incoming("origin").unwrap();
+
+        assert!(!report.can_merge_cleanly);
+        assert!(report.token.is_none());
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(report.conflicts[0].path, Path::new("post.md"));
+    }
+
+    #[test]
     fn delete_remote_variation_publishes_support_ref_before_deleting_visible_ref() {
         let remote = tempfile::tempdir().unwrap();
         Repository::init_bare(remote.path()).unwrap();
@@ -5671,6 +6788,117 @@ mod tests {
         let bare = Repository::open_bare(remote.path()).unwrap();
         assert!(bare.find_reference("refs/heads/old-option").is_err());
         assert!(bare.find_reference(&preflight.support_ref).is_ok());
+    }
+
+    #[test]
+    fn support_refs_publish_create_only_and_fetch_remote_tracking_refs() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"base");
+        first_workspace.save_version("Base").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+        let variation = first_workspace.create_variation("old-option").unwrap();
+        first_workspace.delete_variation(variation.id()).unwrap();
+
+        let preflight = first_workspace
+            .preflight_publish_support_refs("origin")
+            .unwrap();
+        assert!(preflight.can_publish);
+        assert_eq!(preflight.support_refs.len(), 1);
+        first_workspace
+            .publish_support_refs(preflight.token.clone())
+            .unwrap();
+        let repeated_preflight = first_workspace
+            .preflight_publish_support_refs("origin")
+            .unwrap();
+        assert!(!repeated_preflight.can_publish);
+        assert!(repeated_preflight.support_refs.is_empty());
+        first_workspace
+            .publish_support_refs(repeated_preflight.token)
+            .unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        second_workspace.fetch_support_refs("origin").unwrap();
+
+        let remote_support_refs = second_workspace
+            .list_support_refs(SupportRefScope::RemoteTracking)
+            .unwrap();
+        assert_eq!(remote_support_refs.len(), 1);
+        assert_eq!(
+            remote_support_refs[0].scope,
+            SupportRefScope::RemoteTracking
+        );
+        assert_eq!(
+            remote_support_refs[0].source_variation.as_deref(),
+            Some("old-option")
+        );
+        assert!(remote_support_refs[0]
+            .ref_name
+            .starts_with("refs/remotes/origin/draftline/deleted-variations/old-option/"));
+    }
+
+    #[test]
+    fn support_ref_publish_preflight_rejects_same_name_different_oid_collision() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"base");
+        first_workspace.save_version("Base").unwrap();
+        let first_ref_name = "refs/draftline/deleted-variations/old-option/same-operation";
+        first_workspace
+            .repo
+            .reference(
+                first_ref_name,
+                first_workspace.repo.head().unwrap().target().unwrap(),
+                false,
+                "first archive",
+            )
+            .unwrap();
+        let first_preflight = first_workspace
+            .preflight_publish_support_refs("origin")
+            .unwrap();
+        first_workspace
+            .publish_support_refs(first_preflight.token)
+            .unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace = Workspace::init(second.path()).unwrap();
+        configure_identity(&second_workspace, "Maria", "maria@example.com");
+        second_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(second_workspace.root(), "post.md", b"different");
+        second_workspace.save_version("Different").unwrap();
+        second_workspace
+            .repo
+            .reference(
+                first_ref_name,
+                second_workspace.repo.head().unwrap().target().unwrap(),
+                false,
+                "colliding archive",
+            )
+            .unwrap();
+
+        let err = second_workspace
+            .preflight_publish_support_refs("origin")
+            .unwrap_err();
+
+        assert!(matches!(err, DraftlineError::RemoteRace { .. }));
     }
 
     #[test]
