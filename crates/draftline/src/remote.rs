@@ -49,6 +49,27 @@ pub struct PublishResult {
     pub published_versions: usize,
 }
 
+/// Read-only publish preflight with the expected remote state captured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishPreflight {
+    pub remote: String,
+    pub variation: String,
+    pub expected_remote_oid: Option<String>,
+    pub local_oid: String,
+    pub sync_status: SyncStatus,
+    pub token: PublishToken,
+    pub can_publish: bool,
+}
+
+/// Opaque publish execution token tying publish to a preflighted state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishToken {
+    pub remote: String,
+    pub variation: String,
+    pub expected_remote_oid: Option<String>,
+    pub local_oid: String,
+}
+
 /// Attribution metadata from version history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contributor {

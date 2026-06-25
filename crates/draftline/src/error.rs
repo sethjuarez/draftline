@@ -34,6 +34,9 @@ pub enum DraftlineError {
     #[error("workspace has an incomplete Draftline operation")]
     RecoveryRequired(Box<RecoveryState>),
 
+    #[error("recovery operation was not found: {0}")]
+    RecoveryNotFound(String),
+
     #[error("invalid variation name: {0}")]
     InvalidVariationName(String),
 
@@ -63,6 +66,19 @@ pub enum DraftlineError {
 
     #[error("remote has incoming changes that need an explicit merge plan")]
     SyncNeedsMerge(Box<SyncStatus>),
+
+    #[error(
+        "remote state changed for {remote}/{variation}; expected {expected:?}, actual {actual:?}"
+    )]
+    RemoteRace {
+        remote: String,
+        variation: String,
+        expected: Option<String>,
+        actual: Option<String>,
+    },
+
+    #[error("local publish state changed; expected {expected}, actual {actual}")]
+    LocalStateChanged { expected: String, actual: String },
 
     #[error("squash requires at least 2 versions, got {0}")]
     InvalidSquashCount(usize),
