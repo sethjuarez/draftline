@@ -21,4 +21,7 @@ pub enum RecoveryOperation {
     DiscardFile,
     DeleteVariation,
     SquashVersions,
+    ApplyShelf,
+    DeleteRemoteVariation,
+    ExpireSupportRefs,
 }

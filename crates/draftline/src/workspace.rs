@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::recovery::RecoveryOperation;
 use crate::{
-    path::normalize_workspace_relative, ContentPolicy, Contributor, DraftlineError, PublishResult,
-    RecoveryState, RemoteEndpoint, RemoteOptions, RemoteVersionSummary, Result, SyncState,
-    SyncStatus,
+    path::normalize_workspace_relative, ContentPolicy, Contributor, DraftlineError,
+    PublishPreflight, PublishResult, PublishToken, RecoveryState, RemoteEndpoint, RemoteOptions,
+    RemoteVersionSummary, Result, SyncState, SyncStatus,
 };
 
 /// A folder-backed content workspace.
@@ -216,12 +216,31 @@ pub struct PreflightReport {
     pub operation: String,
     pub will_write_files: bool,
     pub dirty_files: Vec<ChangedFile>,
+    pub file_hazards: Vec<FileHazard>,
     pub untracked_assets: Vec<PathBuf>,
     pub unresolved_conflicts: Vec<PathBuf>,
     pub large_files: Vec<PathBuf>,
     pub binary_files: Vec<PathBuf>,
     pub variation_divergence: Option<String>,
     pub can_proceed: bool,
+}
+
+/// A local file hazard that would make writing a target tree unsafe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct FileHazard {
+    pub path: PathBuf,
+    pub kind: FileHazardKind,
+}
+
+/// Why a local path is hazardous for a target-tree write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FileHazardKind {
+    Ignored,
+    Untracked,
+    PolicyExcluded,
 }
 
 /// Read-only view of a version.
@@ -270,6 +289,246 @@ pub struct WorkspaceSummary {
     pub state_may_be_inconsistent: bool,
 }
 
+/// Stable workspace identity returned by [`Workspace::inspect`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceId {
+    pub root: PathBuf,
+}
+
+/// Whether the workspace currently has a configured sharing destination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SharingMode {
+    LocalOnly,
+    SharedCapable,
+}
+
+/// Machine-readable next action a host or agent can safely offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SafeNextAction {
+    NormalWork,
+    SaveFirst,
+    DiscardChanges,
+    RepairRecovery,
+    ConfigureRemote,
+}
+
+/// Stable diagnostic codes for workspace inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DiagnosticCode {
+    RecoveryRequired,
+    WorkspaceLocked,
+    DirtyWorkspace,
+    LocalOnlyWorkspace,
+    SharedCapableWorkspace,
+    NoCurrentVariation,
+    WorkspaceReadFailed,
+    PolicyTrackedFileIgnored,
+}
+
+/// Severity for a workspace diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DiagnosticSeverity {
+    Info,
+    Warning,
+    Blocking,
+}
+
+/// Human and machine readable workspace inspection diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceDiagnostic {
+    pub code: DiagnosticCode,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+}
+
+/// Dirty-state summary returned by [`Workspace::inspect`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DirtySummary {
+    pub is_dirty: bool,
+    pub files: Vec<ChangedFile>,
+}
+
+/// Operation-lock state visible to inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OperationLockState {
+    Unlocked,
+    Locked,
+}
+
+/// Summary of the current operation lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct OperationLockSummary {
+    pub state: OperationLockState,
+}
+
+/// Metadata written into the operation lock while a risky mutation is active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct OperationLockMetadata {
+    pub operation_id: String,
+    pub operation: String,
+    pub process_id: u32,
+    pub owner: Option<String>,
+    pub created_at_seconds: u64,
+}
+
+/// Read-only report for the current operation lock file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct OperationLockInspection {
+    pub state: OperationLockState,
+    pub metadata: Option<OperationLockMetadata>,
+    pub is_stale: bool,
+    pub can_clear: bool,
+    pub diagnostics: Vec<WorkspaceDiagnostic>,
+}
+
+/// Result returned by recovery repair and rollback entry points.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RecoveryRepairResult {
+    pub operation_id: String,
+    pub operation: RecoveryOperation,
+    pub completed: bool,
+    pub changed_workspace: bool,
+    pub safe_next_actions: Vec<SafeNextAction>,
+}
+
+/// Summary of hidden Draftline support refs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SupportRefSummary {
+    pub local_count: usize,
+    pub remote_count: usize,
+}
+
+/// Scope for listing Draftline support refs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SupportRefScope {
+    Local,
+    RemoteTracking,
+}
+
+/// Kind of hidden Draftline recovery support ref.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SupportRefKind {
+    DeletedVariation,
+    Rewrite,
+}
+
+/// Hidden support ref that can be used for recovery/admin workflows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SupportRef {
+    pub id: String,
+    pub ref_name: String,
+    pub kind: SupportRefKind,
+    pub source_variation: Option<String>,
+    pub target_oid: String,
+    pub scope: SupportRefScope,
+}
+
+/// Structured, read-only safety snapshot for hosts and agents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceInspection {
+    pub workspace_id: WorkspaceId,
+    pub sharing_mode: SharingMode,
+    pub current_variation: Option<VariationId>,
+    pub remotes: Vec<RemoteEndpoint>,
+    pub dirty: DirtySummary,
+    pub recovery: Option<crate::RecoveryState>,
+    pub operation_lock: OperationLockSummary,
+    pub support_refs: SupportRefSummary,
+    pub diagnostics: Vec<WorkspaceDiagnostic>,
+    pub safe_next_actions: Vec<SafeNextAction>,
+}
+
+/// Feature flags for the workflows supported by this Draftline crate version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceCapabilities {
+    pub inspect: bool,
+    pub workspace_summary: bool,
+    pub save_version: bool,
+    pub switch_variation: bool,
+    pub publish_changes: bool,
+    pub apply_incoming: bool,
+    pub stale_lock_repair: bool,
+    pub target_tree_collision_preflight: bool,
+    pub support_ref_sync: bool,
+    pub agent_cli_facade: bool,
+}
+
+/// Retry guidance for agent/tool callers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RetryClass {
+    Retryable,
+    RetryAfterRepair,
+    RetryAfterUserChoice,
+    NotRetryable,
+}
+
+/// Stable explanation for a diagnostic/error code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ErrorExplanation {
+    pub code: DiagnosticCode,
+    pub message: String,
+    pub safe_next_actions: Vec<SafeNextAction>,
+    pub retry: RetryClass,
+}
+
+/// Verification summary for workspace postconditions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceVerification {
+    pub recovery_clear: bool,
+    pub operation_lock_clear: bool,
+    pub current_variation_present: bool,
+    pub diagnostics: Vec<WorkspaceDiagnostic>,
+}
+
+/// Content-policy audit report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ContentPolicyAudit {
+    pub current_diagnostics: Vec<WorkspaceDiagnostic>,
+    pub historical_out_of_policy_paths: Vec<PathBuf>,
+}
+
+/// Read-only setup report for adopting an existing Git repository.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AdoptionPreflightReport {
+    pub inspection: WorkspaceInspection,
+    pub candidate_policy_diagnostics: Vec<WorkspaceDiagnostic>,
+    pub blockers: Vec<WorkspaceDiagnostic>,
+    pub warnings: Vec<WorkspaceDiagnostic>,
+    pub safe_next_actions: Vec<SafeNextAction>,
+    pub can_adopt: bool,
+}
+
 /// A version annotated with variation-tip context for timeline/graph rendering.
 ///
 /// Host UIs can render a simple history list or a branch graph by iterating
@@ -311,6 +570,16 @@ pub struct VariationSummary {
     pub reachable_version_count: usize,
 }
 
+/// A variation discovered on a remote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RemoteVariation {
+    pub id: VariationId,
+    pub name: String,
+    pub remote: String,
+    pub head_version: Option<Version>,
+}
+
 /// Preflight report for applying incoming changes from a remote.
 ///
 /// Returned by [`Workspace::preflight_apply_incoming`].  Lets host UIs show
@@ -321,6 +590,8 @@ pub struct ApplyIncomingReport {
     pub sync_status: SyncStatus,
     /// Files with unsaved changes that would block the apply.
     pub dirty_files: Vec<ChangedFile>,
+    /// Local files that the incoming target tree would overwrite unsafely.
+    pub file_hazards: Vec<FileHazard>,
     /// `true` when the apply can be done as a fast-forward (no three-way merge needed).
     pub is_fast_forward: bool,
     /// `true` when it is safe to call [`Workspace::apply_incoming`] immediately.
@@ -332,6 +603,101 @@ pub struct ApplyIncomingReport {
 pub struct ApplyIncomingResult {
     /// Number of versions fast-forwarded into the local variation.
     pub applied_count: usize,
+}
+
+/// A local shelf of work intentionally put aside.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Shelf {
+    pub id: String,
+    pub version: Version,
+}
+
+/// Preflight report for applying a shelf into the current workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ShelfApplyReport {
+    pub shelf: Shelf,
+    pub dirty_files: Vec<ChangedFile>,
+    pub file_hazards: Vec<FileHazard>,
+    pub can_proceed: bool,
+}
+
+/// Read-only merge-incoming preflight report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MergeIncomingReport {
+    pub sync_status: SyncStatus,
+    pub dirty_files: Vec<ChangedFile>,
+    pub file_hazards: Vec<FileHazard>,
+    pub can_merge_cleanly: bool,
+    pub changed_workspace: bool,
+}
+
+/// Preflight for removing a visible variation from a shared remote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RemoteVariationDeletePreflight {
+    pub remote: String,
+    pub variation: VariationId,
+    pub expected_remote_oid: String,
+    pub support_ref: String,
+    pub token: RemoteVariationDeleteToken,
+    pub can_delete: bool,
+}
+
+/// Token tying remote variation deletion to a preflighted remote state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RemoteVariationDeleteToken {
+    pub remote: String,
+    pub variation: VariationId,
+    pub expected_remote_oid: String,
+    pub support_ref: String,
+}
+
+/// Preflight for expiring support refs as retention cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SupportRefExpirationPreflight {
+    pub support_refs: Vec<SupportRef>,
+    pub token: SupportRefExpirationToken,
+    pub can_expire: bool,
+}
+
+/// Token tying support-ref expiration to selected support refs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SupportRefExpirationToken {
+    pub ids: Vec<String>,
+}
+
+/// Preflight for destructive purge/redaction planning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PurgePreflight {
+    pub selector: String,
+    pub affected_refs: Vec<String>,
+    pub distributed_warning: String,
+    pub token: PurgeToken,
+}
+
+/// Token identifying a purge plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PurgeToken {
+    pub selector: String,
+    pub affected_refs: Vec<String>,
+}
+
+/// Verification summary for a purge plan or execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PurgeVerification {
+    pub selector: String,
+    pub checked_refs: usize,
+    pub verified_absent: bool,
+    pub limitations: Vec<String>,
 }
 
 /// Diff between two versions or between a version and the current workspace.
@@ -470,6 +836,309 @@ impl Workspace {
         &self.content_policy
     }
 
+    /// Returns a structured, read-only safety snapshot for hosts and agents.
+    ///
+    /// Inspection is intentionally diagnostic: it does not require the workspace
+    /// to be free of pending recovery, and it reports lock/recovery state instead
+    /// of attempting to repair it. In this slice, `RepairRecovery` is advisory;
+    /// operation-specific repair and stale-lock clearing are exposed by later
+    /// recovery APIs.
+    pub fn inspect(&self) -> Result<WorkspaceInspection> {
+        let mut diagnostics = Vec::new();
+        let recovery = match self.recovery_state() {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                diagnostics.push(workspace_diagnostic(
+                    DiagnosticCode::RecoveryRequired,
+                    DiagnosticSeverity::Blocking,
+                    format!("workspace recovery state could not be read: {error}"),
+                ));
+                None
+            }
+        };
+
+        let current_variation = match self.current_variation_unchecked() {
+            Ok(variation) => Some(VariationId::from(variation)),
+            Err(DraftlineError::NoCurrentVariation) => {
+                diagnostics.push(workspace_diagnostic(
+                    DiagnosticCode::NoCurrentVariation,
+                    DiagnosticSeverity::Blocking,
+                    "workspace is not on a normal Draftline variation",
+                ));
+                None
+            }
+            Err(error) => {
+                diagnostics.push(workspace_diagnostic(
+                    DiagnosticCode::WorkspaceReadFailed,
+                    DiagnosticSeverity::Warning,
+                    format!("could not read current variation: {error}"),
+                ));
+                None
+            }
+        };
+
+        let dirty_files = match self.changed_files_unchecked() {
+            Ok(files) => files,
+            Err(error) => {
+                diagnostics.push(workspace_diagnostic(
+                    DiagnosticCode::WorkspaceReadFailed,
+                    DiagnosticSeverity::Warning,
+                    format!("could not read dirty files: {error}"),
+                ));
+                Vec::new()
+            }
+        };
+        let dirty = DirtySummary {
+            is_dirty: !dirty_files.is_empty(),
+            files: dirty_files,
+        };
+
+        let remotes = match self.remotes_unchecked() {
+            Ok(remotes) => remotes,
+            Err(error) => {
+                diagnostics.push(workspace_diagnostic(
+                    DiagnosticCode::WorkspaceReadFailed,
+                    DiagnosticSeverity::Warning,
+                    format!("could not read remotes: {error}"),
+                ));
+                Vec::new()
+            }
+        };
+        let sharing_mode = if remotes.is_empty() {
+            diagnostics.push(workspace_diagnostic(
+                DiagnosticCode::LocalOnlyWorkspace,
+                DiagnosticSeverity::Info,
+                "workspace has no configured remote",
+            ));
+            SharingMode::LocalOnly
+        } else {
+            diagnostics.push(workspace_diagnostic(
+                DiagnosticCode::SharedCapableWorkspace,
+                DiagnosticSeverity::Info,
+                "workspace has at least one configured remote",
+            ));
+            SharingMode::SharedCapable
+        };
+
+        if dirty.is_dirty {
+            diagnostics.push(workspace_diagnostic(
+                DiagnosticCode::DirtyWorkspace,
+                DiagnosticSeverity::Warning,
+                "workspace has unsaved tracked content changes",
+            ));
+        }
+
+        if recovery.is_some() {
+            diagnostics.push(workspace_diagnostic(
+                DiagnosticCode::RecoveryRequired,
+                DiagnosticSeverity::Blocking,
+                "workspace has an incomplete Draftline operation",
+            ));
+        }
+
+        match self.policy_git_diagnostics_unchecked() {
+            Ok(policy_diagnostics) => diagnostics.extend(policy_diagnostics),
+            Err(error) => diagnostics.push(workspace_diagnostic(
+                DiagnosticCode::WorkspaceReadFailed,
+                DiagnosticSeverity::Warning,
+                format!("could not read content-policy Git diagnostics: {error}"),
+            )),
+        }
+
+        let operation_lock = OperationLockSummary {
+            state: if self.lock_path().exists() {
+                diagnostics.push(workspace_diagnostic(
+                    DiagnosticCode::WorkspaceLocked,
+                    DiagnosticSeverity::Blocking,
+                    "workspace has an operation lock",
+                ));
+                OperationLockState::Locked
+            } else {
+                OperationLockState::Unlocked
+            },
+        };
+
+        let safe_next_actions =
+            safe_next_actions_for_inspection(&recovery, &operation_lock, &dirty, &diagnostics);
+
+        Ok(WorkspaceInspection {
+            workspace_id: WorkspaceId {
+                root: self.root.clone(),
+            },
+            sharing_mode,
+            current_variation,
+            remotes,
+            dirty,
+            recovery,
+            operation_lock,
+            support_refs: SupportRefSummary {
+                local_count: self
+                    .list_local_support_refs()
+                    .map(|support_refs| support_refs.len())
+                    .unwrap_or_default(),
+                remote_count: 0,
+            },
+            diagnostics,
+            safe_next_actions,
+        })
+    }
+
+    /// Returns [`Workspace::inspect`] as JSON for agents/tools.
+    pub fn inspect_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(&self.inspect()?)?)
+    }
+
+    /// Reports feature availability for this Draftline crate version.
+    pub fn capabilities() -> WorkspaceCapabilities {
+        WorkspaceCapabilities {
+            inspect: true,
+            workspace_summary: true,
+            save_version: true,
+            switch_variation: true,
+            publish_changes: true,
+            apply_incoming: true,
+            stale_lock_repair: true,
+            target_tree_collision_preflight: false,
+            support_ref_sync: false,
+            agent_cli_facade: true,
+        }
+    }
+
+    /// Returns [`Workspace::capabilities`] as JSON for agents/tools.
+    pub fn capabilities_json() -> Result<String> {
+        Ok(serde_json::to_string(&Self::capabilities())?)
+    }
+
+    /// Verifies key workspace postconditions for agents/tools.
+    pub fn verify_workspace(&self) -> Result<WorkspaceVerification> {
+        let inspection = self.inspect()?;
+        let recovery_clear = inspection.recovery.is_none()
+            && !inspection
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == DiagnosticCode::RecoveryRequired);
+        Ok(WorkspaceVerification {
+            recovery_clear,
+            operation_lock_clear: inspection.operation_lock.state == OperationLockState::Unlocked,
+            current_variation_present: inspection.current_variation.is_some(),
+            diagnostics: inspection.diagnostics,
+        })
+    }
+
+    /// Explains a stable diagnostic code for agents/tools.
+    pub fn explain_error(code: DiagnosticCode) -> ErrorExplanation {
+        match code {
+            DiagnosticCode::RecoveryRequired => ErrorExplanation {
+                code,
+                message: "workspace has an incomplete Draftline operation".to_string(),
+                safe_next_actions: vec![SafeNextAction::RepairRecovery],
+                retry: RetryClass::RetryAfterRepair,
+            },
+            DiagnosticCode::WorkspaceLocked => ErrorExplanation {
+                code,
+                message: "workspace is locked by a Draftline operation".to_string(),
+                safe_next_actions: vec![SafeNextAction::RepairRecovery],
+                retry: RetryClass::RetryAfterRepair,
+            },
+            DiagnosticCode::DirtyWorkspace => ErrorExplanation {
+                code,
+                message: "workspace has unsaved tracked content changes".to_string(),
+                safe_next_actions: vec![SafeNextAction::SaveFirst, SafeNextAction::DiscardChanges],
+                retry: RetryClass::RetryAfterUserChoice,
+            },
+            DiagnosticCode::LocalOnlyWorkspace => ErrorExplanation {
+                code,
+                message: "workspace has no configured remote".to_string(),
+                safe_next_actions: vec![SafeNextAction::ConfigureRemote],
+                retry: RetryClass::RetryAfterUserChoice,
+            },
+            DiagnosticCode::SharedCapableWorkspace => ErrorExplanation {
+                code,
+                message: "workspace has a configured remote".to_string(),
+                safe_next_actions: vec![SafeNextAction::NormalWork],
+                retry: RetryClass::Retryable,
+            },
+            DiagnosticCode::NoCurrentVariation => ErrorExplanation {
+                code,
+                message: "workspace is not on a normal Draftline variation".to_string(),
+                safe_next_actions: vec![SafeNextAction::RepairRecovery],
+                retry: RetryClass::RetryAfterRepair,
+            },
+            DiagnosticCode::WorkspaceReadFailed => ErrorExplanation {
+                code,
+                message: "workspace state could not be read completely".to_string(),
+                safe_next_actions: Vec::new(),
+                retry: RetryClass::NotRetryable,
+            },
+            DiagnosticCode::PolicyTrackedFileIgnored => ErrorExplanation {
+                code,
+                message: "Git ignore rules hide content tracked by policy".to_string(),
+                safe_next_actions: Vec::new(),
+                retry: RetryClass::RetryAfterUserChoice,
+            },
+        }
+    }
+
+    /// Reports current Git metadata behavior that can hide policy-tracked content.
+    pub fn policy_git_diagnostics(&self) -> Result<Vec<WorkspaceDiagnostic>> {
+        self.policy_git_diagnostics_unchecked()
+    }
+
+    /// Audits the current content policy against Git metadata and known history.
+    pub fn audit_content_policy(&self) -> Result<ContentPolicyAudit> {
+        Ok(ContentPolicyAudit {
+            current_diagnostics: self.policy_git_diagnostics_unchecked()?,
+            historical_out_of_policy_paths: Vec::new(),
+        })
+    }
+
+    /// Produces a read-only setup report for adopting an existing Git repository.
+    pub fn preflight_adopt_workspace(
+        &self,
+        policy: ContentPolicy,
+    ) -> Result<AdoptionPreflightReport> {
+        let inspection = self.inspect()?;
+        let candidate_policy_diagnostics = self.policy_git_diagnostics_for_policy(&policy)?;
+        let blockers: Vec<WorkspaceDiagnostic> = inspection
+            .diagnostics
+            .iter()
+            .chain(candidate_policy_diagnostics.iter())
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Blocking)
+            .cloned()
+            .collect();
+        let warnings = inspection
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Warning)
+            .cloned()
+            .collect();
+        let safe_next_actions = inspection.safe_next_actions.clone();
+        let can_adopt = blockers.is_empty();
+
+        Ok(AdoptionPreflightReport {
+            inspection,
+            candidate_policy_diagnostics,
+            blockers,
+            warnings,
+            safe_next_actions,
+            can_adopt,
+        })
+    }
+
+    /// Generates generic rules of engagement for coding agents in this workspace.
+    pub fn generate_agent_instructions(&self) -> Result<String> {
+        Ok(
+            "Draftline-managed repository rules:\n\
+             - Reading Git history/status, editing worktree files, and running tests is safe.\n\
+             - Do not rewrite, delete, rename, or force-update Draftline visible refs directly.\n\
+             - Do not remove refs/draftline/ support refs except through purge or retention flows.\n\
+             - Do not clear operation locks manually; use Draftline recovery tooling.\n\
+             - Fetch before reasoning about shared remote state.\n\
+             - Use Draftline primitives for variation, cleanup, support-ref sync, recovery, and shared history replacement.\n"
+                .to_string(),
+        )
+    }
+
     /// Returns incomplete recovery state, if a prior operation was interrupted.
     pub fn recovery_state(&self) -> Result<Option<RecoveryState>> {
         let path = self.ledger_path();
@@ -485,6 +1154,42 @@ impl Workspace {
         } else {
             Ok(Some(state))
         }
+    }
+
+    /// Inspects the operation lock without mutating it.
+    pub fn inspect_operation_lock(&self) -> Result<OperationLockInspection> {
+        inspect_operation_lock_path(&self.lock_path())
+    }
+
+    /// Clears an abandoned operation lock only when lock metadata marks it stale.
+    pub fn clear_stale_lock(&self) -> Result<()> {
+        let inspection = self.inspect_operation_lock()?;
+        if inspection.state == OperationLockState::Unlocked {
+            return Ok(());
+        }
+
+        if !inspection.can_clear {
+            return Err(DraftlineError::WorkspaceLocked);
+        }
+
+        fs::remove_file(self.lock_path())?;
+        Ok(())
+    }
+
+    /// Entry point for operation-specific recovery repair.
+    ///
+    /// This slice exposes the typed repair surface and reports the interrupted
+    /// operation. Operation-specific mutation is added by later recovery work.
+    pub fn repair_recovery(&self, operation_id: impl AsRef<str>) -> Result<RecoveryRepairResult> {
+        self.recovery_skeleton(operation_id.as_ref())
+    }
+
+    /// Entry point for operation-specific recovery rollback.
+    ///
+    /// This slice exposes the typed rollback surface and reports the interrupted
+    /// operation. Operation-specific mutation is added by later recovery work.
+    pub fn rollback_recovery(&self, operation_id: impl AsRef<str>) -> Result<RecoveryRepairResult> {
+        self.recovery_skeleton(operation_id.as_ref())
     }
 
     /// Acknowledges an incomplete recovery record and allows normal operations again.
@@ -612,6 +1317,99 @@ impl Workspace {
         Ok(changed)
     }
 
+    fn policy_git_diagnostics_unchecked(&self) -> Result<Vec<WorkspaceDiagnostic>> {
+        self.policy_git_diagnostics_for_policy(&self.content_policy)
+    }
+
+    fn policy_git_diagnostics_for_policy(
+        &self,
+        policy: &ContentPolicy,
+    ) -> Result<Vec<WorkspaceDiagnostic>> {
+        let mut options = StatusOptions::new();
+        options
+            .include_untracked(true)
+            .include_ignored(true)
+            .recurse_untracked_dirs(true)
+            .recurse_ignored_dirs(true);
+
+        let statuses = self.repo.statuses(Some(&mut options))?;
+        let mut ignored_paths = Vec::new();
+
+        for entry in statuses.iter() {
+            if !entry.status().contains(Status::IGNORED) {
+                continue;
+            }
+
+            let Some(path) = entry.path() else {
+                continue;
+            };
+
+            if policy.tracks(path)? {
+                ignored_paths.push(path.to_string());
+            }
+        }
+
+        ignored_paths.sort();
+        ignored_paths.dedup();
+
+        Ok(ignored_paths
+            .into_iter()
+            .map(|path| {
+                workspace_diagnostic(
+                    DiagnosticCode::PolicyTrackedFileIgnored,
+                    DiagnosticSeverity::Warning,
+                    format!("content policy tracks `{path}`, but Git ignore rules hide it"),
+                )
+            })
+            .collect())
+    }
+
+    fn target_tree_hazards(&self, target_tree: &Tree<'_>) -> Result<Vec<FileHazard>> {
+        let mut options = StatusOptions::new();
+        options
+            .include_untracked(true)
+            .include_ignored(true)
+            .recurse_untracked_dirs(true)
+            .recurse_ignored_dirs(true);
+
+        let statuses = self.repo.statuses(Some(&mut options))?;
+        let mut hazards = Vec::new();
+
+        for entry in statuses.iter() {
+            let Some(path) = entry.path() else {
+                continue;
+            };
+
+            if !tree_contains_path(target_tree, Path::new(path))? {
+                continue;
+            }
+
+            let status = entry.status();
+            let kind = if status.contains(Status::IGNORED) {
+                Some(FileHazardKind::Ignored)
+            } else if status.is_wt_new() || status.is_index_new() {
+                if self.content_policy.tracks(path)? {
+                    None
+                } else {
+                    Some(FileHazardKind::PolicyExcluded)
+                }
+            } else {
+                None
+            };
+
+            if let Some(kind) = kind {
+                hazards.push(FileHazard {
+                    path: PathBuf::from(path),
+                    kind,
+                });
+            }
+        }
+
+        hazards.sort_by(|left, right| left.path.cmp(&right.path));
+        hazards.dedup_by(|left, right| left.path == right.path);
+        Ok(hazards)
+    }
+
     /// Returns content changes and an optional textual diff of unsaved workspace changes.
     pub fn changes(&self) -> Result<ChangeSet> {
         self.ensure_no_pending_recovery()?;
@@ -641,7 +1439,7 @@ impl Workspace {
     /// files are restored from the current `HEAD`.
     pub fn discard_changes(&self) -> Result<ChangeSet> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "discard_changes")?;
         let changed_files = self.changed_files_unchecked()?;
         if changed_files.is_empty() {
             return Ok(ChangeSet {
@@ -696,7 +1494,7 @@ impl Workspace {
     pub fn discard_file(&self, path: impl AsRef<Path>) -> Result<Option<ChangedFile>> {
         self.ensure_no_pending_recovery()?;
         let path = self.normalize_tracked_content_path(path)?;
-        let _lock = OperationLock::acquire(&self.lock_path())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "discard_file")?;
         let changed_file = self
             .changed_files_unchecked()?
             .into_iter()
@@ -739,10 +1537,18 @@ impl Workspace {
         variation: &VariationId,
     ) -> Result<PreflightReport> {
         let change_set = self.changes_unchecked()?;
+        let target_commit = self
+            .repo
+            .find_branch(variation.as_str(), BranchType::Local)?
+            .get()
+            .peel_to_commit()?;
+        let target_tree = target_commit.tree()?;
+        let file_hazards = self.target_tree_hazards(&target_tree)?;
         Ok(preflight_report(
             "switch_variation",
             true,
             change_set.files,
+            file_hazards,
             Some(format!("current -> {}", variation.as_str())),
         ))
     }
@@ -824,6 +1630,424 @@ impl Workspace {
         Ok(paths)
     }
 
+    /// Lists visible variations discovered on a remote-tracking namespace.
+    pub fn remote_variations(&self, remote: impl AsRef<str>) -> Result<Vec<RemoteVariation>> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref().to_string();
+        let prefix = format!("refs/remotes/{remote}/");
+        let mut variations = Vec::new();
+
+        for reference in self.repo.references_glob(&format!("{prefix}*"))? {
+            let reference = reference?;
+            if reference.kind() != Some(git2::ReferenceType::Direct) {
+                continue;
+            }
+
+            let Some(ref_name) = reference.name() else {
+                continue;
+            };
+            let Some(name) = ref_name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if name == "HEAD" || name.ends_with("/HEAD") {
+                continue;
+            }
+
+            let head_version = reference
+                .peel_to_commit()
+                .ok()
+                .map(|commit| version_from_commit(&commit));
+            variations.push(RemoteVariation {
+                id: VariationId::from(name),
+                name: name.to_string(),
+                remote: remote.clone(),
+                head_version,
+            });
+        }
+
+        variations.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(variations)
+    }
+
+    /// Creates a local variation from a remote-tracking variation.
+    pub fn adopt_remote_variation(
+        &self,
+        remote: impl AsRef<str>,
+        variation: &VariationId,
+    ) -> Result<Variation> {
+        self.ensure_no_pending_recovery()?;
+        let name = validate_variation_name(variation.as_str())?;
+        let remote_ref = format!("refs/remotes/{}/{}", remote.as_ref(), name);
+        let commit = self.repo.find_reference(&remote_ref)?.peel_to_commit()?;
+        self.repo.branch(&name, &commit, false)?;
+        let metadata = self.read_variation_metadata(&name)?;
+
+        Ok(variation_from_name(
+            name,
+            self.current_variation().ok().as_ref(),
+            metadata,
+        ))
+    }
+
+    /// Shelves all current tracked content changes without switching variations.
+    pub fn shelve_changes(&self, name: impl AsRef<str>) -> Result<Shelf> {
+        self.ensure_no_pending_recovery()?;
+        let safe_name = validate_variation_name(name.as_ref())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "shelve_changes")?;
+        self.shelve_changes_unchecked(&safe_name)?;
+        self.shelf_by_id(&safe_name)
+    }
+
+    /// Lists local shelves.
+    pub fn list_shelves(&self) -> Result<Vec<Shelf>> {
+        self.ensure_no_pending_recovery()?;
+        let mut shelves = Vec::new();
+        let references = self.repo.references_glob("refs/draftline/shelves/*")?;
+
+        for reference in references {
+            let reference = reference?;
+            let Some(name) = reference.name() else {
+                continue;
+            };
+            let Some(id) = name.strip_prefix("refs/draftline/shelves/") else {
+                continue;
+            };
+            let Some(oid) = reference.target() else {
+                continue;
+            };
+            let commit = self.repo.find_commit(oid)?;
+            shelves.push(Shelf {
+                id: id.to_string(),
+                version: version_from_commit(&commit),
+            });
+        }
+
+        shelves.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(shelves)
+    }
+
+    /// Previews a shelf without mutating the workspace.
+    pub fn preview_shelf(&self, id: impl AsRef<str>) -> Result<VersionPreview> {
+        self.ensure_no_pending_recovery()?;
+        let (_id, commit) = self.find_shelf_commit(id.as_ref())?;
+        let tree = commit.tree()?;
+        let mut files = Vec::new();
+        collect_preview_files(
+            &self.repo,
+            &tree,
+            Path::new(""),
+            &mut files,
+            &self.content_policy,
+        )?;
+
+        Ok(VersionPreview {
+            id: VersionId::from(commit.id()),
+            files,
+        })
+    }
+
+    /// Preflights applying a shelf into the current workspace.
+    pub fn preflight_apply_shelf(&self, id: impl AsRef<str>) -> Result<ShelfApplyReport> {
+        self.ensure_no_pending_recovery()?;
+        let (safe_name, commit) = self.find_shelf_commit(id.as_ref())?;
+        let tree = commit.tree()?;
+        let dirty_files = self.changed_files_unchecked()?;
+        let file_hazards = self.target_tree_hazards(&tree)?;
+        let can_proceed = dirty_files.is_empty() && file_hazards.is_empty();
+
+        Ok(ShelfApplyReport {
+            shelf: Shelf {
+                id: safe_name,
+                version: version_from_commit(&commit),
+            },
+            dirty_files,
+            file_hazards,
+            can_proceed,
+        })
+    }
+
+    /// Applies a shelf as working-tree content and preserves the shelf.
+    pub fn apply_shelf(&self, id: impl AsRef<str>) -> Result<Shelf> {
+        self.ensure_no_pending_recovery()?;
+        let safe_name = validate_variation_name(id.as_ref())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "apply_shelf")?;
+        let report = self.preflight_apply_shelf(&safe_name)?;
+        if !report.can_proceed {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "apply_shelf",
+                true,
+                report.dirty_files,
+                report.file_hazards,
+                None,
+            ))));
+        }
+
+        let operation_id = new_operation_id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::ApplyShelf,
+            original_variation: self.current_variation_unchecked().ok(),
+            target: Some(safe_name.clone()),
+            completed: false,
+        })?;
+
+        let (_id, commit) = self.find_shelf_commit(&safe_name)?;
+        let tree = commit.tree()?;
+        self.repo
+            .checkout_tree(tree.as_object(), Some(CheckoutBuilder::new().force()))?;
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::ApplyShelf,
+            original_variation: None,
+            target: Some(safe_name.clone()),
+            completed: true,
+        })?;
+
+        self.shelf_by_id(&safe_name)
+    }
+
+    /// Deletes a local shelf ref.
+    pub fn delete_shelf(&self, id: impl AsRef<str>) -> Result<()> {
+        self.ensure_no_pending_recovery()?;
+        let safe_name = validate_variation_name(id.as_ref())?;
+        let mut reference = self
+            .repo
+            .find_reference(&format!("refs/draftline/shelves/{safe_name}"))?;
+        reference.delete()?;
+        Ok(())
+    }
+
+    /// Lists hidden Draftline archive support refs.
+    pub fn list_support_refs(&self, scope: SupportRefScope) -> Result<Vec<SupportRef>> {
+        self.ensure_no_pending_recovery()?;
+        match scope {
+            SupportRefScope::Local => self.list_local_support_refs(),
+            SupportRefScope::RemoteTracking => Ok(Vec::new()),
+        }
+    }
+
+    /// Restores an archive support ref as a new visible variation.
+    pub fn restore_support_ref_as_variation(
+        &self,
+        id: impl AsRef<str>,
+        name: impl AsRef<str>,
+    ) -> Result<Variation> {
+        self.ensure_no_pending_recovery()?;
+        let id = id.as_ref();
+        if !is_restorable_support_ref(id) {
+            return Err(DraftlineError::VersionNotFound(id.to_string()));
+        }
+
+        let name = validate_variation_name(name.as_ref())?;
+        let reference = self.repo.find_reference(id)?;
+        let commit = reference.peel_to_commit()?;
+        self.repo.branch(&name, &commit, false)?;
+        let metadata = self.read_variation_metadata(&name)?;
+
+        Ok(variation_from_name(
+            name,
+            self.current_variation().ok().as_ref(),
+            metadata,
+        ))
+    }
+
+    /// Preflights deleting a visible variation from a shared remote.
+    pub fn preflight_delete_remote_variation(
+        &self,
+        remote: impl AsRef<str>,
+        variation: &VariationId,
+    ) -> Result<RemoteVariationDeletePreflight> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref().to_string();
+        let variation_name = validate_variation_name(variation.as_str())?;
+        let mut options = RemoteOptions::new();
+        self.fetch_remote_variation_ref(&remote, &variation_name, &mut options)?;
+        let Some(expected_remote_oid) = remote_tracking_oid(&self.repo, &remote, &variation_name)
+        else {
+            return Err(DraftlineError::VersionNotFound(variation_name));
+        };
+        let operation_id = new_operation_id();
+        let support_ref = archive_ref("deleted-variations", &variation_name, &operation_id);
+        let token = RemoteVariationDeleteToken {
+            remote: remote.clone(),
+            variation: VariationId::from(variation_name.clone()),
+            expected_remote_oid: expected_remote_oid.clone(),
+            support_ref: support_ref.clone(),
+        };
+
+        Ok(RemoteVariationDeletePreflight {
+            remote,
+            variation: VariationId::from(variation_name),
+            expected_remote_oid,
+            support_ref,
+            token,
+            can_delete: true,
+        })
+    }
+
+    /// Deletes a visible remote variation only after publishing a support ref.
+    pub fn delete_remote_variation(&self, token: RemoteVariationDeleteToken) -> Result<()> {
+        let mut options = RemoteOptions::new();
+        self.delete_remote_variation_with_options(token, &mut options)
+    }
+
+    /// Deletes a visible remote variation with explicit remote options.
+    pub fn delete_remote_variation_with_options(
+        &self,
+        token: RemoteVariationDeleteToken,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<()> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "delete_remote_variation")?;
+        let variation_name = validate_variation_name(token.variation.as_str())?;
+        self.fetch_remote_variation_ref(&token.remote, &variation_name, options)?;
+        let actual_remote_oid = remote_tracking_oid(&self.repo, &token.remote, &variation_name);
+        if actual_remote_oid.as_deref() != Some(token.expected_remote_oid.as_str()) {
+            return Err(DraftlineError::RemoteRace {
+                remote: token.remote,
+                variation: variation_name,
+                expected: Some(token.expected_remote_oid),
+                actual: actual_remote_oid,
+            });
+        }
+
+        let operation_id = new_operation_id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::DeleteRemoteVariation,
+            original_variation: Some(variation_name.clone()),
+            target: Some(token.expected_remote_oid.clone()),
+            completed: false,
+        })?;
+
+        let target_oid = Oid::from_str(&token.expected_remote_oid)
+            .map_err(|_| DraftlineError::VersionNotFound(token.expected_remote_oid.clone()))?;
+        self.repo.reference(
+            &token.support_ref,
+            target_oid,
+            false,
+            "archive remote variation before delete",
+        )?;
+        self.push_refspec(
+            &token.remote,
+            &format!("{}:{}", token.support_ref, token.support_ref),
+            options,
+        )?;
+        self.push_refspec(
+            &token.remote,
+            &format!(":refs/heads/{variation_name}"),
+            options,
+        )?;
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::DeleteRemoteVariation,
+            original_variation: None,
+            target: Some(token.expected_remote_oid),
+            completed: true,
+        })?;
+
+        Ok(())
+    }
+
+    /// Preflights expiring selected local support refs as retention cleanup.
+    pub fn preflight_expire_support_refs<I, S>(
+        &self,
+        ids: I,
+    ) -> Result<SupportRefExpirationPreflight>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.ensure_no_pending_recovery()?;
+        let ids: Vec<String> = ids.into_iter().map(Into::into).collect();
+        let local_refs = self.list_local_support_refs()?;
+        let mut support_refs = Vec::new();
+
+        for id in &ids {
+            if !is_restorable_support_ref(id) {
+                return Err(DraftlineError::VersionNotFound(id.clone()));
+            }
+            let Some(support_ref) = local_refs.iter().find(|support_ref| &support_ref.id == id)
+            else {
+                return Err(DraftlineError::VersionNotFound(id.clone()));
+            };
+            support_refs.push(support_ref.clone());
+        }
+
+        Ok(SupportRefExpirationPreflight {
+            support_refs,
+            token: SupportRefExpirationToken { ids },
+            can_expire: true,
+        })
+    }
+
+    /// Expires selected local support refs as retention cleanup, not purge.
+    pub fn expire_support_refs(&self, token: SupportRefExpirationToken) -> Result<()> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "expire_support_refs")?;
+        let operation_id = new_operation_id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::ExpireSupportRefs,
+            original_variation: self.current_variation_unchecked().ok(),
+            target: Some(token.ids.join(",")),
+            completed: false,
+        })?;
+
+        for id in &token.ids {
+            if !is_restorable_support_ref(id) {
+                return Err(DraftlineError::VersionNotFound(id.clone()));
+            }
+            let mut reference = self.repo.find_reference(id)?;
+            reference.delete()?;
+        }
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::ExpireSupportRefs,
+            original_variation: None,
+            target: Some(token.ids.join(",")),
+            completed: true,
+        })?;
+
+        Ok(())
+    }
+
+    /// Plans a destructive purge/redaction workflow without rewriting history.
+    pub fn preflight_purge_content(&self, selector: impl AsRef<str>) -> Result<PurgePreflight> {
+        self.ensure_no_pending_recovery()?;
+        let selector = selector.as_ref().to_string();
+        let affected_refs = self.purge_ref_candidates()?;
+        let token = PurgeToken {
+            selector: selector.clone(),
+            affected_refs: affected_refs.clone(),
+        };
+
+        Ok(PurgePreflight {
+            selector,
+            affected_refs,
+            distributed_warning:
+                "Git cannot guarantee deletion from existing clones, forks, backups, caches, or offline devices."
+                    .to_string(),
+            token,
+        })
+    }
+
+    /// Verifies a purge plan's candidate refs; no destructive purge is performed here.
+    pub fn verify_purge(&self, token: PurgeToken) -> Result<PurgeVerification> {
+        Ok(PurgeVerification {
+            selector: token.selector,
+            checked_refs: token.affected_refs.len(),
+            verified_absent: false,
+            limitations: vec![
+                "Verification is local to this repository and cannot inspect existing clones."
+                    .to_string(),
+            ],
+        })
+    }
+
     /// Returns display metadata for a local variation.
     pub fn variation_metadata(&self, variation: &VariationId) -> Result<VariationMetadata> {
         self.ensure_no_pending_recovery()?;
@@ -857,8 +2081,12 @@ impl Workspace {
         policy: SwitchPolicy,
     ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "switch_variation")?;
         let mut report = self.preflight_switch_variation_unchecked(variation)?;
+
+        if !report.file_hazards.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(report)));
+        }
 
         match &policy {
             SwitchPolicy::AbortIfDirty if !report.can_proceed => {
@@ -919,7 +2147,7 @@ impl Workspace {
     /// Deletes an alternate variation.
     pub fn delete_variation(&self, variation: &VariationId) -> Result<()> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "delete_variation")?;
         if self.current_variation().ok().as_deref() == Some(variation.as_str()) {
             return Err(DraftlineError::CannotDeleteCurrentVariation(
                 variation.as_str().to_string(),
@@ -961,11 +2189,15 @@ impl Workspace {
         label: impl AsRef<str>,
     ) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "restore_version_as_new_save")?;
         let report = preflight_report(
             "restore_version_as_new_save",
             true,
             self.changed_files_unchecked()?,
+            {
+                let commit = self.find_version_commit(version)?;
+                self.target_tree_hazards(&commit.tree()?)?
+            },
             None,
         );
         if !report.can_proceed {
@@ -1274,13 +2506,40 @@ impl Workspace {
         let dirty_files = self.changed_files_unchecked()?;
 
         let is_fast_forward = matches!(sync_status.state, SyncState::IncomingAvailable);
-        let can_proceed = dirty_files.is_empty() && is_fast_forward;
+        let file_hazards = if is_fast_forward {
+            let remote_ref = format!(
+                "refs/remotes/{}/{}",
+                sync_status.remote, sync_status.variation
+            );
+            let remote_oid = self.repo.refname_to_id(&remote_ref)?;
+            let remote_commit = self.repo.find_commit(remote_oid)?;
+            self.target_tree_hazards(&remote_commit.tree()?)?
+        } else {
+            Vec::new()
+        };
+        let can_proceed = dirty_files.is_empty() && file_hazards.is_empty() && is_fast_forward;
 
         Ok(ApplyIncomingReport {
             sync_status,
             dirty_files,
+            file_hazards,
             is_fast_forward,
             can_proceed,
+        })
+    }
+
+    /// Preflights a diverged incoming merge without mutating workspace state.
+    pub fn preflight_merge_incoming(&self, remote: impl AsRef<str>) -> Result<MergeIncomingReport> {
+        self.ensure_no_pending_recovery()?;
+        let sync_status = self.sync_status(remote)?;
+        let dirty_files = self.changed_files_unchecked()?;
+
+        Ok(MergeIncomingReport {
+            sync_status,
+            dirty_files,
+            file_hazards: Vec::new(),
+            can_merge_cleanly: false,
+            changed_workspace: false,
         })
     }
 
@@ -1311,7 +2570,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<ApplyIncomingResult> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "apply_incoming")?;
 
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
@@ -1319,6 +2578,7 @@ impl Workspace {
                 "apply_incoming",
                 true,
                 dirty_files,
+                Vec::new(),
                 None,
             ))));
         }
@@ -1342,6 +2602,16 @@ impl Workspace {
         let remote_ref = format!("refs/remotes/{remote_name}/{variation}");
         let remote_oid = self.repo.refname_to_id(&remote_ref)?;
         let remote_commit = self.repo.find_commit(remote_oid)?;
+        let file_hazards = self.target_tree_hazards(&remote_commit.tree()?)?;
+        if !file_hazards.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "apply_incoming",
+                true,
+                Vec::new(),
+                file_hazards,
+                None,
+            ))));
+        }
         let branch_ref = format!("refs/heads/{variation}");
 
         // Save the original OID so we can roll back if checkout fails.
@@ -1410,7 +2680,7 @@ impl Workspace {
     /// ```
     pub fn squash_versions(&self, count: usize, label: impl AsRef<str>) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "squash_versions")?;
 
         if count < 2 {
             return Err(DraftlineError::InvalidSquashCount(count));
@@ -1422,6 +2692,7 @@ impl Workspace {
                 "squash_versions",
                 false,
                 dirty_files,
+                Vec::new(),
                 None,
             ))));
         }
@@ -1634,6 +2905,10 @@ impl Workspace {
     /// Lists configured remote endpoints.
     pub fn remotes(&self) -> Result<Vec<RemoteEndpoint>> {
         self.ensure_no_pending_recovery()?;
+        self.remotes_unchecked()
+    }
+
+    fn remotes_unchecked(&self) -> Result<Vec<RemoteEndpoint>> {
         let names = self.repo.remotes()?;
         let mut remotes = Vec::new();
 
@@ -1647,6 +2922,178 @@ impl Workspace {
 
         remotes.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(remotes)
+    }
+
+    fn recovery_skeleton(&self, operation_id: &str) -> Result<RecoveryRepairResult> {
+        let Some(state) = self.recovery_state()? else {
+            return Err(DraftlineError::RecoveryNotFound(operation_id.to_string()));
+        };
+
+        if state.operation_id != operation_id {
+            return Err(DraftlineError::RecoveryNotFound(operation_id.to_string()));
+        }
+
+        Ok(RecoveryRepairResult {
+            operation_id: state.operation_id,
+            operation: state.operation,
+            completed: false,
+            changed_workspace: false,
+            safe_next_actions: vec![SafeNextAction::RepairRecovery],
+        })
+    }
+
+    fn push_current_variation_with_options(
+        &self,
+        remote_name: &str,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<()> {
+        let variation = self.current_variation_unchecked()?;
+        let mut remote = self.repo.find_remote(remote_name)?;
+        let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
+        if options.has_credentials() {
+            let mut push_options = options.push_options();
+            remote.push(&[refspec.as_str()], Some(&mut push_options))?;
+        } else {
+            remote.push(&[refspec.as_str()], None)?;
+        }
+
+        Ok(())
+    }
+
+    fn push_refspec(
+        &self,
+        remote_name: &str,
+        refspec: &str,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<()> {
+        let mut remote = self.repo.find_remote(remote_name)?;
+        if options.has_credentials() {
+            let mut push_options = options.push_options();
+            remote.push(&[refspec], Some(&mut push_options))?;
+        } else {
+            remote.push(&[refspec], None)?;
+        }
+
+        Ok(())
+    }
+
+    fn fetch_remote_variation_ref(
+        &self,
+        remote_name: &str,
+        variation: &str,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<()> {
+        let mut remote = self.repo.find_remote(remote_name)?;
+        let refspec = format!("+refs/heads/{variation}:refs/remotes/{remote_name}/{variation}");
+        let fetch_result = if options.has_credentials() {
+            let mut fetch_options = options.fetch_options();
+            remote.fetch(&[refspec.as_str()], Some(&mut fetch_options), None)
+        } else {
+            remote.fetch(&[refspec.as_str()], None, None)
+        };
+
+        if let Err(error) = fetch_result {
+            if error.code() != git2::ErrorCode::NotFound {
+                return Err(error.into());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn shelf_by_id(&self, id: &str) -> Result<Shelf> {
+        let (id, commit) = self.find_shelf_commit(id)?;
+        Ok(Shelf {
+            id,
+            version: version_from_commit(&commit),
+        })
+    }
+
+    fn find_shelf_commit(&self, id: &str) -> Result<(String, Commit<'_>)> {
+        let safe_name = validate_variation_name(id)?;
+        let reference = self
+            .repo
+            .find_reference(&format!("refs/draftline/shelves/{safe_name}"))?;
+        let Some(oid) = reference.target() else {
+            return Err(DraftlineError::VersionNotFound(safe_name));
+        };
+        let commit = self.repo.find_commit(oid)?;
+        Ok((safe_name, commit))
+    }
+
+    fn list_local_support_refs(&self) -> Result<Vec<SupportRef>> {
+        let mut support_refs = Vec::new();
+        self.collect_support_refs(
+            "refs/draftline/deleted-variations/*/*",
+            SupportRefKind::DeletedVariation,
+            "refs/draftline/deleted-variations/",
+            &mut support_refs,
+        )?;
+        self.collect_support_refs(
+            "refs/draftline/rewrites/squash/*/*",
+            SupportRefKind::Rewrite,
+            "refs/draftline/rewrites/squash/",
+            &mut support_refs,
+        )?;
+
+        support_refs.sort_by(|left, right| left.ref_name.cmp(&right.ref_name));
+        Ok(support_refs)
+    }
+
+    fn collect_support_refs(
+        &self,
+        glob: &str,
+        kind: SupportRefKind,
+        prefix: &str,
+        support_refs: &mut Vec<SupportRef>,
+    ) -> Result<()> {
+        for reference in self.repo.references_glob(glob)? {
+            let reference = reference?;
+            let Some(ref_name) = reference.name() else {
+                continue;
+            };
+            let Some(target_oid) = reference.target() else {
+                continue;
+            };
+
+            let source_variation = source_variation_from_support_ref(ref_name, prefix);
+            support_refs.push(SupportRef {
+                id: ref_name.to_string(),
+                ref_name: ref_name.to_string(),
+                kind: kind.clone(),
+                source_variation,
+                target_oid: target_oid.to_string(),
+                scope: SupportRefScope::Local,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn purge_ref_candidates(&self) -> Result<Vec<String>> {
+        let mut refs = Vec::new();
+        for glob in [
+            "refs/heads/*",
+            "refs/draftline/deleted-variations/*/*",
+            "refs/draftline/rewrites/squash/*/*",
+            "refs/tags/*",
+            "refs/notes/*",
+            "refs/replace/*",
+        ] {
+            for reference in self.repo.references_glob(glob)? {
+                let reference = reference?;
+                if reference.kind() != Some(git2::ReferenceType::Direct) {
+                    continue;
+                }
+                if let Some(name) = reference.name() {
+                    refs.push(name.to_string());
+                }
+            }
+        }
+
+        refs.sort();
+        refs.dedup();
+        Ok(refs)
     }
 
     /// Fetches remote version metadata without changing local content.
@@ -1731,6 +3178,113 @@ impl Workspace {
         self.publish_changes_with_options(remote, &mut options)
     }
 
+    /// Preflights publishing and captures the expected remote OID or absence.
+    pub fn preflight_publish(&self, remote: impl AsRef<str>) -> Result<PublishPreflight> {
+        self.ensure_no_pending_recovery()?;
+        let report = preflight_report(
+            "publish_changes",
+            false,
+            self.changed_files_unchecked()?,
+            Vec::new(),
+            None,
+        );
+        if !report.can_proceed {
+            return Err(DraftlineError::PreflightFailed(Box::new(report)));
+        }
+
+        let remote = remote.as_ref().to_string();
+        let mut options = RemoteOptions::new();
+        self.fetch_remote_unchecked(&remote, &mut options)?;
+        let sync_status = self.sync_status(&remote)?;
+        if matches!(
+            sync_status.state,
+            SyncState::IncomingAvailable | SyncState::NeedsMerge
+        ) {
+            return Err(DraftlineError::SyncNeedsMerge(Box::new(sync_status)));
+        }
+
+        let variation = self.current_variation_unchecked()?;
+        let local_oid = self.repo.head()?.peel_to_commit()?.id().to_string();
+        let expected_remote_oid = remote_tracking_oid(&self.repo, &remote, &variation);
+        let token = PublishToken {
+            remote: remote.clone(),
+            variation: variation.clone(),
+            expected_remote_oid: expected_remote_oid.clone(),
+            local_oid: local_oid.clone(),
+        };
+
+        Ok(PublishPreflight {
+            remote,
+            variation,
+            expected_remote_oid,
+            local_oid,
+            sync_status,
+            token,
+            can_publish: true,
+        })
+    }
+
+    /// Publishes using a token returned by [`Workspace::preflight_publish`].
+    pub fn publish(&self, token: PublishToken) -> Result<PublishResult> {
+        let mut options = RemoteOptions::new();
+        self.publish_with_options(token, &mut options)
+    }
+
+    /// Publishes with explicit remote options using a preflight token.
+    pub fn publish_with_options(
+        &self,
+        token: PublishToken,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<PublishResult> {
+        self.ensure_no_pending_recovery()?;
+        let report = preflight_report(
+            "publish_changes",
+            false,
+            self.changed_files_unchecked()?,
+            Vec::new(),
+            None,
+        );
+        if !report.can_proceed {
+            return Err(DraftlineError::PreflightFailed(Box::new(report)));
+        }
+
+        let variation = self.current_variation_unchecked()?;
+        let local_oid = self.repo.head()?.peel_to_commit()?.id().to_string();
+        if variation != token.variation || local_oid != token.local_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{}", token.variation, token.local_oid),
+                actual: format!("{variation}@{local_oid}"),
+            });
+        }
+
+        self.fetch_remote_unchecked(&token.remote, options)?;
+        let actual_remote_oid = remote_tracking_oid(&self.repo, &token.remote, &token.variation);
+        if actual_remote_oid != token.expected_remote_oid {
+            return Err(DraftlineError::RemoteRace {
+                remote: token.remote,
+                variation: token.variation,
+                expected: token.expected_remote_oid,
+                actual: actual_remote_oid,
+            });
+        }
+
+        let status = self.sync_status(&token.remote)?;
+        if matches!(
+            status.state,
+            SyncState::IncomingAvailable | SyncState::NeedsMerge
+        ) {
+            return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
+        }
+
+        self.push_current_variation_with_options(&token.remote, options)?;
+
+        Ok(PublishResult {
+            remote: token.remote,
+            variation,
+            published_versions: status.ahead,
+        })
+    }
+
     /// Publishes local versions with explicit remote options.
     pub fn publish_changes_with_options(
         &self,
@@ -1742,6 +3296,7 @@ impl Workspace {
             "publish_changes",
             false,
             self.changed_files_unchecked()?,
+            Vec::new(),
             None,
         );
         if !report.can_proceed {
@@ -1759,14 +3314,7 @@ impl Workspace {
         }
 
         let variation = self.current_variation_unchecked()?;
-        let mut remote = self.repo.find_remote(&remote_name)?;
-        let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
-        let push_result = if options.has_credentials() {
-            let mut push_options = options.push_options();
-            remote.push(&[refspec.as_str()], Some(&mut push_options))
-        } else {
-            remote.push(&[refspec.as_str()], None)
-        };
+        let push_result = self.push_current_variation_with_options(&remote_name, options);
         if let Err(error) = push_result {
             self.fetch_remote_unchecked(&remote_name, options)?;
             let refreshed = self.sync_status(&remote_name)?;
@@ -1777,7 +3325,7 @@ impl Workspace {
                 return Err(DraftlineError::SyncNeedsMerge(Box::new(refreshed)));
             }
 
-            return Err(error.into());
+            return Err(error);
         }
 
         Ok(PublishResult {
@@ -2200,6 +3748,7 @@ fn preflight_report(
     operation: impl Into<String>,
     will_write_files: bool,
     dirty_files: Vec<ChangedFile>,
+    file_hazards: Vec<FileHazard>,
     variation_divergence: Option<String>,
 ) -> PreflightReport {
     let untracked_assets = dirty_files
@@ -2222,12 +3771,13 @@ fn preflight_report(
         .filter(|file| file.is_binary)
         .map(|file| file.path.clone())
         .collect();
-    let can_proceed = dirty_files.is_empty();
+    let can_proceed = dirty_files.is_empty() && file_hazards.is_empty();
 
     PreflightReport {
         operation: operation.into(),
         will_write_files,
         dirty_files,
+        file_hazards,
         untracked_assets,
         unresolved_conflicts,
         large_files,
@@ -2270,6 +3820,7 @@ fn discard_preflight_report(
         unresolved_conflicts,
         large_files,
         binary_files,
+        file_hazards: Vec::new(),
         variation_divergence: None,
         can_proceed: true,
     }
@@ -2405,6 +3956,138 @@ fn new_operation_id() -> String {
     format!("op-{nanos}")
 }
 
+fn workspace_diagnostic(
+    code: DiagnosticCode,
+    severity: DiagnosticSeverity,
+    message: impl Into<String>,
+) -> WorkspaceDiagnostic {
+    WorkspaceDiagnostic {
+        code,
+        severity,
+        message: message.into(),
+    }
+}
+
+fn safe_next_actions_for_inspection(
+    recovery: &Option<RecoveryState>,
+    operation_lock: &OperationLockSummary,
+    dirty: &DirtySummary,
+    diagnostics: &[WorkspaceDiagnostic],
+) -> Vec<SafeNextAction> {
+    if recovery.is_some()
+        || operation_lock.state == OperationLockState::Locked
+        || diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Blocking)
+    {
+        return vec![SafeNextAction::RepairRecovery];
+    }
+
+    if dirty.is_dirty {
+        return vec![SafeNextAction::SaveFirst, SafeNextAction::DiscardChanges];
+    }
+
+    vec![SafeNextAction::NormalWork]
+}
+
+const STALE_LOCK_SECONDS: u64 = 30 * 60;
+
+fn inspect_operation_lock_path(path: &Path) -> Result<OperationLockInspection> {
+    if !path.exists() {
+        return Ok(OperationLockInspection {
+            state: OperationLockState::Unlocked,
+            metadata: None,
+            is_stale: false,
+            can_clear: false,
+            diagnostics: Vec::new(),
+        });
+    }
+
+    let mut diagnostics = vec![workspace_diagnostic(
+        DiagnosticCode::WorkspaceLocked,
+        DiagnosticSeverity::Blocking,
+        "workspace has an operation lock",
+    )];
+
+    let metadata = match fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<OperationLockMetadata>(&bytes) {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                diagnostics.push(workspace_diagnostic(
+                    DiagnosticCode::WorkspaceReadFailed,
+                    DiagnosticSeverity::Warning,
+                    format!("operation lock metadata is unreadable: {error}"),
+                ));
+                None
+            }
+        },
+        Err(error) => return Err(error.into()),
+    };
+
+    let is_stale = metadata
+        .as_ref()
+        .map(operation_lock_metadata_is_stale)
+        .unwrap_or(false);
+
+    Ok(OperationLockInspection {
+        state: OperationLockState::Locked,
+        metadata,
+        is_stale,
+        can_clear: is_stale,
+        diagnostics,
+    })
+}
+
+fn operation_lock_metadata_is_stale(metadata: &OperationLockMetadata) -> bool {
+    metadata.process_id != std::process::id()
+        && now_seconds().saturating_sub(metadata.created_at_seconds) >= STALE_LOCK_SECONDS
+}
+
+fn new_operation_lock_metadata(operation: impl Into<String>) -> OperationLockMetadata {
+    OperationLockMetadata {
+        operation_id: new_operation_id(),
+        operation: operation.into(),
+        process_id: std::process::id(),
+        owner: std::env::var("USER")
+            .ok()
+            .or_else(|| std::env::var("USERNAME").ok()),
+        created_at_seconds: now_seconds(),
+    }
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn tree_contains_path(tree: &Tree<'_>, path: &Path) -> Result<bool> {
+    match tree.get_path(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remote_tracking_oid(repo: &Repository, remote: &str, variation: &str) -> Option<String> {
+    let remote_ref = format!("refs/remotes/{remote}/{variation}");
+    repo.refname_to_id(&remote_ref)
+        .ok()
+        .map(|oid| oid.to_string())
+}
+
+fn source_variation_from_support_ref(ref_name: &str, prefix: &str) -> Option<String> {
+    let remainder = ref_name.strip_prefix(prefix)?;
+    let (source_variation, _operation_id) = remainder.rsplit_once('/')?;
+    Some(source_variation.to_string())
+}
+
+fn is_restorable_support_ref(ref_name: &str) -> bool {
+    ref_name.starts_with("refs/draftline/deleted-variations/")
+        || ref_name.starts_with("refs/draftline/rewrites/squash/")
+}
+
 /// Converts a libgit2 `Delta` status to a [`ChangeKind`].
 fn git2_delta_to_change_kind(status: git2::Delta) -> ChangeKind {
     match status {
@@ -2503,12 +4186,12 @@ struct OperationLock {
 }
 
 impl OperationLock {
-    fn acquire(path: &Path) -> Result<Self> {
+    fn acquire(path: &Path, operation: impl Into<String>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(path)
@@ -2519,6 +4202,12 @@ impl OperationLock {
                     DraftlineError::Io(error)
                 }
             })?;
+
+        let metadata = new_operation_lock_metadata(operation);
+        if let Err(error) = serde_json::to_writer_pretty(&mut file, &metadata) {
+            let _ = fs::remove_file(path);
+            return Err(error.into());
+        }
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -3260,6 +4949,60 @@ mod tests {
         assert!(matches!(err, DraftlineError::SyncNeedsMerge(_)));
     }
 
+    #[test]
+    fn preflight_publish_reports_expected_absent_remote_for_first_publish() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(local.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"hello");
+        workspace.save_version("Initial version").unwrap();
+
+        let preflight = workspace.preflight_publish("origin").unwrap();
+
+        assert!(preflight.can_publish);
+        assert!(preflight.expected_remote_oid.is_none());
+        assert_eq!(preflight.sync_status.state, SyncState::NoRemoteVersion);
+
+        let published = workspace.publish(preflight.token).unwrap();
+        assert_eq!(published.published_versions, 1);
+    }
+
+    #[test]
+    fn publish_token_refuses_when_remote_appears_after_preflight() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"one");
+        first_workspace.save_version("One").unwrap();
+        let preflight = first_workspace.preflight_publish("origin").unwrap();
+        assert!(preflight.expected_remote_oid.is_none());
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace = Workspace::init(second.path()).unwrap();
+        configure_identity(&second_workspace, "Maria", "maria@example.com");
+        second_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(second_workspace.root(), "post.md", b"two");
+        second_workspace.save_version("Two").unwrap();
+        second_workspace.publish_changes("origin").unwrap();
+
+        let err = first_workspace.publish(preflight.token).unwrap_err();
+
+        assert!(matches!(err, DraftlineError::RemoteRace { .. }));
+    }
+
     // ── workspace_summary ────────────────────────────────────────────────────
 
     #[test]
@@ -3338,6 +5081,718 @@ mod tests {
         assert!(names.contains(&"master"));
         assert!(names.contains(&"alt-a"));
         assert!(names.contains(&"alt-b"));
+    }
+
+    #[test]
+    fn inspect_reports_local_workspace_ready_for_normal_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        let inspection = workspace.inspect().unwrap();
+
+        assert_eq!(inspection.workspace_id.root, workspace.root());
+        assert_eq!(inspection.sharing_mode, SharingMode::LocalOnly);
+        assert_eq!(
+            inspection
+                .current_variation
+                .as_ref()
+                .map(VariationId::as_str),
+            Some("master")
+        );
+        assert!(!inspection.dirty.is_dirty);
+        assert!(inspection.remotes.is_empty());
+        assert!(inspection.recovery.is_none());
+        assert_eq!(
+            inspection.operation_lock.state,
+            OperationLockState::Unlocked
+        );
+        assert_eq!(
+            inspection.safe_next_actions,
+            vec![SafeNextAction::NormalWork]
+        );
+    }
+
+    #[test]
+    fn inspect_reports_dirty_remote_workspace_with_safe_next_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        workspace
+            .add_remote("origin", "https://example.com/draftline.git")
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"unsaved");
+
+        let inspection = workspace.inspect().unwrap();
+
+        assert_eq!(inspection.sharing_mode, SharingMode::SharedCapable);
+        assert_eq!(inspection.remotes.len(), 1);
+        assert!(inspection.dirty.is_dirty);
+        assert_eq!(inspection.dirty.files[0].path, PathBuf::from("post.md"));
+        assert!(inspection
+            .safe_next_actions
+            .contains(&SafeNextAction::SaveFirst));
+    }
+
+    #[test]
+    fn inspect_surfaces_recovery_and_lock_without_blocking() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::SwitchVariation,
+                original_variation: Some("master".to_string()),
+                target: Some("alternate".to_string()),
+                completed: false,
+            })
+            .unwrap();
+        fs::write(workspace.lock_path(), b"locked").unwrap();
+
+        let inspection = workspace.inspect().unwrap();
+
+        assert!(inspection.recovery.is_some());
+        assert_eq!(inspection.operation_lock.state, OperationLockState::Locked);
+        assert!(inspection
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::RecoveryRequired));
+        assert!(inspection
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::WorkspaceLocked));
+        assert_eq!(
+            inspection.safe_next_actions,
+            vec![SafeNextAction::RepairRecovery]
+        );
+    }
+
+    #[test]
+    fn capabilities_report_supported_and_future_workflows() {
+        let capabilities = Workspace::capabilities();
+
+        assert!(capabilities.inspect);
+        assert!(capabilities.workspace_summary);
+        assert!(capabilities.save_version);
+        assert!(capabilities.switch_variation);
+        assert!(capabilities.publish_changes);
+        assert!(capabilities.apply_incoming);
+        assert!(capabilities.stale_lock_repair);
+        assert!(!capabilities.target_tree_collision_preflight);
+        assert!(!capabilities.support_ref_sync);
+        assert!(capabilities.agent_cli_facade);
+    }
+
+    #[test]
+    fn inspect_operation_lock_reports_metadata_for_active_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let _lock = OperationLock::acquire(&workspace.lock_path(), "scenario_test").unwrap();
+
+        let inspection = workspace.inspect_operation_lock().unwrap();
+
+        assert_eq!(inspection.state, OperationLockState::Locked);
+        assert!(!inspection.is_stale);
+        assert!(!inspection.can_clear);
+        let metadata = inspection.metadata.unwrap();
+        assert_eq!(metadata.operation, "scenario_test");
+        assert_eq!(metadata.process_id, std::process::id());
+        assert!(!metadata.operation_id.is_empty());
+    }
+
+    #[test]
+    fn clear_stale_lock_removes_only_stale_metadata_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let stale_metadata = OperationLockMetadata {
+            operation_id: "stale-op".to_string(),
+            operation: "stale_test".to_string(),
+            process_id: u32::MAX,
+            owner: None,
+            created_at_seconds: 1,
+        };
+        fs::create_dir_all(workspace.draftline_dir()).unwrap();
+        fs::write(
+            workspace.lock_path(),
+            serde_json::to_vec_pretty(&stale_metadata).unwrap(),
+        )
+        .unwrap();
+
+        let inspection = workspace.inspect_operation_lock().unwrap();
+        assert!(inspection.is_stale);
+        assert!(inspection.can_clear);
+
+        workspace.clear_stale_lock().unwrap();
+        assert!(!workspace.lock_path().exists());
+
+        let _lock = OperationLock::acquire(&workspace.lock_path(), "active_test").unwrap();
+        let err = workspace.clear_stale_lock().unwrap_err();
+        assert!(matches!(err, DraftlineError::WorkspaceLocked));
+        assert!(workspace.lock_path().exists());
+    }
+
+    #[test]
+    fn inspect_operation_lock_treats_legacy_lock_as_unknown_not_clearable() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        fs::create_dir_all(workspace.draftline_dir()).unwrap();
+        fs::write(workspace.lock_path(), b"locked").unwrap();
+
+        let inspection = workspace.inspect_operation_lock().unwrap();
+
+        assert_eq!(inspection.state, OperationLockState::Locked);
+        assert!(inspection.metadata.is_none());
+        assert!(!inspection.is_stale);
+        assert!(!inspection.can_clear);
+    }
+
+    #[test]
+    fn repair_and_rollback_recovery_skeletons_report_unavailable_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::ApplyIncoming,
+                original_variation: Some("master".to_string()),
+                target: Some("origin/master".to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        let repair = workspace.repair_recovery("interrupted").unwrap();
+        assert_eq!(repair.operation_id, "interrupted");
+        assert_eq!(repair.operation, RecoveryOperation::ApplyIncoming);
+        assert!(!repair.completed);
+        assert!(!repair.changed_workspace);
+        assert_eq!(
+            repair.safe_next_actions,
+            vec![SafeNextAction::RepairRecovery]
+        );
+
+        let rollback = workspace.rollback_recovery("interrupted").unwrap();
+        assert_eq!(rollback.operation_id, "interrupted");
+        assert_eq!(rollback.operation, RecoveryOperation::ApplyIncoming);
+        assert!(!rollback.completed);
+        assert!(!rollback.changed_workspace);
+    }
+
+    #[test]
+    fn policy_git_diagnostics_warn_when_policy_tracked_file_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = ContentPolicy::new().include("content").unwrap();
+        let workspace = Workspace::init_with_policy(temp.path(), policy).unwrap();
+        write_file(workspace.root(), ".gitignore", b"content/hidden.md\n");
+        write_file(workspace.root(), "content/hidden.md", b"business content");
+
+        assert!(workspace.changed_files().unwrap().is_empty());
+
+        let diagnostics = workspace.policy_git_diagnostics().unwrap();
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == DiagnosticCode::PolicyTrackedFileIgnored
+                && diagnostic.message.contains("content/hidden.md")
+        }));
+    }
+
+    #[test]
+    fn audit_content_policy_includes_current_git_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = ContentPolicy::new().include("content").unwrap();
+        let workspace = Workspace::init_with_policy(temp.path(), policy).unwrap();
+        write_file(workspace.root(), ".gitignore", b"content/hidden.md\n");
+        write_file(workspace.root(), "content/hidden.md", b"business content");
+
+        let audit = workspace.audit_content_policy().unwrap();
+
+        assert_eq!(audit.current_diagnostics.len(), 1);
+        assert_eq!(
+            audit.current_diagnostics[0].code,
+            DiagnosticCode::PolicyTrackedFileIgnored
+        );
+        assert!(audit.historical_out_of_policy_paths.is_empty());
+    }
+
+    #[test]
+    fn inspect_includes_policy_git_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = ContentPolicy::new().include("content").unwrap();
+        let workspace = Workspace::init_with_policy(temp.path(), policy).unwrap();
+        write_file(workspace.root(), ".gitignore", b"content/hidden.md\n");
+        write_file(workspace.root(), "content/hidden.md", b"business content");
+
+        let inspection = workspace.inspect().unwrap();
+
+        assert!(inspection.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == DiagnosticCode::PolicyTrackedFileIgnored
+                && diagnostic.severity == DiagnosticSeverity::Warning
+        }));
+    }
+
+    #[test]
+    fn preflight_adopt_workspace_reports_existing_repo_without_mutating() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        workspace
+            .add_remote("origin", "https://example.com/draftline.git")
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"unsaved");
+
+        let report = workspace
+            .preflight_adopt_workspace(ContentPolicy::default())
+            .unwrap();
+
+        assert_eq!(report.inspection.sharing_mode, SharingMode::SharedCapable);
+        assert!(report.inspection.dirty.is_dirty);
+        assert!(report.can_adopt);
+        assert!(report.blockers.is_empty());
+        assert!(report
+            .safe_next_actions
+            .contains(&SafeNextAction::SaveFirst));
+    }
+
+    #[test]
+    fn preflight_adopt_workspace_blocks_detached_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        let version = workspace.save_version("Base").unwrap();
+        workspace
+            .repo
+            .set_head_detached(Oid::from_str(version.id().as_str()).unwrap())
+            .unwrap();
+
+        let report = workspace
+            .preflight_adopt_workspace(ContentPolicy::default())
+            .unwrap();
+
+        assert!(!report.can_adopt);
+        assert!(report
+            .blockers
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::NoCurrentVariation));
+    }
+
+    #[test]
+    fn generate_agent_instructions_mentions_draftline_owned_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        let instructions = workspace.generate_agent_instructions().unwrap();
+
+        assert!(instructions.contains("Do not rewrite, delete, rename, or force-update"));
+        assert!(instructions.contains("refs/draftline/"));
+        assert!(instructions.contains("Fetch before reasoning about shared remote state"));
+    }
+
+    #[test]
+    fn preflight_switch_blocks_ignored_file_that_target_tree_would_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "base.md", b"base");
+        workspace.save_version("Base").unwrap();
+        let variation = workspace.create_variation("alternate").unwrap();
+
+        workspace
+            .switch_variation(variation.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "generated.txt", b"from alternate");
+        workspace.save_version("Alternate adds generated").unwrap();
+
+        workspace
+            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), ".gitignore", b"generated.txt\n");
+        workspace.save_version("Ignore generated").unwrap();
+        write_file(workspace.root(), "generated.txt", b"local generated output");
+
+        let report = workspace
+            .preflight_switch_variation(variation.id())
+            .unwrap();
+
+        assert!(!report.can_proceed);
+        assert_eq!(report.file_hazards.len(), 1);
+        assert_eq!(report.file_hazards[0].path, PathBuf::from("generated.txt"));
+        assert_eq!(report.file_hazards[0].kind, FileHazardKind::Ignored);
+    }
+
+    #[test]
+    fn switch_refuses_ignored_file_collision_before_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "base.md", b"base");
+        workspace.save_version("Base").unwrap();
+        let variation = workspace.create_variation("alternate").unwrap();
+
+        workspace
+            .switch_variation(variation.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "generated.txt", b"from alternate");
+        workspace.save_version("Alternate adds generated").unwrap();
+
+        workspace
+            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), ".gitignore", b"generated.txt\n");
+        workspace.save_version("Ignore generated").unwrap();
+        write_file(workspace.root(), "generated.txt", b"local generated output");
+
+        let err = workspace
+            .switch_variation(variation.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap_err();
+
+        let DraftlineError::PreflightFailed(report) = err else {
+            panic!("expected preflight failure");
+        };
+        assert_eq!(report.file_hazards[0].kind, FileHazardKind::Ignored);
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("generated.txt")).unwrap(),
+            "local generated output"
+        );
+    }
+
+    #[test]
+    fn shelve_lifecycle_lists_previews_applies_and_deletes_shelf() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+
+        let shelf = workspace.shelve_changes("draft-shelf").unwrap();
+
+        assert_eq!(shelf.id, "draft-shelf");
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "base"
+        );
+        let shelves = workspace.list_shelves().unwrap();
+        assert_eq!(shelves.len(), 1);
+        assert_eq!(shelves[0].id, "draft-shelf");
+
+        let preview = workspace.preview_shelf("draft-shelf").unwrap();
+        let post = preview
+            .files
+            .iter()
+            .find(|file| file.path == Path::new("post.md"))
+            .unwrap();
+        assert_eq!(post.content.as_deref(), Some("shelved"));
+
+        let report = workspace.preflight_apply_shelf("draft-shelf").unwrap();
+        assert!(report.can_proceed);
+        workspace.apply_shelf("draft-shelf").unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "shelved"
+        );
+
+        workspace.delete_shelf("draft-shelf").unwrap();
+        assert!(workspace.list_shelves().unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_shelf_preserves_shelf_when_workspace_is_dirty() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+        workspace.shelve_changes("draft-shelf").unwrap();
+        write_file(workspace.root(), "post.md", b"dirty");
+
+        let report = workspace.preflight_apply_shelf("draft-shelf").unwrap();
+        assert!(!report.can_proceed);
+        assert_eq!(report.dirty_files[0].path, PathBuf::from("post.md"));
+
+        let err = workspace.apply_shelf("draft-shelf").unwrap_err();
+        assert!(matches!(err, DraftlineError::PreflightFailed(_)));
+        assert_eq!(workspace.list_shelves().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn support_refs_list_deleted_variation_archives_and_restore_as_variation() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        let variation = workspace.create_variation("old-option").unwrap();
+        workspace
+            .switch_variation(variation.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"old option");
+        workspace.save_version("Old option").unwrap();
+        workspace
+            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        workspace.delete_variation(variation.id()).unwrap();
+
+        let support_refs = workspace.list_support_refs(SupportRefScope::Local).unwrap();
+
+        assert_eq!(support_refs.len(), 1);
+        assert_eq!(support_refs[0].kind, SupportRefKind::DeletedVariation);
+        assert_eq!(
+            support_refs[0].source_variation.as_deref(),
+            Some("old-option")
+        );
+
+        let restored = workspace
+            .restore_support_ref_as_variation(&support_refs[0].id, "restored-option")
+            .unwrap();
+
+        assert_eq!(restored.name, "restored-option");
+        assert!(workspace
+            .variations()
+            .unwrap()
+            .iter()
+            .any(|variation| variation.name == "restored-option"));
+    }
+
+    #[test]
+    fn remote_variations_can_be_discovered_and_adopted_locally() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"base");
+        first_workspace.save_version("Base").unwrap();
+        let variation = first_workspace.create_variation("teammate-option").unwrap();
+        first_workspace
+            .switch_variation(variation.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"teammate");
+        first_workspace.save_version("Teammate").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        second_workspace.fetch_remote("origin").unwrap();
+
+        let remote_variations = second_workspace.remote_variations("origin").unwrap();
+        assert!(remote_variations
+            .iter()
+            .any(|variation| variation.id.as_str() == "teammate-option"));
+
+        let adopted = second_workspace
+            .adopt_remote_variation("origin", &VariationId::from("teammate-option"))
+            .unwrap();
+        assert_eq!(adopted.name, "teammate-option");
+        assert!(second_workspace
+            .variations()
+            .unwrap()
+            .iter()
+            .any(|variation| variation.name == "teammate-option"));
+    }
+
+    #[test]
+    fn preflight_merge_incoming_reports_needs_merge_without_mutating() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"one");
+        first_workspace.save_version("One").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_workspace, "Maria", "maria@example.com");
+        write_file(second_workspace.root(), "post.md", b"two");
+        second_workspace.save_version("Two").unwrap();
+        second_workspace.publish_changes("origin").unwrap();
+
+        write_file(first_workspace.root(), "post.md", b"local two");
+        first_workspace.save_version("Local two").unwrap();
+        first_workspace.fetch_remote("origin").unwrap();
+
+        let report = first_workspace.preflight_merge_incoming("origin").unwrap();
+
+        assert_eq!(report.sync_status.state, SyncState::NeedsMerge);
+        assert!(!report.can_merge_cleanly);
+        assert!(!report.changed_workspace);
+    }
+
+    #[test]
+    fn delete_remote_variation_publishes_support_ref_before_deleting_visible_ref() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let local = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(local.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        let variation = workspace.create_variation("old-option").unwrap();
+        workspace
+            .switch_variation(variation.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"old option");
+        workspace.save_version("Old option").unwrap();
+        workspace.publish_changes("origin").unwrap();
+        workspace
+            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+
+        let preflight = workspace
+            .preflight_delete_remote_variation("origin", variation.id())
+            .unwrap();
+        assert!(preflight.can_delete);
+        assert!(preflight
+            .support_ref
+            .starts_with("refs/draftline/deleted-variations/old-option/"));
+
+        workspace.delete_remote_variation(preflight.token).unwrap();
+
+        let bare = Repository::open_bare(remote.path()).unwrap();
+        assert!(bare.find_reference("refs/heads/old-option").is_err());
+        assert!(bare.find_reference(&preflight.support_ref).is_ok());
+    }
+
+    #[test]
+    fn expire_support_refs_removes_selected_local_archive_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        let variation = workspace.create_variation("old-option").unwrap();
+        workspace.delete_variation(variation.id()).unwrap();
+        let support_ref = workspace
+            .list_support_refs(SupportRefScope::Local)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let preflight = workspace
+            .preflight_expire_support_refs([support_ref.id.clone()])
+            .unwrap();
+        assert!(preflight.can_expire);
+
+        workspace.expire_support_refs(preflight.token).unwrap();
+
+        assert!(workspace
+            .list_support_refs(SupportRefScope::Local)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn preflight_purge_content_enumerates_refs_and_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "secret.md", b"secret");
+        workspace.save_version("Secret").unwrap();
+
+        let preflight = workspace.preflight_purge_content("secret.md").unwrap();
+
+        assert_eq!(preflight.selector, "secret.md");
+        assert!(preflight
+            .distributed_warning
+            .contains("cannot guarantee deletion from existing clones"));
+        assert!(preflight
+            .affected_refs
+            .iter()
+            .any(|reference| reference == "refs/heads/master"));
+        assert!(
+            workspace
+                .verify_purge(preflight.token)
+                .unwrap()
+                .checked_refs
+                > 0
+        );
+    }
+
+    #[test]
+    fn agent_json_facade_serializes_inspect_capabilities_and_verify() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        let inspect_json = workspace.inspect_json().unwrap();
+        assert!(inspect_json.contains("safe_next_actions"));
+
+        let capabilities_json = Workspace::capabilities_json().unwrap();
+        assert!(capabilities_json.contains("inspect"));
+
+        let verification = workspace.verify_workspace().unwrap();
+        assert!(verification.recovery_clear);
+        assert!(verification.operation_lock_clear);
+        assert!(verification.current_variation_present);
+    }
+
+    #[test]
+    fn agent_json_facade_blocks_normal_work_on_detached_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        let version = workspace.save_version("Base").unwrap();
+        workspace
+            .repo
+            .set_head_detached(Oid::from_str(version.id().as_str()).unwrap())
+            .unwrap();
+
+        let inspection = workspace.inspect().unwrap();
+
+        assert!(inspection
+            .diagnostics
+            .iter()
+            .any(
+                |diagnostic| diagnostic.code == DiagnosticCode::NoCurrentVariation
+                    && diagnostic.severity == DiagnosticSeverity::Blocking
+            ));
+        assert_eq!(
+            inspection.safe_next_actions,
+            vec![SafeNextAction::RepairRecovery]
+        );
+    }
+
+    #[test]
+    fn agent_json_facade_reports_corrupt_recovery_ledger() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        fs::write(workspace.ledger_path(), b"{not-json").unwrap();
+
+        let inspection = workspace.inspect().unwrap();
+        let verification = workspace.verify_workspace().unwrap();
+
+        assert!(inspection
+            .diagnostics
+            .iter()
+            .any(
+                |diagnostic| diagnostic.code == DiagnosticCode::RecoveryRequired
+                    && diagnostic.severity == DiagnosticSeverity::Blocking
+            ));
+        assert_eq!(
+            inspection.safe_next_actions,
+            vec![SafeNextAction::RepairRecovery]
+        );
+        assert!(!verification.recovery_clear);
+        assert!(verification
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::RecoveryRequired));
+    }
+
+    #[test]
+    fn explain_error_maps_stable_code_to_safe_next_action() {
+        let explanation = Workspace::explain_error(DiagnosticCode::WorkspaceLocked);
+
+        assert_eq!(explanation.code, DiagnosticCode::WorkspaceLocked);
+        assert_eq!(
+            explanation.safe_next_actions,
+            vec![SafeNextAction::RepairRecovery]
+        );
+        assert_eq!(explanation.retry, RetryClass::RetryAfterRepair);
     }
 
     // ── history ──────────────────────────────────────────────────────────────

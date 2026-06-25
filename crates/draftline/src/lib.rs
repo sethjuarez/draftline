@@ -85,11 +85,21 @@ pub use content_policy::ContentPolicy;
 pub use error::{DraftlineError, Result};
 pub use recovery::{RecoveryOperation, RecoveryState};
 pub use remote::{
-    Contributor, PublishResult, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
-    RemoteOptions, RemoteVersionSummary, SyncState, SyncStatus,
+    Contributor, PublishPreflight, PublishResult, PublishToken, RemoteCredential,
+    RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVersionSummary, SyncState,
+    SyncStatus,
 };
 pub use workspace::{
-    ApplyIncomingReport, ApplyIncomingResult, ChangeKind, ChangeSet, ChangedFile, HistoryEntry,
-    PreflightReport, PreviewFile, SwitchPolicy, Variation, VariationId, VariationMetadata,
-    VariationSummary, Version, VersionDiff, VersionId, VersionPreview, Workspace, WorkspaceSummary,
+    AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult, ChangeKind, ChangeSet,
+    ChangedFile, ContentPolicyAudit, DiagnosticCode, DiagnosticSeverity, DirtySummary,
+    ErrorExplanation, FileHazard, FileHazardKind, HistoryEntry, MergeIncomingReport,
+    OperationLockInspection, OperationLockMetadata, OperationLockState, OperationLockSummary,
+    PreflightReport, PreviewFile, PurgePreflight, PurgeToken, PurgeVerification,
+    RecoveryRepairResult, RemoteVariation, RemoteVariationDeletePreflight,
+    RemoteVariationDeleteToken, RetryClass, SafeNextAction, SharingMode, Shelf, ShelfApplyReport,
+    SupportRef, SupportRefExpirationPreflight, SupportRefExpirationToken, SupportRefKind,
+    SupportRefScope, SupportRefSummary, SwitchPolicy, Variation, VariationId, VariationMetadata,
+    VariationSummary, Version, VersionDiff, VersionId, VersionPreview, Workspace,
+    WorkspaceCapabilities, WorkspaceDiagnostic, WorkspaceId, WorkspaceInspection, WorkspaceSummary,
+    WorkspaceVerification,
 };
