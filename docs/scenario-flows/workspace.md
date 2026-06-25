@@ -62,10 +62,10 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | `open*`, `workspace_summary`, `changes`, `history`, `variation_summaries`, `remotes`, and `sync_status` expose pieces of the state. |
+| Current support | `open*`, `workspace_summary`, `inspect`, `preflight_adopt_workspace`, `changes`, `history`, `variation_summaries`, `remotes`, and `sync_status` expose structured state. |
 | Safety behavior | Adoption should begin as read-only diagnostics. Draftline should not rewrite branches, rename refs, change remotes, delete files, or persist new policy decisions until the user chooses a setup path. |
 | Edge cases | Existing repos can have detached HEAD, branch names that do not fit product naming, multiple remotes, protected branches, tags/releases, submodules/gitlinks, symlinks, Git LFS or filter-driver assets, ignored generated files, staged changes that differ from the working tree, case or Unicode path collisions, multiple worktrees, existing conflict markers, or history containing files outside the selected policy. |
-| Gap | Need an explicit `preflight_adopt_workspace` or setup report that explains blockers, maps Git concepts to Draftline concepts, recommends a content policy, identifies actor identity and sharing mode, detects Git ignore/attributes hazards, and lists which follow-up primitives are safe. |
+| Gap | Adoption preflight exists, but broader branch/remote mapping, actor identity, attributes/filter diagnostics, and product-specific migration choices still need host policy or follow-up primitives. |
 
 For app migrations, ownership should split by layer:
 
@@ -99,10 +99,10 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | `init` and `open` support local work. `clone_workspace*` starts from a remote. `add_remote` can attach a remote after local work exists. |
+| Current support | `init` and `open` support local work. `clone_workspace*` starts from a remote. `add_remote` can attach a remote after local work exists. `inspect` reports whether remotes are configured. |
 | Safety behavior | Local-only work should remain fully usable for save, variation, history, discard, shelve, local cleanup, and local recovery. Shared operations should require an explicit remote and fetch before deciding. |
 | Edge cases | A newly added remote may already contain a branch with the same variation name, no matching branch, different history, or support refs that need to be discovered separately. Existing repos can also have multiple remotes; the host may need the user to choose which remote represents shared Draftline work. |
-| Gap | Need explicit sharing-mode diagnostics and first-publish/adopt-remote preflight so hosts can explain what will become shared. |
+| Gap | Basic sharing-mode diagnostics and publish preflight exist; hosts still need support-ref bootstrap policy and explicit remote destination confirmation flows. |
 
 ## Flow 1c: add a remote after local work exists
 
@@ -127,10 +127,10 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | `add_remote` records or updates the remote. `publish_changes` can create a remote branch when there is no remote version for the current variation. |
+| Current support | `add_remote` records or updates the remote. `preflight_publish` captures expected remote state or absence, and `publish`/`publish_changes` can create a remote branch when there is no remote version for the current variation. |
 | Safety behavior | First publish must fetch before deciding and must not overwrite remote work that happens to use the same variation name. |
 | Edge cases | Local archive refs created before the remote was added remain local until support-ref sync exists. If support refs are synced later, they need unique names and create-only pushes just like new shared archives. |
-| Gap | Need preflight for first publish, remote name conflicts, support-ref bootstrap, and explicit product copy for "this local work will become shared." |
+| Gap | Need explicit remote destination confirmation, support-ref bootstrap, and product copy for "this local work will become shared." Push mechanics should use explicit lease/create-only semantics rather than only fetch-then-compare plus normal push. |
 
 ## Flow 1d: start from a shared remote
 
@@ -145,17 +145,17 @@ flowchart TD
     C --> D[Fetch visible current variation]
     D --> E[workspace_summary]
     E --> F{Need more shared state?}
-    F -- Teammate variations --> G[Need remote_variations]
+    F -- Teammate variations --> G[Use remote_variations after fetch]
     F -- Recovery support refs --> H[Need fetch_support_refs]
 ```
 
 | Question | Answer |
 |---|---|
-| Covered today? | Covered for basic clone/open. |
-| Current support | `clone_workspace*` can create a workspace from a remote with host-provided credentials and policy. |
+| Covered today? | Covered for basic clone/open and remote variation discovery. |
+| Current support | `clone_workspace*` can create a workspace from a remote with host-provided credentials and policy. `remote_variations` lists fetched remote-tracking variations, and `adopt_remote_variation` creates a local variation from one. |
 | Safety behavior | Clone is a read/create operation, but follow-up sync should still fetch before making publish/apply decisions. |
-| Edge cases | Current remote APIs are current-variation-oriented. Teammate-created variations and support refs may exist remotely without being visible in the normal workspace summary. |
-| Gap | Need remote variation discovery and support-ref fetch/list flows after clone. |
+| Edge cases | Remote variation discovery depends on fetched remote-tracking refs. Support refs may exist remotely without being visible in the normal workspace summary. |
+| Gap | Need fetch-all/prune diagnostics for remote variations and support-ref fetch/list flows after clone. |
 
 ## Flow 1e: developer Copilot opens a Draftline-managed repo
 
@@ -177,11 +177,11 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered as a first-class scenario. |
-| Current support | The repository remains a normal Git repo, and Draftline can surface some unusual states through `workspace_summary`, `NoCurrentVariation`, recovery state, and Git errors. |
+| Covered today? | Partially covered as a first-class scenario. |
+| Current support | The repository remains a normal Git repo. Draftline can generate generic rules through `generate_agent_instructions` and surface unusual states through `inspect`, `verify_workspace`, `workspace_summary`, `NoCurrentVariation`, recovery state, and Git errors. |
 | Safety behavior | Agent instructions should distinguish safe worktree actions from Draftline-owned state. Reading history/status, editing source files, and running tests are fine; deleting, rewriting, renaming, or force-updating visible refs or `refs/draftline/...` should use Draftline primitives or admin tooling. |
 | Edge cases | A coding agent may run `git checkout`, `git reset`, `git clean`, `git stash`, `git branch -D`, force-push, edit `.gitignore`/attributes, delete support refs, clear operation locks, or resolve conflicts outside Draftline. Those actions can bypass content policy, recovery state, support-ref retention, and user-facing variation metadata. |
-| Gap | Need generated or surfaced agent instructions, such as a repository instruction file or helper output, plus a diagnostic helper that explains current safety posture, Draftline-owned namespaces, safe direct Git commands, and when Draftline must repair or re-adopt the repo. |
+| Gap | Helper output exists, but no repository instruction file writer or standalone agent CLI/tool facade exists yet. Recovery repair guidance is still mostly diagnostic. |
 
 Implementation shape:
 
@@ -216,11 +216,11 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered as an agent-oriented surface. |
-| Current support | Draftline has Rust primitives for many operations, but the API is not organized as an agent-facing discover/preflight/execute/verify/repair protocol. |
+| Covered today? | Partially covered as an agent-oriented Rust surface. |
+| Current support | Draftline has Rust primitives, `inspect_json`, `capabilities_json`, `verify_workspace`, `explain_error`, and operation-specific preflights. It does not yet expose a standalone CLI/tool discover/preflight/execute/verify/repair protocol. |
 | Safety behavior | Agent-facing APIs should make safe behavior easier than raw Git: every risky mutation should have a preflight, explicit blockers, an operation ID, recovery metadata, and a verification result. |
 | Edge cases | Agents may need to operate without a human watching every step, so APIs must avoid ambiguous success, broad fallbacks, hidden force behavior, and prose-only errors. Long-running or interrupted operations need resumable status and repair paths. |
-| Gap | Need a tool/CLI/API facade that exposes Draftline's safety model directly to agents and host automations. |
+| Gap | Need a CLI/tool facade and generic tokenized execution protocol that exposes Draftline's safety model outside embedded Rust callers. |
 
 Recommended API shape:
 

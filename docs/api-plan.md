@@ -176,10 +176,10 @@ Required results:
 
 | API | Purpose |
 |---|---|
-| `Workspace::remote_variations(remote)` | List visible variations on a remote. |
-| `Workspace::preflight_adopt_remote_variation(id)` | Plan local adoption of teammate-created work. |
-| `Workspace::adopt_remote_variation(token)` | Create a local variation from a remote variation. |
-| `Workspace::prune_remote_variations(token)` | Safely update stale remote-tracking state. |
+| `Workspace::remote_variations(remote)` | List visible variations from the fetched remote-tracking namespace. Implemented. |
+| `Workspace::preflight_adopt_remote_variation(id)` | Plan local adoption of teammate-created work. Not implemented as a separate tokenized preflight. |
+| `Workspace::adopt_remote_variation(remote, id)` | Create a local variation from a remote-tracking variation. Implemented without a separate preflight token. |
+| `Workspace::prune_remote_variations(token)` | Safely update stale remote-tracking state. Not implemented. |
 
 ### Merge incoming
 
@@ -290,18 +290,20 @@ Tool calls that mutate state should require a preflight token generated from the
 
 ## Proposed priority slices
 
-| Slice | APIs | Outcome |
-|---|---|---|
-| 1. Diagnostics baseline | `inspect`, `capabilities`, adoption report, content/Git diagnostics | Hosts and agents can understand workspace safety before mutating. |
-| 2. Recovery baseline | stale-lock inspection, repair/rollback skeleton, verification | Crashes and interrupted operations have a principled path. |
-| 3. Target-tree safety | shared collision preflight wired into switch, restore, apply | File-writing operations stop before clobbering local non-versioned files. |
-| 4. Remote race safety | publish preflight, expected-OID push, create-only first publish | Normal sharing no longer relies only on fetch-then-push. |
-| 5. Agent/tool facade | JSON CLI/tool layer over inspect/preflight/execute/verify | Coding agents can use Draftline safely without raw Git. |
-| 6. Shelf lifecycle | shelve in place, list, preview, apply with conflicts, delete | "Put aside" becomes a complete workflow. |
-| 7. Support refs | publish/fetch/list/restore/expire support refs | Shared recovery works across machines. |
-| 8. Collaboration expansion | remote variation lifecycle and merge incoming | Team workflows cover created/deleted/renamed/diverged variations. |
-| 9. Shared cleanup | remote delete and shared history replacement | Team cleanup becomes lease-protected and recoverable. |
-| 10. Admin deletion | purge/redaction | Sensitive-content deletion is explicit and best-effort. |
+This table tracks the intended API shape and the current implementation state. "Partial" means the public Rust surface exists for part of the scenario, but the full product contract still needs the listed follow-up work.
+
+| Slice | APIs | Outcome | Current status |
+|---|---|---|---|
+| 1. Diagnostics baseline | `inspect`, `capabilities`, adoption report, content/Git diagnostics | Hosts and agents can understand workspace safety before mutating. | Implemented for Rust callers; content/Git diagnostics are current-ignore focused. |
+| 2. Recovery baseline | stale-lock inspection, repair/rollback skeleton, verification | Crashes and interrupted operations have a principled path. | Partial: stale-lock inspection/clear and skeleton repair/rollback reports exist; operation-specific mutation is missing. |
+| 3. Target-tree safety | shared collision preflight wired into switch, restore, apply, shelf apply | File-writing operations stop before clobbering local non-versioned files. | Partial: ignored and policy-excluded target-path hazards are wired for key operations; generated/platform hazards remain. |
+| 4. Remote race safety | publish preflight, expected-OID push, create-only first publish | Normal sharing no longer relies only on fetch-then-push. | Partial: tokenized preflight/publish rejects changed fetched state; push still needs explicit lease/create-only mechanics. |
+| 5. Agent/tool facade | JSON CLI/tool layer over inspect/preflight/execute/verify | Coding agents can use Draftline safely without raw Git. | Partial for Rust JSON helpers; no standalone CLI/tool facade. |
+| 6. Shelf lifecycle | shelve in place, list, preview, apply with conflicts, delete | "Put aside" becomes a complete workflow. | Implemented for all-work shelves; selected-file and conflict-resolution apply remain. |
+| 7. Support refs | publish/fetch/list/restore/expire support refs | Shared recovery works across machines. | Partial locally: list/restore/expire exist; general publish/fetch sync is missing. |
+| 8. Collaboration expansion | remote variation lifecycle and merge incoming | Team workflows cover created/deleted/renamed/diverged variations. | Partial: remote list/adopt and merge preflight exist; prune/stale diagnostics and merge execution are missing. |
+| 9. Shared cleanup | remote delete and shared history replacement | Team cleanup becomes lease-protected and recoverable. | Partial: remote delete exists with support-ref-first ordering; explicit lease mechanics and shared history replacement are missing. |
+| 10. Admin deletion | purge/redaction | Sensitive-content deletion is explicit and best-effort. | Partial planning only: purge preflight and verify exist; destructive execution is missing. |
 
 ## Open design questions
 

@@ -47,10 +47,10 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered. |
-| Current support | `ContentPolicy` is provided when opening/initializing a workspace. It is not persisted as a versioned workspace rule and is not retroactive. |
+| Covered today? | Partially covered. |
+| Current support | `ContentPolicy` is provided when opening/initializing a workspace. `audit_content_policy` reports current diagnostics and reserves a historical out-of-policy field, but historical migration/redaction is not implemented. The policy is not persisted as a versioned workspace rule and is not retroactive. |
 | Safety behavior | New change detection, discard, and many workspace views use the current runtime policy, but old commits can still contain content saved under an earlier policy. |
-| Gap | Need policy audit, migration, and redaction primitives if hosts need to remove or reclassify previously saved content. |
+| Gap | Need historical policy audit, migration, and redaction primitives if hosts need to remove or reclassify previously saved content. |
 
 ## Flow 2b: content policy conflicts with Git ignore or attributes
 
@@ -72,7 +72,7 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | ContentPolicy validates product paths. Git status and checkout behavior still follow repository ignore, attributes, filters, and filesystem rules. |
+| Current support | ContentPolicy validates product paths. `policy_git_diagnostics` and `audit_content_policy` warn when current policy-tracked files are hidden by Git ignore rules. Git attributes, filters, path normalization, and broader filesystem behavior still need deeper diagnostics. |
 | Safety behavior | A host should not claim all business content is saved unless policy-tracked-but-ignored files are detected or explicitly accepted. |
 | Edge cases | Existing repos may include `.gitignore`, `.gitattributes`, LFS/filter drivers, autocrlf/line-ending rules, symlinks, submodules/gitlinks, case-colliding paths, Unicode-normalization collisions, or filemode-only changes. |
-| Gap | Need policy/Git diagnostics in `changes`, adoption preflight, and file-writing preflights so ignored or transformed business content is visible before save, restore, switch, publish, or purge. |
+| Gap | Need broader policy/Git diagnostics in `changes`, adoption preflight, and file-writing preflights so attributes, filters, normalization, and transformed business content are visible before save, restore, switch, publish, or purge. |

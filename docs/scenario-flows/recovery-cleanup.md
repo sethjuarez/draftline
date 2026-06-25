@@ -20,11 +20,11 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered. |
-| Current support | Shelf refs can be created internally by switch-with-shelve, but there are no public list, preview, apply, delete, or shelve-in-place APIs. |
-| Safety behavior | Shelf application should be treated as a merge-like file-writing operation, not as a guaranteed safe pop. It should preserve the shelf until the apply succeeds or the user explicitly deletes it. |
-| Edge cases | Shelf names must be unique/create-only. Applying a shelf can conflict with current tracked work or collide with untracked/ignored/excluded files. Re-shelving with the same name should produce a business-shaped collision result, not a raw Git failure after partial mutation. |
-| Gap | Need `shelve_changes`, `list_shelves`, `preview_shelf`, `preflight_apply_shelf`, `apply_shelf`, and `delete_shelf`, plus conflict and naming contracts. |
+| Covered today? | Covered for MVP all-work shelves. |
+| Current support | `shelve_changes`, `list_shelves`, `preview_shelf`, `preflight_apply_shelf`, `apply_shelf`, and `delete_shelf` are public. Switch-with-shelve also creates shelf refs. |
+| Safety behavior | Shelf application is treated as a file-writing operation with dirty-work and target-tree collision preflight. It preserves the shelf until the user explicitly deletes it. |
+| Edge cases | Shelf names must be unique/create-only. Applying a shelf can conflict with current tracked work or collide with untracked/ignored/excluded files. Conflict-resolution apply and selected-file shelves remain future work. |
+| Gap | Need selected-file shelves and semantic conflict-resolution apply for shelves that cannot be applied cleanly. |
 
 ## Flow 13: remove or clean up work
 
@@ -54,7 +54,7 @@ flowchart TD
 | Current support | `delete_variation` and `squash_versions` preserve old tips under local `refs/draftline/...` refs before destructive ref movement. |
 | Safety behavior | The old commit remains named by a Draftline support ref locally, so it is not left only to reflog or garbage-collection timing on that machine. Cross-machine recovery still requires support-ref sync. |
 | Edge cases | Deleting the current variation is rejected. Squash rejects dirty work, `count < 2`, and ranges without a parent outside the squash range. Squashing a published variation rewrites history, so normal `publish_changes` will reject it as diverged because Draftline does not force-push. |
-| Gap | Need preflight APIs that explain what will be archived, support-ref sync to the shared remote, restore APIs that turn an archive ref back into a visible variation, and an explicit replace-remote-history workflow for shared squash. |
+| Gap | Local archive listing and `restore_support_ref_as_variation` exist. Still need preflight APIs that explain what will be archived, general support-ref sync to the shared remote, and an explicit replace-remote-history workflow for shared squash. |
 
 ## Flow 13a: remove or rewrite shared work
 
@@ -80,11 +80,11 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered. |
-| Current support | `delete_variation` and `squash_versions` only operate on local refs and local archive refs. `publish_changes` refuses non-fast-forward history replacement. |
-| Safety behavior | Shared cleanup must be archive-first, support-ref-publish-first, and visible-ref-delete-or-replace-last. The visible remote ref must only move if the old remote OID still matches the user's preflight. |
-| Edge cases | Support-ref push can succeed while visible cleanup fails; that is safe but leaves an extra recovery point. Visible shared cleanup must not happen if support-ref publication fails. The user can still perform local-only cleanup, but not remote delete/replace, when shared recovery is unavailable. |
-| Gap | Need `preflight_delete_remote_variation`, `delete_remote_variation`, `preflight_replace_remote_history`, and `replace_remote_history` or equivalent, with expected-OID/lease semantics and teammate-facing product copy. |
+| Covered today? | Partially covered. |
+| Current support | `preflight_delete_remote_variation` and `delete_remote_variation` archive the remote tip under a support ref, push that support ref, then delete the visible remote variation. `delete_variation` and `squash_versions` operate on local refs and local archive refs. `publish_changes` refuses non-fast-forward history replacement. |
+| Safety behavior | Shared remote delete is archive-first and visible-ref-delete-last. The implementation fetches and compares expected remote OID before deleting. |
+| Edge cases | Support-ref push can succeed while visible cleanup fails; that is safe but leaves an extra recovery point. Visible shared cleanup must not happen if support-ref publication fails. Explicit lease/create-only push mechanics still need tightening beyond fetch-then-compare plus normal push refspecs. |
+| Gap | Need explicit lease/create-only push mechanics, `preflight_replace_remote_history`, and `replace_remote_history` or equivalent, with teammate-facing product copy. |
 
 ## Flow 13b: sync hidden recovery support refs
 
@@ -102,11 +102,11 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered. |
-| Current support | Delete and squash create local support refs under `refs/draftline/...`. Publish/fetch currently use visible variation refs, not support refs. |
+| Covered today? | Partially covered locally; general remote sync is not covered. |
+| Current support | Delete and squash create local support refs under `refs/draftline/...`. `list_support_refs`, `restore_support_ref_as_variation`, `preflight_expire_support_refs`, and `expire_support_refs` cover local support-ref management. Shared remote delete publishes one operation-specific support ref before deleting the visible remote ref. General publish/fetch still uses visible variation refs, not support-ref refspecs. |
 | Safety behavior | Recovery support refs are hidden from normal views but are part of the shared repository trust boundary once synced. They are not privacy or access-control boundaries. |
 | Edge cases | Remote support refs must be uniquely named, append-only, and fetched without overwriting unsynced local support refs. Hosts must surface remotes that reject `refs/draftline/...` pushes. |
-| Gap | Need `publish_support_refs`, `fetch_support_refs`, `list_archived_refs`, and `restore_archived_ref_as_variation` or equivalent. |
+| Gap | Need general `publish_support_refs` and `fetch_support_refs` with a remote-tracking layout. Local listing and restore already exist. |
 
 ## Flow 13c: recover cleanup after clone or device loss
 
@@ -126,11 +126,11 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered. |
-| Current support | Local archive refs may exist on the machine where cleanup happened. They are not pushed/fetched today. |
+| Covered today? | Partially covered locally. |
+| Current support | Local archive refs may exist on the machine where cleanup happened and can be listed/restored locally. They are not generally pushed/fetched today except as part of remote variation delete. |
 | Safety behavior | The intended model is shared hidden support refs: recoverability travels with the shared remote, while normal views remain uncluttered. |
 | Edge cases | Restoring an archived ref must create a new visible variation by default, require a non-conflicting name, fetch before publish, and never overwrite an existing local or remote variation without a separate explicit replace workflow. |
-| Gap | Needs support-ref sync and archive restore APIs. |
+| Gap | Needs general support-ref sync; local archive restore APIs exist. |
 
 ## Flow 13d: permanently purge or redact content
 
@@ -148,10 +148,10 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered. |
-| Current support | Cleanup preserves old tips by design. Planned support-ref sync would also preserve those tips on the shared remote. |
+| Covered today? | Partially covered for planning only. |
+| Current support | Cleanup preserves old tips by design. `preflight_purge_content` enumerates candidate refs and reports distributed-Git limitations; `verify_purge` reports verification limitations. There is no destructive `purge_content` execution primitive. Planned support-ref sync would also preserve those tips on the shared remote. |
 | Safety behavior | Draftline currently optimizes for recoverability, not permanent deletion. Purge must be a destructive, admin-permissioned, best-effort workflow over controlled remotes; Git cannot guarantee removal from existing clones, forks, backups, logs, caches, or offline devices that already fetched the objects. |
-| Gap | Need an explicit purge/redaction model with confirmations, enumeration of visible refs, support refs, tags, notes, replace refs, stash refs, remote-tracking refs, reflogs, alternates, hosting caches, object reachability checks, remote GC coordination, post-purge verification, audit trail, and user copy that does not over-promise deletion from distributed copies. |
+| Gap | Need destructive `purge_content` execution with confirmations, enumeration of visible refs, support refs, tags, notes, replace refs, stash refs, remote-tracking refs, reflogs, alternates, hosting caches, object reachability checks, remote GC coordination, post-purge verification, audit trail, and user copy that does not over-promise deletion from distributed copies. |
 
 ## Flow 13e: expire old support refs
 
@@ -171,10 +171,10 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered. |
-| Current support | No support-ref listing or deletion APIs. |
+| Covered today? | Partially covered locally. |
+| Current support | `list_support_refs`, `preflight_expire_support_refs`, and `expire_support_refs` support local retention cleanup. General remote support-ref retention is not implemented. |
 | Safety behavior | Retention cleanup may remove convenient recovery pointers but should not be framed as sensitive-content deletion. |
-| Gap | Need `list_support_refs`, `preflight_expire_support_refs`, and `expire_support_refs` with permissions, audit, and remote GC guidance. |
+| Gap | Need remote support-ref retention with permissions, audit, and remote GC guidance. |
 
 ## Flow 13f: large or binary business assets
 
@@ -231,10 +231,10 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | Operation locks prevent concurrent risky operations. `RecoveryState` blocks normal APIs. `workspace_summary` can still surface recovery context. |
+| Current support | Operation locks prevent concurrent risky operations. `RecoveryState` blocks normal APIs. `workspace_summary` and `inspect` can still surface recovery context. `repair_recovery` and `rollback_recovery` return typed skeleton reports but do not yet perform operation-specific mutations. |
 | Safety behavior | Draftline avoids pretending the workspace is coherent when an operation may have been interrupted. |
 | Edge cases | `acknowledge_recovery` clears metadata but does not repair or roll back the Git state. Hosts should not present acknowledgment as repair; it can unblock normal APIs while refs and files remain inconsistent. Recovery state is single-slot because only one Draftline risky operation should hold the operation lock at a time. |
-| Gap | Need operation-specific repair and rollback APIs. |
+| Gap | Need operation-specific mutation behind the existing repair and rollback APIs. |
 
 ## Flow 14a: out-of-band Git mutation
 
@@ -254,9 +254,9 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | Some states surface through `NoCurrentVariation`, status, or raw Git errors. |
+| Current support | Some states surface through `NoCurrentVariation`, status, `inspect`, `verify_workspace`, `explain_error`, or raw Git errors. |
 | Safety behavior | Draftline refuses normal variation operations when HEAD is detached or no local variation can be identified. |
-| Gap | Need a structured diagnostic report and repair flows for detached HEAD, raw Git branch changes, existing conflicted indexes, and non-Draftline history edits. |
+| Gap | Need deeper repair flows for detached HEAD, raw Git branch changes, existing conflicted indexes, and non-Draftline history edits. |
 
 ## Flow 14b: stale or abandoned operation lock
 
@@ -276,11 +276,11 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered. |
-| Current support | `WorkspaceLocked` blocks mutating operations. `RecoveryState` may also exist, but acknowledgment does not repair refs/files or clear an abandoned lock. |
+| Covered today? | Partially covered. |
+| Current support | `WorkspaceLocked` blocks mutating operations. `inspect_operation_lock` distinguishes active, stale, and legacy/unknown locks. `clear_stale_lock` clears only metadata locks deemed stale. `RecoveryState` may also exist, but acknowledgment does not repair refs/files. |
 | Safety behavior | A host must distinguish an active operation from a stale lock. Clearing a lock should be a guarded recovery action, not a blind retry loop or automatic delete. |
 | Edge cases | A crash can leave both recovery metadata and an operation lock. Multiple host instances may race on the same workspace. Lock metadata needs owner, PID/process identity, timestamp, and enough context to decide stale vs active. |
-| Gap | Need stale-lock detection and primitives such as `inspect_operation_lock`, `clear_stale_lock`, or integrated `repair_recovery` that handles lock and recovery state together. |
+| Gap | Need integrated repair that coordinates lock and recovery state together. |
 
 ## Edge and error scenarios
 
@@ -296,11 +296,11 @@ flowchart TD
 | Abbreviated or non-canonical version ID | Covered | `VersionId::from_canonical_string` | Require full lowercase canonical ID from app storage. |
 | No current variation / detached state | Covered as signal | `NoCurrentVariation` | Show repair flow; do not run ref-moving operations. |
 | Workspace locked | Covered as signal | `WorkspaceLocked` | Show active operation if known; if the lock may be stale, use the stale-lock recovery flow instead of retrying forever. |
-| Stale operation lock | Not covered | `WorkspaceLocked` only | Distinguish active work from abandoned lock; do not retry forever. |
+| Stale operation lock | Partially covered | `inspect_operation_lock`, `clear_stale_lock` | Use guarded stale-lock repair; do not retry forever or delete locks manually. |
 | Pending recovery | Covered as blocker | `RecoveryRequired` | Show recovery prompt instead of normal actions. |
 | Dirty workspace before risky operation | Covered | `PreflightFailed` with `PreflightReport` | Ask user to save, discard, shelve, or cancel. |
-| Target tree would overwrite non-versioned file | Not covered | Missing shared preflight | Block checkout-like operation or ask user to move/backup the file. |
-| Git-ignored file matches content policy | Partially covered | Current status behavior | Warn that business content may be hidden from save/publish. |
+| Target tree would overwrite non-versioned file | Partially covered | `FileHazard` checks in switch, restore, apply incoming, and apply shelf | Block checkout-like operation or ask user to move/backup the file. |
+| Git-ignored file matches content policy | Partially covered | `policy_git_diagnostics`, `audit_content_policy` | Warn that business content may be hidden from save/publish. |
 | Binary or large files in preflight | Covered | `binary_files`, `large_files` | Warn before switching or risky operation if useful. |
 | Remote has incoming work during publish | Covered as blocker | `SyncNeedsMerge` containing `SyncState::IncomingAvailable` | Ask user to apply incoming work before publishing. |
 | Remote needs merge | Covered as blocker | `SyncNeedsMerge` containing `SyncState::NeedsMerge` | Start merge workflow; do not publish/apply. |

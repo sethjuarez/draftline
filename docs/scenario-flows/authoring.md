@@ -69,8 +69,8 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered for save/shelve; covered for one-file discard. |
-| Current support | `save_version` saves all tracked dirty files. `SwitchPolicy::Shelve` shelves all tracked dirty files. `discard_file` supports one selected file. |
+| Covered today? | Not covered for selected save/shelve; covered for one-file discard and all-work shelves. |
+| Current support | `save_version` saves all tracked dirty files. `SwitchPolicy::Shelve` and `shelve_changes` shelve all tracked dirty files. `discard_file` supports one selected file. |
 | Safety behavior | Current all-or-nothing behavior is simple and predictable, but not granular. Shelves should be local-only by default because they may contain personal unfinished work. |
 | Gap | Need `preflight_save_files`, `save_files`, `shelve_files`, possibly batch `discard_files`, plus an explicit policy if shelved work can ever be shared. |
 
@@ -173,10 +173,10 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Covered for safe switching; partially covered for the full shelve lifecycle. |
-| Correct primitive path | `preflight_switch_variation` -> `switch_variation` with `AbortIfDirty`, `SaveFirst`, or `Shelve`. |
+| Covered today? | Covered for safe switching and all-work shelf lifecycle. |
+| Correct primitive path | `preflight_switch_variation` -> `switch_variation` with `AbortIfDirty`, `SaveFirst`, or `Shelve`; use shelf APIs to list, preview, apply, or delete shelved work later. |
 | Safety behavior | `SwitchPolicy::Discard` remains unsupported. Dirty work must be saved, shelved, or explicitly discarded before checkout. Unsaved business-content files include modified tracked files and untracked files that match the current content policy. |
-| Edge cases | `SaveFirst` should not be used with unresolved conflicts because it can commit conflict-marker content as the saved state. Switching writes recovery metadata and uses an operation lock. If checkout is interrupted, normal APIs block until recovery is addressed. Switching must also preflight target-tree collisions with untracked, ignored, or current-policy-excluded files before checkout. |
+| Edge cases | `SaveFirst` should not be used with unresolved conflicts because it can commit conflict-marker content as the saved state. Switching writes recovery metadata and uses an operation lock. If checkout is interrupted, normal APIs block until recovery is addressed. Switching preflights target-tree collisions with ignored or current-policy-excluded target-path files before checkout. |
 
 ## Flow 8: review older work
 
@@ -221,9 +221,9 @@ flowchart TD
 |---|---|
 | Covered today? | Partially covered. |
 | Correct primitive path | `restore_version_as_new_save(version, label)`. |
-| Safety behavior | Restore creates a new save on the current variation and does not reset or delete older versions. It must also respect the current content boundary when deciding which historical files are safe to materialize. |
-| Edge cases | Dirty work blocks restore through preflight. Unknown version IDs return `VersionNotFound`. Interrupted restore is recorded in recovery metadata. Old versions may contain files that are now excluded by the current policy, and checkout can collide with untracked, ignored, generated, or policy-excluded local files. |
-| Gap | Need restore preflight that reports exact historical-tree restore vs current-policy-filtered restore, old-policy content, and target-tree file collisions before writing workspace files. |
+| Safety behavior | Restore creates a new save on the current variation and does not reset or delete older versions. Dirty work and target-tree collisions block before the restore writes workspace files. |
+| Edge cases | Unknown version IDs return `VersionNotFound`. Interrupted restore is recorded in recovery metadata. Old versions may contain files that are now excluded by the current policy, and restore planning does not yet explain exact historical-tree restore vs current-policy-filtered restore. |
+| Gap | Need a richer restore preflight that reports exact historical-tree restore vs current-policy-filtered restore and old-policy content before writing workspace files. |
 
 ## Flow 9a: target tree collides with local non-versioned files
 
@@ -243,8 +243,8 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered as a complete scenario. |
-| Current support | Some operations block on dirty tracked work, but the scenario contract needs all target-tree writes to check collisions beyond tracked dirty files. |
+| Covered today? | Partially covered. |
+| Current support | Shared `FileHazard` target-tree checks are wired into switching, restoring, applying incoming changes, and applying shelves. |
 | Safety behavior | No operation should overwrite a local file merely because it is untracked, ignored, generated, or excluded by the current policy. |
-| Edge cases | Case-insensitive filesystems, Unicode-normalization differences, symlinks, submodules, generated files, and old-policy paths can make collisions non-obvious. |
-| Gap | Need shared target-tree collision preflight used by switch, restore, apply incoming, merge incoming, and any future checkout-like primitive. |
+| Edge cases | Current checks cover ignored and current-policy-excluded target-path collisions. Case-insensitive filesystems, Unicode-normalization differences, symlinks, submodules, generated files, distinct untracked hazard reporting, and old-policy paths can still make collisions non-obvious. |
+| Gap | Need to broaden target-tree collision coverage for merge incoming and platform-specific path hazards. |

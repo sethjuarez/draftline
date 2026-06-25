@@ -35,10 +35,10 @@ sequenceDiagram
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Correct primitive path | `changes` -> `publish_changes` or `publish_changes_with_options`. |
-| Safety behavior | `publish_changes` fetches first, checks `sync_status`, and refuses incoming or diverged remote state. Draftline does not force-push. Safe shared publishing should also bind the push to the expected remote OID or expected absence of the remote ref. |
-| Edge cases | The library enforces a clean workspace before publish even though push itself does not write local files. `NoRemoteVersion` publishes the current variation as a new remote branch. Authentication is supplied by the host through `RemoteOptions`. `SyncNeedsMerge` can wrap either `IncomingAvailable` or `NeedsMerge`; hosts must inspect `SyncStatus.state` before deciding whether to apply incoming work or start merge. A remote branch can be deleted, recreated, or rewound after fetch but before push; first publish should be create-only. |
-| Gap | Need explicit expected-OID/lease semantics and result types for remote branch disappeared, branch recreated, first-publish race, and remote rewind between fetch and push. |
+| Correct primitive path | `changes` -> `preflight_publish` -> `publish`, or legacy `publish_changes` / `publish_changes_with_options`. |
+| Safety behavior | `publish_changes` fetches first, checks `sync_status`, and refuses incoming or diverged remote state. Tokenized `publish` also rejects changed local state or changed remote-tracking OID/absence after preflight. Draftline does not force-push. |
+| Edge cases | The library enforces a clean workspace before publish even though push itself does not write local files. `NoRemoteVersion` publishes the current variation as a new remote branch. Authentication is supplied by the host through `RemoteOptions`. `SyncNeedsMerge` can wrap either `IncomingAvailable` or `NeedsMerge`; hosts must inspect `SyncStatus.state` before deciding whether to apply incoming work or start merge. A remote branch can still be deleted, recreated, or rewound after the final fetch but before the normal push refspec reaches the server. |
+| Gap | Need explicit lease/create-only push mechanics and result types for remote branch disappeared, branch recreated, first-publish race, and remote rewind between final fetch and push. |
 
 ## Flow 11: receive teammate updates
 
@@ -76,18 +76,18 @@ Why this flow exists: collaboration is not only updates to the current variation
 ```mermaid
 flowchart TD
     A[Teammate publishes new variation] --> B[Local user fetches current variation]
-    B --> C{New remote variation visible?}
-    C -- No --> D[Not covered today]
-    D --> E[Need remote variation listing]
-    E --> F[Need adopt/import variation]
+    B --> C{New remote variation fetched?}
+    C -- Yes --> D[remote_variations]
+    D --> E[adopt_remote_variation]
+    C -- No --> F[Need fetch-all or prune diagnostics]
 ```
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered. |
-| Current support | `fetch_remote` and `sync_status` operate on the current variation. `switch_variation` only switches to local variations. |
-| Safety behavior | Current APIs avoid surprising local branch creation, but they also hide teammate-created branches. |
-| Gap | Need `remote_variations`, `fetch_all_variations`, and `adopt_remote_variation` or equivalent. |
+| Covered today? | Partially covered. |
+| Current support | `remote_variations` lists fetched remote-tracking variations, and `adopt_remote_variation` creates a local variation from one. `fetch_remote` and `sync_status` still operate on the current variation. |
+| Safety behavior | Draftline avoids surprising local branch creation; adoption is an explicit call. |
+| Gap | Need `fetch_all_variations` or equivalent broad fetch support, plus stale/prune diagnostics for renamed or deleted remote variations. |
 
 ## Flow 11b: remote variation was deleted or renamed
 
@@ -106,7 +106,7 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Not covered as a business scenario. |
-| Current support | Missing remote refs can be ignored during fetch; current APIs do not expose remote variation lifecycle diagnostics. |
+| Current support | Missing remote refs can be ignored during fetch. `remote_variations` can show fetched remote-tracking refs, but current APIs do not yet expose prune/stale lifecycle diagnostics. |
 | Safety behavior | Draftline does not delete local variations automatically. |
 | Gap | Need prune semantics, stale-ref diagnostics, and user-facing "remote option removed" guidance. |
 
@@ -157,6 +157,6 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | `sync_status` detects `NeedsMerge`; `SyncNeedsMerge` prevents unsafe publish/apply; `MergeOutcome`, `MergeConflict`, `ResolverRegistry`, `PlainTextResolver`, and `MarkdownResolver` model conflict results. |
+| Current support | `sync_status` detects `NeedsMerge`; `SyncNeedsMerge` prevents unsafe publish/apply; `preflight_merge_incoming` reports the diverged state without mutating; `MergeOutcome`, `MergeConflict`, `ResolverRegistry`, `PlainTextResolver`, and `MarkdownResolver` model conflict results. |
 | Safety behavior | Draftline blocks overwrite and routes the user into an explicit merge decision. |
-| Gap | Need public primitives such as `preflight_merge_incoming` and `merge_incoming` that compute merge base, enumerate tree-level conflicts, handle binary/large-file conflicts, and create a safe merged version after conflicts are resolved. Because merge writes files and moves refs, it must use the operation lock, write recovery state, and reuse target-tree collision checks. |
+| Gap | Need public `merge_incoming` execution that computes merge base, enumerates tree-level conflicts, handles binary/large-file conflicts, and creates a safe merged version after conflicts are resolved. Because merge writes files and moves refs, it must use the operation lock, write recovery state, and reuse target-tree collision checks. |

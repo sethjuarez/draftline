@@ -472,9 +472,22 @@ pub struct WorkspaceCapabilities {
     pub switch_variation: bool,
     pub publish_changes: bool,
     pub apply_incoming: bool,
+    /// Stale lock inspection and guarded lock clearing are available.
+    ///
+    /// Operation-specific repair and rollback still return skeleton recovery
+    /// reports and do not mutate workspace state.
     pub stale_lock_repair: bool,
+    /// File-writing operations perform target-tree collision checks where wired.
+    ///
+    /// Current coverage includes switch, restore, apply incoming, and shelf
+    /// apply. This does not imply every future checkout-like operation is wired.
     pub target_tree_collision_preflight: bool,
     pub support_ref_sync: bool,
+    /// A standalone CLI/tool facade is available when this flag is `true`.
+    ///
+    /// Rust JSON helpers exist separately as `inspect_json`,
+    /// `capabilities_json`, and `verify_workspace`; they are not a standalone
+    /// facade.
     pub agent_cli_facade: bool,
 }
 
@@ -998,9 +1011,9 @@ impl Workspace {
             publish_changes: true,
             apply_incoming: true,
             stale_lock_repair: true,
-            target_tree_collision_preflight: false,
+            target_tree_collision_preflight: true,
             support_ref_sync: false,
-            agent_cli_facade: true,
+            agent_cli_facade: false,
         }
     }
 
@@ -5176,9 +5189,9 @@ mod tests {
         assert!(capabilities.publish_changes);
         assert!(capabilities.apply_incoming);
         assert!(capabilities.stale_lock_repair);
-        assert!(!capabilities.target_tree_collision_preflight);
+        assert!(capabilities.target_tree_collision_preflight);
         assert!(!capabilities.support_ref_sync);
-        assert!(capabilities.agent_cli_facade);
+        assert!(!capabilities.agent_cli_facade);
     }
 
     #[test]
