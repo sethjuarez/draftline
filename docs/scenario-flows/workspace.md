@@ -151,7 +151,7 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Covered for basic clone/open and remote variation discovery. |
+| Covered today? | Yes for basic clone/open and fetched remote variation discovery. No for support-ref fetch/list after clone. |
 | Current support | `clone_workspace*` can create a workspace from a remote with host-provided credentials and policy. `remote_variations` lists fetched remote-tracking variations, and `adopt_remote_variation` creates a local variation from one. |
 | Safety behavior | Clone is a read/create operation, but follow-up sync should still fetch before making publish/apply decisions. |
 | Edge cases | Remote variation discovery depends on fetched remote-tracking refs. Support refs may exist remotely without being visible in the normal workspace summary. |

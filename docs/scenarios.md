@@ -23,9 +23,13 @@ See the [Draftline API plan](api-plan.md) for the roadmap from these scenarios t
 | Status | Meaning |
 |---|---|
 | Covered | Existing primitives support the scenario safely. |
+| Covered for `<scope>` | Existing primitives support only the named scope. Anything outside that phrase is not covered unless another row says so. |
 | Partially covered | The safe foundation exists, but the full business workflow still needs one or more primitives or UI steps. |
+| Planning-only | Draftline exposes inspection, preflight, or verification shape, but does not execute the user-visible mutation. |
 | Not covered | The scenario is identified, but Draftline does not yet expose the needed primitive. |
 | Host concern | Draftline exposes the low-level signal; the embedding app owns product copy, UX, auth, or policy decisions. |
+
+Use the narrowest truthful status. Prefer "Covered for all-work shelves" over "Covered" when selected-file shelves, sharing, or conflict-resolution apply are still outside the implementation.
 
 ## Business safety principles
 

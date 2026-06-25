@@ -69,7 +69,7 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered for selected save/shelve; covered for one-file discard and all-work shelves. |
+| Covered today? | No for selected save/shelve. Yes for one-file discard. Yes for all-work shelves only. |
 | Current support | `save_version` saves all tracked dirty files. `SwitchPolicy::Shelve` and `shelve_changes` shelve all tracked dirty files. `discard_file` supports one selected file. |
 | Safety behavior | Current all-or-nothing behavior is simple and predictable, but not granular. Shelves should be local-only by default because they may contain personal unfinished work. |
 | Gap | Need `preflight_save_files`, `save_files`, `shelve_files`, possibly batch `discard_files`, plus an explicit policy if shelved work can ever be shared. |
@@ -173,7 +173,7 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Covered for safe switching and all-work shelf lifecycle. |
+| Covered today? | Yes for full-variation switching with save-first, all-work shelve, or explicit discard-before-switch. No for selected-file switch/shelf. |
 | Correct primitive path | `preflight_switch_variation` -> `switch_variation` with `AbortIfDirty`, `SaveFirst`, or `Shelve`; use shelf APIs to list, preview, apply, or delete shelved work later. |
 | Safety behavior | `SwitchPolicy::Discard` remains unsupported. Dirty work must be saved, shelved, or explicitly discarded before checkout. Unsaved business-content files include modified tracked files and untracked files that match the current content policy. |
 | Edge cases | `SaveFirst` should not be used with unresolved conflicts because it can commit conflict-marker content as the saved state. Switching writes recovery metadata and uses an operation lock. If checkout is interrupted, normal APIs block until recovery is addressed. Switching preflights target-tree collisions with ignored or current-policy-excluded target-path files before checkout. |

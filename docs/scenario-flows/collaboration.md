@@ -62,7 +62,7 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Covered for fast-forward updates. |
+| Covered today? | Yes for current-variation fast-forward updates. No for diverged merge execution or broad remote lifecycle diagnostics. |
 | Correct primitive path | `fetch_remote` -> `preflight_apply_incoming` -> `apply_incoming`. |
 | Safety behavior | Dirty work blocks apply. Diverged history returns `SyncNeedsMerge` instead of overwriting. Fast-forward ref updates roll back if checkout fails. Apply must also avoid target-tree collisions with untracked, ignored, generated, or policy-excluded files. |
 | Edge cases | `preflight_apply_incoming` uses cached remote-tracking state; fetch before preflight for accurate reporting. `apply_incoming` fetches again before applying, so a clean preflight can still fail if the remote changed between preflight and apply. `UpToDate`, `LocalAhead`, and `NoRemoteVersion` return `applied_count: 0`. A remote branch can disappear or be recreated between fetch and apply. |

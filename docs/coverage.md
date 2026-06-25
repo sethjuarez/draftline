@@ -4,6 +4,8 @@
 
 ## Executive scenario coverage
 
+Status values are intentionally narrow. `Covered for <scope>` means only that named scope is implemented; the `Remaining gap` column is still out of scope for current consumers.
+
 | Scenario group | Coverage | Current primitives | Remaining gap |
 |---|---|---|---|
 | Start or open workspace | Covered | `init`, `open`, `clone_workspace`, `workspace_summary` | None for MVP. |
@@ -13,7 +15,7 @@
 | Configure actor identity | Host concern | Commit signatures through workspace configuration | Need explicit identity diagnostics because authorship, audit, and support-ref naming depend on it. |
 | Work local-only before remote exists | Covered | `init`, `open`, local save/variation/history APIs | Publish, apply incoming, and shared support-ref sync are unavailable until a remote is configured. |
 | Add remote after local work exists | Partially covered | `add_remote`, `preflight_publish`, `publish`, `publish_changes` | First publish captures expected remote absence/state, but support-ref sync bootstrap and remote destination confirmation are still missing. |
-| Start from shared remote | Covered for clone/open | `clone_workspace`, `clone_workspace_with_policy_and_options`, `remote_variations`, `adopt_remote_variation` | Need broader fetch-all/prune diagnostics after clone. |
+| Start from shared remote | Covered for clone/open and fetched remote variations | `clone_workspace`, `clone_workspace_with_policy_and_options`, `remote_variations`, `adopt_remote_variation` | Need broader fetch-all/prune diagnostics after clone. |
 | Configure tracked content | Host concern | `ContentPolicy`, `tracks`, `content_policy`, `resolve_path` | Default policy is permissive except `.draftline`; hosts must choose app-specific policy and account for Git ignore rules. |
 | Content policy vs Git ignore rules | Partially covered | Git status plus `ContentPolicy`, `policy_git_diagnostics`, `audit_content_policy` | Current ignored-file warnings exist; attributes/filter/path-normalization/history migration diagnostics remain limited. |
 | Change content policy after saves | Not covered | Runtime `ContentPolicy` only | Need policy migration/redaction model; existing versions are not retroactively filtered. |
@@ -24,12 +26,12 @@
 | Abandon unsaved edits | Covered | `preflight_discard_changes`, `discard_changes`, `preflight_discard_file`, `discard_file` | Switch-time discard remains intentionally unsupported; discard must be a separate explicit action. |
 | Try another direction | Covered | `create_variation`, `create_variation_from`, variation metadata APIs | None for MVP. |
 | Rename or relabel direction | Covered | `set_variation_metadata`, `variation_metadata` | Ref renaming is intentionally not exposed. |
-| Move between directions | Covered for MVP | `preflight_switch_variation`, `switch_variation`, `AbortIfDirty`, `SaveFirst`, `Shelve`, shelf lifecycle APIs | Switching preflights dirty work and target-tree collisions; partial selected-file switch/shelf remains future work. |
+| Move between directions | Covered for full-variation switching | `preflight_switch_variation`, `switch_variation`, `AbortIfDirty`, `SaveFirst`, `Shelve`, shelf lifecycle APIs | Selected-file switch/shelf remains future work. |
 | Review older work | Covered | `history`, `full_history`, `diff_versions`, `preview_version`, `preview_version_file` | None for MVP. |
 | Restore older work | Partially covered | `restore_version_as_new_save` | Restore blocks dirty work and target-tree collisions; current-policy vs old-policy restore planning still needs a richer report. |
 | Target tree collides with local files | Partially covered | Shared `FileHazard` checks in switch, restore, apply incoming, and apply shelf | Ignored and policy-excluded target-path collisions are covered for key file-writing operations; generated, symlink, submodule, case, Unicode, and distinct `Untracked` hazard reporting remain limited. |
 | Publish my work | Partially covered | `fetch_remote`, `sync_status`, `preflight_publish`, `publish`, `publish_changes` | Tokenized publish detects local/remote state changes after preflight; push refspecs still rely on server rejection rather than explicit lease/create-only refspecs. |
-| Receive teammate work | Covered for current-variation fast-forward | `fetch_remote`, `preflight_apply_incoming`, `apply_incoming`, target-tree collision checks | Diverged merge execution and broad remote lifecycle diagnostics are still missing. |
+| Receive teammate work | Covered for current-variation fast-forward only | `fetch_remote`, `preflight_apply_incoming`, `apply_incoming`, target-tree collision checks | Diverged merge execution and broad remote lifecycle diagnostics are still missing. |
 | We both changed the same workspace | Partially covered | `sync_status`, `SyncNeedsMerge`, semantic resolver types, `preflight_merge_incoming` | Public read-only merge preflight exists; no public `merge_incoming` execution workflow yet. |
 | Discover teammate-created variations | Partially covered | `remote_variations`, `adopt_remote_variation` | Listing/adoption exist from fetched remote-tracking refs; fetch-all and stale/prune diagnostics remain missing. |
 | Remote variation deleted or renamed | Not covered | `fetch_remote` ignores missing remote refs | Need prune/stale-ref diagnostics and product messaging. |
@@ -40,14 +42,16 @@
 | Replace shared history | Not covered | Local squash only | Needs explicit replace-remote-history workflow with consent, support-ref publish, and force-with-lease semantics. |
 | Sync hidden recovery support refs | Not covered | Local `refs/draftline/...` refs only; remote delete publishes one support ref as part of that operation | Need general support-ref fetch/publish refspecs for the shared remote. |
 | Recover cleanup after clone/device loss | Partially covered | Local archive listing and `restore_support_ref_as_variation` | Cross-machine recovery still needs shared support-ref sync. |
-| Permanently purge/redact content | Partially covered | `preflight_purge_content`, `verify_purge` | Planning and limitation reporting exist; no destructive `purge_content` execution workflow. |
+| Permanently purge/redact content | Planning-only | `preflight_purge_content`, `verify_purge` | Planning and limitation reporting exist; no destructive `purge_content` execution workflow. |
 | Large or binary business assets | Partially covered | `is_binary`, `is_large`, preview metadata | Need policy for block/warn/stream/external storage. |
 | Out-of-band Git mutation | Partially covered | `NoCurrentVariation`, Git errors, status, `inspect`, `verify_workspace`, `explain_error` | Structured diagnostics exist for common states; repair guidance is still limited. |
 | Recover from interruption | Partially covered | `RecoveryState`, `workspace_summary.recovery`, operation lock, `acknowledge_recovery`, `repair_recovery`, `rollback_recovery` skeletons | Typed repair/rollback entry points report state but do not yet perform operation-specific mutation. |
 | Recover stale operation lock | Partially covered | `inspect_operation_lock`, `clear_stale_lock` | Metadata-based stale lock clearing exists; deeper lock/recovery repair coordination remains limited. |
-| Bring shelved work back | Covered for MVP | `shelve_changes`, `list_shelves`, `preview_shelf`, `preflight_apply_shelf`, `apply_shelf`, `delete_shelf` | Selected-file shelves and conflict-resolution apply remain future work. |
+| Bring shelved work back | Covered for all-work shelves | `shelve_changes`, `list_shelves`, `preview_shelf`, `preflight_apply_shelf`, `apply_shelf`, `delete_shelf` | Selected-file shelves and conflict-resolution apply remain future work. |
 
 ## Detailed primitive coverage
+
+Primitive rows use the same scoped-status rule: if the status names a scope, consuming apps should depend only on that scope.
 
 | Business action | Status | Primitive coverage | Notes |
 |---|---|---|---|
@@ -65,8 +69,8 @@
 | Create option | Covered | `create_variation`, `create_variation_from` | Does not expose detached HEAD. |
 | Label option | Covered | `VariationMetadata`, `set_variation_metadata`, `variation_metadata` | Display metadata does not rename Git refs. |
 | List options | Covered | `variations`, `variation_summaries` | Summary avoids switching variations. |
-| Switch option | Covered for MVP | `preflight_switch_variation`, `switch_variation` | Dirty-work policies and key target-tree collision checks are explicit; selected-file flows remain future work. |
-| Put work aside | Covered for MVP | `SwitchPolicy::Shelve`, `shelve_changes`, `list_shelves`, `preview_shelf`, `preflight_apply_shelf`, `apply_shelf`, `delete_shelf` | All-work shelf lifecycle exists; selected-file shelves and share-shelf policy remain future work. |
+| Switch option | Covered for full-variation switching | `preflight_switch_variation`, `switch_variation` | Dirty-work policies and key target-tree collision checks are explicit; selected-file flows remain future work. |
+| Put work aside | Covered for all-work shelves | `SwitchPolicy::Shelve`, `shelve_changes`, `list_shelves`, `preview_shelf`, `preflight_apply_shelf`, `apply_shelf`, `delete_shelf` | All-work shelf lifecycle exists; selected-file shelves and share-shelf policy remain future work. |
 | Preview old work | Covered | `preview_version`, `preview_version_file` | Read-only. |
 | Compare versions | Covered | `diff_versions`, `diff_version_to_workspace` | Read-only; version-to-version diffs are historical tree comparisons, not policy redaction. |
 | Restore old version | Partially covered | `restore_version_as_new_save` | Append-only restore and target-tree collision checks exist; richer policy-aware old-tree restore planning remains missing. |
@@ -74,10 +78,10 @@
 | Fetch remote state | Covered | `fetch_remote`, `fetch_remote_with_options` | Fetches current variation. |
 | Show sync state | Covered | `sync_status` | Reports ahead/behind and incoming summaries. |
 | Publish | Partially covered | `publish_changes`, `publish_changes_with_options`, `preflight_publish`, `publish` | Tokenized publish captures expected state and rejects changed local/remote state; explicit lease/create-only push mechanics still need tightening. |
-| Get updates | Covered for fast-forward | `preflight_apply_incoming`, `apply_incoming` | Dirty, diverged, and key target-tree collision states block. |
+| Get updates | Covered for current-variation fast-forward only | `preflight_apply_incoming`, `apply_incoming` | Dirty, diverged, and key target-tree collision states block. |
 | Sync recovery support refs | Not covered | Local `refs/draftline/...` only | Needs shared-remote support-ref refspecs, create-only pushes, and remote-tracking layout. |
 | Merge teammate changes | Partially covered | `SyncNeedsMerge`, merge resolver model, `preflight_merge_incoming` | Needs public merge execution workflow. |
-| Apply shelved work | Covered for MVP | `preview_shelf`, `preflight_apply_shelf`, `apply_shelf` | Conflict-resolution apply for dirty/diverged shelf scenarios remains future work. |
+| Apply shelved work | Covered for clean all-work shelf apply | `preview_shelf`, `preflight_apply_shelf`, `apply_shelf` | Conflict-resolution apply for dirty/diverged shelf scenarios remains future work. |
 | Delete local old option | Partially covered | `delete_variation`, `list_support_refs`, `restore_support_ref_as_variation` | Archives first and local restore exists; preflight delete remains missing. |
 | Delete shared old option | Partially covered | `preflight_delete_remote_variation`, `delete_remote_variation` | Archive-first remote delete exists; general support-ref sync and explicit lease/create-only mechanics remain incomplete. |
 | Squash local history | Partially covered | `squash_versions` | Archives first; preflight and restore archive APIs missing. |
