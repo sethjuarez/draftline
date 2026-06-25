@@ -29,6 +29,8 @@ The first crate focuses on an embeddable core:
 
 Ghost publishing, CutReady-specific file formats, UI components, LLM provider logic, and CLI-first workflows are intentionally out of scope for the first pass.
 
+See [Draftline scenarios](docs/scenarios.md) for the business-user flows, Mermaid diagrams, safe primitive mappings, and coverage gaps. See the [Draftline API plan](docs/api-plan.md) for the roadmap from those scenarios to Rust APIs, CLI commands, and agent/tool surfaces.
+
 ## Working vocabulary
 
 Draftline intentionally treats product language as design work, not just renamed Git commands. The current API uses:

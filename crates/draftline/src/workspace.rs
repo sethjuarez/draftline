@@ -919,15 +919,38 @@ impl Workspace {
     /// Deletes an alternate variation.
     pub fn delete_variation(&self, variation: &VariationId) -> Result<()> {
         self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path())?;
         if self.current_variation().ok().as_deref() == Some(variation.as_str()) {
             return Err(DraftlineError::CannotDeleteCurrentVariation(
                 variation.as_str().to_string(),
             ));
         }
 
+        let operation_id = new_operation_id();
+        let mut branch = self
+            .repo
+            .find_branch(variation.as_str(), BranchType::Local)?;
+        let target_oid = branch.get().peel_to_commit()?.id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::DeleteVariation,
+            original_variation: Some(variation.as_str().to_string()),
+            target: Some(target_oid.to_string()),
+            completed: false,
+        })?;
+
+        let archive_ref = archive_ref("deleted-variations", variation.as_str(), &operation_id);
         self.repo
-            .find_branch(variation.as_str(), BranchType::Local)?
-            .delete()?;
+            .reference(&archive_ref, target_oid, false, "archive deleted variation")?;
+        branch.delete()?;
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::DeleteVariation,
+            original_variation: None,
+            target: Some(target_oid.to_string()),
+            completed: true,
+        })?;
         Ok(())
     }
 
@@ -1445,8 +1468,30 @@ impl Workspace {
         // Force the current branch to point at the new squash commit.
         let variation = self.current_variation_unchecked()?;
         let branch_ref = format!("refs/heads/{variation}");
+        let operation_id = new_operation_id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::SquashVersions,
+            original_variation: Some(variation.clone()),
+            target: Some(head_commit.id().to_string()),
+            completed: false,
+        })?;
+        let archive_ref = archive_ref("rewrites/squash", &variation, &operation_id);
+        self.repo.reference(
+            &archive_ref,
+            head_commit.id(),
+            false,
+            "archive pre-squash tip",
+        )?;
         self.repo
             .reference(&branch_ref, oid, true, "squash_versions")?;
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::SquashVersions,
+            original_variation: None,
+            target: Some(oid.to_string()),
+            completed: true,
+        })?;
 
         Ok(version_from_commit(&self.repo.find_commit(oid)?))
     }
@@ -2093,6 +2138,10 @@ fn normalize_optional_metadata(value: String) -> Option<String> {
 
 fn variation_metadata_key(variation: &str, name: &str) -> String {
     format!("branch.{variation}.draftline-{name}")
+}
+
+fn archive_ref(namespace: &str, variation: &str, operation_id: &str) -> String {
+    format!("refs/draftline/{namespace}/{variation}/{operation_id}")
 }
 
 fn read_optional_config(config: &git2::Config, key: &str) -> Result<Option<String>> {
@@ -2942,6 +2991,45 @@ mod tests {
     }
 
     #[test]
+    fn delete_variation_archives_tip_before_removing_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        let variation = workspace.create_variation("alternate").unwrap();
+        workspace
+            .switch_variation(variation.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"alternate only");
+        let alternate_version = workspace.save_version("Alternate only").unwrap();
+        workspace
+            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+
+        workspace.delete_variation(variation.id()).unwrap();
+
+        assert!(workspace
+            .repo
+            .find_branch("alternate", BranchType::Local)
+            .is_err());
+        assert!(workspace
+            .repo
+            .references()
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|reference| {
+                reference
+                    .name()
+                    .map(|name| name.starts_with("refs/draftline/deleted-variations/alternate/"))
+                    .unwrap_or(false)
+                    && reference.target() == Some(alternate_version.id().as_str().parse().unwrap())
+            }));
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
     fn stores_and_lists_variation_display_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
@@ -3737,6 +3825,36 @@ mod tests {
         // workspace files must still reflect v3 content
         let content = std::fs::read_to_string(workspace.root().join("post.md")).unwrap();
         assert_eq!(content, "v3");
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn squash_versions_archives_original_tip_before_rewriting_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let original_tip = workspace.save_version("v3").unwrap();
+
+        workspace.squash_versions(2, "Squashed v2+v3").unwrap();
+
+        assert!(workspace
+            .repo
+            .references()
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|reference| {
+                reference
+                    .name()
+                    .map(|name| name.starts_with("refs/draftline/rewrites/squash/master/"))
+                    .unwrap_or(false)
+                    && reference.target() == Some(original_tip.id().as_str().parse().unwrap())
+            }));
     }
 
     #[test]

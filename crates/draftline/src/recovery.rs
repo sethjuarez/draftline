@@ -19,4 +19,6 @@ pub enum RecoveryOperation {
     ApplyIncoming,
     DiscardChanges,
     DiscardFile,
+    DeleteVariation,
+    SquashVersions,
 }
