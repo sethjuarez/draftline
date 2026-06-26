@@ -216,7 +216,7 @@ impl<'callbacks> RemoteOptions<'callbacks> {
         self.credentials.is_some()
     }
 
-    fn remote_callbacks(&mut self) -> git2::RemoteCallbacks<'_> {
+    pub(crate) fn remote_callbacks(&mut self) -> git2::RemoteCallbacks<'_> {
         let mut callbacks = git2::RemoteCallbacks::new();
 
         if let Some(credentials) = self.credentials.as_mut() {
