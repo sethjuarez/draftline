@@ -1,0 +1,15 @@
+[package]
+name = "draftline-workbench"
+version = "0.1.0"
+description = "Repo-local Tauri workbench for Draftline contract validation."
+edition = "2021"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+draftline = { path = "../../crates/draftline" }
+tauri = { version = "2", features = [] }
+tauri-plugin-auditaur = "0.3.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

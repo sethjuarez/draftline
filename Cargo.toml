@@ -1,10 +1,13 @@
 [workspace]
 members = ["crates/draftline"]
+exclude = ["workbench/src-tauri"]
 resolver = "2"
+
+[workspace.dependencies]
+tracing = "0.1"
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sethjuarez/draftline"
 authors = ["Seth Juarez"]
-

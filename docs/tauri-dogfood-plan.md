@@ -1,6 +1,6 @@
-# Tauri dogfood plan
+# Tauri Workbench plan
 
-Draftline should prove its host-facing contract in a real Tauri application, not only through Rust unit tests. The dogfood goal is an end-to-end harness that exercises Draftline through Tauri commands, React views, real filesystem state, and real remote Git state while Auditaur observes the app.
+Draftline should prove its host-facing contract in a real Tauri application, not only through Rust unit tests. The Workbench goal is an end-to-end harness that exercises Draftline through Tauri commands, React views, real filesystem state, and real remote Git state while Auditaur observes the app.
 
 ## Goals
 
@@ -10,9 +10,11 @@ Draftline should prove its host-facing contract in a real Tauri application, not
 - Turn manual remote/recovery confidence checks into repeatable smoke scenarios.
 - Discover API gaps before exposing reusable npm packages or React views.
 
-## Candidate dogfood app
+## Workbench app
 
-Use an Auditaur-observed Tauri app, potentially Auditaur itself, as the first dogfood host. The app should start through its normal development workflow while Auditaur attaches in observe mode, or through wrapper mode for repeatable smoke runs.
+Use `workbench/` as the repo-local Tauri host for repeatable Draftline validation. Auditaur should observe Workbench runs rather than being the primary host, so Draftline owns a stable UI and command-contract fixture while Auditaur owns timeline, exception, trace, IPC, and bundle observation.
+
+Use `packages/client/` for the typed TypeScript command client over the Workbench/Tauri invoke boundary and `packages/react/` for provider-backed hooks and reusable React components. Keep publishing gated until tarball consumer smoke, command-contract tests, and Workbench bridge runs pass.
 
 ## Harness shape
 
@@ -21,6 +23,27 @@ Use an Auditaur-observed Tauri app, potentially Auditaur itself, as the first do
 3. Run scenarios against disposable local workspaces and a disposable shared remote.
 4. Query Auditaur after each run for exceptions, failed traces, failed IPC calls, and timeline detail.
 5. Save a redacted Auditaur bundle for handoffs when a scenario fails.
+
+## Next confidence phase: contract harness
+
+Start with a dependency-free Rust command adapter that Tauri hosts can wrap with
+`#[tauri::command]`. This keeps Draftline's Rust crate as the source of truth
+for preflight, mutation, verification, and error semantics while giving the
+Workbench app the same JSON/serde boundary that a real Tauri frontend will use.
+
+Initial adapter commands should cover the first repeatable smoke loop:
+
+- `inspect_workspace` returns a dashboard-ready diagnostics payload.
+- `verify_workspace` returns postcondition checks after each scenario.
+- `list_variations` feeds the variation switcher.
+- `list_support_refs` feeds recovery/admin views.
+- `selected_save`, `selected_shelve`, and `selected_discard` exercise selected-file flows.
+- `publish_current_variation` exercises local-to-remote sharing with tokenized publish.
+
+The first React panel should render the adapter output directly: workspace
+summary, dirty files, current variation, remotes, recovery/lock state, support
+refs, safe next actions, and a raw JSON inspector. Avoid reusable npm packaging
+until the command payloads survive Workbench runs.
 
 ## Initial Tauri commands
 
@@ -45,30 +68,29 @@ Use an Auditaur-observed Tauri app, potentially Auditaur itself, as the first do
 - Support-ref list and restore flow.
 - Recovery prompt with repair, rollback, and acknowledge actions.
 - Destructive/shared-history confirmation panel.
-- Raw JSON inspector for command input/output during dogfood.
+- Raw JSON inspector for command input/output during Workbench runs.
 
 ## Auditaur workflow
 
-Prefer attach mode when a developer owns app startup:
+Prefer attach mode when a developer owns app startup. Workbench initializes the Auditaur in-app drive bridge, so selector actions should use the bridge and should not require CDP:
 
 ```powershell
-$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS='--remote-debugging-port=9222'
-auditaur debug --app draftline-dogfood --active --cdp-port 9222 --json watch --until-ready
+auditaur debug --app draftline-workbench --active --require-drive-bridge --require-frontend --json watch --until-ready --timeout-seconds 120
 ```
 
 Prefer wrapper mode for repeatable smoke runs:
 
-```bash
-auditaur debug --app draftline-dogfood --active --cdp-port 9222 --json run --timeout-seconds 180 -- npm run tauri dev
+```powershell
+auditaur debug --app draftline-workbench --active --require-drive-bridge --require-frontend --json run --timeout-seconds 180 -- npm run workbench:dev
 ```
 
 After each scenario, inspect:
 
-```bash
-auditaur exceptions --json
-auditaur traces --failed --json
-auditaur ipc --failed --json
-auditaur bundle --redacted --output auditaur-bundle.json
+```powershell
+auditaur errors --active --json
+auditaur traces --active --json
+auditaur ipc --active --json
+auditaur explain --active --json
 ```
 
 ## Scenario backlog
@@ -84,12 +106,24 @@ auditaur bundle --redacted --output auditaur-bundle.json
 9. Surface operation locks and stale-lock recovery prompts.
 10. Export a redacted Auditaur bundle for a failed scenario.
 
-## Future npm packages
+## Scenario confidence matrix
 
-Once the Tauri command contract stabilizes, split reusable frontend pieces into npm packages:
+| Scenario | Rust/API coverage | Tauri contract coverage | TypeScript/client coverage | React/package coverage | Bridge smoke coverage | Remaining gap |
+|---|---|---|---|---|---|---|
+| Open workspace diagnostics | `scenario_flows.rs` and workspace tests validate summaries, verification, and diagnostics. | `tauri_contract.rs` validates `inspect_workspace` JSON keys and support refs. | `@draftline/client` tests lock command name and request casing. | Provider lifecycle test loads diagnostics/support refs. | Workbench bridge inspect renders package-backed panels. | None for current package boundary. |
+| Selected save/shelve/discard | Rust selected-file APIs and scenario tests validate postconditions. | `selected_save`, `selected_shelve`, `selected_discard` contract tests validate preflight/postcondition DTOs. | Client tests lock selected-operation request casing. | Selected-operation failure test keeps preflight errors visible. | Bridge smoke drove selected save, shelve, and discard through Workbench UI. | Rich selected-file conflict UI remains future work. |
+| Remote fetch/apply | Collaboration scenario validates fast-forward incoming apply. | Contract tests validate `fetch_remote`, `preflight_apply_incoming`, and `apply_incoming`. | Client tests lock remote request casing. | `RemoteSyncBar` test validates fetch/preflight/apply lifecycle and refresh. | Bridge smoke applied teammate work through package-backed Workbench UI. | Broader remote lifecycle diagnostics remain future work. |
+| Clean merge / conflict preflight | Collaboration scenario validates clean merge and conflict preflight without mutation. | Contract tests validate merge success and blocked merge serialized errors. | Client tests lock `merge_incoming` request casing. | Mutation failure tests cover visible error state. | No full bridge merge-conflict UI yet. | User-driven conflict resolution panel remains future work. |
+| Content policy diagnostics | Content-policy scenario tests cover ignored/tracked diagnostics and large/binary signals. | Diagnostics are included in `inspect_workspace`/verification contract payloads. | DTOs expose verification diagnostics and dirty file large/binary fields. | `ContentPolicyDiagnosticsPanel` test renders warning diagnostics. | Workbench renders diagnostics panel after inspect. | Policy migration/redaction remains future work. |
+| Recovery/support refs | Support-ref scenarios cover local and remote-tracking restore paths. | `list_support_refs` contract tests validate local support refs and stable shape. | Client tests lock support-ref command casing. | Provider and inspector tests load and render support refs. | Workbench bridge inspect shows support refs tab. | Remote retention policy remains future work. |
+| Package consumption | N/A | N/A | `npm pack --dry-run` verifies built client exports. | `npm pack --dry-run` verifies built React exports and registry-compatible dependency metadata. | Separate tarball consumer smoke imports both packages outside Workbench. | Actual npm publishing is intentionally gated and not automated. |
 
-- `@draftline/tauri-client`: typed TypeScript client and React hooks over Tauri invokes.
-- `@draftline/react`: reusable React views for diagnostics, recovery, variations, dirty files, and confirmation flows.
-- `@draftline/test-harness`: scenario helpers for dogfood apps and CI smoke runs.
+## npm packages
+
+The current package split is:
+
+- `@draftline/client`: typed TypeScript client over Tauri invokes.
+- `@draftline/react`: provider-backed hooks and reusable React views for diagnostics, recovery, variations, dirty files, remote sync, and command inspection.
+- Future `@draftline/test-harness`: scenario helpers for Workbench-style apps and CI smoke runs.
 
 These packages should remain host-agnostic and treat the Rust crate as the source of truth for safety decisions.

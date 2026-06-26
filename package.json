@@ -1,0 +1,17 @@
+{
+  "name": "draftline-repo",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "workbench"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @draftline/client && npm run build --workspace @draftline/react && npm run build --workspace @draftline/workbench",
+    "client:build": "npm run build --workspace @draftline/client",
+    "package:smoke": "node scripts/package-consumer-smoke.mjs",
+    "react:build": "npm run build --workspace @draftline/react",
+    "test": "npm run test --workspace @draftline/client && npm run test --workspace @draftline/react",
+    "workbench:build": "npm run build --workspace @draftline/workbench",
+    "workbench:dev": "npm run tauri --workspace @draftline/workbench -- dev"
+  }
+}
