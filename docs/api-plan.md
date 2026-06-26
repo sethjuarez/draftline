@@ -179,14 +179,15 @@ Required results:
 | `Workspace::remote_variations(remote)` | List visible variations from the fetched remote-tracking namespace. Implemented. |
 | `Workspace::preflight_adopt_remote_variation(id)` | Plan local adoption of teammate-created work. Not implemented as a separate tokenized preflight. |
 | `Workspace::adopt_remote_variation(remote, id)` | Create a local variation from a remote-tracking variation. Implemented without a separate preflight token. |
-| `Workspace::prune_remote_variations(token)` | Safely update stale remote-tracking state. Not implemented. |
+| `Workspace::fetch_all_variations(remote)` | Fetch and prune all visible remote variation refs. Implemented. |
+| `Workspace::remote_variation_diagnostics(remote)` | Compare local, shared, and remote-only variation refs after fetch/prune. Implemented. |
 
 ### Merge incoming
 
 | API | Purpose |
 |---|---|
-| `Workspace::preflight_merge_incoming()` | Compute merge base, file hazards, and semantic conflicts. |
-| `Workspace::merge_incoming(token, resolutions)` | Write merge result as a new version. |
+| `Workspace::preflight_merge_incoming()` | Compute merge base, file hazards, and semantic conflicts. Implemented. |
+| `Workspace::merge_incoming(token, label)` | Write a clean semantic merge result as a new two-parent version. Implemented for clean merges; explicit conflict resolutions remain future work. |
 
 Merge is file-writing and ref-moving. It must use operation locks, recovery state, target-tree collision preflight, and semantic conflict results.
 
@@ -196,8 +197,13 @@ Shelves are personal work-in-progress by default. Sharing a shelf should be a se
 
 | API | Purpose |
 |---|---|
+| `Workspace::preflight_save_files(paths)` | Partial save plan. |
+| `Workspace::save_files(paths, label)` | Save selected tracked content changes. |
 | `Workspace::shelve_changes(label)` | Put work aside without switching. |
-| `Workspace::preflight_shelve_files(paths)` | Partial shelf plan. |
+| `Workspace::preflight_shelve_files(name, paths)` | Partial shelf plan. |
+| `Workspace::shelve_files(name, paths)` | Put selected tracked content changes aside without switching. |
+| `Workspace::preflight_discard_files(paths)` | Partial discard plan. |
+| `Workspace::discard_files(paths)` | Discard selected tracked content changes. |
 | `Workspace::list_shelves()` | List local shelves. |
 | `Workspace::preview_shelf(id)` | Read-only shelf preview. |
 | `Workspace::preflight_apply_shelf(id)` | Detect conflicts and target-tree collisions. |
@@ -214,10 +220,12 @@ Recovery support refs are hidden from normal views but not private from collabor
 | API | Purpose |
 |---|---|
 | `Workspace::list_support_refs(scope)` | List local and remote-tracking support refs. |
-| `Workspace::publish_support_refs(token)` | Create-only push of recovery support refs. |
-| `Workspace::fetch_support_refs(remote)` | Fetch into a remote-tracking support namespace without overwriting local refs. |
-| `Workspace::preflight_restore_support_ref(id)` | Plan restore as a new visible variation. |
-| `Workspace::restore_support_ref_as_variation(token, name)` | Restore without overwriting existing visible refs. |
+| `Workspace::preflight_publish_support_refs(remote)` | Plan create-only publication of local recovery support refs. Implemented. |
+| `Workspace::publish_support_refs(token)` | Create-only push of recovery support refs. Implemented. |
+| `Workspace::fetch_support_refs(remote)` | Fetch into a remote-tracking support namespace without overwriting local refs. Implemented. |
+| `Workspace::preflight_restore_support_ref(id)` | Plan restore as a new visible variation. Implemented for local and remote-tracking support refs. |
+| `Workspace::restore_support_ref(token)` | Restore without overwriting existing visible refs. Implemented. |
+| `Workspace::restore_support_ref_as_variation(id, name)` | Compatibility restore helper that preflights and executes. Implemented. |
 | `Workspace::preflight_expire_support_refs(ids)` | Retention cleanup preflight. |
 | `Workspace::expire_support_refs(token)` | Delete support refs as retention, not purge. |
 
@@ -233,14 +241,17 @@ Support refs should be:
 
 | API | Purpose |
 |---|---|
-| `Workspace::preflight_delete_variation(id)` | Local delete preflight with archive details. |
-| `Workspace::delete_variation(token)` | Local delete after archive. |
+| `Workspace::preflight_delete_variation(id)` | Local delete preflight with archive details. Implemented. |
+| `Workspace::delete_variation_with_token(token)` | Local delete after archive. Implemented. |
+| `Workspace::delete_variation(id)` | Compatibility helper that preflights and executes. Implemented. |
 | `Workspace::preflight_delete_remote_variation(id)` | Shared delete preflight with expected remote OID and support-ref plan. |
 | `Workspace::delete_remote_variation(token)` | Publish support ref first, then delete visible remote ref by lease. |
-| `Workspace::preflight_squash_versions(count)` | Local squash preflight with archive details. |
-| `Workspace::squash_versions(token)` | Local squash after archive. |
-| `Workspace::preflight_replace_remote_history(id)` | Shared history replacement preflight with consent and support-ref plan. |
-| `Workspace::replace_remote_history(token)` | Lease-protected replacement after shared support ref publication. |
+| `Workspace::preflight_squash_versions(count)` | Local squash preflight with archive details. Implemented. |
+| `Workspace::squash_versions_with_token(token)` | Local squash after archive. Implemented. |
+| `Workspace::squash_versions(count, label)` | Compatibility helper that preflights and executes. Implemented. |
+| `Workspace::preflight_replace_remote_history(remote)` | Current-variation shared history replacement preflight with support-ref plan. Implemented. |
+| `RemoteHistoryReplaceToken::confirm_shared_history_rewrite()` | Explicit confirmation boundary before shared history replacement. Implemented. |
+| `Workspace::replace_remote_history(token)` | Lease-protected replacement after confirmation and shared support ref publication. Implemented. |
 
 Shared visible refs should never be deleted or replaced unless the recovery support ref is durably published to the shared remote.
 
@@ -265,14 +276,19 @@ Draftline should expose the same safety model through CLI or tool calls for codi
 ```text
 draftline inspect --json
 draftline capabilities --json
+draftline verify --json
+draftline explain-error --json <code>
+```
+
+Future mutation/recovery CLI commands:
+
+```text
 draftline preflight <operation> --json
 draftline execute <operation> --operation-id <id> --json
-draftline verify <operation-id|workspace> --json
 draftline recovery diagnose --json
 draftline repair <operation-id> --json
 draftline rollback <operation-id> --json
 draftline clear-stale-lock --token <token> --json
-draftline explain-error <code> --json
 ```
 
 ### Tool shape
@@ -298,11 +314,11 @@ This table tracks the intended API shape and the current implementation state. "
 | 2. Recovery baseline | stale-lock inspection, repair/rollback skeleton, verification | Crashes and interrupted operations have a principled path. | Partial: stale-lock inspection/clear and skeleton repair/rollback reports exist; operation-specific mutation is missing. |
 | 3. Target-tree safety | shared collision preflight wired into switch, restore, apply, shelf apply | File-writing operations stop before clobbering local non-versioned files. | Partial: ignored and policy-excluded target-path hazards are wired for key operations; generated/platform hazards remain. |
 | 4. Remote race safety | publish preflight, expected-OID push, create-only first publish | Normal sharing no longer relies only on fetch-then-push. | Partial: tokenized preflight/publish rejects changed fetched state; push still needs explicit lease/create-only mechanics. |
-| 5. Agent/tool facade | JSON CLI/tool layer over inspect/preflight/execute/verify | Coding agents can use Draftline safely without raw Git. | Partial for Rust JSON helpers; no standalone CLI/tool facade. |
-| 6. Shelf lifecycle | shelve in place, list, preview, apply with conflicts, delete | "Put aside" becomes a complete workflow. | Implemented for all-work shelves; selected-file and conflict-resolution apply remain. |
-| 7. Support refs | publish/fetch/list/restore/expire support refs | Shared recovery works across machines. | Partial locally: list/restore/expire exist; general publish/fetch sync is missing. |
-| 8. Collaboration expansion | remote variation lifecycle and merge incoming | Team workflows cover created/deleted/renamed/diverged variations. | Partial: remote list/adopt and merge preflight exist; prune/stale diagnostics and merge execution are missing. |
-| 9. Shared cleanup | remote delete and shared history replacement | Team cleanup becomes lease-protected and recoverable. | Partial: remote delete exists with support-ref-first ordering; explicit lease mechanics and shared history replacement are missing. |
+| 5. Agent/tool facade | JSON CLI/tool layer over inspect/preflight/execute/verify | Coding agents can use Draftline safely without raw Git. | Partial: Rust JSON helpers and CLI inspect/capabilities/verify/explain-error exist; generic CLI mutation remains. |
+| 6. Shelf lifecycle | shelve in place, list, preview, apply with conflicts, delete | "Put aside" becomes a complete workflow. | Implemented for all-work and selected-file shelves; conflict-resolution apply remains. |
+| 7. Support refs | publish/fetch/list/restore/expire support refs | Shared recovery works across machines. | Implemented for local publish/fetch/list/restore and local expiration; remote retention remains. |
+| 8. Collaboration expansion | remote variation lifecycle and merge incoming | Team workflows cover created/deleted/renamed/diverged variations. | Partial: fetch-all/prune diagnostics, remote list/adopt, merge preflight, and clean merge execution exist; rename inference/conflict execution remain. |
+| 9. Shared cleanup | remote delete and shared history replacement | Team cleanup becomes lease-protected and recoverable. | Implemented for remote delete and current-variation replacement with explicit confirmation plus support-ref-first lease mechanics; broader admin UX remains. |
 | 10. Admin deletion | purge/redaction | Sensitive-content deletion is explicit and best-effort. | Partial planning only: purge preflight and verify exist; destructive execution is missing. |
 
 ## Open design questions

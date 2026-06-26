@@ -80,6 +80,9 @@ pub enum DraftlineError {
     #[error("local publish state changed; expected {expected}, actual {actual}")]
     LocalStateChanged { expected: String, actual: String },
 
+    #[error("operation requires explicit confirmation: {0}")]
+    ConsentRequired(String),
+
     #[error("squash requires at least 2 versions, got {0}")]
     InvalidSquashCount(usize),
 

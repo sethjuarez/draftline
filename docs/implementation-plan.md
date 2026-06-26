@@ -29,16 +29,16 @@ This plan turns the scenario gaps in [coverage and roadmap](coverage.md) and the
 
 **Goal:** make interrupted operations repairable instead of only acknowledgeable.
 
-**Current status:** Partially implemented. Lock metadata, `inspect_operation_lock`, and guarded `clear_stale_lock` exist. `repair_recovery` and `rollback_recovery` are typed skeleton entry points that report the interrupted operation but do not yet perform operation-specific mutations.
+**Current status:** Partially implemented. Lock metadata, `inspect_operation_lock`, and guarded `clear_stale_lock` exist. `repair_recovery` and `rollback_recovery` perform metadata-backed recovery for covered operations and return safe blockers when the ledger lacks enough state.
 
 | Work item | Outcome |
 |---|---|
 | Add lock metadata | Record owner, process identity, operation ID, timestamp, and operation kind. |
 | Add `inspect_operation_lock` | Distinguishes active, stale, unknown, and conflicting lock states. |
-| Add `repair_recovery` and `rollback_recovery` skeletons | Provide operation-specific repair entry points for switch, restore, apply incoming, discard, delete, and squash. |
+| Add `repair_recovery` and `rollback_recovery` | Repair or roll back operations when the ledger captured enough state; report safe blockers for operations that need richer recovery metadata. |
 | Add guarded `clear_stale_lock` | Clears abandoned locks only after diagnostics. |
 
-**Acceptance:** a crash with recovery metadata and/or a stale lock returns actionable repair state instead of leaving the workspace permanently blocked. This is only partially met until repair/rollback execute operation-specific recovery.
+**Acceptance:** a crash with recovery metadata and/or a stale lock returns actionable repair state instead of leaving the workspace permanently blocked. This is partially met: covered operations can be repaired or rolled back, while operations without sufficient ledger metadata still return explicit blockers.
 
 ## Slice 3: target-tree collision preflight
 
@@ -86,74 +86,74 @@ This plan turns the scenario gaps in [coverage and roadmap](coverage.md) and the
 
 **Goal:** close the race between fetch and push.
 
-**Current status:** Partially implemented. `preflight_publish` captures expected remote OID or absence, and tokenized `publish` rejects changed local state or changed remote-tracking state after its final fetch. The actual push still uses normal refspecs rather than explicit lease/create-only push mechanics.
+**Current status:** Implemented for current-variation publish. `preflight_publish` captures expected remote OID or absence, tokenized `publish` rejects changed local state or changed remote-tracking state after its final fetch, and push negotiation enforces expected remote old/new OIDs before upload.
 
 | Work item | Outcome |
 |---|---|
 | Add `preflight_publish` | Captures expected remote ref OID or expected absence, plus remote identity. |
-| Add token-bound `publish` | Fetches again and pushes only if the remote-tracking state still matches the preflight; explicit lease/create-only push refspecs remain future work. |
+| Add token-bound `publish` | Fetches again and pushes only if the remote-tracking state still matches the preflight; push negotiation enforces expected remote old/new OIDs before upload. |
 | Add explicit remote-race results | Distinguishes deleted, recreated, rewound, incoming, diverged, and expected-OID mismatch states. |
 
-**Acceptance:** remote changes detected by the final fetch surface as business-shaped blockers. First publish create-only and normal publish lease semantics are not fully met until the push itself is lease/create-only protected.
+**Acceptance:** remote changes detected by the final fetch surface as business-shaped blockers, and first publish/create-only plus normal publish lease semantics are enforced during push negotiation before upload.
 
 ## Slice 7: support-ref sync and archive recovery
 
 **Goal:** make recovery points for shared work durable across machines without showing them as normal variations.
 
-**Current status:** Partially implemented locally. Local support-ref listing, restoration, and expiration exist. General support-ref publish/fetch sync is not implemented; remote variation delete publishes one operation-specific support ref.
+**Current status:** Implemented for local publish/fetch/restore sync. Local and remote-tracking support-ref listing and restoration exist, and local expiration exists. Support refs can be published with create-only remote updates and fetched into a remote-tracking support-ref layout; remote variation delete and shared history replacement publish support refs before visible remote mutation.
 
 | Work item | Outcome |
 |---|---|
-| Add support-ref listing | Lists local support refs with source variation and target OID. Fetched remote support refs, actor/device, and age remain future work. |
-| Add create-only support-ref publish | Not generally implemented; remote variation delete publishes one support ref before visible deletion. |
-| Add support-ref fetch layout | Not implemented. |
-| Add restore-as-variation | Implemented locally. |
+| Add support-ref listing | Lists local and remote-tracking support refs with source variation and target OID. Actor/device and age remain future work. |
+| Add create-only support-ref publish | Implemented generally through `preflight_publish_support_refs` and `publish_support_refs`; remote variation delete also publishes one support ref before visible deletion. |
+| Add support-ref fetch layout | Implemented with `fetch_support_refs`, fetching into `refs/remotes/<remote>/draftline/...` without overwriting local support refs. |
+| Add restore-as-variation | Implemented for local and remote-tracking support refs through `preflight_restore_support_ref`, `restore_support_ref`, and compatibility `restore_support_ref_as_variation`. |
 
-**Acceptance:** delete/squash recovery points can be listed and restored locally without polluting normal variation views. Cross-machine publish/fetch remains future work.
+**Acceptance:** delete/squash recovery points can be listed and restored without polluting normal variation views, and they can be published/fetched across machines into hidden remote-tracking support refs. Remote retention remains future work.
 
 ## Slice 8: shared cleanup and history replacement
 
 **Goal:** support team-visible delete and history replacement only when shared recovery is durable first.
 
-**Current status:** Partially implemented for remote variation deletion. Shared history replacement is not implemented.
+**Current status:** Implemented for remote variation deletion and current-variation shared history replacement. Replacement tokens require explicit confirmation before execution. Broader admin UX and multi-variation replacement policy remain host/future work.
 
 | Work item | Outcome |
 |---|---|
 | Add `preflight_delete_remote_variation` | Plans archive support ref, support-ref publish, and expected-OID remote deletion. |
-| Add `delete_remote_variation` | Publishes support ref first, then deletes visible remote ref after fetch-and-compare. Explicit lease/create-only push mechanics remain future work. |
-| Add `preflight_replace_remote_history` | Requires consent, replacement details, support-ref plan, and force-with-lease target. |
-| Add `replace_remote_history` | Performs lease-protected history replacement only after support-ref publication succeeds. |
+| Add `delete_remote_variation` | Publishes support ref first with create-only negotiation, then deletes the visible remote ref with expected-OID negotiation after fetch-and-compare. |
+| Add `preflight_replace_remote_history` | Implemented for the current variation with replacement details, support-ref plan, and force-with-lease target. |
+| Add `replace_remote_history` | Implemented: requires explicit token confirmation, publishes support refs first, then performs lease-protected history replacement. |
 
-**Acceptance:** remote variation delete preserves the old tip in a support ref before visible deletion. Shared history replacement and explicit lease/create-only push mechanics remain future work.
+**Acceptance:** remote variation delete and current-variation shared history replacement preserve recovery support refs before visible remote mutation and guard remote pushes with negotiated expectations; shared history replacement also requires explicit token confirmation.
 
 ## Slice 9: collaboration expansion
 
 **Goal:** make collaboration complete beyond current-variation fast-forward.
 
-**Current status:** Partially implemented. `remote_variations`, `adopt_remote_variation`, and `preflight_merge_incoming` exist. Prune/stale diagnostics and merge execution remain missing.
+**Current status:** Partially implemented. `fetch_all_variations`, `remote_variations`, `remote_variation_diagnostics`, `adopt_remote_variation`, `preflight_merge_incoming`, and clean `merge_incoming` execution exist. Rename inference, tokenized adoption, and user-driven conflict resolution remain missing.
 
 | Work item | Outcome |
 |---|---|
 | Add `remote_variations` and adoption | Lets users discover and adopt fetched teammate-created variations. |
-| Add prune/stale remote diagnostics | Explains deleted or renamed remote variations without deleting local work automatically. |
-| Add `preflight_merge_incoming` and `merge_incoming` | `preflight_merge_incoming` exists; `merge_incoming` execution remains future work. |
+| Add prune/stale remote diagnostics | Implemented with fetch-all/prune plus local-only and remote-only variation diagnostics. |
+| Add `preflight_merge_incoming` and `merge_incoming` | Clean semantic merge execution exists; unresolved conflict resolution remains future work. |
 
-**Acceptance:** teammate-created and diverged variation discovery/preflight have explicit product flows. Deleted/renamed remote diagnostics and merge execution remain future work.
+**Acceptance:** teammate-created/deleted and diverged variation discovery/preflight have explicit product flows, and clean diverged merges can be written as two-parent versions. Rename inference and conflict-resolution merge execution remain future work.
 
 ## Slice 10: shelf lifecycle
 
 **Goal:** complete the "put work aside" promise.
 
-**Current status:** Implemented for all-work shelves. Selected-file shelves and semantic conflict-resolution apply remain future work.
+**Current status:** Implemented for all-work and selected-file shelves. Semantic conflict-resolution apply remains future work.
 
 | Work item | Outcome |
 |---|---|
-| Add `shelve_changes` and `preflight_shelve_files` | `shelve_changes` supports all-work shelves; selected-file shelf preflight remains future work. |
+| Add `shelve_changes` and `preflight_shelve_files` | `shelve_changes` supports all-work shelves; `preflight_shelve_files` and `shelve_files` support selected-file shelves. |
 | Add `list_shelves` and `preview_shelf` | Makes shelves discoverable and read-only previewable. |
 | Add `preflight_apply_shelf` and `apply_shelf` | Applies shelves as file-writing operations with dirty-work and collision checks; conflict-resolution apply remains future work. |
 | Add `delete_shelf` and optional `share_shelf` | `delete_shelf` exists; `share_shelf` remains future work if hosts want it. |
 
-**Acceptance:** users can shelve all current work, list, preview, apply, and delete shelves without relying on hidden internal shelf refs.
+**Acceptance:** users can shelve all current work or selected files, list, preview, apply, and delete shelves without relying on hidden internal shelf refs.
 
 ## Slice 11: purge/redaction and retention
 
@@ -173,13 +173,13 @@ This plan turns the scenario gaps in [coverage and roadmap](coverage.md) and the
 
 **Goal:** expose the same safety model to coding agents and automation.
 
-**Current status:** Partially implemented for embedded Rust callers. JSON helpers and stable diagnostic explanations exist. No standalone CLI/tool facade exists, and `WorkspaceCapabilities::agent_cli_facade` reports `false`.
+**Current status:** Partially implemented for embedded Rust callers and a minimal standalone CLI. JSON helpers, stable diagnostic explanations, and `draftline inspect --json`, `capabilities --json`, `verify --json`, and `explain-error --json` exist; generic CLI preflight/execute and recovery commands remain future work.
 
 | Work item | Outcome |
 |---|---|
 | Add JSON result schema | Partially implemented through `inspect_json`, `capabilities_json`, diagnostics, safe next actions, retry class, and stable codes. |
-| Add `draftline inspect`, `capabilities`, `preflight`, `execute`, and `verify` | Not implemented as CLI commands. |
+| Add `draftline inspect`, `capabilities`, `preflight`, `execute`, and `verify` | `inspect`, `capabilities`, and `verify` are implemented as JSON CLI commands; generic `preflight` and `execute` remain future work. |
 | Add recovery commands | Not implemented as CLI commands; Rust recovery helpers exist. |
-| Add `explain-error` | Implemented as a Rust helper. |
+| Add `explain-error` | Implemented as a Rust helper and JSON CLI command. |
 
-**Acceptance:** an embedded Rust agent can inspect, use operation-specific preflights, execute supported operations, verify workspace postconditions, and explain stable codes. CLI/tool agents still need a standalone facade.
+**Acceptance:** an embedded Rust agent can inspect, use operation-specific preflights, execute supported operations, verify workspace postconditions, and explain stable codes. CLI agents can inspect, verify, list capabilities, and explain stable codes; generic CLI mutation remains future work.

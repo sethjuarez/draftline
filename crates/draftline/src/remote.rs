@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use git2::Oid;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
@@ -114,6 +115,13 @@ pub struct RemoteOptions<'callbacks> {
     credentials: Option<Box<RemoteCredentialCallback<'callbacks>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushRefExpectation {
+    pub dst_refname: String,
+    pub expected_old_oid: Option<String>,
+    pub expected_new_oid: Option<String>,
+}
+
 type RemoteCredentialCallback<'callbacks> =
     dyn FnMut(RemoteCredentialRequest<'_>) -> Result<RemoteCredential> + 'callbacks;
 
@@ -155,9 +163,48 @@ impl<'callbacks> RemoteOptions<'callbacks> {
         options
     }
 
-    pub(crate) fn push_options(&mut self) -> git2::PushOptions<'_> {
+    pub(crate) fn push_options_with_expectations(
+        &mut self,
+        expectations: Vec<PushRefExpectation>,
+    ) -> git2::PushOptions<'_> {
+        let mut callbacks = self.remote_callbacks();
+        callbacks.push_negotiation(move |updates| {
+            if updates.len() != expectations.len() {
+                return Err(git2::Error::from_str(
+                    "push negotiated unexpected ref updates",
+                ));
+            }
+
+            for expectation in &expectations {
+                let Some(update) = updates
+                    .iter()
+                    .find(|update| update.dst_refname() == Some(expectation.dst_refname.as_str()))
+                else {
+                    return Err(git2::Error::from_str(&format!(
+                        "push did not negotiate expected ref {}",
+                        expectation.dst_refname
+                    )));
+                };
+
+                if oid_to_option(update.src()) != expectation.expected_old_oid {
+                    return Err(git2::Error::from_str(&format!(
+                        "remote ref {} did not match expected old oid",
+                        expectation.dst_refname
+                    )));
+                }
+
+                if oid_to_option(update.dst()) != expectation.expected_new_oid {
+                    return Err(git2::Error::from_str(&format!(
+                        "remote ref {} did not match expected new oid",
+                        expectation.dst_refname
+                    )));
+                }
+            }
+            Ok(())
+        });
+
         let mut options = git2::PushOptions::new();
-        options.remote_callbacks(self.remote_callbacks());
+        options.remote_callbacks(callbacks);
         options
     }
 
@@ -169,7 +216,7 @@ impl<'callbacks> RemoteOptions<'callbacks> {
         self.credentials.is_some()
     }
 
-    fn remote_callbacks(&mut self) -> git2::RemoteCallbacks<'_> {
+    pub(crate) fn remote_callbacks(&mut self) -> git2::RemoteCallbacks<'_> {
         let mut callbacks = git2::RemoteCallbacks::new();
 
         if let Some(credentials) = self.credentials.as_mut() {
@@ -190,6 +237,14 @@ impl<'callbacks> RemoteOptions<'callbacks> {
         }
 
         callbacks
+    }
+}
+
+fn oid_to_option(oid: Oid) -> Option<String> {
+    if oid.is_zero() {
+        None
+    } else {
+        Some(oid.to_string())
     }
 }
 
@@ -217,6 +272,40 @@ fn credential_to_git(credential: RemoteCredential) -> Result<git2::Cred> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git2::{Repository, Signature};
+
+    fn commit_file(repo: &Repository, path: &str, content: &[u8], message: &str) -> Oid {
+        let workdir = repo.workdir().unwrap();
+        let full_path = workdir.join(path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full_path, content).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(path)).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("Draftline", "draftline@example.invalid").unwrap();
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn converts_username_password_credentials() {
@@ -227,5 +316,48 @@ mod tests {
         .unwrap();
 
         assert!(credential.has_username());
+    }
+
+    #[test]
+    fn push_expectations_reject_create_only_when_remote_ref_exists() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote_dir.path()).unwrap();
+
+        let first_dir = tempfile::tempdir().unwrap();
+        let first_repo = Repository::init(first_dir.path()).unwrap();
+        let first_oid = commit_file(&first_repo, "post.md", b"one", "one");
+        let mut first_remote = first_repo
+            .remote("origin", remote_dir.path().to_str().unwrap())
+            .unwrap();
+        first_remote
+            .push(&["refs/heads/master:refs/heads/master"], None)
+            .unwrap();
+
+        let second_dir = tempfile::tempdir().unwrap();
+        let second_repo = Repository::init(second_dir.path()).unwrap();
+        let second_oid = commit_file(&second_repo, "post.md", b"two", "two");
+        let mut second_remote = second_repo
+            .remote("origin", remote_dir.path().to_str().unwrap())
+            .unwrap();
+        let mut remote_options = RemoteOptions::new();
+        let mut options = remote_options.push_options_with_expectations(vec![PushRefExpectation {
+            dst_refname: "refs/heads/master".to_string(),
+            expected_old_oid: None,
+            expected_new_oid: Some(second_oid.to_string()),
+        }]);
+
+        let error = second_remote
+            .push(&["refs/heads/master:refs/heads/master"], Some(&mut options))
+            .unwrap_err();
+
+        assert!(error.message().contains("did not match expected old oid"));
+        let remote_repo = Repository::open_bare(remote_dir.path()).unwrap();
+        assert_eq!(
+            remote_repo
+                .refname_to_id("refs/heads/master")
+                .unwrap()
+                .to_string(),
+            first_oid.to_string()
+        );
     }
 }
