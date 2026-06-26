@@ -88,4 +88,10 @@ pub enum DraftlineError {
 
     #[error("not enough versions to squash: need {needed}, available {available}")]
     NotEnoughVersionsToSquash { needed: usize, available: usize },
+
+    #[error("invalid contributor identity: {0}")]
+    InvalidContributorIdentity(String),
+
+    #[error("invalid merge resolution: {0}")]
+    InvalidMergeResolution(String),
 }

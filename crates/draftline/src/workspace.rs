@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,9 +14,9 @@ use crate::merge::{MergeConflict, MergeInput, ResolverRegistry};
 use crate::recovery::RecoveryOperation;
 use crate::remote::PushRefExpectation;
 use crate::{
-    path::normalize_workspace_relative, ContentPolicy, Contributor, DraftlineError,
-    PublishPreflight, PublishResult, PublishToken, RecoveryState, RemoteEndpoint, RemoteOptions,
-    RemoteVersionSummary, Result, SyncState, SyncStatus,
+    path::normalize_workspace_relative, ContentPolicy, Contributor, ContributorProfile,
+    DraftlineError, PublishPreflight, PublishResult, PublishToken, RecoveryState, RemoteEndpoint,
+    RemoteOptions, RemoteVersionSummary, Result, SyncState, SyncStatus,
 };
 
 /// A folder-backed content workspace.
@@ -707,7 +707,7 @@ pub struct MergeIncomingReport {
     pub changed_workspace: bool,
 }
 
-/// Opaque token tying merge execution to a clean merge preflight.
+/// Opaque token tying merge execution to a preflighted local/remote/base state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct MergeIncomingToken {
@@ -716,6 +716,51 @@ pub struct MergeIncomingToken {
     pub local_oid: String,
     pub remote_oid: String,
     pub merge_base_oid: String,
+}
+
+/// Explicit user choice for resolving one merge conflict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
+pub enum MergeResolutionChoice {
+    UseOurs,
+    UseTheirs,
+    UseBase,
+    Delete,
+    UseContent { content: String },
+}
+
+/// User-provided resolution for a conflict returned by [`MergeIncomingReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MergeConflictResolution {
+    pub path: PathBuf,
+    pub field_path: Option<String>,
+    pub choice: MergeResolutionChoice,
+}
+
+impl MergeConflictResolution {
+    /// Creates an explicit resolution for a whole-file merge conflict.
+    pub fn new(path: impl Into<PathBuf>, choice: MergeResolutionChoice) -> Self {
+        Self {
+            path: path.into(),
+            field_path: None,
+            choice,
+        }
+    }
+
+    /// Creates an explicit resolution for a semantic conflict at a field path.
+    pub fn with_field_path(
+        path: impl Into<PathBuf>,
+        field_path: impl Into<String>,
+        choice: MergeResolutionChoice,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            field_path: Some(field_path.into()),
+            choice,
+        }
+    }
 }
 
 /// Result of writing a clean incoming merge as a new version.
@@ -1599,10 +1644,24 @@ impl Workspace {
     /// Saves the current workspace content as a named version.
     pub fn save_version(&self, label: impl AsRef<str>) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
-        self.save_version_unchecked(label)
+        self.save_version_unchecked(label, None)
     }
 
-    fn save_version_unchecked(&self, label: impl AsRef<str>) -> Result<Version> {
+    /// Saves the current workspace content using host-supplied attribution.
+    pub fn save_version_with_profile(
+        &self,
+        label: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<Version> {
+        self.ensure_no_pending_recovery()?;
+        self.save_version_unchecked(label, Some(profile))
+    }
+
+    fn save_version_unchecked(
+        &self,
+        label: impl AsRef<str>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Version> {
         let mut index = self.repo.index()?;
 
         for changed in self.changed_files_unchecked()? {
@@ -1616,7 +1675,7 @@ impl Workspace {
 
         let tree_id = index.write_tree()?;
         let tree = self.repo.find_tree(tree_id)?;
-        let signature = self.workspace_signature()?;
+        let (author, committer) = self.workspace_signatures(profile)?;
         let parent = self
             .repo
             .head()
@@ -1627,16 +1686,16 @@ impl Workspace {
         let oid = match parent.as_ref() {
             Some(parent) => self.repo.commit(
                 Some("HEAD"),
-                &signature,
-                &signature,
+                &author,
+                &committer,
                 label.as_ref(),
                 &tree,
                 &[parent],
             )?,
             None => self.repo.commit(
                 Some("HEAD"),
-                &signature,
-                &signature,
+                &author,
+                &committer,
                 label.as_ref(),
                 &tree,
                 &[],
@@ -1667,6 +1726,33 @@ impl Workspace {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        self.save_files_with_optional_profile(paths, label, None)
+    }
+
+    /// Saves only selected tracked content files using host-supplied attribution.
+    pub fn save_files_with_profile<I, P>(
+        &self,
+        paths: I,
+        label: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<Version>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.save_files_with_optional_profile(paths, label, Some(profile))
+    }
+
+    fn save_files_with_optional_profile<I, P>(
+        &self,
+        paths: I,
+        label: impl AsRef<str>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Version>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         self.ensure_no_pending_recovery()?;
         let changed_files = self.selected_changed_files(paths)?;
         if changed_files.is_empty() {
@@ -1677,7 +1763,7 @@ impl Workspace {
 
         let tree_id = self.write_selected_changes_tree(&changed_files)?;
         let tree = self.repo.find_tree(tree_id)?;
-        let signature = self.workspace_signature()?;
+        let (author, committer) = self.workspace_signatures(profile)?;
         let parent = self
             .repo
             .head()
@@ -1688,16 +1774,16 @@ impl Workspace {
         let oid = match parent.as_ref() {
             Some(parent) => self.repo.commit(
                 Some("HEAD"),
-                &signature,
-                &signature,
+                &author,
+                &committer,
                 label.as_ref(),
                 &tree,
                 &[parent],
             )?,
             None => self.repo.commit(
                 Some("HEAD"),
-                &signature,
-                &signature,
+                &author,
+                &committer,
                 label.as_ref(),
                 &tree,
                 &[],
@@ -3172,7 +3258,7 @@ impl Workspace {
                 return Err(DraftlineError::PreflightFailed(Box::new(report)));
             }
             SwitchPolicy::SaveFirst { label } if !report.can_proceed => {
-                self.save_version_unchecked(label)?;
+                self.save_version_unchecked(label, None)?;
             }
             SwitchPolicy::Shelve { name } if !report.can_proceed => {
                 self.shelve_changes_unchecked(name)?;
@@ -3674,7 +3760,7 @@ impl Workspace {
                 &merge_input.remote_commit.tree()?,
             )?;
             conflicts = plan.conflicts;
-            if dirty_files.is_empty() && file_hazards.is_empty() && conflicts.is_empty() {
+            if dirty_files.is_empty() && file_hazards.is_empty() {
                 token = Some(MergeIncomingToken {
                     remote: sync_status.remote.clone(),
                     variation: sync_status.variation.clone(),
@@ -3684,7 +3770,7 @@ impl Workspace {
                 });
             }
         }
-        let can_merge_cleanly = token.is_some();
+        let can_merge_cleanly = token.is_some() && conflicts.is_empty();
 
         Ok(MergeIncomingReport {
             sync_status,
@@ -3703,6 +3789,27 @@ impl Workspace {
         token: MergeIncomingToken,
         label: impl AsRef<str>,
         options: &mut RemoteOptions<'_>,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_incoming_with_optional_profile(token, label, options, None)
+    }
+
+    /// Writes a clean incoming merge as a new two-parent version using host-supplied attribution.
+    pub fn merge_incoming_with_profile(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+        profile: &ContributorProfile,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_incoming_with_optional_profile(token, label, options, Some(profile))
+    }
+
+    fn merge_incoming_with_optional_profile(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+        profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "merge_incoming")?;
@@ -3776,61 +3883,131 @@ impl Workspace {
             ))));
         }
 
-        let operation_id = new_operation_id();
-        self.write_recovery_state(&RecoveryState {
-            operation_id: operation_id.clone(),
-            operation: RecoveryOperation::MergeIncoming,
-            original_variation: Some(variation),
-            target: Some(token.remote_oid.clone()),
-            completed: false,
-        })?;
-
-        let mut index = self.repo.index()?;
-        for change in &plan.files {
-            let full_path = self.root.join(&change.path);
-            match &change.content {
-                Some(content) => {
-                    if let Some(parent) = full_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&full_path, content)?;
-                    index.add_path(&change.path)?;
-                }
-                None => {
-                    remove_workspace_path_if_exists(&full_path)?;
-                    if let Err(error) = index.remove_path(&change.path) {
-                        if error.code() != git2::ErrorCode::NotFound {
-                            return Err(error.into());
-                        }
-                    }
-                }
-            }
-        }
-        index.write()?;
-        let tree_id = index.write_tree()?;
-        let tree = self.repo.find_tree(tree_id)?;
-        let signature = self.workspace_signature()?;
-        let oid = self.repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
+        self.write_incoming_merge_version(
+            variation,
+            token.remote_oid,
+            &merge_input,
             label.as_ref(),
-            &tree,
-            &[&merge_input.local_commit, &merge_input.remote_commit],
+            plan.files,
+            profile,
+        )
+    }
+
+    /// Writes an incoming merge using explicit user-provided conflict resolutions.
+    pub fn merge_incoming_with_resolutions(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        resolutions: impl IntoIterator<Item = MergeConflictResolution>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_incoming_with_resolutions_and_optional_profile(
+            token,
+            label,
+            resolutions,
+            options,
+            None,
+        )
+    }
+
+    /// Writes an incoming merge with explicit resolutions using host-supplied attribution.
+    pub fn merge_incoming_with_resolutions_and_profile(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        resolutions: impl IntoIterator<Item = MergeConflictResolution>,
+        options: &mut RemoteOptions<'_>,
+        profile: &ContributorProfile,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_incoming_with_resolutions_and_optional_profile(
+            token,
+            label,
+            resolutions,
+            options,
+            Some(profile),
+        )
+    }
+
+    fn merge_incoming_with_resolutions_and_optional_profile(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        resolutions: impl IntoIterator<Item = MergeConflictResolution>,
+        options: &mut RemoteOptions<'_>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<MergeIncomingResult> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "merge_incoming_with_resolutions")?;
+        let dirty_files = self.changed_files_unchecked()?;
+        if !dirty_files.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "merge_incoming_with_resolutions",
+                true,
+                dirty_files,
+                Vec::new(),
+                None,
+            ))));
+        }
+
+        let variation = self.current_variation_unchecked()?;
+        let local_oid = self.repo.head()?.peel_to_commit()?.id().to_string();
+        if variation != token.variation || local_oid != token.local_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{}", token.variation, token.local_oid),
+                actual: format!("{variation}@{local_oid}"),
+            });
+        }
+
+        self.fetch_remote_unchecked(&token.remote, options)?;
+        let status = self.sync_status(&token.remote)?;
+        if status.state != SyncState::NeedsMerge {
+            return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
+        }
+        let remote_oid = remote_tracking_oid(&self.repo, &token.remote, &token.variation);
+        if remote_oid.as_deref() != Some(token.remote_oid.as_str()) {
+            return Err(DraftlineError::RemoteRace {
+                remote: token.remote,
+                variation: token.variation,
+                expected: Some(token.remote_oid),
+                actual: remote_oid,
+            });
+        }
+
+        let merge_input = self.merge_input_for_status(&status)?;
+        if merge_input.base_commit.id().to_string() != token.merge_base_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: token.merge_base_oid,
+                actual: merge_input.base_commit.id().to_string(),
+            });
+        }
+
+        let remote_tree = merge_input.remote_commit.tree()?;
+        let file_hazards = self.target_tree_hazards(&remote_tree)?;
+        if !file_hazards.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "merge_incoming_with_resolutions",
+                true,
+                Vec::new(),
+                file_hazards,
+                None,
+            ))));
+        }
+
+        let plan = self.plan_clean_merge(
+            &merge_input.base_commit.tree()?,
+            &merge_input.local_commit.tree()?,
+            &remote_tree,
         )?;
+        let files = self.resolve_merge_plan(plan, resolutions)?;
 
-        self.write_recovery_state(&RecoveryState {
-            operation_id,
-            operation: RecoveryOperation::MergeIncoming,
-            original_variation: None,
-            target: Some(oid.to_string()),
-            completed: true,
-        })?;
-
-        Ok(MergeIncomingResult {
-            version: version_from_commit(&self.repo.find_commit(oid)?),
-            merged_files: plan.files.into_iter().map(|file| file.path).collect(),
-        })
+        self.write_incoming_merge_version(
+            variation,
+            token.remote_oid,
+            &merge_input,
+            label.as_ref(),
+            files,
+            profile,
+        )
     }
 
     /// Applies incoming changes from a remote using a fast-forward when possible.
@@ -4730,6 +4907,16 @@ impl Workspace {
 
     /// Preflights publishing and captures the expected remote OID or absence.
     pub fn preflight_publish(&self, remote: impl AsRef<str>) -> Result<PublishPreflight> {
+        let mut options = RemoteOptions::new();
+        self.preflight_publish_with_options(remote, &mut options)
+    }
+
+    /// Preflights publishing with explicit remote options.
+    pub fn preflight_publish_with_options(
+        &self,
+        remote: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<PublishPreflight> {
         self.ensure_no_pending_recovery()?;
         let report = preflight_report(
             "publish_changes",
@@ -4743,8 +4930,7 @@ impl Workspace {
         }
 
         let remote = remote.as_ref().to_string();
-        let mut options = RemoteOptions::new();
-        self.fetch_remote_unchecked(&remote, &mut options)?;
+        self.fetch_remote_unchecked(&remote, options)?;
         let sync_status = self.sync_status(&remote)?;
         if matches!(
             sync_status.state,
@@ -5359,6 +5545,128 @@ impl Workspace {
         Ok(CleanMergePlan { files, conflicts })
     }
 
+    fn resolve_merge_plan(
+        &self,
+        plan: CleanMergePlan,
+        resolutions: impl IntoIterator<Item = MergeConflictResolution>,
+    ) -> Result<Vec<MergeFileChange>> {
+        let mut resolved_files = plan
+            .files
+            .into_iter()
+            .map(|file| (file.path, file.content))
+            .collect::<BTreeMap<_, _>>();
+        let mut resolutions_by_conflict = BTreeMap::new();
+
+        for resolution in resolutions {
+            let key = (resolution.path.clone(), resolution.field_path.clone());
+            if resolutions_by_conflict.insert(key, resolution).is_some() {
+                return Err(DraftlineError::InvalidMergeResolution(
+                    "duplicate resolution for the same conflict".to_string(),
+                ));
+            }
+        }
+
+        for conflict in &plan.conflicts {
+            let key = (conflict.path.clone(), conflict.field_path.clone());
+            let Some(resolution) = resolutions_by_conflict.remove(&key) else {
+                return Err(DraftlineError::InvalidMergeResolution(format!(
+                    "missing resolution for `{}`",
+                    conflict.path.display()
+                )));
+            };
+            let content = resolved_conflict_content(conflict, &resolution.choice)?;
+            if let Some(existing) = resolved_files.insert(conflict.path.clone(), content.clone()) {
+                if existing != content {
+                    return Err(DraftlineError::InvalidMergeResolution(format!(
+                        "conflicting resolutions for `{}`",
+                        conflict.path.display()
+                    )));
+                }
+            }
+        }
+
+        if let Some(((path, field_path), _)) = resolutions_by_conflict.into_iter().next() {
+            let field = field_path
+                .map(|field| format!(" field `{field}`"))
+                .unwrap_or_default();
+            return Err(DraftlineError::InvalidMergeResolution(format!(
+                "resolution does not match any conflict: `{}`{field}",
+                path.display()
+            )));
+        }
+
+        Ok(resolved_files
+            .into_iter()
+            .map(|(path, content)| MergeFileChange { path, content })
+            .collect())
+    }
+
+    fn write_incoming_merge_version(
+        &self,
+        variation: String,
+        remote_oid: String,
+        merge_input: &IncomingMergeInput<'_>,
+        label: &str,
+        files: Vec<MergeFileChange>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<MergeIncomingResult> {
+        let operation_id = new_operation_id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::MergeIncoming,
+            original_variation: Some(variation),
+            target: Some(remote_oid),
+            completed: false,
+        })?;
+
+        let mut index = self.repo.index()?;
+        for change in &files {
+            let full_path = self.root.join(&change.path);
+            match &change.content {
+                Some(content) => {
+                    if let Some(parent) = full_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&full_path, content)?;
+                    index.add_path(&change.path)?;
+                }
+                None => {
+                    remove_workspace_path_if_exists(&full_path)?;
+                    if let Err(error) = index.remove_path(&change.path) {
+                        if error.code() != git2::ErrorCode::NotFound {
+                            return Err(error.into());
+                        }
+                    }
+                }
+            }
+        }
+        index.write()?;
+        let tree_id = index.write_tree()?;
+        let tree = self.repo.find_tree(tree_id)?;
+        let (author, committer) = self.workspace_signatures(profile)?;
+        let oid = self.repo.commit(
+            Some("HEAD"),
+            &author,
+            &committer,
+            label,
+            &tree,
+            &[&merge_input.local_commit, &merge_input.remote_commit],
+        )?;
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::MergeIncoming,
+            original_variation: None,
+            target: Some(oid.to_string()),
+            completed: true,
+        })?;
+
+        Ok(MergeIncomingResult {
+            version: version_from_commit(&self.repo.find_commit(oid)?),
+            merged_files: files.into_iter().map(|file| file.path).collect(),
+        })
+    }
+
     fn collect_tracked_tree_paths(
         &self,
         tree: &Tree<'_>,
@@ -5409,6 +5717,23 @@ impl Workspace {
             Ok(signature) => Ok(signature),
             Err(_) => Ok(Signature::now("Draftline", "draftline@example.invalid")?),
         }
+    }
+
+    fn workspace_signatures(
+        &self,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<(Signature<'static>, Signature<'static>)> {
+        if let Some(profile) = profile {
+            return Ok((
+                signature_from_contributor(&profile.author)?,
+                signature_from_contributor(&profile.saved_by)?,
+            ));
+        }
+
+        let signature = self.workspace_signature()?;
+        let contributor = contributor_from_signature(&signature);
+        let signature = signature_from_contributor(&contributor)?;
+        Ok((signature.clone(), signature))
     }
 
     fn versions_unchecked(&self) -> Result<Vec<Version>> {
@@ -5750,6 +6075,24 @@ fn contributor_from_signature(signature: &git2::Signature<'_>) -> Contributor {
     }
 }
 
+fn signature_from_contributor(contributor: &Contributor) -> Result<Signature<'static>> {
+    let name = contributor.name.trim();
+    if name.is_empty() {
+        return Err(DraftlineError::InvalidContributorIdentity(
+            "contributor name is required".to_string(),
+        ));
+    }
+
+    let email = contributor
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .unwrap_or("draftline@example.invalid");
+
+    Ok(Signature::now(name, email)?)
+}
+
 fn version_from_commit(commit: &Commit<'_>) -> Version {
     Version {
         id: VersionId::from(commit.id()),
@@ -6016,6 +6359,38 @@ fn merge_blob_contents(
                 }),
         ))
     }
+}
+
+fn resolved_conflict_content(
+    conflict: &MergeConflict,
+    choice: &MergeResolutionChoice,
+) -> Result<Option<Vec<u8>>> {
+    if conflict.field_path.is_some() && !matches!(choice, MergeResolutionChoice::UseContent { .. })
+    {
+        return Err(DraftlineError::InvalidMergeResolution(format!(
+            "semantic conflict `{}` requires full resolved file content",
+            conflict.path.display()
+        )));
+    }
+
+    let selected = match choice {
+        MergeResolutionChoice::UseOurs => conflict.ours.as_deref(),
+        MergeResolutionChoice::UseTheirs => conflict.theirs.as_deref(),
+        MergeResolutionChoice::UseBase => conflict.base.as_deref(),
+        MergeResolutionChoice::Delete => return Ok(None),
+        MergeResolutionChoice::UseContent { content } => {
+            return Ok(Some(content.as_bytes().to_vec()))
+        }
+    };
+
+    selected
+        .map(|content| Some(content.as_bytes().to_vec()))
+        .ok_or_else(|| {
+            DraftlineError::InvalidMergeResolution(format!(
+                "selected content is unavailable for `{}`",
+                conflict.path.display()
+            ))
+        })
 }
 
 fn is_restorable_support_ref(ref_name: &str) -> bool {
@@ -8573,9 +8948,122 @@ mod tests {
         let report = second_workspace.preflight_merge_incoming("origin").unwrap();
 
         assert!(!report.can_merge_cleanly);
-        assert!(report.token.is_none());
         assert_eq!(report.conflicts.len(), 1);
         assert_eq!(report.conflicts[0].path, Path::new("post.md"));
+        assert!(report.token.is_some());
+    }
+
+    #[test]
+    fn merge_incoming_with_resolutions_writes_two_parent_version() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"base");
+        first_workspace.save_version("Base").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_workspace, "Maria", "maria@example.com");
+
+        write_file(first_workspace.root(), "post.md", b"remote");
+        first_workspace.save_version("Remote").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        write_file(second_workspace.root(), "post.md", b"local");
+        second_workspace.save_version("Local").unwrap();
+        second_workspace.fetch_remote("origin").unwrap();
+
+        let report = second_workspace.preflight_merge_incoming("origin").unwrap();
+        let token = report.token.unwrap();
+        let conflict = report.conflicts[0].clone();
+        let mut options = RemoteOptions::new();
+        let result = second_workspace
+            .merge_incoming_with_resolutions(
+                token,
+                "Merge with explicit resolution",
+                [MergeConflictResolution {
+                    path: conflict.path.clone(),
+                    field_path: conflict.field_path.clone(),
+                    choice: MergeResolutionChoice::UseContent {
+                        content: "resolved".to_string(),
+                    },
+                }],
+                &mut options,
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(second_workspace.root().join("post.md")).unwrap(),
+            "resolved"
+        );
+        assert!(result
+            .merged_files
+            .iter()
+            .any(|path| path == Path::new("post.md")));
+        let commit = second_workspace
+            .repo
+            .find_commit(Oid::from_str(result.version.id().as_str()).unwrap())
+            .unwrap();
+        assert_eq!(commit.parent_count(), 2);
+        assert!(second_workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_incoming_with_resolutions_requires_matching_resolution() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let first = tempfile::tempdir().unwrap();
+        let first_workspace = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_workspace, "Seth", "seth@example.com");
+        first_workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_workspace.root(), "post.md", b"base");
+        first_workspace.save_version("Base").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_workspace =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_workspace, "Maria", "maria@example.com");
+
+        write_file(first_workspace.root(), "post.md", b"remote");
+        first_workspace.save_version("Remote").unwrap();
+        first_workspace.publish_changes("origin").unwrap();
+
+        write_file(second_workspace.root(), "post.md", b"local");
+        second_workspace.save_version("Local").unwrap();
+        second_workspace.fetch_remote("origin").unwrap();
+
+        let token = second_workspace
+            .preflight_merge_incoming("origin")
+            .unwrap()
+            .token
+            .unwrap();
+        let mut options = RemoteOptions::new();
+        let error = second_workspace
+            .merge_incoming_with_resolutions(
+                token,
+                "Merge without resolution",
+                Vec::<MergeConflictResolution>::new(),
+                &mut options,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, DraftlineError::InvalidMergeResolution(_)));
+        assert_eq!(
+            fs::read_to_string(second_workspace.root().join("post.md")).unwrap(),
+            "local"
+        );
     }
 
     #[test]

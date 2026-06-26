@@ -1,7 +1,13 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { DraftlineClient, FetchRemoteResult, WorkspaceDiagnostics } from '@draftline/client';
+import type {
+  DraftlineClient,
+  DraftlineEvent,
+  DraftlineEventHandler,
+  FetchRemoteResult,
+  WorkspaceDiagnostics,
+} from '@draftline/client';
 import {
   ChangedFilesList,
   ContentPolicyDiagnosticsPanel,
@@ -37,6 +43,29 @@ describe('@draftline/react', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Support refs' }));
     await screen.findByText(/active support ref/);
     expect(client.inspectWorkspace).toHaveBeenCalledWith(workspacePath);
+    expect(client.listSupportRefs).toHaveBeenCalledWith(workspacePath, 'local');
+  });
+
+  it('refreshes diagnostics when matching Draftline workspace events arrive', async () => {
+    let eventHandler: DraftlineEventHandler | null = null;
+    const unlisten = vi.fn();
+    const client = fakeClient({
+      subscribeWorkspaceEvents: vi.fn(async (handler) => {
+        eventHandler = handler;
+        return unlisten;
+      }),
+    });
+
+    render(
+      <DraftlineProvider client={client} workspacePath={workspacePath}>
+        <RawInspectorPanel />
+      </DraftlineProvider>,
+    );
+
+    await waitFor(() => expect(client.subscribeWorkspaceEvents).toHaveBeenCalledTimes(1));
+    eventHandler?.(workspaceEvent('dirty_changed', 'C:/repo/'));
+
+    await waitFor(() => expect(client.inspectWorkspace).toHaveBeenCalledWith(workspacePath));
     expect(client.listSupportRefs).toHaveBeenCalledWith(workspacePath, 'local');
   });
 
@@ -515,8 +544,40 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
         sync_status: syncStatus,
       },
     })),
+    applyShelf: vi.fn(async () => ({
+      postconditions: { errors: [] },
+      preflight: {
+        can_proceed: true,
+        dirty_files: [],
+        file_hazards: [],
+        shelf: { id: 'shelf', version },
+      },
+      shelf: { id: 'shelf', version },
+    })),
+    auditContentPolicy: vi.fn(async () => ({
+      current_diagnostics: [],
+      historical_out_of_policy_paths: [],
+    })),
+    clearStaleLock: vi.fn(async () => ({ errors: [] })),
+    deleteShelf: vi.fn(async () => ({ postconditions: { errors: [] } })),
+    diffVersionToWorkspace: vi.fn(async () => ({
+      files: [],
+      from_version: version.id,
+      patch: null,
+      to_version: null,
+    })),
+    diffVersions: vi.fn(async () => ({
+      files: [],
+      from_version: version.id,
+      patch: null,
+      to_version: version.id,
+    })),
     fetchRemote: vi.fn(async () => fetchResult),
+    getChanges: vi.fn(async () => ({ files: [] })),
+    getFullHistory: vi.fn(async () => []),
+    getHistory: vi.fn(async () => []),
     inspectWorkspace: vi.fn(async () => fixtureDiagnostics),
+    listShelves: vi.fn(async () => []),
     listSupportRefs: vi.fn(async () => [
       {
         id: 'support-1',
@@ -541,12 +602,31 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
         token: null,
       },
     })),
+    mergeIncomingWithResolutions: vi.fn(async () => ({
+      merge: { merged_files: [], version: version },
+      postconditions: { errors: [] },
+      preflight: {
+        can_merge_cleanly: false,
+        changed_workspace: false,
+        conflicts: [],
+        dirty_files: [],
+        file_hazards: [],
+        sync_status: syncStatus,
+        token: null,
+      },
+    })),
     preflightApplyIncoming: vi.fn(async () => ({
       can_proceed: true,
       dirty_files: [],
       file_hazards: [],
       is_fast_forward: true,
       sync_status: syncStatus,
+    })),
+    preflightApplyShelf: vi.fn(async () => ({
+      can_proceed: true,
+      dirty_files: [],
+      file_hazards: [],
+      shelf: { id: 'shelf', version },
     })),
     preflightMergeIncoming: vi.fn(async () => ({
       can_merge_cleanly: true,
@@ -557,6 +637,9 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
       sync_status: syncStatus,
       token: null,
     })),
+    previewShelf: vi.fn(async () => ({ files: [], id: version.id })),
+    previewVersion: vi.fn(async () => ({ files: [], id: version.id })),
+    previewVersionFile: vi.fn(async () => null),
     publishCurrentVariation: vi.fn(async () => ({
       postconditions: { errors: [] },
       preflight: {
@@ -568,6 +651,24 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
         variation: 'main',
       },
       publish: { published_versions: 1, remote: 'origin', variation: 'main' },
+    })),
+    repairRecovery: vi.fn(async () => ({
+      changed_workspace: false,
+      completed: true,
+      operation: 'repair',
+      operation_id: 'op-1',
+      safe_next_actions: ['normal_work'],
+    })),
+    restoreVersionAsNewSave: vi.fn(async () => ({
+      postconditions: { errors: [] },
+      version,
+    })),
+    rollbackRecovery: vi.fn(async () => ({
+      changed_workspace: false,
+      completed: true,
+      operation: 'rollback',
+      operation_id: 'op-1',
+      safe_next_actions: ['normal_work'],
     })),
     selectedDiscard: vi.fn(async () => ({
       discarded: { files: [] },
@@ -584,8 +685,23 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
       preflight: preflightReport,
       shelf: { id: 'shelf', version },
     })),
+    subscribeWorkspaceEvents: vi.fn(async () => () => undefined),
     verifyWorkspace: vi.fn(async () => fixtureDiagnostics.verification),
     ...overrides,
+  };
+}
+
+function workspaceEvent(kind: DraftlineEvent['kind'], root: string): DraftlineEvent {
+  return {
+    active_variation: 'main',
+    changed_paths: ['post.md'],
+    diagnostics: [],
+    dirty: { files: [], is_dirty: false },
+    kind,
+    recovery: null,
+    sequence: 1,
+    sync: null,
+    workspace_id: { root },
   };
 }
 

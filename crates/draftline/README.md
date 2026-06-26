@@ -85,16 +85,26 @@ The contract includes read-only diagnostics (`inspect_workspace`,
 mutations (`selected_save`, `selected_shelve`, `selected_discard`), and remote
 collaboration commands (`fetch_remote`, `preflight_apply_incoming`,
 `apply_incoming`, `preflight_merge_incoming`, `merge_incoming`,
-`publish_current_variation`). Collaboration commands refresh remote-tracking
-state before reporting preflight results so host UIs can render current
-`SyncState` values and then execute through Draftline's tokenized apply, merge,
-and publish paths.
+`merge_incoming_with_resolutions`, `publish_current_variation`). Collaboration
+commands refresh remote-tracking state before reporting preflight results so host
+UIs can render current `SyncState` values and then execute through Draftline's
+tokenized apply, merge, and publish paths.
+
+Conflicted merge preflight returns conflicts plus a token when the workspace and
+remote heads are safe to merge, while `can_merge_cleanly` remains `false`. Hosts
+should collect explicit user choices and call `merge_incoming_with_resolutions`
+with the preflight token and one `MergeConflictResolution` per conflict. The
+token binds execution to the local, remote, and merge-base commits the user
+reviewed, so stale resolution submissions fail instead of resolving unseen
+remote content. Whole-file choices support `use_ours`, `use_theirs`, `use_base`,
+`delete`, or `use_content`; semantic `field_path` conflicts currently require a
+host-produced `use_content` result for the resolved file.
 
 The Workbench contract intentionally keeps credential handling out of its DTOs for
-now. These remote commands are suitable for local, file, and otherwise
-credential-free remotes; hosts that need private HTTPS or SSH authentication
-should call the underlying workspace APIs with `RemoteOptions` until a
-host-specific credential flow is added.
+now for plain DTOs, but hosts can route commands through
+`DraftlineCommandContext` to configure content policy, host-provided contributor
+attribution, backend-only remote credentials, and redaction-safe workspace
+events in one place.
 
 ```rust,no_run
 use draftline::tauri_contract::{inspect_workspace, WorkspaceRequest};
@@ -109,4 +119,42 @@ fn inspect_workspace_command(
         workspace_path,
     }))
 }
+```
+
+For product hosts, prefer context-aware wrappers:
+
+```rust,no_run
+use draftline::{
+    tauri_contract::{selected_save_with_context, DraftlineCommandContext, SelectedSaveRequest},
+    ContentPolicy, Contributor, ContributorProfile,
+};
+
+let policy = ContentPolicy::new()
+    .include("content")?
+    .exclude(".chats")?
+    .exclude("runtime")?;
+let profile = ContributorProfile::new(
+    Contributor {
+        name: "Product User".to_string(),
+        email: Some("user@example.invalid".to_string()),
+    },
+    Contributor {
+        name: "Draftline Service".to_string(),
+        email: Some("service@example.invalid".to_string()),
+    },
+);
+let mut context = DraftlineCommandContext::new()
+    .with_content_policy(policy)
+    .with_contributor_profile(profile)
+    .with_event_sink(|event| {
+        // Tauri hosts can emit this as `draftline://workspace_event`.
+        let _ = event.sequence;
+    });
+# let request = SelectedSaveRequest {
+#     workspace_path: std::path::PathBuf::from("my-content"),
+#     paths: vec![std::path::PathBuf::from("content/post.md")],
+#     label: "Save".to_string(),
+# };
+let _ = selected_save_with_context(&mut context, request);
+# Ok::<(), draftline::DraftlineError>(())
 ```

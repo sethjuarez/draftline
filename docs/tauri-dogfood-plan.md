@@ -18,7 +18,8 @@ Use `packages/client/` for the typed TypeScript command client over the Workbenc
 
 ## Harness shape
 
-1. Add a small Tauri command adapter over Draftline APIs.
+1. Add a reusable Tauri command adapter context over Draftline APIs so hosts
+   configure content policy, attribution, credentials, and events once.
 2. Add dev-only React views for workspace state and operation flows.
 3. Run scenarios against disposable local workspaces and a disposable shared remote.
 4. Query Auditaur after each run for exceptions, failed traces, failed IPC calls, and timeline detail.
@@ -113,7 +114,7 @@ auditaur explain --active --json
 | Open workspace diagnostics | `scenario_flows.rs` and workspace tests validate summaries, verification, and diagnostics. | `tauri_contract.rs` validates `inspect_workspace` JSON keys and support refs. | `@draftline/client` tests lock command name and request casing. | Provider lifecycle test loads diagnostics/support refs. | Workbench bridge inspect renders package-backed panels. | None for current package boundary. |
 | Selected save/shelve/discard | Rust selected-file APIs and scenario tests validate postconditions. | `selected_save`, `selected_shelve`, `selected_discard` contract tests validate preflight/postcondition DTOs. | Client tests lock selected-operation request casing. | Selected-operation failure test keeps preflight errors visible. | Bridge smoke drove selected save, shelve, and discard through Workbench UI. | Rich selected-file conflict UI remains future work. |
 | Remote fetch/apply | Collaboration scenario validates fast-forward incoming apply. | Contract tests validate `fetch_remote`, `preflight_apply_incoming`, and `apply_incoming`. | Client tests lock remote request casing. | `RemoteSyncBar` test validates fetch/preflight/apply lifecycle and refresh. | Bridge smoke applied teammate work through package-backed Workbench UI. | Broader remote lifecycle diagnostics remain future work. |
-| Clean merge / conflict preflight | Collaboration scenario validates clean merge and conflict preflight without mutation. | Contract tests validate merge success and blocked merge serialized errors. | Client tests lock `merge_incoming` request casing. | Mutation failure tests cover visible error state. | No full bridge merge-conflict UI yet. | User-driven conflict resolution panel remains future work. |
+| Clean merge / conflict execution | Collaboration scenario validates clean merge, conflict preflight, and explicit user resolutions. | Contract tests validate merge success, blocked merge serialized errors, and `merge_incoming_with_resolutions`. | Client tests lock `merge_incoming` and `merge_incoming_with_resolutions` request casing. | Mutation failure tests cover visible error state. | No full bridge merge-conflict UI yet. | Rich per-hunk/per-field resolution UI remains future work. |
 | Content policy diagnostics | Content-policy scenario tests cover ignored/tracked diagnostics and large/binary signals. | Diagnostics are included in `inspect_workspace`/verification contract payloads. | DTOs expose verification diagnostics and dirty file large/binary fields. | `ContentPolicyDiagnosticsPanel` test renders warning diagnostics. | Workbench renders diagnostics panel after inspect. | Policy migration/redaction remains future work. |
 | Recovery/support refs | Support-ref scenarios cover local and remote-tracking restore paths. | `list_support_refs` contract tests validate local support refs and stable shape. | Client tests lock support-ref command casing. | Provider and inspector tests load and render support refs. | Workbench bridge inspect shows support refs tab. | Remote retention policy remains future work. |
 | Package consumption | N/A | N/A | `npm pack --dry-run` verifies built client exports. | `npm pack --dry-run` verifies built React exports and registry-compatible dependency metadata. | Separate tarball consumer smoke imports both packages outside Workbench. | Actual npm publishing is intentionally gated and not automated. |
@@ -127,3 +128,9 @@ The current package split is:
 - Future `@draftline/test-harness`: scenario helpers for Workbench-style apps and CI smoke runs.
 
 These packages should remain host-agnostic and treat the Rust crate as the source of truth for safety decisions.
+
+The stable frontend invalidation channel is `draftline://workspace_event`.
+Payloads carry `workspace_id`, `kind`, `sequence`, `changed_paths`,
+`active_variation`, optional `dirty`, optional `sync`, optional `recovery`, and
+diagnostics. Hosts own filesystem watcher lifecycle and Tauri emission, while
+Draftline owns the event kind and payload schema.

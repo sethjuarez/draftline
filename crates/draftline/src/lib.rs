@@ -77,6 +77,7 @@ pub mod content_policy;
 pub mod error;
 pub mod merge;
 pub mod path;
+pub mod profile;
 pub mod recovery;
 pub mod remote;
 pub mod tauri_contract;
@@ -84,6 +85,7 @@ pub mod workspace;
 
 pub use content_policy::ContentPolicy;
 pub use error::{DraftlineError, Result};
+pub use profile::{AttributionOperation, ContributorProfile, ContributorProvider};
 pub use recovery::{RecoveryOperation, RecoveryState};
 pub use remote::{
     Contributor, PublishPreflight, PublishResult, PublishToken, RemoteCredential,
@@ -93,18 +95,18 @@ pub use remote::{
 pub use workspace::{
     AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult, ChangeKind, ChangeSet,
     ChangedFile, ContentPolicyAudit, DiagnosticCode, DiagnosticSeverity, DirtySummary,
-    ErrorExplanation, FileHazard, FileHazardKind, HistoryEntry, MergeIncomingReport,
-    MergeIncomingResult, MergeIncomingToken, OperationLockInspection, OperationLockMetadata,
-    OperationLockState, OperationLockSummary, PreflightReport, PreviewFile, PurgePreflight,
-    PurgeToken, PurgeVerification, RecoveryRepairResult, RemoteHistoryReplacePreflight,
-    RemoteHistoryReplaceToken, RemoteVariation, RemoteVariationDeletePreflight,
-    RemoteVariationDeleteToken, RemoteVariationDiagnostics, RetryClass, SafeNextAction,
-    SharingMode, Shelf, ShelfApplyReport, SquashVersionsPreflight, SquashVersionsToken, SupportRef,
-    SupportRefExpirationPreflight, SupportRefExpirationToken, SupportRefKind,
-    SupportRefPublishItem, SupportRefPublishPreflight, SupportRefPublishToken,
-    SupportRefRestorePreflight, SupportRefRestoreToken, SupportRefScope, SupportRefSummary,
-    SwitchPolicy, Variation, VariationDeletePreflight, VariationDeleteToken, VariationId,
-    VariationMetadata, VariationSummary, Version, VersionDiff, VersionId, VersionPreview,
-    Workspace, WorkspaceCapabilities, WorkspaceDiagnostic, WorkspaceId, WorkspaceInspection,
-    WorkspaceSummary, WorkspaceVerification,
+    ErrorExplanation, FileHazard, FileHazardKind, HistoryEntry, MergeConflictResolution,
+    MergeIncomingReport, MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice,
+    OperationLockInspection, OperationLockMetadata, OperationLockState, OperationLockSummary,
+    PreflightReport, PreviewFile, PurgePreflight, PurgeToken, PurgeVerification,
+    RecoveryRepairResult, RemoteHistoryReplacePreflight, RemoteHistoryReplaceToken,
+    RemoteVariation, RemoteVariationDeletePreflight, RemoteVariationDeleteToken,
+    RemoteVariationDiagnostics, RetryClass, SafeNextAction, SharingMode, Shelf, ShelfApplyReport,
+    SquashVersionsPreflight, SquashVersionsToken, SupportRef, SupportRefExpirationPreflight,
+    SupportRefExpirationToken, SupportRefKind, SupportRefPublishItem, SupportRefPublishPreflight,
+    SupportRefPublishToken, SupportRefRestorePreflight, SupportRefRestoreToken, SupportRefScope,
+    SupportRefSummary, SwitchPolicy, Variation, VariationDeletePreflight, VariationDeleteToken,
+    VariationId, VariationMetadata, VariationSummary, Version, VersionDiff, VersionId,
+    VersionPreview, Workspace, WorkspaceCapabilities, WorkspaceDiagnostic, WorkspaceId,
+    WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
 };

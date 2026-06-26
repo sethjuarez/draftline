@@ -24,6 +24,25 @@ describe('createDraftlineClient', () => {
       remote: 'origin',
       label: 'Merge incoming',
     });
+    await client.mergeIncomingWithResolutions({
+      workspace_path: 'C:\\repo',
+      remote: 'origin',
+      label: 'Merge resolved',
+      token: {
+        remote: 'origin',
+        variation: 'main',
+        local_oid: 'local',
+        remote_oid: 'remote',
+        merge_base_oid: 'base',
+      },
+      resolutions: [
+        {
+          path: 'post.md',
+          field_path: null,
+          choice: { kind: 'use_content', content: 'resolved' },
+        },
+      ],
+    });
     await client.selectedSave({
       workspace_path: 'C:\\repo',
       paths: ['post.md'],
@@ -53,19 +72,40 @@ describe('createDraftlineClient', () => {
     expect(invoke).toHaveBeenNthCalledWith(4, 'merge_incoming', {
       request: { workspace_path: 'C:\\repo', remote: 'origin', label: 'Merge incoming' },
     });
-    expect(invoke).toHaveBeenNthCalledWith(5, 'selected_save', {
+    expect(invoke).toHaveBeenNthCalledWith(5, 'merge_incoming_with_resolutions', {
+      request: {
+        workspace_path: 'C:\\repo',
+        remote: 'origin',
+        label: 'Merge resolved',
+        token: {
+          remote: 'origin',
+          variation: 'main',
+          local_oid: 'local',
+          remote_oid: 'remote',
+          merge_base_oid: 'base',
+        },
+        resolutions: [
+          {
+            path: 'post.md',
+            field_path: null,
+            choice: { kind: 'use_content', content: 'resolved' },
+          },
+        ],
+      },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(6, 'selected_save', {
       request: { workspace_path: 'C:\\repo', paths: ['post.md'], label: 'Save post' },
     });
-    expect(invoke).toHaveBeenNthCalledWith(6, 'selected_shelve', {
+    expect(invoke).toHaveBeenNthCalledWith(7, 'selected_shelve', {
       request: { workspace_path: 'C:\\repo', paths: ['post.md'], name: 'post-shelf' },
     });
-    expect(invoke).toHaveBeenNthCalledWith(7, 'selected_discard', {
+    expect(invoke).toHaveBeenNthCalledWith(8, 'selected_discard', {
       request: { workspace_path: 'C:\\repo', paths: ['post.md'] },
     });
-    expect(invoke).toHaveBeenNthCalledWith(8, 'publish_current_variation', {
+    expect(invoke).toHaveBeenNthCalledWith(9, 'publish_current_variation', {
       request: { workspace_path: 'C:\\repo', remote: 'origin' },
     });
-    expect(invoke).toHaveBeenNthCalledWith(9, 'list_support_refs', {
+    expect(invoke).toHaveBeenNthCalledWith(10, 'list_support_refs', {
       request: { workspace_path: 'C:\\repo', scope: 'local' },
     });
   });
@@ -93,8 +133,118 @@ describe('createDraftlineClient', () => {
     expect(start).toHaveBeenCalledWith('inspect_workspace', {
       request: { workspace_path: 'C:\\repo' },
     });
+
     expect(success).toHaveBeenCalledWith('inspect_workspace', fixtureDiagnostics);
     expect(error).toHaveBeenCalledWith('verify_workspace', failure);
+  });
+
+  it('invokes expanded Draftline command coverage with stable request DTO casing', async () => {
+    const invoke = vi.fn<DraftlineInvoke>(async () => ({ ok: true }) as never);
+    const client = createDraftlineClient({ invoke });
+    const versionId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const versionRequest = { workspace_path: 'C:\\repo', version_id: versionId };
+    const shelfRequest = { workspace_path: 'C:\\repo', shelf_id: 'draft-shelf' };
+    const recoveryRequest = { workspace_path: 'C:\\repo', operation_id: 'op-1' };
+
+    await client.getChanges('C:\\repo');
+    await client.getHistory('C:\\repo');
+    await client.getFullHistory('C:\\repo');
+    await client.diffVersions({
+      workspace_path: 'C:\\repo',
+      from_version_id: versionId,
+      to_version_id: versionId,
+    });
+    await client.diffVersionToWorkspace(versionRequest);
+    await client.previewVersion(versionRequest);
+    await client.previewVersionFile({ ...versionRequest, path: 'post.md' });
+    await client.restoreVersionAsNewSave({ ...versionRequest, label: 'Restore' });
+    await client.listShelves('C:\\repo');
+    await client.previewShelf(shelfRequest);
+    await client.preflightApplyShelf(shelfRequest);
+    await client.applyShelf(shelfRequest);
+    await client.deleteShelf(shelfRequest);
+    await client.auditContentPolicy('C:\\repo');
+    await client.clearStaleLock('C:\\repo');
+    await client.repairRecovery(recoveryRequest);
+    await client.rollbackRecovery(recoveryRequest);
+
+    expect(invoke).toHaveBeenCalledWith('get_changes', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_history', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_full_history', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('diff_versions', {
+      request: {
+        workspace_path: 'C:\\repo',
+        from_version_id: versionId,
+        to_version_id: versionId,
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('diff_version_to_workspace', { request: versionRequest });
+    expect(invoke).toHaveBeenCalledWith('preview_version', { request: versionRequest });
+    expect(invoke).toHaveBeenCalledWith('preview_version_file', {
+      request: { ...versionRequest, path: 'post.md' },
+    });
+    expect(invoke).toHaveBeenCalledWith('restore_version_as_new_save', {
+      request: { ...versionRequest, label: 'Restore' },
+    });
+    expect(invoke).toHaveBeenCalledWith('list_shelves', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('preview_shelf', { request: shelfRequest });
+    expect(invoke).toHaveBeenCalledWith('preflight_apply_shelf', { request: shelfRequest });
+    expect(invoke).toHaveBeenCalledWith('apply_shelf', { request: shelfRequest });
+    expect(invoke).toHaveBeenCalledWith('delete_shelf', { request: shelfRequest });
+    expect(invoke).toHaveBeenCalledWith('audit_content_policy', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('clear_stale_lock', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('repair_recovery', { request: recoveryRequest });
+    expect(invoke).toHaveBeenCalledWith('rollback_recovery', { request: recoveryRequest });
+  });
+
+  it('subscribes to the stable Draftline workspace event channel', async () => {
+    const unlisten = vi.fn();
+    const listen = vi.fn(async (_event, handler) => {
+      handler({
+        payload: {
+          active_variation: 'main',
+          changed_paths: ['post.md'],
+          diagnostics: [],
+          dirty: { files: [], is_dirty: false },
+          kind: 'history_changed',
+          recovery: null,
+          sequence: 7,
+          sync: null,
+          workspace_id: { root: 'C:/repo/' },
+        },
+      });
+      return unlisten;
+    });
+    const handler = vi.fn();
+    const client = createDraftlineClient({
+      invoke: vi.fn<DraftlineInvoke>(async () => fixtureDiagnostics as never),
+      listen,
+    });
+
+    const unsubscribe = await client.subscribeWorkspaceEvents(handler);
+    unsubscribe();
+
+    expect(listen).toHaveBeenCalledWith('draftline://workspace_event', expect.any(Function));
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        changed_paths: ['post.md'],
+        kind: 'history_changed',
+        sequence: 7,
+      }),
+    );
+    expect(unlisten).toHaveBeenCalled();
   });
 });
 

@@ -2,13 +2,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use draftline::tauri_contract::{
-    apply_incoming, fetch_remote, inspect_workspace, into_tauri_result, list_support_refs,
-    list_variations, merge_incoming, preflight_apply_incoming, preflight_merge_incoming,
-    publish_current_variation, selected_discard, selected_save, selected_shelve, verify_workspace,
-    ListSupportRefsRequest, MergeIncomingRequest, PublishCurrentVariationRequest, RemoteRequest,
-    SelectedDiscardRequest, SelectedSaveRequest, SelectedShelveRequest, WorkspaceRequest,
+    apply_incoming, apply_shelf, audit_content_policy, diff_version_to_workspace, diff_versions,
+    fetch_remote, get_changes, get_full_history, get_history, inspect_workspace, into_tauri_result,
+    list_shelves, list_support_refs, list_variations, merge_incoming,
+    merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
+    preflight_apply_incoming, preflight_apply_shelf, preflight_merge_incoming, preview_shelf,
+    preview_version, preview_version_file, publish_current_variation, restore_version_as_new_save,
+    selected_discard, selected_save, selected_save_with_context, selected_shelve, verify_workspace,
+    DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind, ListSupportRefsRequest,
+    MergeIncomingRequest, MergeIncomingWithResolutionsRequest, PreviewVersionFileRequest,
+    PublishCurrentVariationRequest, RemoteRequest, RestoreVersionRequest, SelectedDiscardRequest,
+    SelectedSaveRequest, SelectedShelveRequest, ShelfRequest, VersionRequest, WorkspaceRequest,
 };
-use draftline::{SupportRefScope, SyncState, Workspace};
+use draftline::{
+    ContentPolicy, Contributor, ContributorProfile, MergeConflictResolution, MergeResolutionChoice,
+    SupportRefScope, SyncState, Workspace,
+};
 use serde_json::Value;
 
 fn write_file(root: &Path, relative: &str, content: &[u8]) {
@@ -278,6 +287,96 @@ fn tauri_contract_smokes_selected_file_operations() {
 }
 
 #[test]
+fn tauri_contract_smokes_history_preview_restore_shelf_and_policy_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"# Base");
+    let base = workspace.save_version("Base").unwrap();
+    write_file(workspace.root(), "post.md", b"# Second");
+    let second = workspace.save_version("Second").unwrap();
+
+    let workspace_request = WorkspaceRequest {
+        workspace_path: temp.path().to_path_buf(),
+    };
+    let changes = get_changes(workspace_request.clone()).unwrap();
+    assert!(changes.files.is_empty());
+    assert_eq!(get_history(workspace_request.clone()).unwrap().len(), 2);
+    assert_eq!(
+        get_full_history(workspace_request.clone()).unwrap().len(),
+        2
+    );
+
+    let diff = diff_versions(DiffVersionsRequest {
+        workspace_path: temp.path().to_path_buf(),
+        from_version_id: base.id().as_str().to_string(),
+        to_version_id: second.id().as_str().to_string(),
+    })
+    .unwrap();
+    assert_eq!(diff.files[0].path, PathBuf::from("post.md"));
+
+    write_file(workspace.root(), "post.md", b"# Workspace");
+    let workspace_diff = diff_version_to_workspace(VersionRequest {
+        workspace_path: temp.path().to_path_buf(),
+        version_id: second.id().as_str().to_string(),
+    })
+    .unwrap();
+    assert_eq!(workspace_diff.to_version, None);
+    fs::write(workspace.root().join("post.md"), b"# Second").unwrap();
+
+    let preview = preview_version(VersionRequest {
+        workspace_path: temp.path().to_path_buf(),
+        version_id: second.id().as_str().to_string(),
+    })
+    .unwrap();
+    assert_eq!(preview.files.len(), 1);
+    let preview_file = preview_version_file(PreviewVersionFileRequest {
+        workspace_path: temp.path().to_path_buf(),
+        version_id: second.id().as_str().to_string(),
+        path: PathBuf::from("post.md"),
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(preview_file.content.as_deref(), Some("# Second"));
+
+    let restored = restore_version_as_new_save(RestoreVersionRequest {
+        workspace_path: temp.path().to_path_buf(),
+        version_id: base.id().as_str().to_string(),
+        label: "Restore base".to_string(),
+    })
+    .unwrap();
+    assert_eq!(restored.version.label, "Restore base");
+    assert!(restored.postconditions.errors.is_empty());
+
+    write_file(workspace.root(), "shelf.md", b"temporary");
+    workspace.shelve_changes("temporary-shelf").unwrap();
+    let shelves = list_shelves(workspace_request.clone()).unwrap();
+    assert_eq!(shelves[0].id, "temporary-shelf");
+    let shelf_request = ShelfRequest {
+        workspace_path: temp.path().to_path_buf(),
+        shelf_id: "temporary-shelf".to_string(),
+    };
+    let shelf_preview = preview_shelf(shelf_request.clone()).unwrap();
+    assert!(shelf_preview
+        .files
+        .iter()
+        .any(|file| file.path == Path::new("shelf.md")));
+    let shelf_preflight = preflight_apply_shelf(shelf_request.clone()).unwrap();
+    assert!(shelf_preflight.can_proceed);
+    let applied = apply_shelf(shelf_request.clone()).unwrap();
+    assert_eq!(applied.shelf.id, "temporary-shelf");
+    assert!(applied.postconditions.errors.is_empty());
+    workspace.discard_changes().unwrap();
+
+    let deleted = draftline::tauri_contract::delete_shelf(shelf_request).unwrap();
+    assert!(deleted.postconditions.errors.is_empty());
+    assert!(audit_content_policy(workspace_request)
+        .unwrap()
+        .historical_out_of_policy_paths
+        .is_empty());
+}
+
+#[test]
 fn tauri_contract_smokes_publish_current_variation() {
     let remote_dir = tempfile::tempdir().unwrap();
     git2::Repository::init_bare(remote_dir.path()).unwrap();
@@ -419,6 +518,134 @@ fn tauri_contract_smokes_collaboration_incoming_and_merge() {
 }
 
 #[test]
+fn tauri_contract_smokes_merge_incoming_with_resolutions() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    git2::Repository::init_bare(remote_dir.path()).unwrap();
+
+    let author_dir = tempfile::tempdir().unwrap();
+    let author = Workspace::init(author_dir.path()).unwrap();
+    configure_identity(author.root());
+    write_file(author.root(), "shared.md", b"base");
+    author.save_version("Base").unwrap();
+    author
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    author.publish_changes("origin").unwrap();
+
+    let teammate_dir = tempfile::tempdir().unwrap();
+    let teammate =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), teammate_dir.path())
+            .unwrap();
+    configure_identity(teammate.root());
+
+    write_file(author.root(), "shared.md", b"ours");
+    author.save_version("Author local update").unwrap();
+    write_file(teammate.root(), "shared.md", b"theirs");
+    teammate.save_version("Teammate update").unwrap();
+    teammate.publish_changes("origin").unwrap();
+
+    let remote_request = RemoteRequest {
+        workspace_path: author_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+    };
+    let preflight = preflight_merge_incoming(remote_request).unwrap();
+    assert_eq!(preflight.sync_status.state, SyncState::NeedsMerge);
+    assert!(!preflight.can_merge_cleanly);
+    assert_eq!(preflight.conflicts.len(), 1);
+    assert!(preflight.token.is_some());
+
+    let profile = ContributorProfile::new(
+        Contributor {
+            name: "Profile Author".to_string(),
+            email: Some("author@example.invalid".to_string()),
+        },
+        Contributor {
+            name: "Profile Service".to_string(),
+            email: Some("service@example.invalid".to_string()),
+        },
+    );
+    let mut context = DraftlineCommandContext::new().with_contributor_profile(profile);
+    let merged = merge_incoming_with_resolutions_with_context(
+        &mut context,
+        MergeIncomingWithResolutionsRequest {
+            workspace_path: author_dir.path().to_path_buf(),
+            remote: "origin".to_string(),
+            label: "Resolved merge".to_string(),
+            token: preflight.token.clone().unwrap(),
+            resolutions: vec![MergeConflictResolution::new(
+                preflight.conflicts[0].path.clone(),
+                MergeResolutionChoice::UseContent {
+                    content: "resolved".to_string(),
+                },
+            )],
+        },
+    )
+    .unwrap();
+
+    assert_eq!(merged.merge.version.label, "Resolved merge");
+    assert_eq!(merged.merge.version.author.name, "Profile Author");
+    assert_eq!(merged.merge.version.saved_by.name, "Profile Service");
+    assert_eq!(read_file(author.root(), "shared.md"), "resolved");
+    assert!(merged.postconditions.errors.is_empty());
+}
+
+#[test]
+fn tauri_contract_rejects_stale_merge_resolution_token() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    git2::Repository::init_bare(remote_dir.path()).unwrap();
+
+    let author_dir = tempfile::tempdir().unwrap();
+    let author = Workspace::init(author_dir.path()).unwrap();
+    configure_identity(author.root());
+    write_file(author.root(), "shared.md", b"base");
+    author.save_version("Base").unwrap();
+    author
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    author.publish_changes("origin").unwrap();
+
+    let teammate_dir = tempfile::tempdir().unwrap();
+    let teammate =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), teammate_dir.path())
+            .unwrap();
+    configure_identity(teammate.root());
+
+    write_file(author.root(), "shared.md", b"ours");
+    author.save_version("Author local update").unwrap();
+    write_file(teammate.root(), "shared.md", b"theirs");
+    teammate.save_version("Teammate update").unwrap();
+    teammate.publish_changes("origin").unwrap();
+
+    let remote_request = RemoteRequest {
+        workspace_path: author_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+    };
+    let preflight = preflight_merge_incoming(remote_request).unwrap();
+    let stale_token = preflight.token.clone().unwrap();
+
+    write_file(teammate.root(), "shared.md", b"new theirs");
+    teammate.save_version("Teammate second update").unwrap();
+    teammate.publish_changes("origin").unwrap();
+
+    let error = into_tauri_result(merge_incoming_with_resolutions(
+        MergeIncomingWithResolutionsRequest {
+            workspace_path: author_dir.path().to_path_buf(),
+            remote: "origin".to_string(),
+            label: "Stale resolved merge".to_string(),
+            token: stale_token,
+            resolutions: vec![MergeConflictResolution::new(
+                preflight.conflicts[0].path.clone(),
+                MergeResolutionChoice::UseTheirs,
+            )],
+        },
+    ))
+    .unwrap_err();
+
+    assert_eq!(error.code, "remote_race");
+    assert_eq!(read_file(author.root(), "shared.md"), "ours");
+}
+
+#[test]
 fn tauri_contract_serializes_errors_for_frontend_calls() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::init(temp.path()).unwrap();
@@ -439,4 +666,66 @@ fn tauri_contract_serializes_errors_for_frontend_calls() {
     assert!(json["message"].as_str().unwrap().contains("preflight"));
     assert_eq!(json["details"]["operation"], "save_files");
     assert_eq!(json["details"]["can_proceed"], false);
+}
+
+#[test]
+fn tauri_contract_context_applies_policy_profile_and_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "content/post.md", b"# Base");
+    write_file(workspace.root(), ".chats/transcript.json", b"{}");
+    workspace.save_version("Base").unwrap();
+
+    write_file(workspace.root(), "content/post.md", b"# Edited");
+    write_file(
+        workspace.root(),
+        ".chats/transcript.json",
+        b"{\"runtime\":true}",
+    );
+
+    let profile = ContributorProfile::new(
+        Contributor {
+            name: "Product Author".to_string(),
+            email: Some("author@example.invalid".to_string()),
+        },
+        Contributor {
+            name: "Draftline Service".to_string(),
+            email: Some("service@example.invalid".to_string()),
+        },
+    );
+    let policy = ContentPolicy::new()
+        .include("content")
+        .unwrap()
+        .exclude(".chats")
+        .unwrap();
+    let mut events = Vec::new();
+
+    let saved = {
+        let mut context = DraftlineCommandContext::new()
+            .with_content_policy(policy)
+            .with_contributor_profile(profile)
+            .with_event_sink(|event| events.push(event));
+
+        selected_save_with_context(
+            &mut context,
+            SelectedSaveRequest {
+                workspace_path: temp.path().to_path_buf(),
+                paths: vec![PathBuf::from("content/post.md")],
+                label: "Profile save".to_string(),
+            },
+        )
+        .unwrap()
+    };
+
+    assert_eq!(saved.version.author.name, "Product Author");
+    assert_eq!(saved.version.saved_by.name, "Draftline Service");
+    assert_eq!(
+        saved.postconditions.remaining_changes.unwrap().files.len(),
+        0
+    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, DraftlineEventKind::HistoryChanged);
+    assert_eq!(events[0].sequence, 1);
+    assert!(events[0].changed_paths.is_empty());
 }
