@@ -1,0 +1,78 @@
+name: Publish npm packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_publish:
+        description: "Type publish to publish @draftline/client and @draftline/react"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Test and publish npm packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Confirm publish intent
+        run: |
+          if [ "${{ inputs.confirm_publish }}" != "publish" ]; then
+            echo "Refusing to publish without confirm_publish=publish"
+            exit 1
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test packages
+        run: npm test
+
+      - name: Build packages
+        run: npm run build
+
+      - name: Package consumer smoke
+        run: npm run package:smoke
+
+      - name: Check published npm versions
+        id: npm
+        run: |
+          client_version=$(node -p "require('./packages/client/package.json').version")
+          react_version=$(node -p "require('./packages/react/package.json').version")
+
+          if npm view "@draftline/client@${client_version}" version >/dev/null 2>&1; then
+            echo "publish_client=false" >> "$GITHUB_OUTPUT"
+            echo "@draftline/client ${client_version} is already published"
+          else
+            echo "publish_client=true" >> "$GITHUB_OUTPUT"
+            echo "@draftline/client ${client_version} is not published yet"
+          fi
+
+          if npm view "@draftline/react@${react_version}" version >/dev/null 2>&1; then
+            echo "publish_react=false" >> "$GITHUB_OUTPUT"
+            echo "@draftline/react ${react_version} is already published"
+          else
+            echo "publish_react=true" >> "$GITHUB_OUTPUT"
+            echo "@draftline/react ${react_version} is not published yet"
+          fi
+
+      - name: Publish @draftline/client
+        if: steps.npm.outputs.publish_client == 'true'
+        run: npm publish --workspace @draftline/client --provenance --access public
+
+      - name: Publish @draftline/react
+        if: steps.npm.outputs.publish_react == 'true'
+        run: npm publish --workspace @draftline/react --provenance --access public

@@ -79,6 +79,7 @@ pub mod merge;
 pub mod path;
 pub mod recovery;
 pub mod remote;
+pub mod tauri_contract;
 pub mod workspace;
 
 pub use content_policy::ContentPolicy;

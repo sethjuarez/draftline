@@ -14,8 +14,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  npm:
+    name: NPM packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test packages
+        run: npm test
+
+      - name: Build packages
+        run: npm run build
+
+      - name: Package consumer smoke
+        run: npm run package:smoke
+
   rust:
-    name: Test
+    name: Rust
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

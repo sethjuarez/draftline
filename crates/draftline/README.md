@@ -72,3 +72,41 @@ fn main() -> Result<(), draftline::DraftlineError> {
     Ok(())
 }
 ```
+
+## Tauri Workbench contract
+
+The `draftline::tauri_contract` module exposes dependency-free command adapter
+functions for Workbench and other Tauri hosts. Hosts can wrap these functions with
+`#[tauri::command]` while keeping Draftline's Rust APIs as the source of truth
+for preflight, execution, verification, and serializable error shapes.
+
+The contract includes read-only diagnostics (`inspect_workspace`,
+`verify_workspace`, `list_variations`, `list_support_refs`), selected-file
+mutations (`selected_save`, `selected_shelve`, `selected_discard`), and remote
+collaboration commands (`fetch_remote`, `preflight_apply_incoming`,
+`apply_incoming`, `preflight_merge_incoming`, `merge_incoming`,
+`publish_current_variation`). Collaboration commands refresh remote-tracking
+state before reporting preflight results so host UIs can render current
+`SyncState` values and then execute through Draftline's tokenized apply, merge,
+and publish paths.
+
+The Workbench contract intentionally keeps credential handling out of its DTOs for
+now. These remote commands are suitable for local, file, and otherwise
+credential-free remotes; hosts that need private HTTPS or SSH authentication
+should call the underlying workspace APIs with `RemoteOptions` until a
+host-specific credential flow is added.
+
+```rust,no_run
+use draftline::tauri_contract::{inspect_workspace, WorkspaceRequest};
+
+#[tauri::command]
+fn inspect_workspace_command(
+    workspace_path: std::path::PathBuf,
+) -> draftline::tauri_contract::TauriCommandResult<
+    draftline::tauri_contract::WorkspaceDiagnostics,
+> {
+    draftline::tauri_contract::into_tauri_result(inspect_workspace(WorkspaceRequest {
+        workspace_path,
+    }))
+}
+```

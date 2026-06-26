@@ -81,6 +81,10 @@ jobs:
             exit 1
           fi
 
+      - name: Dry-run crate publish
+        if: steps.crate.outputs.publish == 'true'
+        run: cargo publish --manifest-path crates/draftline/Cargo.toml --dry-run
+
       - name: Publish to crates.io
         if: steps.crate.outputs.publish == 'true'
         env:

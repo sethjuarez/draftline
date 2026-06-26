@@ -62,7 +62,7 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Yes for current-variation fast-forward updates. No for diverged merge execution or broad remote lifecycle diagnostics. |
+| Covered today? | Yes for current-variation fast-forward updates. Diverged clean-merge execution is covered by Flow 12; unresolved conflict UX and broad remote lifecycle diagnostics remain future work. |
 | Correct primitive path | `fetch_remote` -> `preflight_apply_incoming` -> `apply_incoming`. |
 | Safety behavior | Dirty work blocks apply. Diverged history returns `SyncNeedsMerge` instead of overwriting. Fast-forward ref updates roll back if checkout fails. Apply must also avoid target-tree collisions with untracked, ignored, generated, or policy-excluded files. |
 | Edge cases | `preflight_apply_incoming` uses cached remote-tracking state; fetch before preflight for accurate reporting. `apply_incoming` fetches again before applying, so a clean preflight can still fail if the remote changed between preflight and apply. `UpToDate`, `LocalAhead`, and `NoRemoteVersion` return `applied_count: 0`. A remote branch can disappear or be recreated between fetch and apply. |
@@ -157,6 +157,6 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | `sync_status` detects `NeedsMerge`; `SyncNeedsMerge` prevents unsafe publish/apply; `preflight_merge_incoming` reports the diverged state without mutating; `MergeOutcome`, `MergeConflict`, `ResolverRegistry`, `PlainTextResolver`, and `MarkdownResolver` model conflict results. |
-| Safety behavior | Draftline blocks overwrite and routes the user into an explicit merge decision. |
-| Gap | Need public `merge_incoming` execution that computes merge base, enumerates tree-level conflicts, handles binary/large-file conflicts, and creates a safe merged version after conflicts are resolved. Because merge writes files and moves refs, it must use the operation lock, write recovery state, and reuse target-tree collision checks. |
+| Current support | `sync_status` detects `NeedsMerge`; `SyncNeedsMerge` prevents unsafe publish/apply; `preflight_merge_incoming` reports the diverged state without mutating; `merge_incoming` writes a clean two-parent merged version through a preflight token; `MergeOutcome`, `MergeConflict`, `ResolverRegistry`, `PlainTextResolver`, and `MarkdownResolver` model conflict results. |
+| Safety behavior | Draftline blocks overwrite and routes the user into an explicit merge decision. Clean merge execution re-fetches, validates the tokenized local/remote/base OIDs, checks dirty work and target-tree hazards, uses the operation lock, and writes recovery state before moving files/refs. |
+| Gap | Need user-driven execution for unresolved conflicts, richer binary/large-file conflict UX, and host copy for choosing, editing, or combining conflicting content. |

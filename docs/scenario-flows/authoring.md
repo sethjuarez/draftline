@@ -244,7 +244,7 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | Shared `FileHazard` target-tree checks are wired into switching, restoring, applying incoming changes, and applying shelves. |
+| Current support | Shared `FileHazard` target-tree checks are wired into switching, restoring, applying incoming changes, merging incoming changes, and applying shelves. |
 | Safety behavior | No operation should overwrite a local file merely because it is untracked, ignored, generated, or excluded by the current policy. |
 | Edge cases | Current checks cover ignored and current-policy-excluded target-path collisions. Case-insensitive filesystems, Unicode-normalization differences, symlinks, submodules, generated files, distinct untracked hazard reporting, and old-policy paths can still make collisions non-obvious. |
-| Gap | Need to broaden target-tree collision coverage for merge incoming and platform-specific path hazards. |
+| Gap | Need to broaden target-tree collision coverage for platform-specific path hazards such as generated files, symlinks, submodules, case-insensitive collisions, and Unicode-normalization differences. |
