@@ -260,6 +260,14 @@ pub struct PreviewFile {
     pub is_binary: bool,
 }
 
+/// Current live workspace content for one tracked file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentFilePreview {
+    pub path: PathBuf,
+    pub content: Option<String>,
+    pub is_binary: bool,
+}
+
 /// Comprehensive UI snapshot returned by [`Workspace::workspace_summary`].
 ///
 /// Collects all state a host UI needs to render the workspace panel — active
@@ -956,6 +964,15 @@ pub struct VersionDiff {
     pub files: Vec<ChangedFile>,
     /// Unified diff patch text, or `None` when there are no text changes.
     pub patch: Option<String>,
+}
+
+/// Diff and live preview content for one tracked workspace file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentFileDiff {
+    pub path: PathBuf,
+    pub file: Option<ChangedFile>,
+    pub patch: Option<String>,
+    pub preview: Option<CurrentFilePreview>,
 }
 
 impl Workspace {
@@ -3510,6 +3527,31 @@ impl Workspace {
         }))
     }
 
+    /// Reads one tracked file from the current workspace without mutating state.
+    pub fn preview_workspace_file(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<Option<CurrentFilePreview>> {
+        self.ensure_no_pending_recovery()?;
+        let path = normalize_workspace_relative(path)?;
+        if !self.content_policy.tracks(&path)? {
+            return Ok(None);
+        }
+
+        let full_path = self.root.join(&path);
+        if !full_path.exists() {
+            return Ok(None);
+        }
+
+        let bytes = fs::read(full_path)?;
+        let content = std::str::from_utf8(&bytes).ok().map(ToString::to_string);
+        Ok(Some(CurrentFilePreview {
+            path,
+            is_binary: content.is_none(),
+            content,
+        }))
+    }
+
     /// Returns a comprehensive UI snapshot of this workspace.
     ///
     /// Unlike individual accessor methods, `workspace_summary` succeeds even
@@ -4376,6 +4418,36 @@ impl Workspace {
         })
     }
 
+    /// Returns a diff and live preview for one tracked file in the workspace.
+    pub fn diff_workspace_file(&self, path: impl AsRef<Path>) -> Result<Option<CurrentFileDiff>> {
+        self.ensure_no_pending_recovery()?;
+        let path = normalize_workspace_relative(path)?;
+        if !self.content_policy.tracks(&path)? {
+            return Ok(None);
+        }
+
+        let head_tree = self.repo.head()?.peel_to_commit()?.tree()?;
+        let mut opts = DiffOptions::new();
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .pathspec(&path);
+        let diff = self
+            .repo
+            .diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts))?;
+        let files =
+            diff_deltas_to_changed_files_with_policy(&diff, &self.root, &self.content_policy)?;
+        let file = files.into_iter().find(|file| file.path == path);
+        let patch = diff_to_patch_text(&diff)?;
+        let preview = self.preview_workspace_file(&path)?;
+
+        Ok(Some(CurrentFileDiff {
+            path,
+            file,
+            patch: if patch.is_empty() { None } else { Some(patch) },
+            preview,
+        }))
+    }
+
     /// Returns the current variation name when the workspace is on a normal variation.
     pub fn current_variation(&self) -> Result<String> {
         self.ensure_no_pending_recovery()?;
@@ -4428,7 +4500,7 @@ impl Workspace {
 
         Ok(RemoteEndpoint {
             name: name.to_string(),
-            url: url.to_string(),
+            url: redact_remote_url(url),
         })
     }
 
@@ -4446,7 +4518,7 @@ impl Workspace {
             let remote = self.repo.find_remote(name)?;
             remotes.push(RemoteEndpoint {
                 name: name.to_string(),
-                url: remote.url().unwrap_or_default().to_string(),
+                url: redact_remote_url(remote.url().unwrap_or_default()),
             });
         }
 
@@ -6496,6 +6568,28 @@ fn diff_to_patch_text(diff: &git2::Diff<'_>) -> Result<String> {
     Ok(text)
 }
 
+fn redact_remote_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let path_start = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map(|index| authority_start + index)
+        .unwrap_or(url.len());
+    let authority = &url[authority_start..path_start];
+    let Some(userinfo_end) = authority.rfind('@') else {
+        return url.to_string();
+    };
+
+    format!(
+        "{}://{}{}",
+        &url[..scheme_end],
+        &authority[userinfo_end + 1..],
+        &url[path_start..]
+    )
+}
+
 struct OperationLock {
     path: PathBuf,
 }
@@ -7378,6 +7472,23 @@ mod tests {
                 url: "https://example.invalid/content.git".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn remote_endpoint_urls_redact_embedded_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        let added = workspace
+            .add_remote(
+                "backup",
+                "https://x-access-token:secret@example.invalid/content.git",
+            )
+            .unwrap();
+        assert_eq!(added.url, "https://example.invalid/content.git");
+
+        let remotes = workspace.remotes().unwrap();
+        assert_eq!(remotes[0].url, "https://example.invalid/content.git");
     }
 
     #[test]

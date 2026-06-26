@@ -2,21 +2,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use draftline::tauri_contract::{
-    apply_incoming, apply_shelf, audit_content_policy, diff_version_to_workspace, diff_versions,
-    fetch_remote, get_changes, get_full_history, get_history, inspect_workspace, into_tauri_result,
-    list_shelves, list_support_refs, list_variations, merge_incoming,
-    merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
-    preflight_apply_incoming, preflight_apply_shelf, preflight_merge_incoming, preview_shelf,
-    preview_version, preview_version_file, publish_current_variation, restore_version_as_new_save,
-    selected_discard, selected_save, selected_save_with_context, selected_shelve, verify_workspace,
-    DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind, ListSupportRefsRequest,
-    MergeIncomingRequest, MergeIncomingWithResolutionsRequest, PreviewVersionFileRequest,
-    PublishCurrentVariationRequest, RemoteRequest, RestoreVersionRequest, SelectedDiscardRequest,
-    SelectedSaveRequest, SelectedShelveRequest, ShelfRequest, VersionRequest, WorkspaceRequest,
+    adopt_remote_variation, adopt_workspace, apply_incoming, apply_shelf, audit_content_policy,
+    clone_workspace, diff_version_to_workspace, diff_versions, diff_workspace_file, fetch_remote,
+    get_changes, get_full_history, get_history, inspect_workspace, into_tauri_result,
+    list_remote_variations, list_remotes, list_shelves, list_support_refs, list_variations,
+    merge_conflict_view_model, merge_incoming, merge_incoming_with_resolutions,
+    merge_incoming_with_resolutions_with_context, open_workspace, preflight_apply_incoming,
+    preflight_apply_shelf, preflight_merge_incoming, preview_shelf, preview_version,
+    preview_version_file, preview_workspace_file, publish_current_variation,
+    restore_version_as_new_save, save, selected_discard, selected_save, selected_save_with_context,
+    selected_shelve, verify_workspace, whole_file_use_content_resolutions, CloneWorkspaceRequest,
+    ConflictContentSource, CurrentFileRequest, DiffVersionsRequest, DraftlineCommandContext,
+    DraftlineEventKind, ListSupportRefsRequest, MergeIncomingRequest,
+    MergeIncomingWithResolutionsRequest, PreviewVersionFileRequest, PublishCurrentVariationRequest,
+    RemoteRequest, RemoteVariationRequest, RestoreVersionRequest, SaveRequest,
+    SelectedDiscardRequest, SelectedSaveRequest, SelectedShelveRequest, ShelfRequest,
+    VersionRequest, WorkspaceRequest,
 };
 use draftline::{
     ContentPolicy, Contributor, ContributorProfile, MergeConflictResolution, MergeResolutionChoice,
-    SupportRefScope, SyncState, Workspace,
+    OperationLockState, SupportRefScope, SwitchPolicy, SyncState, VariationId, Workspace,
 };
 use serde_json::Value;
 
@@ -728,4 +733,199 @@ fn tauri_contract_context_applies_policy_profile_and_events() {
     assert_eq!(events[0].kind, DraftlineEventKind::HistoryChanged);
     assert_eq!(events[0].sequence, 1);
     assert!(events[0].changed_paths.is_empty());
+}
+
+#[test]
+fn tauri_contract_smokes_setup_and_current_file_commands() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    git2::Repository::init_bare(remote_dir.path()).unwrap();
+
+    let author_dir = tempfile::tempdir().unwrap();
+    let author = Workspace::init(author_dir.path()).unwrap();
+    configure_identity(author.root());
+    write_file(author.root(), "post.md", b"# Base");
+    author.save_version("Base").unwrap();
+    author
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    publish_current_variation(PublishCurrentVariationRequest {
+        workspace_path: author_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+    })
+    .unwrap();
+
+    let clone_dir = tempfile::tempdir().unwrap();
+    let cloned = clone_workspace(CloneWorkspaceRequest {
+        remote_url: remote_dir.path().to_string_lossy().to_string(),
+        workspace_path: clone_dir.path().to_path_buf(),
+    })
+    .unwrap();
+    assert!(!cloned.diagnostics.summary.state_may_be_inconsistent);
+
+    let opened = open_workspace(WorkspaceRequest {
+        workspace_path: clone_dir.path().to_path_buf(),
+    })
+    .unwrap();
+    assert_eq!(opened.diagnostics.inspection.remotes[0].name, "origin");
+
+    let adopted = adopt_workspace(WorkspaceRequest {
+        workspace_path: clone_dir.path().to_path_buf(),
+    })
+    .unwrap();
+    assert!(adopted.preflight.can_adopt);
+
+    configure_identity(clone_dir.path());
+    write_file(clone_dir.path(), "post.md", b"# Edited");
+    let file_request = CurrentFileRequest {
+        workspace_path: clone_dir.path().to_path_buf(),
+        path: PathBuf::from("post.md"),
+    };
+    let diff = diff_workspace_file(file_request.clone()).unwrap().unwrap();
+    assert_eq!(diff.path, PathBuf::from("post.md"));
+    assert!(diff.patch.unwrap().contains("# Edited"));
+    let preview = preview_workspace_file(file_request).unwrap().unwrap();
+    assert_eq!(preview.content.as_deref(), Some("# Edited"));
+
+    let saved = save(SaveRequest {
+        workspace_path: clone_dir.path().to_path_buf(),
+        label: "Current file edit".to_string(),
+    })
+    .unwrap();
+    assert_eq!(saved.version.label, "Current file edit");
+}
+
+#[test]
+fn tauri_contract_adopt_workspace_returns_blockers_without_mutating() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"# Base");
+    workspace.save_version("Base").unwrap();
+    let draftline_dir = workspace.root().join(".git").join("draftline");
+    fs::create_dir_all(&draftline_dir).unwrap();
+    fs::write(draftline_dir.join("operation.lock"), b"{not-json").unwrap();
+
+    let result = adopt_workspace(WorkspaceRequest {
+        workspace_path: temp.path().to_path_buf(),
+    })
+    .unwrap();
+
+    assert!(!result.preflight.can_adopt);
+    assert!(!result.preflight.blockers.is_empty());
+    assert_eq!(
+        result.diagnostics.operation_lock.state,
+        OperationLockState::Locked
+    );
+    assert!(!result.diagnostics.operation_lock.diagnostics.is_empty());
+}
+
+#[test]
+fn tauri_contract_groups_conflicts_for_host_ui() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    git2::Repository::init_bare(remote_dir.path()).unwrap();
+
+    let first_dir = tempfile::tempdir().unwrap();
+    let first = Workspace::init(first_dir.path()).unwrap();
+    configure_identity(first.root());
+    write_file(first.root(), "post.md", b"base");
+    first.save_version("Base").unwrap();
+    first
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    publish_current_variation(PublishCurrentVariationRequest {
+        workspace_path: first_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+    })
+    .unwrap();
+
+    let second_dir = tempfile::tempdir().unwrap();
+    let second =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), second_dir.path()).unwrap();
+    configure_identity(second.root());
+
+    write_file(first.root(), "post.md", b"ours");
+    first.save_version("Ours").unwrap();
+    write_file(second.root(), "post.md", b"theirs");
+    second.save_version("Theirs").unwrap();
+    second.publish_changes("origin").unwrap();
+
+    let report = preflight_merge_incoming(RemoteRequest {
+        workspace_path: first_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+    })
+    .unwrap();
+    let model = merge_conflict_view_model(&report);
+    assert_eq!(model.files.len(), 1);
+    assert_eq!(model.files[0].path, PathBuf::from("post.md"));
+    assert_eq!(model.files[0].whole_file_conflicts.len(), 1);
+
+    let resolutions = whole_file_use_content_resolutions(&report, ConflictContentSource::Theirs);
+    assert_eq!(resolutions.len(), 1);
+    assert!(matches!(
+        resolutions[0].choice,
+        MergeResolutionChoice::UseContent { .. }
+    ));
+}
+
+#[test]
+fn tauri_contract_smokes_remote_variation_lifecycle_commands() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    git2::Repository::init_bare(remote_dir.path()).unwrap();
+
+    let first_dir = tempfile::tempdir().unwrap();
+    let first = Workspace::init(first_dir.path()).unwrap();
+    configure_identity(first.root());
+    write_file(first.root(), "post.md", b"main");
+    let base = first.save_version("Base").unwrap();
+    first
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    first.publish_changes("origin").unwrap();
+
+    let second_dir = tempfile::tempdir().unwrap();
+    let second =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), second_dir.path()).unwrap();
+    configure_identity(second.root());
+
+    first
+        .create_variation_from(base.id(), "teammate-option")
+        .unwrap();
+    first
+        .switch_variation(
+            &VariationId::from("teammate-option"),
+            SwitchPolicy::AbortIfDirty,
+        )
+        .unwrap();
+    write_file(first.root(), "post.md", b"remote variation");
+    first.save_version("Remote variation").unwrap();
+    first.publish_changes("origin").unwrap();
+
+    let request = RemoteRequest {
+        workspace_path: second_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+    };
+    assert_eq!(
+        list_remotes(WorkspaceRequest {
+            workspace_path: second_dir.path().to_path_buf(),
+        })
+        .unwrap()[0]
+            .name,
+        "origin"
+    );
+    let remote_variations = list_remote_variations(request.clone()).unwrap();
+    assert!(remote_variations
+        .iter()
+        .any(|variation| variation.name == "teammate-option"));
+    let diagnostics = draftline::tauri_contract::remote_variation_diagnostics(request).unwrap();
+    assert!(diagnostics
+        .remote_only_variations
+        .contains(&draftline::VariationId::from("teammate-option")));
+
+    let adopted = adopt_remote_variation(RemoteVariationRequest {
+        workspace_path: second_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+        variation_id: "teammate-option".to_string(),
+    })
+    .unwrap();
+    assert_eq!(adopted.variation.name, "teammate-option");
 }

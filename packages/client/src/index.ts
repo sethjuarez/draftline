@@ -19,18 +19,28 @@ export interface DraftlineClientOptions {
 }
 
 export interface DraftlineClient {
+  openWorkspace(workspacePath: string): Promise<WorkspaceOpenResult>;
+  cloneWorkspace(request: CloneWorkspaceRequest): Promise<WorkspaceOpenResult>;
+  adoptWorkspace(workspacePath: string): Promise<AdoptWorkspaceResult>;
   inspectWorkspace(workspacePath: string): Promise<WorkspaceDiagnostics>;
   verifyWorkspace(workspacePath: string): Promise<WorkspaceVerification>;
   listVariations(workspacePath: string): Promise<VariationSummary[]>;
   listSupportRefs(workspacePath: string, scope: SupportRefScope): Promise<SupportRef[]>;
+  listRemotes(workspacePath: string): Promise<RemoteEndpoint[]>;
+  listRemoteVariations(request: RemoteRequest): Promise<RemoteVariation[]>;
+  remoteVariationDiagnostics(request: RemoteRequest): Promise<RemoteVariationDiagnostics>;
+  adoptRemoteVariation(request: RemoteVariationRequest): Promise<AdoptRemoteVariationResult>;
   getChanges(workspacePath: string): Promise<ChangeSet>;
   getHistory(workspacePath: string): Promise<HistoryEntry[]>;
   getFullHistory(workspacePath: string): Promise<HistoryEntry[]>;
   diffVersions(request: DiffVersionsRequest): Promise<VersionDiff>;
   diffVersionToWorkspace(request: VersionRequest): Promise<VersionDiff>;
+  diffWorkspaceFile(request: CurrentFileRequest): Promise<CurrentFileDiff | null>;
   previewVersion(request: VersionRequest): Promise<VersionPreview>;
   previewVersionFile(request: PreviewVersionFileRequest): Promise<PreviewFile | null>;
+  previewWorkspaceFile(request: CurrentFileRequest): Promise<CurrentFilePreview | null>;
   restoreVersionAsNewSave(request: RestoreVersionRequest): Promise<RestoreVersionResult>;
+  save(request: SaveRequest): Promise<SaveResult>;
   listShelves(workspacePath: string): Promise<Shelf[]>;
   previewShelf(request: ShelfRequest): Promise<VersionPreview>;
   preflightApplyShelf(request: ShelfRequest): Promise<ShelfApplyReport>;
@@ -81,6 +91,15 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
   }
 
   return {
+    openWorkspace: (workspacePath) =>
+      run('open_workspace', {
+        request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
+      }),
+    cloneWorkspace: (request) => run('clone_workspace', { request }),
+    adoptWorkspace: (workspacePath) =>
+      run('adopt_workspace', {
+        request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
+      }),
     inspectWorkspace: (workspacePath) =>
       run('inspect_workspace', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
@@ -97,6 +116,14 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('list_support_refs', {
         request: { workspace_path: workspacePath, scope } satisfies ListSupportRefsRequest,
       }),
+    listRemotes: (workspacePath) =>
+      run('list_remotes', {
+        request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
+      }),
+    listRemoteVariations: (request) => run('list_remote_variations', { request }),
+    remoteVariationDiagnostics: (request) =>
+      run('remote_variation_diagnostics', { request }),
+    adoptRemoteVariation: (request) => run('adopt_remote_variation', { request }),
     getChanges: (workspacePath) =>
       run('get_changes', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
@@ -111,9 +138,12 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       }),
     diffVersions: (request) => run('diff_versions', { request }),
     diffVersionToWorkspace: (request) => run('diff_version_to_workspace', { request }),
+    diffWorkspaceFile: (request) => run('diff_workspace_file', { request }),
     previewVersion: (request) => run('preview_version', { request }),
     previewVersionFile: (request) => run('preview_version_file', { request }),
+    previewWorkspaceFile: (request) => run('preview_workspace_file', { request }),
     restoreVersionAsNewSave: (request) => run('restore_version_as_new_save', { request }),
+    save: (request) => run('save', { request }),
     listShelves: (workspacePath) =>
       run('list_shelves', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
@@ -247,7 +277,20 @@ export interface VersionDiff {
   patch?: string | null;
 }
 
+export interface CurrentFileDiff {
+  path: string;
+  file?: ChangedFile | null;
+  patch?: string | null;
+  preview?: CurrentFilePreview | null;
+}
+
 export interface PreviewFile {
+  path: string;
+  content?: string | null;
+  is_binary: boolean;
+}
+
+export interface CurrentFilePreview {
   path: string;
   content?: string | null;
   is_binary: boolean;
@@ -297,6 +340,20 @@ export interface WorkspaceSummary {
 export interface RemoteEndpoint {
   name: string;
   url: string;
+}
+
+export interface RemoteVariation {
+  id: string;
+  name: string;
+  remote: string;
+  head_version?: Version | null;
+}
+
+export interface RemoteVariationDiagnostics {
+  remote: string;
+  shared_variations: string[];
+  local_only_variations: string[];
+  remote_only_variations: string[];
 }
 
 export interface DirtySummary {
@@ -362,6 +419,24 @@ export interface WorkspaceDiagnostics {
   operation_lock: OperationLockInspection;
 }
 
+export interface WorkspaceOpenResult {
+  diagnostics: WorkspaceDiagnostics;
+}
+
+export interface AdoptWorkspaceResult {
+  preflight: AdoptionPreflightReport;
+  diagnostics: WorkspaceDiagnostics;
+}
+
+export interface AdoptionPreflightReport {
+  inspection: WorkspaceInspection;
+  candidate_policy_diagnostics: WorkspaceDiagnostic[];
+  blockers: WorkspaceDiagnostic[];
+  warnings: WorkspaceDiagnostic[];
+  safe_next_actions: SafeNextAction[];
+  can_adopt: boolean;
+}
+
 export interface ContentPolicyAudit {
   current_diagnostics: WorkspaceDiagnostic[];
   historical_out_of_policy_paths: string[];
@@ -404,6 +479,11 @@ export interface ShelfApplyReport {
 }
 
 export interface RestoreVersionResult {
+  version: Version;
+  postconditions: CommandPostconditions;
+}
+
+export interface SaveResult {
   version: Version;
   postconditions: CommandPostconditions;
 }
@@ -482,6 +562,11 @@ export interface PublishCurrentVariationResult {
   postconditions: CommandPostconditions;
 }
 
+export interface AdoptRemoteVariationResult {
+  variation: Variation;
+  postconditions: CommandPostconditions;
+}
+
 export interface ApplyIncomingReport {
   sync_status: SyncStatus;
   dirty_files: ChangedFile[];
@@ -552,6 +637,29 @@ export interface MergeIncomingCommandResult {
   postconditions: CommandPostconditions;
 }
 
+export type ConflictContentSource = 'ours' | 'theirs' | 'base';
+
+export interface MergeConflictViewModel {
+  files: MergeFileConflictGroup[];
+  token?: MergeIncomingToken | null;
+  can_merge_cleanly: boolean;
+}
+
+export interface MergeFileConflictGroup {
+  path: string;
+  label: string;
+  whole_file_conflicts: MergeConflictItem[];
+  field_conflicts: MergeFieldConflictGroup[];
+}
+
+export interface MergeFieldConflictGroup {
+  field_path: string;
+  label: string;
+  conflicts: MergeConflictItem[];
+}
+
+export interface MergeConflictItem extends MergeConflict {}
+
 export interface SupportRef {
   id: string;
   ref_name: string;
@@ -565,12 +673,20 @@ export interface WorkspaceRequest {
   workspace_path: string;
 }
 
+export interface CloneWorkspaceRequest extends WorkspaceRequest {
+  remote_url: string;
+}
+
 export interface ListSupportRefsRequest extends WorkspaceRequest {
   scope: SupportRefScope;
 }
 
 export interface VersionRequest extends WorkspaceRequest {
   version_id: string;
+}
+
+export interface CurrentFileRequest extends WorkspaceRequest {
+  path: string;
 }
 
 export interface PreviewVersionFileRequest extends VersionRequest {
@@ -583,6 +699,10 @@ export interface DiffVersionsRequest extends WorkspaceRequest {
 }
 
 export interface RestoreVersionRequest extends VersionRequest {
+  label: string;
+}
+
+export interface SaveRequest extends WorkspaceRequest {
   label: string;
 }
 
@@ -616,6 +736,10 @@ export interface RemoteRequest extends WorkspaceRequest {
   remote: string;
 }
 
+export interface RemoteVariationRequest extends RemoteRequest {
+  variation_id: string;
+}
+
 export interface FetchRemoteResult {
   sync_status: SyncStatus;
   postconditions: CommandPostconditions;
@@ -628,6 +752,201 @@ export interface MergeIncomingRequest extends RemoteRequest {
 export interface MergeIncomingWithResolutionsRequest extends MergeIncomingRequest {
   token: MergeIncomingToken;
   resolutions: MergeConflictResolution[];
+}
+
+export interface DraftlineHostFacadeOptions {
+  client?: DraftlineClient;
+  defaultRemote?: string;
+  workspacePath: string;
+}
+
+export interface DraftlineHostFacade {
+  workspacePath: string;
+  open(): Promise<WorkspaceOpenResult>;
+  inspect(): Promise<WorkspaceDiagnostics>;
+  save(label: string): Promise<SaveResult>;
+  selectedSave(paths: string[], label: string): Promise<SelectedSaveResult>;
+  selectedShelve(paths: string[], name: string): Promise<SelectedShelveResult>;
+  selectedDiscard(paths: string[]): Promise<SelectedDiscardResult>;
+  history(): Promise<HistoryEntry[]>;
+  fullHistory(): Promise<HistoryEntry[]>;
+  changes(): Promise<ChangeSet>;
+  variations(): Promise<VariationSummary[]>;
+  remotes(): Promise<RemoteEndpoint[]>;
+  supportRefs(scope: SupportRefScope): Promise<SupportRef[]>;
+  diffVersions(fromVersionId: string, toVersionId: string): Promise<VersionDiff>;
+  diffVersionToWorkspace(versionId: string): Promise<VersionDiff>;
+  diffWorkspaceFile(path: string): Promise<CurrentFileDiff | null>;
+  previewVersion(versionId: string): Promise<VersionPreview>;
+  previewVersionFile(versionId: string, path: string): Promise<PreviewFile | null>;
+  previewWorkspaceFile(path: string): Promise<CurrentFilePreview | null>;
+  restoreAsNewSave(versionId: string, label: string): Promise<RestoreVersionResult>;
+  shelves(): Promise<Shelf[]>;
+  previewShelf(shelfId: string): Promise<VersionPreview>;
+  applyShelf(shelfId: string): Promise<ApplyShelfCommandResult>;
+  repairRecovery(operationId: string): Promise<RecoveryRepairResult>;
+  rollbackRecovery(operationId: string): Promise<RecoveryRepairResult>;
+  fetchRemote(remote?: string): Promise<FetchRemoteResult>;
+  publishCurrentVariation(remote?: string): Promise<PublishCurrentVariationResult>;
+  preflightApplyIncoming(remote?: string): Promise<ApplyIncomingReport>;
+  applyIncoming(remote?: string): Promise<ApplyIncomingCommandResult>;
+  preflightMergeIncoming(remote?: string): Promise<MergeIncomingReport>;
+  mergeIncoming(label: string, remote?: string): Promise<MergeIncomingCommandResult>;
+  mergeIncomingWithResolutions(
+    label: string,
+    token: MergeIncomingToken,
+    resolutions: MergeConflictResolution[],
+    remote?: string,
+  ): Promise<MergeIncomingCommandResult>;
+  remoteVariations(remote?: string): Promise<RemoteVariation[]>;
+  remoteVariationDiagnostics(remote?: string): Promise<RemoteVariationDiagnostics>;
+  adoptRemoteVariation(variationId: string, remote?: string): Promise<AdoptRemoteVariationResult>;
+}
+
+export function createDraftlineHostFacade({
+  client = createDraftlineClient(),
+  defaultRemote = 'origin',
+  workspacePath,
+}: DraftlineHostFacadeOptions): DraftlineHostFacade {
+  const workspaceRequest = () => ({ workspace_path: workspacePath });
+  const remoteRequest = (remote = defaultRemote) => ({ ...workspaceRequest(), remote });
+  const versionRequest = (versionId: string) => ({
+    ...workspaceRequest(),
+    version_id: versionId,
+  });
+
+  return {
+    workspacePath,
+    open: () => client.openWorkspace(workspacePath),
+    inspect: () => client.inspectWorkspace(workspacePath),
+    save: (label) => client.save({ ...workspaceRequest(), label }),
+    selectedSave: (paths, label) => client.selectedSave({ ...workspaceRequest(), paths, label }),
+    selectedShelve: (paths, name) => client.selectedShelve({ ...workspaceRequest(), paths, name }),
+    selectedDiscard: (paths) => client.selectedDiscard({ ...workspaceRequest(), paths }),
+    history: () => client.getHistory(workspacePath),
+    fullHistory: () => client.getFullHistory(workspacePath),
+    changes: () => client.getChanges(workspacePath),
+    variations: () => client.listVariations(workspacePath),
+    remotes: () => client.listRemotes(workspacePath),
+    supportRefs: (scope) => client.listSupportRefs(workspacePath, scope),
+    diffVersions: (fromVersionId, toVersionId) =>
+      client.diffVersions({
+        ...workspaceRequest(),
+        from_version_id: fromVersionId,
+        to_version_id: toVersionId,
+      }),
+    diffVersionToWorkspace: (versionId) => client.diffVersionToWorkspace(versionRequest(versionId)),
+    diffWorkspaceFile: (path) => client.diffWorkspaceFile({ ...workspaceRequest(), path }),
+    previewVersion: (versionId) => client.previewVersion(versionRequest(versionId)),
+    previewVersionFile: (versionId, path) =>
+      client.previewVersionFile({ ...versionRequest(versionId), path }),
+    previewWorkspaceFile: (path) => client.previewWorkspaceFile({ ...workspaceRequest(), path }),
+    restoreAsNewSave: (versionId, label) =>
+      client.restoreVersionAsNewSave({ ...versionRequest(versionId), label }),
+    shelves: () => client.listShelves(workspacePath),
+    previewShelf: (shelfId) => client.previewShelf({ ...workspaceRequest(), shelf_id: shelfId }),
+    applyShelf: (shelfId) => client.applyShelf({ ...workspaceRequest(), shelf_id: shelfId }),
+    repairRecovery: (operationId) =>
+      client.repairRecovery({ ...workspaceRequest(), operation_id: operationId }),
+    rollbackRecovery: (operationId) =>
+      client.rollbackRecovery({ ...workspaceRequest(), operation_id: operationId }),
+    fetchRemote: (remote) => client.fetchRemote(remoteRequest(remote)),
+    publishCurrentVariation: (remote) => client.publishCurrentVariation(remoteRequest(remote)),
+    preflightApplyIncoming: (remote) => client.preflightApplyIncoming(remoteRequest(remote)),
+    applyIncoming: (remote) => client.applyIncoming(remoteRequest(remote)),
+    preflightMergeIncoming: (remote) => client.preflightMergeIncoming(remoteRequest(remote)),
+    mergeIncoming: (label, remote) => client.mergeIncoming({ ...remoteRequest(remote), label }),
+    mergeIncomingWithResolutions: (label, token, resolutions, remote) =>
+      client.mergeIncomingWithResolutions({
+        ...remoteRequest(remote),
+        label,
+        resolutions,
+        token,
+      }),
+    remoteVariations: (remote) => client.listRemoteVariations(remoteRequest(remote)),
+    remoteVariationDiagnostics: (remote) => client.remoteVariationDiagnostics(remoteRequest(remote)),
+    adoptRemoteVariation: (variationId, remote) =>
+      client.adoptRemoteVariation({
+        ...remoteRequest(remote),
+        variation_id: variationId,
+      }),
+  };
+}
+
+export function createMergeConflictViewModel(
+  report: MergeIncomingReport,
+): MergeConflictViewModel {
+  const files = new Map<string, MergeFileConflictGroup>();
+  for (const conflict of report.conflicts) {
+    const group =
+      files.get(conflict.path) ??
+      {
+        field_conflicts: [],
+        label: conflict.path,
+        path: conflict.path,
+        whole_file_conflicts: [],
+      };
+    files.set(conflict.path, group);
+
+    if (conflict.field_path) {
+      let field = group.field_conflicts.find(
+        (candidate) => candidate.field_path === conflict.field_path,
+      );
+      if (!field) {
+        field = {
+          conflicts: [],
+          field_path: conflict.field_path,
+          label: conflict.label,
+        };
+        group.field_conflicts.push(field);
+      }
+      field.conflicts.push({ ...conflict });
+    } else {
+      group.whole_file_conflicts.push({ ...conflict });
+    }
+  }
+
+  return {
+    can_merge_cleanly: report.can_merge_cleanly,
+    files: [...files.values()].sort((left, right) => left.path.localeCompare(right.path)),
+    token: report.token,
+  };
+}
+
+export function createWholeFileUseContentResolutions(
+  report: MergeIncomingReport,
+  source: ConflictContentSource,
+): MergeConflictResolution[] {
+  return report.conflicts.flatMap((conflict) => {
+    if (conflict.field_path) {
+      return [];
+    }
+    const content = conflict[source];
+    if (content == null) {
+      return [];
+    }
+    return [
+      {
+        choice: { kind: 'use_content', content },
+        field_path: null,
+        path: conflict.path,
+      },
+    ];
+  });
+}
+
+export async function openWorkspace(workspacePath: string): Promise<WorkspaceOpenResult> {
+  return createDraftlineClient().openWorkspace(workspacePath);
+}
+
+export async function cloneWorkspace(
+  request: CloneWorkspaceRequest,
+): Promise<WorkspaceOpenResult> {
+  return createDraftlineClient().cloneWorkspace(request);
+}
+
+export async function adoptWorkspace(workspacePath: string): Promise<AdoptWorkspaceResult> {
+  return createDraftlineClient().adoptWorkspace(workspacePath);
 }
 
 export async function inspectWorkspace(workspacePath: string): Promise<WorkspaceDiagnostics> {
@@ -647,6 +966,26 @@ export async function listSupportRefs(
   scope: SupportRefScope,
 ): Promise<SupportRef[]> {
   return createDraftlineClient().listSupportRefs(workspacePath, scope);
+}
+
+export async function listRemotes(workspacePath: string): Promise<RemoteEndpoint[]> {
+  return createDraftlineClient().listRemotes(workspacePath);
+}
+
+export async function listRemoteVariations(request: RemoteRequest): Promise<RemoteVariation[]> {
+  return createDraftlineClient().listRemoteVariations(request);
+}
+
+export async function remoteVariationDiagnostics(
+  request: RemoteRequest,
+): Promise<RemoteVariationDiagnostics> {
+  return createDraftlineClient().remoteVariationDiagnostics(request);
+}
+
+export async function adoptRemoteVariation(
+  request: RemoteVariationRequest,
+): Promise<AdoptRemoteVariationResult> {
+  return createDraftlineClient().adoptRemoteVariation(request);
 }
 
 export async function getChanges(workspacePath: string): Promise<ChangeSet> {
@@ -669,6 +1008,12 @@ export async function diffVersionToWorkspace(request: VersionRequest): Promise<V
   return createDraftlineClient().diffVersionToWorkspace(request);
 }
 
+export async function diffWorkspaceFile(
+  request: CurrentFileRequest,
+): Promise<CurrentFileDiff | null> {
+  return createDraftlineClient().diffWorkspaceFile(request);
+}
+
 export async function previewVersion(request: VersionRequest): Promise<VersionPreview> {
   return createDraftlineClient().previewVersion(request);
 }
@@ -679,10 +1024,20 @@ export async function previewVersionFile(
   return createDraftlineClient().previewVersionFile(request);
 }
 
+export async function previewWorkspaceFile(
+  request: CurrentFileRequest,
+): Promise<CurrentFilePreview | null> {
+  return createDraftlineClient().previewWorkspaceFile(request);
+}
+
 export async function restoreVersionAsNewSave(
   request: RestoreVersionRequest,
 ): Promise<RestoreVersionResult> {
   return createDraftlineClient().restoreVersionAsNewSave(request);
+}
+
+export async function save(request: SaveRequest): Promise<SaveResult> {
+  return createDraftlineClient().save(request);
 }
 
 export async function listShelves(workspacePath: string): Promise<Shelf[]> {

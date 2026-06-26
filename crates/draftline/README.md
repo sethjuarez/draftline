@@ -100,11 +100,12 @@ remote content. Whole-file choices support `use_ours`, `use_theirs`, `use_base`,
 `delete`, or `use_content`; semantic `field_path` conflicts currently require a
 host-produced `use_content` result for the resolved file.
 
-The Workbench contract intentionally keeps credential handling out of its DTOs for
-now for plain DTOs, but hosts can route commands through
-`DraftlineCommandContext` to configure content policy, host-provided contributor
-attribution, backend-only remote credentials, and redaction-safe workspace
-events in one place.
+The Workbench contract keeps credential handling out of frontend DTOs. Hosts route
+commands through `DraftlineCommandContext` to configure content policy,
+host-provided contributor attribution, backend-only remote credentials, and
+redaction-safe workspace events in one place. Clone, open, adopt, fetch, publish,
+apply, and merge command adapters all use the context so product frontends never
+need to pass clone or fetch tokens over IPC.
 
 ```rust,no_run
 use draftline::tauri_contract::{inspect_workspace, WorkspaceRequest};
@@ -157,4 +158,31 @@ let mut context = DraftlineCommandContext::new()
 # };
 let _ = selected_save_with_context(&mut context, request);
 # Ok::<(), draftline::DraftlineError>(())
+```
+
+Treat `ContributorProfile` as product identity and service attribution, not as a
+Git configuration screen. The host should derive `author` from the signed-in
+product user, `saved_by` from the actor that initiated the save, and optional
+`service` from the backend automation performing the operation. Draftline writes
+normal Git author/committer metadata from that profile, but users should not need
+to understand or edit `user.name` / `user.email` for product saves:
+
+```rust,no_run
+use draftline::{Contributor, ContributorProfile};
+
+let profile = ContributorProfile::new(
+    Contributor {
+        name: "Avery Writer".to_string(),
+        email: Some("avery@example.invalid".to_string()),
+    },
+    Contributor {
+        name: "CutReady Sync Service".to_string(),
+        email: Some("sync@example.invalid".to_string()),
+    },
+)
+.with_service(Contributor {
+    name: "CutReady".to_string(),
+    email: None,
+});
+# let _ = profile;
 ```
