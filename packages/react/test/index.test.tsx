@@ -529,6 +529,21 @@ function ChangedFilesListToggle() {
 
 function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
   return {
+    adoptRemoteVariation: vi.fn(async () => ({
+      postconditions: { errors: [] },
+      variation: fixtureDiagnostics.summary.active_variation,
+    })),
+    adoptWorkspace: vi.fn(async () => ({
+      diagnostics: fixtureDiagnostics,
+      preflight: {
+        blockers: [],
+        can_adopt: true,
+        candidate_policy_diagnostics: [],
+        inspection: fixtureDiagnostics.inspection,
+        safe_next_actions: ['normal_work'],
+        warnings: [],
+      },
+    })),
     applyIncoming: vi.fn(async () => ({
       apply: { applied_count: 1 },
       postconditions: {
@@ -559,7 +574,9 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
       historical_out_of_policy_paths: [],
     })),
     clearStaleLock: vi.fn(async () => ({ errors: [] })),
+    cloneWorkspace: vi.fn(async () => ({ diagnostics: fixtureDiagnostics })),
     deleteShelf: vi.fn(async () => ({ postconditions: { errors: [] } })),
+    diffWorkspaceFile: vi.fn(async () => null),
     diffVersionToWorkspace: vi.fn(async () => ({
       files: [],
       from_version: version.id,
@@ -578,6 +595,8 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
     getHistory: vi.fn(async () => []),
     inspectWorkspace: vi.fn(async () => fixtureDiagnostics),
     listShelves: vi.fn(async () => []),
+    listRemoteVariations: vi.fn(async () => []),
+    listRemotes: vi.fn(async () => fixtureDiagnostics.inspection.remotes),
     listSupportRefs: vi.fn(async () => [
       {
         id: 'support-1',
@@ -615,6 +634,7 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
         token: null,
       },
     })),
+    openWorkspace: vi.fn(async () => ({ diagnostics: fixtureDiagnostics })),
     preflightApplyIncoming: vi.fn(async () => ({
       can_proceed: true,
       dirty_files: [],
@@ -638,6 +658,7 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
       token: null,
     })),
     previewShelf: vi.fn(async () => ({ files: [], id: version.id })),
+    previewWorkspaceFile: vi.fn(async () => null),
     previewVersion: vi.fn(async () => ({ files: [], id: version.id })),
     previewVersionFile: vi.fn(async () => null),
     publishCurrentVariation: vi.fn(async () => ({
@@ -659,6 +680,12 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
       operation_id: 'op-1',
       safe_next_actions: ['normal_work'],
     })),
+    remoteVariationDiagnostics: vi.fn(async () => ({
+      local_only_variations: [],
+      remote: 'origin',
+      remote_only_variations: [],
+      shared_variations: ['main'],
+    })),
     restoreVersionAsNewSave: vi.fn(async () => ({
       postconditions: { errors: [] },
       version,
@@ -669,6 +696,10 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
       operation: 'rollback',
       operation_id: 'op-1',
       safe_next_actions: ['normal_work'],
+    })),
+    save: vi.fn(async () => ({
+      postconditions: { errors: [] },
+      version,
     })),
     selectedDiscard: vi.fn(async () => ({
       discarded: { files: [] },

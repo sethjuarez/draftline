@@ -4,19 +4,21 @@
 //! expose them behind `#[tauri::command]` wrappers while preserving Draftline's
 //! existing preflight, recovery, and verification semantics.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApplyIncomingReport, ApplyIncomingResult, ChangeSet, ContentPolicy, ContentPolicyAudit,
-    ContributorProfile, DirtySummary, DraftlineError, HistoryEntry, MergeConflictResolution,
-    MergeIncomingReport, MergeIncomingResult, MergeIncomingToken, OperationLockInspection,
-    PreflightReport, PreviewFile, PublishPreflight, PublishResult, RecoveryRepairResult,
-    RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteOptions, Result, Shelf,
-    ShelfApplyReport, SupportRef, SupportRefScope, SyncState, SyncStatus, VariationId,
-    VariationSummary, Version, VersionDiff, VersionId, VersionPreview, Workspace,
-    WorkspaceDiagnostic, WorkspaceId, WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
+    merge::MergeConflict, AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult,
+    ChangeSet, ContentPolicy, ContentPolicyAudit, ContributorProfile, CurrentFileDiff,
+    CurrentFilePreview, DirtySummary, DraftlineError, HistoryEntry, MergeConflictResolution,
+    MergeIncomingReport, MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice,
+    OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight, PublishResult,
+    RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
+    RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, Result, Shelf, ShelfApplyReport,
+    SupportRef, SupportRefScope, SyncState, SyncStatus, Variation, VariationId, VariationSummary,
+    Version, VersionDiff, VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceId,
+    WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -179,6 +181,26 @@ pub struct WorkspaceRequest {
     pub workspace_path: PathBuf,
 }
 
+/// Request for cloning a workspace from a remote endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneWorkspaceRequest {
+    pub remote_url: String,
+    pub workspace_path: PathBuf,
+}
+
+/// Result returned after opening, cloning, or adopting a workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceOpenResult {
+    pub diagnostics: WorkspaceDiagnostics,
+}
+
+/// Result returned after adopting an existing Git repository.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdoptWorkspaceResult {
+    pub preflight: AdoptionPreflightReport,
+    pub diagnostics: WorkspaceDiagnostics,
+}
+
 /// One workspace snapshot suitable for a Tauri diagnostics panel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceDiagnostics {
@@ -210,6 +232,13 @@ pub struct VersionRequest {
     pub version_id: String,
 }
 
+/// Request for reading diff/preview content for one current workspace file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentFileRequest {
+    pub workspace_path: PathBuf,
+    pub path: PathBuf,
+}
+
 /// Request for reading one file from a version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewVersionFileRequest {
@@ -237,6 +266,20 @@ pub struct RestoreVersionRequest {
 /// Restore result with postcondition state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreVersionResult {
+    pub version: Version,
+    pub postconditions: CommandPostconditions,
+}
+
+/// Request for saving all tracked workspace changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveRequest {
+    pub workspace_path: PathBuf,
+    pub label: String,
+}
+
+/// Save result with postcondition state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveResult {
     pub version: Version,
     pub postconditions: CommandPostconditions,
 }
@@ -338,6 +381,21 @@ pub struct RemoteRequest {
     pub remote: String,
 }
 
+/// Request for a remote-tracking variation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteVariationRequest {
+    pub workspace_path: PathBuf,
+    pub remote: String,
+    pub variation_id: String,
+}
+
+/// Remote-variation adoption result with postcondition state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdoptRemoteVariationResult {
+    pub variation: Variation,
+    pub postconditions: CommandPostconditions,
+}
+
 /// Fetch result with current sync status after remote refs refresh.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchRemoteResult {
@@ -379,6 +437,49 @@ pub struct MergeIncomingCommandResult {
     pub postconditions: CommandPostconditions,
 }
 
+/// UI-friendly conflict model grouped by file and semantic field path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeConflictViewModel {
+    pub files: Vec<MergeFileConflictGroup>,
+    pub token: Option<MergeIncomingToken>,
+    pub can_merge_cleanly: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeFileConflictGroup {
+    pub path: PathBuf,
+    pub label: String,
+    pub whole_file_conflicts: Vec<MergeConflictItem>,
+    pub field_conflicts: Vec<MergeFieldConflictGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeFieldConflictGroup {
+    pub field_path: String,
+    pub label: String,
+    pub conflicts: Vec<MergeConflictItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeConflictItem {
+    pub path: PathBuf,
+    pub field_path: Option<String>,
+    pub label: String,
+    pub base: Option<String>,
+    pub ours: Option<String>,
+    pub theirs: Option<String>,
+    pub resolution: crate::merge::ResolutionKind,
+}
+
+/// Source content to snapshot into safest whole-file `use_content` resolutions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictContentSource {
+    Ours,
+    Theirs,
+    Base,
+}
+
 /// Error shape that Tauri commands can serialize directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TauriCommandError {
@@ -400,6 +501,87 @@ impl From<DraftlineError> for TauriCommandError {
 /// Result alias for Tauri command wrappers that need a serializable error.
 pub type TauriCommandResult<T> = std::result::Result<T, TauriCommandError>;
 
+/// Opens an existing Draftline workspace through the host-configured context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn open_workspace(request: WorkspaceRequest) -> Result<WorkspaceOpenResult> {
+    open_workspace_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Opens an existing Draftline workspace through the host-configured context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn open_workspace_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceRequest,
+) -> Result<WorkspaceOpenResult> {
+    Ok(WorkspaceOpenResult {
+        diagnostics: inspect_workspace_with_context(context, request)?,
+    })
+}
+
+/// Clones a Draftline workspace using backend-only credentials from the context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn clone_workspace(request: CloneWorkspaceRequest) -> Result<WorkspaceOpenResult> {
+    clone_workspace_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Clones a Draftline workspace using backend-only credentials from the context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn clone_workspace_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: CloneWorkspaceRequest,
+) -> Result<WorkspaceOpenResult> {
+    let content_policy = context.content_policy.clone();
+    let workspace = {
+        let mut options = context.remote_options();
+        Workspace::clone_workspace_with_policy_and_options(
+            request.remote_url,
+            &request.workspace_path,
+            content_policy,
+            &mut options,
+        )?
+    };
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(WorkspaceOpenResult {
+        diagnostics: workspace_diagnostics(&workspace)?,
+    })
+}
+
+/// Adopts an existing Git repository as a Draftline workspace.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn adopt_workspace(request: WorkspaceRequest) -> Result<AdoptWorkspaceResult> {
+    adopt_workspace_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Adopts an existing Git repository using the host-configured content policy.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn adopt_workspace_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: WorkspaceRequest,
+) -> Result<AdoptWorkspaceResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let preflight = workspace.preflight_adopt_workspace(context.content_policy.clone())?;
+    Ok(AdoptWorkspaceResult {
+        preflight,
+        diagnostics: workspace_diagnostics(&workspace)?,
+    })
+}
+
 /// Returns a full diagnostics payload for the workspace dashboard.
 #[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
 pub fn inspect_workspace(request: WorkspaceRequest) -> Result<WorkspaceDiagnostics> {
@@ -413,12 +595,7 @@ pub fn inspect_workspace_with_context(
     request: WorkspaceRequest,
 ) -> Result<WorkspaceDiagnostics> {
     let workspace = context.open_workspace(&request.workspace_path)?;
-    Ok(WorkspaceDiagnostics {
-        summary: workspace.workspace_summary()?,
-        inspection: workspace.inspect()?,
-        verification: workspace.verify_workspace()?,
-        operation_lock: workspace.inspect_operation_lock()?,
-    })
+    workspace_diagnostics(&workspace)
 }
 
 /// Returns the workspace verification payload used by smoke postconditions.
@@ -632,6 +809,56 @@ pub fn preview_version_file_with_context(
         .preview_version_file(&version, request.path)
 }
 
+/// Diffs one current workspace file against the current variation head.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), path = %request.path.display())
+)]
+pub fn diff_workspace_file(request: CurrentFileRequest) -> Result<Option<CurrentFileDiff>> {
+    diff_workspace_file_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Diffs one current workspace file using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), path = %request.path.display())
+)]
+pub fn diff_workspace_file_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: CurrentFileRequest,
+) -> Result<Option<CurrentFileDiff>> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .diff_workspace_file(request.path)
+}
+
+/// Previews one current workspace file without mutating state.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), path = %request.path.display())
+)]
+pub fn preview_workspace_file(request: CurrentFileRequest) -> Result<Option<CurrentFilePreview>> {
+    preview_workspace_file_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Previews one current workspace file using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), path = %request.path.display())
+)]
+pub fn preview_workspace_file_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: CurrentFileRequest,
+) -> Result<Option<CurrentFilePreview>> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .preview_workspace_file(request.path)
+}
+
 /// Restores a saved version as a new save.
 #[tracing::instrument(
     err(level = tracing::Level::WARN),
@@ -657,6 +884,39 @@ pub fn restore_version_as_new_save_with_context(
     let version = workspace.restore_version_as_new_save(&version_id, request.label)?;
     context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
     Ok(RestoreVersionResult {
+        version,
+        postconditions: collect_postconditions(&workspace, true),
+    })
+}
+
+/// Saves all tracked workspace changes as a new version.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn save(request: SaveRequest) -> Result<SaveResult> {
+    save_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Saves all tracked workspace changes using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn save_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: SaveRequest,
+) -> Result<SaveResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let version = if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.save_version_with_profile(request.label, profile)?
+    } else {
+        workspace.save_version(request.label)?
+    };
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(SaveResult {
         version,
         postconditions: collect_postconditions(&workspace, true),
     })
@@ -1063,6 +1323,121 @@ pub fn fetch_remote_with_context(
     })
 }
 
+/// Lists configured remotes for the workspace.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn list_remotes(request: WorkspaceRequest) -> Result<Vec<RemoteEndpoint>> {
+    list_remotes_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Lists configured remotes using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn list_remotes_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceRequest,
+) -> Result<Vec<RemoteEndpoint>> {
+    context.open_workspace(&request.workspace_path)?.remotes()
+}
+
+/// Fetches and lists visible remote variations.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn list_remote_variations(request: RemoteRequest) -> Result<Vec<RemoteVariation>> {
+    list_remote_variations_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Fetches and lists visible remote variations using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn list_remote_variations_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: RemoteRequest,
+) -> Result<Vec<RemoteVariation>> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    {
+        let mut options = context.remote_options();
+        workspace.fetch_all_variations_with_options(&request.remote, &mut options)?;
+    }
+    workspace.remote_variations(&request.remote)
+}
+
+/// Fetches and compares local and remote-tracking variations.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn remote_variation_diagnostics(request: RemoteRequest) -> Result<RemoteVariationDiagnostics> {
+    remote_variation_diagnostics_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Fetches and compares variations using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn remote_variation_diagnostics_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: RemoteRequest,
+) -> Result<RemoteVariationDiagnostics> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    {
+        let mut options = context.remote_options();
+        workspace.fetch_all_variations_with_options(&request.remote, &mut options)?;
+    }
+    workspace.remote_variation_diagnostics(&request.remote)
+}
+
+/// Adopts a fetched remote-tracking variation as a local Draftline variation.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        remote = %request.remote,
+        variation_id = %request.variation_id
+    )
+)]
+pub fn adopt_remote_variation(
+    request: RemoteVariationRequest,
+) -> Result<AdoptRemoteVariationResult> {
+    adopt_remote_variation_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Adopts a fetched remote-tracking variation using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        remote = %request.remote,
+        variation_id = %request.variation_id
+    )
+)]
+pub fn adopt_remote_variation_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: RemoteVariationRequest,
+) -> Result<AdoptRemoteVariationResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    {
+        let mut options = context.remote_options();
+        workspace.fetch_all_variations_with_options(&request.remote, &mut options)?;
+    }
+    let variation = workspace
+        .adopt_remote_variation(&request.remote, &VariationId::from(request.variation_id))?;
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(AdoptRemoteVariationResult {
+        variation,
+        postconditions: collect_postconditions(&workspace, false),
+    })
+}
+
 /// Preflights a fast-forward incoming apply without mutating workspace state.
 #[tracing::instrument(
     err,
@@ -1258,6 +1633,89 @@ pub fn merge_incoming_with_resolutions_with_context(
     })
 }
 
+/// Converts a merge preflight report into grouped conflict UI data.
+pub fn merge_conflict_view_model(report: &MergeIncomingReport) -> MergeConflictViewModel {
+    let mut files = BTreeMap::<PathBuf, MergeFileConflictGroup>::new();
+
+    for conflict in &report.conflicts {
+        let entry = files
+            .entry(conflict.path.clone())
+            .or_insert_with(|| MergeFileConflictGroup {
+                path: conflict.path.clone(),
+                label: conflict.path.display().to_string(),
+                whole_file_conflicts: Vec::new(),
+                field_conflicts: Vec::new(),
+            });
+        let item = merge_conflict_item(conflict);
+        if let Some(field_path) = conflict.field_path.as_ref() {
+            if let Some(group) = entry
+                .field_conflicts
+                .iter_mut()
+                .find(|group| group.field_path == *field_path)
+            {
+                group.conflicts.push(item);
+            } else {
+                entry.field_conflicts.push(MergeFieldConflictGroup {
+                    field_path: field_path.clone(),
+                    label: conflict.label.clone(),
+                    conflicts: vec![item],
+                });
+            }
+        } else {
+            entry.whole_file_conflicts.push(item);
+        }
+    }
+
+    MergeConflictViewModel {
+        files: files.into_values().collect(),
+        token: report.token.clone(),
+        can_merge_cleanly: report.can_merge_cleanly,
+    }
+}
+
+/// Builds explicit whole-file `use_content` resolutions from preflight conflict snapshots.
+///
+/// The helper intentionally snapshots the selected side into `UseContent` instead
+/// of returning symbolic choices, so stale tokens cannot silently resolve content
+/// the user did not review.
+pub fn whole_file_use_content_resolutions(
+    report: &MergeIncomingReport,
+    source: ConflictContentSource,
+) -> Vec<MergeConflictResolution> {
+    report
+        .conflicts
+        .iter()
+        .filter(|conflict| conflict.field_path.is_none())
+        .filter_map(|conflict| {
+            conflict_content(conflict, source).map(|content| MergeConflictResolution {
+                path: conflict.path.clone(),
+                field_path: None,
+                choice: MergeResolutionChoice::UseContent { content },
+            })
+        })
+        .collect()
+}
+
+fn merge_conflict_item(conflict: &MergeConflict) -> MergeConflictItem {
+    MergeConflictItem {
+        path: conflict.path.clone(),
+        field_path: conflict.field_path.clone(),
+        label: conflict.label.clone(),
+        base: conflict.base.clone(),
+        ours: conflict.ours.clone(),
+        theirs: conflict.theirs.clone(),
+        resolution: conflict.resolution.clone(),
+    }
+}
+
+fn conflict_content(conflict: &MergeConflict, source: ConflictContentSource) -> Option<String> {
+    match source {
+        ConflictContentSource::Ours => conflict.ours.clone(),
+        ConflictContentSource::Theirs => conflict.theirs.clone(),
+        ConflictContentSource::Base => conflict.base.clone(),
+    }
+}
+
 fn merge_preflight_error(preflight: MergeIncomingReport) -> DraftlineError {
     if matches!(preflight.sync_status.state, SyncState::NeedsMerge) {
         return DraftlineError::PreflightFailed(Box::new(PreflightReport {
@@ -1288,6 +1746,15 @@ pub fn into_tauri_result<T>(result: Result<T>) -> TauriCommandResult<T> {
 
 fn parse_version_id(version_id: String) -> Result<VersionId> {
     VersionId::from_canonical_string(version_id)
+}
+
+fn workspace_diagnostics(workspace: &Workspace) -> Result<WorkspaceDiagnostics> {
+    Ok(WorkspaceDiagnostics {
+        summary: workspace.workspace_summary()?,
+        inspection: workspace.inspect()?,
+        verification: workspace.verify_workspace()?,
+        operation_lock: workspace.inspect_operation_lock()?,
+    })
 }
 
 fn collect_postconditions(workspace: &Workspace, include_changes: bool) -> CommandPostconditions {

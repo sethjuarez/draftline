@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  createDraftlineHostFacade,
+  createMergeConflictViewModel,
   createDraftlineClient,
+  createWholeFileUseContentResolutions,
   type DraftlineInvoke,
+  type MergeIncomingReport,
   type WorkspaceDiagnostics,
 } from '../src/index';
 
@@ -154,6 +158,7 @@ describe('createDraftlineClient', () => {
       from_version_id: versionId,
       to_version_id: versionId,
     });
+
     await client.diffVersionToWorkspace(versionRequest);
     await client.previewVersion(versionRequest);
     await client.previewVersionFile({ ...versionRequest, path: 'post.md' });
@@ -207,6 +212,146 @@ describe('createDraftlineClient', () => {
     });
     expect(invoke).toHaveBeenCalledWith('repair_recovery', { request: recoveryRequest });
     expect(invoke).toHaveBeenCalledWith('rollback_recovery', { request: recoveryRequest });
+  });
+
+  it('invokes reusable host setup, file preview, facade, and remote variation commands', async () => {
+    const invoke = vi.fn<DraftlineInvoke>(async (command) => {
+      if (command === 'open_workspace' || command === 'clone_workspace') {
+        return { diagnostics: fixtureDiagnostics } as never;
+      }
+      if (command === 'adopt_workspace') {
+        return {
+          diagnostics: fixtureDiagnostics,
+          preflight: {
+            blockers: [],
+            can_adopt: true,
+            candidate_policy_diagnostics: [],
+            inspection: fixtureDiagnostics.inspection,
+            safe_next_actions: ['normal_work'],
+            warnings: [],
+          },
+        } as never;
+      }
+      return { ok: true } as never;
+    });
+    const client = createDraftlineClient({ invoke });
+    const facade = createDraftlineHostFacade({ client, workspacePath: 'C:\\repo' });
+
+    await client.openWorkspace('C:\\repo');
+    await client.cloneWorkspace({
+      remote_url: 'file:///remote.git',
+      workspace_path: 'C:\\clone',
+    });
+    await client.adoptWorkspace('C:\\repo');
+    await client.listRemotes('C:\\repo');
+    await client.listRemoteVariations({ workspace_path: 'C:\\repo', remote: 'origin' });
+    await client.remoteVariationDiagnostics({ workspace_path: 'C:\\repo', remote: 'origin' });
+    await client.adoptRemoteVariation({
+      workspace_path: 'C:\\repo',
+      remote: 'origin',
+      variation_id: 'teammate-option',
+    });
+    await client.diffWorkspaceFile({ workspace_path: 'C:\\repo', path: 'post.md' });
+    await client.previewWorkspaceFile({ workspace_path: 'C:\\repo', path: 'post.md' });
+    await facade.save('Facade save');
+
+    expect(invoke).toHaveBeenCalledWith('open_workspace', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('clone_workspace', {
+      request: { remote_url: 'file:///remote.git', workspace_path: 'C:\\clone' },
+    });
+    expect(invoke).toHaveBeenCalledWith('adopt_workspace', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('list_remotes', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('list_remote_variations', {
+      request: { workspace_path: 'C:\\repo', remote: 'origin' },
+    });
+    expect(invoke).toHaveBeenCalledWith('remote_variation_diagnostics', {
+      request: { workspace_path: 'C:\\repo', remote: 'origin' },
+    });
+    expect(invoke).toHaveBeenCalledWith('adopt_remote_variation', {
+      request: {
+        workspace_path: 'C:\\repo',
+        remote: 'origin',
+        variation_id: 'teammate-option',
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('diff_workspace_file', {
+      request: { workspace_path: 'C:\\repo', path: 'post.md' },
+    });
+    expect(invoke).toHaveBeenCalledWith('preview_workspace_file', {
+      request: { workspace_path: 'C:\\repo', path: 'post.md' },
+    });
+    expect(invoke).toHaveBeenCalledWith('save', {
+      request: { workspace_path: 'C:\\repo', label: 'Facade save' },
+    });
+  });
+
+  it('groups merge conflicts and creates safest whole-file use_content resolutions', () => {
+    const report: MergeIncomingReport = {
+      can_merge_cleanly: false,
+      changed_workspace: false,
+      conflicts: [
+        {
+          base: 'base',
+          field_path: null,
+          label: 'post.md',
+          ours: 'ours',
+          path: 'post.md',
+          resolution: 'Choose',
+          theirs: 'theirs',
+        },
+        {
+          base: 'base title',
+          field_path: 'frontmatter.title',
+          label: 'Title',
+          ours: 'our title',
+          path: 'post.md',
+          resolution: 'Edit',
+          theirs: 'their title',
+        },
+      ],
+      dirty_files: [],
+      file_hazards: [],
+      sync_status: {
+        ahead: 1,
+        behind: 1,
+        incoming: [],
+        remote: 'origin',
+        state: 'NeedsMerge',
+        variation: 'main',
+      },
+      token: {
+        local_oid: 'local',
+        merge_base_oid: 'base',
+        remote: 'origin',
+        remote_oid: 'remote',
+        variation: 'main',
+      },
+    };
+
+    expect(createMergeConflictViewModel(report).files).toEqual([
+      expect.objectContaining({
+        field_conflicts: [
+          expect.objectContaining({
+            field_path: 'frontmatter.title',
+          }),
+        ],
+        path: 'post.md',
+        whole_file_conflicts: [expect.objectContaining({ ours: 'ours' })],
+      }),
+    ]);
+    expect(createWholeFileUseContentResolutions(report, 'theirs')).toEqual([
+      {
+        choice: { kind: 'use_content', content: 'theirs' },
+        field_path: null,
+        path: 'post.md',
+      },
+    ]);
   });
 
   it('subscribes to the stable Draftline workspace event channel', async () => {

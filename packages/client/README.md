@@ -18,8 +18,11 @@ const unlisten = await client.subscribeWorkspaceEvents((event) => {
 
 Remote merge flows use the same typed DTOs as `draftline::tauri_contract`.
 Call `preflightMergeIncoming` first; if it returns conflicts and a token with
-`can_merge_cleanly: false`, collect explicit resolutions and call
-`mergeIncomingWithResolutions`:
+`can_merge_cleanly: false`, use `createMergeConflictViewModel` to render
+file/field groups and `createWholeFileUseContentResolutions` when the product UI
+offers whole-file "use ours/theirs/base" actions. Those helpers emit explicit
+`use_content` resolutions so the submitted payload matches the content the user
+reviewed:
 
 ```ts
 await client.mergeIncomingWithResolutions({
@@ -27,14 +30,15 @@ await client.mergeIncomingWithResolutions({
   remote: 'origin',
   label: 'Resolve teammate changes',
   token: preflight.token,
-  resolutions: [
-    {
-      path: 'content/post.md',
-      choice: { kind: 'use_content', content: resolvedMarkdown },
-    },
-  ],
+  resolutions: createWholeFileUseContentResolutions(preflight, 'theirs'),
 });
 ```
+
+For host code, `createDraftlineHostFacade` binds a client to one workspace path
+and exposes product-level operations such as `save`, `selectedSave`,
+`diffWorkspaceFile`, `previewWorkspaceFile`, `fetchRemote`, `mergeIncoming`,
+`mergeIncomingWithResolutions`, recovery repair/rollback, and remote variation
+adoption without repeating request DTO plumbing in every component.
 
 Build from the repository root:
 
