@@ -228,7 +228,7 @@ fn scenario_collaboration_conflict_preflight_reports_without_mutating() {
 
     assert_eq!(preflight.sync_status.state, SyncState::NeedsMerge);
     assert!(!preflight.can_merge_cleanly);
-    assert!(preflight.token.is_none());
+    assert!(preflight.token.is_some());
     assert!(preflight.dirty_files.is_empty());
     assert!(preflight.file_hazards.is_empty());
     assert_eq!(preflight.conflicts.len(), 1);

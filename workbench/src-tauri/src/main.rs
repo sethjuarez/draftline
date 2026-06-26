@@ -1,83 +1,335 @@
 use draftline::tauri_contract as contract;
 use draftline::tauri_contract::{
-    ApplyIncomingCommandResult, FetchRemoteResult, ListSupportRefsRequest,
-    MergeIncomingCommandResult, MergeIncomingRequest, PublishCurrentVariationRequest,
-    PublishCurrentVariationResult, RemoteRequest, SelectedDiscardRequest, SelectedDiscardResult,
-    SelectedSaveRequest, SelectedSaveResult, SelectedShelveRequest, SelectedShelveResult,
-    TauriCommandResult, WorkspaceDiagnostics, WorkspaceRequest,
+    ApplyIncomingCommandResult, ApplyShelfCommandResult, CommandPostconditions,
+    DeleteShelfResult, DiffVersionsRequest, FetchRemoteResult, ListSupportRefsRequest,
+    MergeIncomingCommandResult, MergeIncomingRequest, PreviewVersionFileRequest,
+    PublishCurrentVariationRequest, PublishCurrentVariationResult, RecoveryRequest, RemoteRequest,
+    RestoreVersionRequest, RestoreVersionResult, SelectedDiscardRequest,
+    SelectedDiscardResult, SelectedSaveRequest, SelectedSaveResult, SelectedShelveRequest,
+    SelectedShelveResult, ShelfRequest, TauriCommandError, TauriCommandResult, VersionRequest,
+    WorkspaceDiagnostics, WorkspaceRequest, MergeIncomingWithResolutionsRequest,
 };
 use draftline::{
-    ApplyIncomingReport, MergeIncomingReport, SupportRef, VariationSummary, WorkspaceVerification,
+    ApplyIncomingReport, ChangeSet, ContentPolicyAudit, HistoryEntry, MergeIncomingReport,
+    PreviewFile, RecoveryRepairResult, Shelf, ShelfApplyReport, SupportRef, VariationSummary,
+    VersionDiff, VersionPreview, WorkspaceVerification,
 };
+use std::sync::{Mutex, MutexGuard};
+use tauri::{Emitter, Manager};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
-#[tauri::command]
-fn inspect_workspace(request: WorkspaceRequest) -> TauriCommandResult<WorkspaceDiagnostics> {
-    contract::into_tauri_result(contract::inspect_workspace(request))
+type DraftlineContextState = Mutex<contract::DraftlineCommandContext<'static>>;
+
+fn lock_context(
+    state: &DraftlineContextState,
+) -> TauriCommandResult<MutexGuard<'_, contract::DraftlineCommandContext<'static>>> {
+    state.lock().map_err(|_| TauriCommandError {
+        code: "command_context_locked".to_string(),
+        message: "Draftline command context lock is poisoned".to_string(),
+        details: None,
+    })
 }
 
 #[tauri::command]
-fn verify_workspace(request: WorkspaceRequest) -> TauriCommandResult<WorkspaceVerification> {
-    contract::into_tauri_result(contract::verify_workspace(request))
+fn inspect_workspace(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<WorkspaceDiagnostics> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::inspect_workspace_with_context(&context, request))
 }
 
 #[tauri::command]
-fn list_variations(request: WorkspaceRequest) -> TauriCommandResult<Vec<VariationSummary>> {
-    contract::into_tauri_result(contract::list_variations(request))
+fn verify_workspace(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<WorkspaceVerification> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::verify_workspace_with_context(&context, request))
 }
 
 #[tauri::command]
-fn list_support_refs(request: ListSupportRefsRequest) -> TauriCommandResult<Vec<SupportRef>> {
-    contract::into_tauri_result(contract::list_support_refs(request))
+fn list_variations(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<Vec<VariationSummary>> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::list_variations_with_context(&context, request))
 }
 
 #[tauri::command]
-fn selected_save(request: SelectedSaveRequest) -> TauriCommandResult<SelectedSaveResult> {
-    contract::into_tauri_result(contract::selected_save(request))
+fn list_support_refs(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: ListSupportRefsRequest,
+) -> TauriCommandResult<Vec<SupportRef>> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::list_support_refs_with_context(&context, request))
 }
 
 #[tauri::command]
-fn selected_shelve(request: SelectedShelveRequest) -> TauriCommandResult<SelectedShelveResult> {
-    contract::into_tauri_result(contract::selected_shelve(request))
+fn get_changes(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<ChangeSet> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_changes_with_context(&context, request))
 }
 
 #[tauri::command]
-fn selected_discard(request: SelectedDiscardRequest) -> TauriCommandResult<SelectedDiscardResult> {
-    contract::into_tauri_result(contract::selected_discard(request))
+fn get_history(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<Vec<HistoryEntry>> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_history_with_context(&context, request))
+}
+
+#[tauri::command]
+fn get_full_history(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<Vec<HistoryEntry>> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_full_history_with_context(&context, request))
+}
+
+#[tauri::command]
+fn diff_versions(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: DiffVersionsRequest,
+) -> TauriCommandResult<VersionDiff> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::diff_versions_with_context(&context, request))
+}
+
+#[tauri::command]
+fn diff_version_to_workspace(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: VersionRequest,
+) -> TauriCommandResult<VersionDiff> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::diff_version_to_workspace_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri::command]
+fn preview_version(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: VersionRequest,
+) -> TauriCommandResult<VersionPreview> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::preview_version_with_context(&context, request))
+}
+
+#[tauri::command]
+fn preview_version_file(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: PreviewVersionFileRequest,
+) -> TauriCommandResult<Option<PreviewFile>> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::preview_version_file_with_context(&context, request))
+}
+
+#[tauri::command]
+fn restore_version_as_new_save(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: RestoreVersionRequest,
+) -> TauriCommandResult<RestoreVersionResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::restore_version_as_new_save_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn list_shelves(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<Vec<Shelf>> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::list_shelves_with_context(&context, request))
+}
+
+#[tauri::command]
+fn preview_shelf(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: ShelfRequest,
+) -> TauriCommandResult<VersionPreview> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::preview_shelf_with_context(&context, request))
+}
+
+#[tauri::command]
+fn preflight_apply_shelf(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: ShelfRequest,
+) -> TauriCommandResult<ShelfApplyReport> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::preflight_apply_shelf_with_context(&context, request))
+}
+
+#[tauri::command]
+fn apply_shelf(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: ShelfRequest,
+) -> TauriCommandResult<ApplyShelfCommandResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::apply_shelf_with_context(&mut context, request))
+}
+
+#[tauri::command]
+fn delete_shelf(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: ShelfRequest,
+) -> TauriCommandResult<DeleteShelfResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::delete_shelf_with_context(&mut context, request))
+}
+
+#[tauri::command]
+fn audit_content_policy(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<ContentPolicyAudit> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::audit_content_policy_with_context(&context, request))
+}
+
+#[tauri::command]
+fn clear_stale_lock(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<CommandPostconditions> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::clear_stale_lock_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn repair_recovery(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: RecoveryRequest,
+) -> TauriCommandResult<RecoveryRepairResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::repair_recovery_with_context(&mut context, request))
+}
+
+#[tauri::command]
+fn rollback_recovery(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: RecoveryRequest,
+) -> TauriCommandResult<RecoveryRepairResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::rollback_recovery_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn selected_save(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: SelectedSaveRequest,
+) -> TauriCommandResult<SelectedSaveResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::selected_save_with_context(&mut context, request))
+}
+
+#[tauri::command]
+fn selected_shelve(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: SelectedShelveRequest,
+) -> TauriCommandResult<SelectedShelveResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::selected_shelve_with_context(&mut context, request))
+}
+
+#[tauri::command]
+fn selected_discard(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: SelectedDiscardRequest,
+) -> TauriCommandResult<SelectedDiscardResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::selected_discard_with_context(&mut context, request))
 }
 
 #[tauri::command]
 fn publish_current_variation(
+    state: tauri::State<'_, DraftlineContextState>,
     request: PublishCurrentVariationRequest,
 ) -> TauriCommandResult<PublishCurrentVariationResult> {
-    contract::into_tauri_result(contract::publish_current_variation(request))
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::publish_current_variation_with_context(
+        &mut context,
+        request,
+    ))
 }
 
 #[tauri::command]
-fn fetch_remote(request: RemoteRequest) -> TauriCommandResult<FetchRemoteResult> {
-    contract::into_tauri_result(contract::fetch_remote(request))
+fn fetch_remote(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: RemoteRequest,
+) -> TauriCommandResult<FetchRemoteResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::fetch_remote_with_context(&mut context, request))
 }
 
 #[tauri::command]
-fn preflight_apply_incoming(request: RemoteRequest) -> TauriCommandResult<ApplyIncomingReport> {
-    contract::into_tauri_result(contract::preflight_apply_incoming(request))
+fn preflight_apply_incoming(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: RemoteRequest,
+) -> TauriCommandResult<ApplyIncomingReport> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::preflight_apply_incoming_with_context(
+        &mut context,
+        request,
+    ))
 }
 
 #[tauri::command]
-fn apply_incoming(request: RemoteRequest) -> TauriCommandResult<ApplyIncomingCommandResult> {
-    contract::into_tauri_result(contract::apply_incoming(request))
+fn apply_incoming(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: RemoteRequest,
+) -> TauriCommandResult<ApplyIncomingCommandResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::apply_incoming_with_context(&mut context, request))
 }
 
 #[tauri::command]
-fn preflight_merge_incoming(request: RemoteRequest) -> TauriCommandResult<MergeIncomingReport> {
-    contract::into_tauri_result(contract::preflight_merge_incoming(request))
+fn preflight_merge_incoming(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: RemoteRequest,
+) -> TauriCommandResult<MergeIncomingReport> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::preflight_merge_incoming_with_context(
+        &mut context,
+        request,
+    ))
 }
 
 #[tauri::command]
 fn merge_incoming(
+    state: tauri::State<'_, DraftlineContextState>,
     request: MergeIncomingRequest,
 ) -> TauriCommandResult<MergeIncomingCommandResult> {
-    contract::into_tauri_result(contract::merge_incoming(request))
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::merge_incoming_with_context(&mut context, request))
+}
+
+#[tauri::command]
+fn merge_incoming_with_resolutions(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: MergeIncomingWithResolutionsRequest,
+) -> TauriCommandResult<MergeIncomingCommandResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::merge_incoming_with_resolutions_with_context(
+        &mut context,
+        request,
+    ))
 }
 
 fn main() {
@@ -96,11 +348,39 @@ fn main() {
                 .session_name("workbench-dev")
                 .build(),
         )
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            app.manage(Mutex::new(
+                contract::DraftlineCommandContext::new().with_event_sink(move |event| {
+                    if let Err(error) = app_handle.emit("draftline://workspace_event", event) {
+                        tracing::warn!(?error, "failed to emit Draftline workspace event");
+                    }
+                }),
+            ));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             inspect_workspace,
             verify_workspace,
             list_variations,
             list_support_refs,
+            get_changes,
+            get_history,
+            get_full_history,
+            diff_versions,
+            diff_version_to_workspace,
+            preview_version,
+            preview_version_file,
+            restore_version_as_new_save,
+            list_shelves,
+            preview_shelf,
+            preflight_apply_shelf,
+            apply_shelf,
+            delete_shelf,
+            audit_content_policy,
+            clear_stale_lock,
+            repair_recovery,
+            rollback_recovery,
             selected_save,
             selected_shelve,
             selected_discard,
@@ -109,7 +389,8 @@ fn main() {
             preflight_apply_incoming,
             apply_incoming,
             preflight_merge_incoming,
-            merge_incoming
+            merge_incoming,
+            merge_incoming_with_resolutions
         ])
         .run(tauri::generate_context!())
         .expect("error while running Draftline Workbench");

@@ -210,6 +210,10 @@ interface RefreshOptions {
 
 const DraftlineContext = createContext<DraftlineContextValue | null>(null);
 
+function normalizeWorkspacePath(path: string) {
+  return path.replace(/\\/g, '/').replace(/\/+$/g, '');
+}
+
 export function DraftlineProvider({
   children,
   client: clientProp,
@@ -302,6 +306,41 @@ export function DraftlineProvider({
     setCommandResult(null);
     setError(null);
   }, [workspacePath]);
+
+  useEffect(() => {
+    if (!workspacePath.trim()) {
+      return;
+    }
+
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    const activeWorkspace = normalizeWorkspacePath(workspacePath.trim());
+
+    client
+      .subscribeWorkspaceEvents((event) => {
+        if (normalizeWorkspacePath(event.workspace_id.root) !== activeWorkspace) {
+          return;
+        }
+        void refresh({ recordResult: false });
+      })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch((eventError: unknown) => {
+        if (!disposed) {
+          setError(eventError);
+        }
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [client, refresh, workspacePath]);
 
   const value = useMemo<DraftlineContextValue>(
     () => ({
