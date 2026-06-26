@@ -62,17 +62,17 @@ flowchart TD
     A[User selects subset of changed files] --> B{Intent}
     B -- Save selected --> C[Need save selected files]
     B -- Shelve selected --> D[Need shelve selected files]
-    B -- Discard selected --> E[discard_file one at a time]
-    C --> F[Not covered today]
-    D --> F
+    B -- Discard selected --> E[discard_files]
+    C --> G[save_files]
+    D --> H[shelve_files]
 ```
 
 | Question | Answer |
 |---|---|
-| Covered today? | No for selected save/shelve. Yes for one-file discard. Yes for all-work shelves only. |
-| Current support | `save_version` saves all tracked dirty files. `SwitchPolicy::Shelve` and `shelve_changes` shelve all tracked dirty files. `discard_file` supports one selected file. |
-| Safety behavior | Current all-or-nothing behavior is simple and predictable, but not granular. Shelves should be local-only by default because they may contain personal unfinished work. |
-| Gap | Need `preflight_save_files`, `save_files`, `shelve_files`, possibly batch `discard_files`, plus an explicit policy if shelved work can ever be shared. |
+| Covered today? | Yes for selected save, selected shelf, batch discard, one-file discard, and all-work shelves. |
+| Current support | `preflight_save_files`/`save_files`, `preflight_shelve_files`/`shelve_files`, `preflight_discard_files`/`discard_files`, `discard_file`, `SwitchPolicy::Shelve`, and `shelve_changes`. |
+| Safety behavior | Selected-file operations normalize paths through the active content policy and preserve unselected dirty files. Shelves remain local-only by default because they may contain personal unfinished work. |
+| Gap | Need explicit policy if shelved work can ever be shared and richer selected-file conflict UX. |
 
 ## Flow 5: abandon unsaved edits
 
