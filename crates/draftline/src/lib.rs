@@ -107,7 +107,8 @@ pub use workspace::{
     SupportRefKind, SupportRefPublishItem, SupportRefPublishPreflight, SupportRefPublishToken,
     SupportRefRestorePreflight, SupportRefRestoreToken, SupportRefScope, SupportRefSummary,
     SwitchPolicy, TargetedRestoreVersionResult, Variation, VariationDeletePreflight,
-    VariationDeleteToken, VariationId, VariationMetadata, VariationSummary, Version, VersionDiff,
-    VersionId, VersionPreview, Workspace, WorkspaceCapabilities, WorkspaceDiagnostic, WorkspaceId,
-    WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
+    VariationDeleteToken, VariationId, VariationMetadata, VariationRenamePreflight,
+    VariationRenameToken, VariationSummary, Version, VersionDiff, VersionId, VersionPreview,
+    Workspace, WorkspaceCapabilities, WorkspaceDiagnostic, WorkspaceId, WorkspaceInspection,
+    WorkspaceSummary, WorkspaceVerification,
 };

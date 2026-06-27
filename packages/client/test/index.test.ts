@@ -7,6 +7,7 @@ import {
   createWholeFileUseContentResolutions,
   type DraftlineInvoke,
   type MergeIncomingReport,
+  type VariationRenameToken,
   type WorkspaceDiagnostics,
 } from '../src/index';
 
@@ -63,6 +64,16 @@ describe('createDraftlineClient', () => {
     });
     await client.publishCurrentVariation({ workspace_path: 'C:\\repo', remote: 'origin' });
     await client.listSupportRefs('C:\\repo', 'local');
+    await client.preflightRenameVariation({
+      workspace_path: 'C:\\repo',
+      source_variation_id: 'master',
+      target_variation_id: 'main',
+    });
+    await client.renameVariation({
+      workspace_path: 'C:\\repo',
+      source_variation_id: 'master',
+      target_variation_id: 'main',
+    });
 
     expect(invoke).toHaveBeenNthCalledWith(1, 'inspect_workspace', {
       request: { workspace_path: 'C:\\repo' },
@@ -111,6 +122,20 @@ describe('createDraftlineClient', () => {
     });
     expect(invoke).toHaveBeenNthCalledWith(10, 'list_support_refs', {
       request: { workspace_path: 'C:\\repo', scope: 'local' },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(11, 'preflight_rename_variation', {
+      request: {
+        workspace_path: 'C:\\repo',
+        source_variation_id: 'master',
+        target_variation_id: 'main',
+      },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(12, 'rename_variation', {
+      request: {
+        workspace_path: 'C:\\repo',
+        source_variation_id: 'master',
+        target_variation_id: 'main',
+      },
     });
   });
 
@@ -270,6 +295,15 @@ describe('createDraftlineClient', () => {
       name: 'snapshot-preview',
       metadata: { label: 'Snapshot Preview' },
     });
+    const renameToken: VariationRenameToken = {
+      operation_id: 'op-1',
+      source_variation: 'master',
+      target_variation: 'main',
+      expected_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      support_ref: 'refs/draftline/deleted-variations/master/op-1',
+    };
+    await facade.preflightRenameVariation('master', 'main');
+    await facade.renameVariation('master', 'main', renameToken);
     await facade.save('Facade save');
 
     expect(invoke).toHaveBeenCalledWith('open_workspace', {
@@ -313,6 +347,21 @@ describe('createDraftlineClient', () => {
           name: 'snapshot-preview',
           metadata: { label: 'Snapshot Preview' },
         },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('preflight_rename_variation', {
+      request: {
+        workspace_path: 'C:\\repo',
+        source_variation_id: 'master',
+        target_variation_id: 'main',
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('rename_variation', {
+      request: {
+        workspace_path: 'C:\\repo',
+        source_variation_id: 'master',
+        target_variation_id: 'main',
+        token: renameToken,
       },
     });
     expect(invoke).toHaveBeenCalledWith('save', {

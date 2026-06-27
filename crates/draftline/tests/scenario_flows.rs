@@ -27,6 +27,12 @@ fn configure_identity(root: &Path, name: &str) {
         .unwrap();
 }
 
+fn init_bare_remote(root: &Path) {
+    let mut options = git2::RepositoryInitOptions::new();
+    options.bare(true).initial_head("main");
+    git2::Repository::init_opts(root, &options).unwrap();
+}
+
 #[test]
 fn scenario_variation_restore_and_support_ref_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
@@ -312,7 +318,7 @@ fn scenario_shelf_apply_preview_and_delete_roundtrip() {
 #[test]
 fn scenario_collaboration_fast_forward_and_clean_merge() {
     let remote_dir = tempfile::tempdir().unwrap();
-    git2::Repository::init_bare(remote_dir.path()).unwrap();
+    init_bare_remote(remote_dir.path());
 
     let author_dir = tempfile::tempdir().unwrap();
     let author = Workspace::init(author_dir.path()).unwrap();
@@ -378,7 +384,7 @@ fn scenario_collaboration_fast_forward_and_clean_merge() {
 #[test]
 fn scenario_collaboration_conflict_preflight_reports_without_mutating() {
     let remote_dir = tempfile::tempdir().unwrap();
-    git2::Repository::init_bare(remote_dir.path()).unwrap();
+    init_bare_remote(remote_dir.path());
 
     let author_dir = tempfile::tempdir().unwrap();
     let author = Workspace::init(author_dir.path()).unwrap();
@@ -423,7 +429,7 @@ fn scenario_collaboration_conflict_preflight_reports_without_mutating() {
 #[test]
 fn scenario_remote_support_refs_roundtrip_restore_and_local_expire() {
     let remote_dir = tempfile::tempdir().unwrap();
-    git2::Repository::init_bare(remote_dir.path()).unwrap();
+    init_bare_remote(remote_dir.path());
 
     let author_dir = tempfile::tempdir().unwrap();
     let author = Workspace::init(author_dir.path()).unwrap();
@@ -502,7 +508,7 @@ fn scenario_purge_api_is_explicitly_planning_only() {
     assert!(preflight
         .affected_refs
         .iter()
-        .any(|reference| reference == "refs/heads/master"));
+        .any(|reference| reference == "refs/heads/main"));
     assert!(preflight
         .distributed_warning
         .contains("cannot guarantee deletion from existing clones"));

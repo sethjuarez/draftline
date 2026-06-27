@@ -17,8 +17,9 @@ use crate::{
     RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
     RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result,
     Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SyncState, SyncStatus, Variation,
-    VariationId, VariationSummary, Version, VersionDiff, VersionId, VersionPreview, Workspace,
-    WorkspaceDiagnostic, WorkspaceId, WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
+    VariationId, VariationRenamePreflight, VariationRenameToken, VariationSummary, Version,
+    VersionDiff, VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceId,
+    WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -225,6 +226,16 @@ pub struct ListSupportRefsRequest {
     pub scope: SupportRefScope,
 }
 
+/// Request for renaming a local variation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameVariationRequest {
+    pub workspace_path: PathBuf,
+    pub source_variation_id: String,
+    pub target_variation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<VariationRenameToken>,
+}
+
 /// Request for commands that target one version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionRequest {
@@ -409,6 +420,14 @@ pub struct RemoteVariationRequest {
 /// Remote-variation adoption result with postcondition state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdoptRemoteVariationResult {
+    pub variation: Variation,
+    pub postconditions: CommandPostconditions,
+}
+
+/// Variation rename result with preflight and postcondition state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameVariationResult {
+    pub preflight: VariationRenamePreflight,
     pub variation: Variation,
     pub postconditions: CommandPostconditions,
 }
@@ -647,6 +666,99 @@ pub fn list_variations_with_context(
     context
         .open_workspace(&request.workspace_path)?
         .variation_summaries()
+}
+
+/// Preflights a local variation rename without mutating refs.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        source_variation_id = %request.source_variation_id,
+        target_variation_id = %request.target_variation_id
+    )
+)]
+pub fn preflight_rename_variation(
+    request: RenameVariationRequest,
+) -> Result<VariationRenamePreflight> {
+    preflight_rename_variation_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Preflights a local variation rename using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        source_variation_id = %request.source_variation_id,
+        target_variation_id = %request.target_variation_id
+    )
+)]
+pub fn preflight_rename_variation_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: RenameVariationRequest,
+) -> Result<VariationRenamePreflight> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .preflight_rename_variation(
+            &VariationId::from(request.source_variation_id),
+            &VariationId::from(request.target_variation_id),
+        )
+}
+
+/// Renames a local variation through the tokenized guarded path.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        source_variation_id = %request.source_variation_id,
+        target_variation_id = %request.target_variation_id
+    )
+)]
+pub fn rename_variation(request: RenameVariationRequest) -> Result<RenameVariationResult> {
+    rename_variation_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Renames a local variation using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        source_variation_id = %request.source_variation_id,
+        target_variation_id = %request.target_variation_id
+    )
+)]
+pub fn rename_variation_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: RenameVariationRequest,
+) -> Result<RenameVariationResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let source = VariationId::from(request.source_variation_id);
+    let target = VariationId::from(request.target_variation_id);
+    let preflight = workspace.preflight_rename_variation(&source, &target)?;
+    let token = request.token.unwrap_or_else(|| preflight.token.clone());
+    if token.source_variation != source
+        || token.target_variation != target
+        || token.expected_oid != preflight.expected_oid
+    {
+        return Err(DraftlineError::LocalStateChanged {
+            expected: format!(
+                "{}@{}",
+                preflight.source_variation.as_str(),
+                preflight.expected_oid
+            ),
+            actual: format!("{}@{}", token.source_variation.as_str(), token.expected_oid),
+        });
+    }
+    let variation = workspace.rename_variation_with_token(token)?;
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(RenameVariationResult {
+        preflight,
+        variation,
+        postconditions: collect_postconditions(&workspace, false),
+    })
 }
 
 /// Returns hidden recovery support refs for admin/recovery views.

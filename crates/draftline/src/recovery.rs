@@ -25,4 +25,5 @@ pub enum RecoveryOperation {
     ApplyShelf,
     DeleteRemoteVariation,
     ExpireSupportRefs,
+    RenameVariation,
 }
