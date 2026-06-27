@@ -15,10 +15,10 @@ use crate::{
     MergeIncomingReport, MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice,
     OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight, PublishResult,
     RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
-    RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, Result, Shelf, ShelfApplyReport,
-    SupportRef, SupportRefScope, SyncState, SyncStatus, Variation, VariationId, VariationSummary,
-    Version, VersionDiff, VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceId,
-    WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
+    RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result,
+    Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SyncState, SyncStatus, Variation,
+    VariationId, VariationSummary, Version, VersionDiff, VersionId, VersionPreview, Workspace,
+    WorkspaceDiagnostic, WorkspaceId, WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -263,10 +263,27 @@ pub struct RestoreVersionRequest {
     pub label: String,
 }
 
+/// Request for restoring one saved version as a new save on a target variation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetedRestoreVersionRequest {
+    pub workspace_path: PathBuf,
+    pub version_id: String,
+    pub label: String,
+    pub target: RestoreVersionTarget,
+}
+
 /// Restore result with postcondition state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreVersionResult {
     pub version: Version,
+    pub postconditions: CommandPostconditions,
+}
+
+/// Targeted restore result with the activated target variation and postcondition state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetedRestoreVersionCommandResult {
+    pub version: Version,
+    pub target_variation: Variation,
     pub postconditions: CommandPostconditions,
 }
 
@@ -885,6 +902,46 @@ pub fn restore_version_as_new_save_with_context(
     context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
     Ok(RestoreVersionResult {
         version,
+        postconditions: collect_postconditions(&workspace, true),
+    })
+}
+
+/// Restores a saved version as a new save on a target variation.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn restore_version_as_new_save_to_variation(
+    request: TargetedRestoreVersionRequest,
+) -> Result<TargetedRestoreVersionCommandResult> {
+    restore_version_as_new_save_to_variation_with_context(
+        &mut DraftlineCommandContext::new(),
+        request,
+    )
+}
+
+/// Restores a saved version as a new save on a target variation using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn restore_version_as_new_save_to_variation_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: TargetedRestoreVersionRequest,
+) -> Result<TargetedRestoreVersionCommandResult> {
+    let version_id = parse_version_id(request.version_id)?;
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let result = workspace.restore_version_as_new_save_to_variation(
+        &version_id,
+        request.label,
+        request.target,
+    )?;
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(TargetedRestoreVersionCommandResult {
+        version: result.version,
+        target_variation: result.target_variation,
         postconditions: collect_postconditions(&workspace, true),
     })
 }
@@ -1804,6 +1861,8 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::RecoveryRequired(_) => "recovery_required",
         DraftlineError::RecoveryNotFound(_) => "recovery_not_found",
         DraftlineError::InvalidVariationName(_) => "invalid_variation_name",
+        DraftlineError::VariationAlreadyExists(_) => "variation_already_exists",
+        DraftlineError::VariationNotFound(_) => "variation_not_found",
         DraftlineError::CannotDeleteCurrentVariation(_) => "cannot_delete_current_variation",
         DraftlineError::VersionNotFound(_) => "version_not_found",
         DraftlineError::NoCurrentVariation => "no_current_variation",

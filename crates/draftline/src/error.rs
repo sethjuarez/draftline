@@ -40,6 +40,12 @@ pub enum DraftlineError {
     #[error("invalid variation name: {0}")]
     InvalidVariationName(String),
 
+    #[error("variation already exists: {0}")]
+    VariationAlreadyExists(String),
+
+    #[error("variation was not found: {0}")]
+    VariationNotFound(String),
+
     #[error("cannot delete the current variation: {0}")]
     CannotDeleteCurrentVariation(String),
 

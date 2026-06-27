@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use draftline::{
-    ContentPolicy, DiagnosticCode, DraftlineError, RemoteOptions, SupportRefScope, SwitchPolicy,
-    SyncState, VariationId, VariationMetadata, Workspace,
+    ContentPolicy, DiagnosticCode, DraftlineError, RemoteOptions, RestoreVersionTarget,
+    SupportRefScope, SwitchPolicy, SyncState, VariationId, VariationMetadata, Workspace,
 };
 
 fn write_file(root: &Path, relative: &str, content: &str) {
@@ -93,6 +93,187 @@ fn scenario_variation_restore_and_support_ref_lifecycle() {
     assert!(restore.can_restore);
     let restored_variation = workspace.restore_support_ref(restore.token).unwrap();
     assert_eq!(restored_variation.name, restored_name);
+}
+
+#[test]
+fn targeted_restore_creates_save_on_existing_variation_without_wrong_branch_write() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root(), "Scenario Targeted Restore");
+
+    write_file(workspace.root(), "story.md", "base");
+    let base = workspace.save_version("Base").unwrap();
+    write_file(workspace.root(), "story.md", "main edit");
+    workspace.save_version("Main edit").unwrap();
+    let original_variation = workspace.current_variation().unwrap();
+
+    let alternate = workspace.create_variation("alternate").unwrap();
+    let restored = workspace
+        .restore_version_as_new_save_to_variation(
+            base.id(),
+            "Restore base onto alternate",
+            RestoreVersionTarget::Existing {
+                variation: alternate.id().clone(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(restored.version.label, "Restore base onto alternate");
+    assert_eq!(restored.target_variation.name, "alternate");
+    assert_eq!(workspace.current_variation().unwrap(), "alternate");
+    assert_eq!(read_file(workspace.root(), "story.md"), "base");
+
+    workspace
+        .switch_variation(
+            &VariationId::from(original_variation.clone()),
+            SwitchPolicy::AbortIfDirty,
+        )
+        .unwrap();
+    assert_eq!(workspace.current_variation().unwrap(), original_variation);
+    assert_eq!(read_file(workspace.root(), "story.md"), "main edit");
+}
+
+#[test]
+fn targeted_restore_current_variation_matches_regular_restore_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root(), "Scenario Targeted Restore Current");
+
+    write_file(workspace.root(), "story.md", "base");
+    let base = workspace.save_version("Base").unwrap();
+    write_file(workspace.root(), "story.md", "main edit");
+    workspace.save_version("Main edit").unwrap();
+    let original_variation = workspace.current_variation().unwrap();
+
+    let restored = workspace
+        .restore_version_as_new_save_to_variation(
+            base.id(),
+            "Restore base onto current",
+            RestoreVersionTarget::Current,
+        )
+        .unwrap();
+
+    assert_eq!(restored.version.label, "Restore base onto current");
+    assert_eq!(restored.target_variation.name, original_variation);
+    assert_eq!(workspace.current_variation().unwrap(), original_variation);
+    assert_eq!(read_file(workspace.root(), "story.md"), "base");
+}
+
+#[test]
+fn targeted_restore_creates_new_variation_and_preserves_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root(), "Scenario Targeted Restore New");
+
+    write_file(workspace.root(), "story.md", "base");
+    let base = workspace.save_version("Base").unwrap();
+    write_file(workspace.root(), "story.md", "main edit");
+    workspace.save_version("Main edit").unwrap();
+
+    let restored = workspace
+        .restore_version_as_new_save_to_variation(
+            base.id(),
+            "Restore base onto new variation",
+            RestoreVersionTarget::New {
+                name: "snapshot-preview".to_string(),
+                metadata: VariationMetadata::new()
+                    .with_label("Snapshot Preview")
+                    .with_slug("snapshot-preview"),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(workspace.current_variation().unwrap(), "snapshot-preview");
+    assert_eq!(read_file(workspace.root(), "story.md"), "base");
+    assert_eq!(
+        restored.target_variation.display_label(),
+        "Snapshot Preview"
+    );
+    assert_eq!(
+        workspace
+            .variations()
+            .unwrap()
+            .into_iter()
+            .find(|variation| variation.name == "snapshot-preview")
+            .unwrap()
+            .metadata
+            .slug
+            .as_deref(),
+        Some("snapshot-preview")
+    );
+}
+
+#[test]
+fn targeted_restore_fails_before_writing_for_target_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root(), "Scenario Targeted Restore Errors");
+
+    write_file(workspace.root(), "story.md", "base");
+    let base = workspace.save_version("Base").unwrap();
+    write_file(workspace.root(), "story.md", "main edit");
+    workspace.save_version("Main edit").unwrap();
+    let original_variation = workspace.current_variation().unwrap();
+
+    let missing = workspace.restore_version_as_new_save_to_variation(
+        base.id(),
+        "Missing target",
+        RestoreVersionTarget::Existing {
+            variation: VariationId::from("missing-target"),
+        },
+    );
+    assert!(matches!(
+        missing,
+        Err(DraftlineError::VariationNotFound(name)) if name == "missing-target"
+    ));
+    assert_eq!(workspace.current_variation().unwrap(), original_variation);
+    assert_eq!(read_file(workspace.root(), "story.md"), "main edit");
+
+    let collision = workspace.restore_version_as_new_save_to_variation(
+        base.id(),
+        "Collision target",
+        RestoreVersionTarget::New {
+            name: original_variation.clone(),
+            metadata: VariationMetadata::default(),
+        },
+    );
+    assert!(matches!(
+        collision,
+        Err(DraftlineError::VariationAlreadyExists(name)) if name == original_variation
+    ));
+    assert_eq!(workspace.current_variation().unwrap(), original_variation);
+    assert_eq!(read_file(workspace.root(), "story.md"), "main edit");
+}
+
+#[test]
+fn targeted_restore_fails_without_activating_target_when_restore_cannot_proceed() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root(), "Scenario Targeted Restore Failure");
+
+    write_file(workspace.root(), "story.md", "base");
+    let base = workspace.save_version("Base").unwrap();
+    write_file(workspace.root(), "story.md", "main edit");
+    workspace.save_version("Main edit").unwrap();
+    let original_variation = workspace.current_variation().unwrap();
+    let alternate = workspace.create_variation("alternate").unwrap();
+
+    write_file(workspace.root(), "scratch.md", "unsaved");
+    let blocked = workspace.restore_version_as_new_save_to_variation(
+        base.id(),
+        "Blocked restore",
+        RestoreVersionTarget::Existing {
+            variation: alternate.id().clone(),
+        },
+    );
+    assert!(matches!(
+        blocked,
+        Err(DraftlineError::PreflightFailed(report))
+            if report.operation == "restore_version_as_new_save_to_variation"
+    ));
+    assert_eq!(workspace.current_variation().unwrap(), original_variation);
+    assert_eq!(read_file(workspace.root(), "story.md"), "main edit");
+    assert_eq!(read_file(workspace.root(), "scratch.md"), "unsaved");
 }
 
 #[test]

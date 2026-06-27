@@ -8,7 +8,8 @@ use draftline::tauri_contract::{
     RecoveryRequest, RemoteRequest, RemoteVariationRequest, RestoreVersionRequest,
     RestoreVersionResult, SaveRequest, SaveResult, SelectedDiscardRequest, SelectedDiscardResult,
     SelectedSaveRequest, SelectedSaveResult, SelectedShelveRequest, SelectedShelveResult,
-    ShelfRequest, TauriCommandError, TauriCommandResult, VersionRequest, WorkspaceDiagnostics,
+    ShelfRequest, TargetedRestoreVersionCommandResult, TargetedRestoreVersionRequest,
+    TauriCommandError, TauriCommandResult, VersionRequest, WorkspaceDiagnostics,
     WorkspaceOpenResult, WorkspaceRequest,
 };
 use draftline::{
@@ -233,6 +234,18 @@ fn restore_version_as_new_save(
 ) -> TauriCommandResult<RestoreVersionResult> {
     let mut context = lock_context(state.inner())?;
     contract::into_tauri_result(contract::restore_version_as_new_save_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn restore_version_as_new_save_to_variation(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: TargetedRestoreVersionRequest,
+) -> TauriCommandResult<TargetedRestoreVersionCommandResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::restore_version_as_new_save_to_variation_with_context(
         &mut context,
         request,
     ))
@@ -485,6 +498,7 @@ fn main() {
             preview_version_file,
             preview_workspace_file,
             restore_version_as_new_save,
+            restore_version_as_new_save_to_variation,
             save,
             list_shelves,
             preview_shelf,
