@@ -10,18 +10,20 @@ use draftline::tauri_contract::{
     merge_incoming_with_resolutions_with_context, open_workspace, preflight_apply_incoming,
     preflight_apply_shelf, preflight_merge_incoming, preview_shelf, preview_version,
     preview_version_file, preview_workspace_file, publish_current_variation,
-    restore_version_as_new_save, save, selected_discard, selected_save, selected_save_with_context,
-    selected_shelve, verify_workspace, whole_file_use_content_resolutions, CloneWorkspaceRequest,
-    ConflictContentSource, CurrentFileRequest, DiffVersionsRequest, DraftlineCommandContext,
-    DraftlineEventKind, ListSupportRefsRequest, MergeIncomingRequest,
-    MergeIncomingWithResolutionsRequest, PreviewVersionFileRequest, PublishCurrentVariationRequest,
-    RemoteRequest, RemoteVariationRequest, RestoreVersionRequest, SaveRequest,
-    SelectedDiscardRequest, SelectedSaveRequest, SelectedShelveRequest, ShelfRequest,
+    restore_version_as_new_save, restore_version_as_new_save_to_variation, save, selected_discard,
+    selected_save, selected_save_with_context, selected_shelve, verify_workspace,
+    whole_file_use_content_resolutions, CloneWorkspaceRequest, ConflictContentSource,
+    CurrentFileRequest, DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
+    ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
+    PreviewVersionFileRequest, PublishCurrentVariationRequest, RemoteRequest,
+    RemoteVariationRequest, RestoreVersionRequest, SaveRequest, SelectedDiscardRequest,
+    SelectedSaveRequest, SelectedShelveRequest, ShelfRequest, TargetedRestoreVersionRequest,
     VersionRequest, WorkspaceRequest,
 };
 use draftline::{
     ContentPolicy, Contributor, ContributorProfile, MergeConflictResolution, MergeResolutionChoice,
-    OperationLockState, SupportRefScope, SwitchPolicy, SyncState, VariationId, Workspace,
+    OperationLockState, RestoreVersionTarget, SupportRefScope, SwitchPolicy, SyncState,
+    VariationId, Workspace,
 };
 use serde_json::Value;
 
@@ -379,6 +381,46 @@ fn tauri_contract_smokes_history_preview_restore_shelf_and_policy_commands() {
         .unwrap()
         .historical_out_of_policy_paths
         .is_empty());
+}
+
+#[test]
+fn tauri_contract_restores_version_to_target_variation() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"# Base");
+    let base = workspace.save_version("Base").unwrap();
+    write_file(workspace.root(), "post.md", b"# Current");
+    workspace.save_version("Current").unwrap();
+
+    let restored = restore_version_as_new_save_to_variation(TargetedRestoreVersionRequest {
+        workspace_path: temp.path().to_path_buf(),
+        version_id: base.id().as_str().to_string(),
+        label: "Restore to preview branch".to_string(),
+        target: RestoreVersionTarget::New {
+            name: "preview-branch".to_string(),
+            metadata: Default::default(),
+        },
+    })
+    .unwrap();
+
+    assert_eq!(restored.version.label, "Restore to preview branch");
+    assert_eq!(restored.target_variation.name, "preview-branch");
+    assert!(restored.postconditions.errors.is_empty());
+    assert_eq!(
+        Workspace::open(temp.path())
+            .unwrap()
+            .current_variation()
+            .unwrap(),
+        "preview-branch"
+    );
+
+    let json = serde_json::to_value(restored).unwrap();
+    assert_object_keys(
+        &json,
+        &[],
+        &["postconditions", "target_variation", "version"],
+    );
 }
 
 #[test]

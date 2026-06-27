@@ -163,6 +163,11 @@ describe('createDraftlineClient', () => {
     await client.previewVersion(versionRequest);
     await client.previewVersionFile({ ...versionRequest, path: 'post.md' });
     await client.restoreVersionAsNewSave({ ...versionRequest, label: 'Restore' });
+    await client.restoreVersionAsNewSaveToVariation({
+      ...versionRequest,
+      label: 'Restore targeted',
+      target: { kind: 'existing', variation: 'alternate' },
+    });
     await client.listShelves('C:\\repo');
     await client.previewShelf(shelfRequest);
     await client.preflightApplyShelf(shelfRequest);
@@ -196,6 +201,13 @@ describe('createDraftlineClient', () => {
     });
     expect(invoke).toHaveBeenCalledWith('restore_version_as_new_save', {
       request: { ...versionRequest, label: 'Restore' },
+    });
+    expect(invoke).toHaveBeenCalledWith('restore_version_as_new_save_to_variation', {
+      request: {
+        ...versionRequest,
+        label: 'Restore targeted',
+        target: { kind: 'existing', variation: 'alternate' },
+      },
     });
     expect(invoke).toHaveBeenCalledWith('list_shelves', {
       request: { workspace_path: 'C:\\repo' },
@@ -253,6 +265,11 @@ describe('createDraftlineClient', () => {
     });
     await client.diffWorkspaceFile({ workspace_path: 'C:\\repo', path: 'post.md' });
     await client.previewWorkspaceFile({ workspace_path: 'C:\\repo', path: 'post.md' });
+    await facade.restoreAsNewSaveToVariation('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'Facade restore', {
+      kind: 'new',
+      name: 'snapshot-preview',
+      metadata: { label: 'Snapshot Preview' },
+    });
     await facade.save('Facade save');
 
     expect(invoke).toHaveBeenCalledWith('open_workspace', {
@@ -285,6 +302,18 @@ describe('createDraftlineClient', () => {
     });
     expect(invoke).toHaveBeenCalledWith('preview_workspace_file', {
       request: { workspace_path: 'C:\\repo', path: 'post.md' },
+    });
+    expect(invoke).toHaveBeenCalledWith('restore_version_as_new_save_to_variation', {
+      request: {
+        workspace_path: 'C:\\repo',
+        version_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        label: 'Facade restore',
+        target: {
+          kind: 'new',
+          name: 'snapshot-preview',
+          metadata: { label: 'Snapshot Preview' },
+        },
+      },
     });
     expect(invoke).toHaveBeenCalledWith('save', {
       request: { workspace_path: 'C:\\repo', label: 'Facade save' },

@@ -1,6 +1,6 @@
 {
   "name": "@draftline/client",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Typed Draftline client for Tauri host applications.",
   "license": "MIT",
   "type": "module",

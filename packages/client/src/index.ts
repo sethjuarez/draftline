@@ -40,6 +40,9 @@ export interface DraftlineClient {
   previewVersionFile(request: PreviewVersionFileRequest): Promise<PreviewFile | null>;
   previewWorkspaceFile(request: CurrentFileRequest): Promise<CurrentFilePreview | null>;
   restoreVersionAsNewSave(request: RestoreVersionRequest): Promise<RestoreVersionResult>;
+  restoreVersionAsNewSaveToVariation(
+    request: TargetedRestoreVersionRequest,
+  ): Promise<TargetedRestoreVersionResult>;
   save(request: SaveRequest): Promise<SaveResult>;
   listShelves(workspacePath: string): Promise<Shelf[]>;
   previewShelf(request: ShelfRequest): Promise<VersionPreview>;
@@ -143,6 +146,8 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     previewVersionFile: (request) => run('preview_version_file', { request }),
     previewWorkspaceFile: (request) => run('preview_workspace_file', { request }),
     restoreVersionAsNewSave: (request) => run('restore_version_as_new_save', { request }),
+    restoreVersionAsNewSaveToVariation: (request) =>
+      run('restore_version_as_new_save_to_variation', { request }),
     save: (request) => run('save', { request }),
     listShelves: (workspacePath) =>
       run('list_shelves', {
@@ -244,6 +249,11 @@ export interface Variation {
   metadata: VariationMetadata;
   is_current: boolean;
 }
+
+export type RestoreVersionTarget =
+  | { kind: 'current' }
+  | { kind: 'existing'; variation: string }
+  | { kind: 'new'; name: string; metadata?: VariationMetadata };
 
 export interface VariationSummary {
   variation: Variation;
@@ -483,6 +493,12 @@ export interface RestoreVersionResult {
   postconditions: CommandPostconditions;
 }
 
+export interface TargetedRestoreVersionResult {
+  version: Version;
+  target_variation: Variation;
+  postconditions: CommandPostconditions;
+}
+
 export interface SaveResult {
   version: Version;
   postconditions: CommandPostconditions;
@@ -702,6 +718,10 @@ export interface RestoreVersionRequest extends VersionRequest {
   label: string;
 }
 
+export interface TargetedRestoreVersionRequest extends RestoreVersionRequest {
+  target: RestoreVersionTarget;
+}
+
 export interface SaveRequest extends WorkspaceRequest {
   label: string;
 }
@@ -781,6 +801,11 @@ export interface DraftlineHostFacade {
   previewVersionFile(versionId: string, path: string): Promise<PreviewFile | null>;
   previewWorkspaceFile(path: string): Promise<CurrentFilePreview | null>;
   restoreAsNewSave(versionId: string, label: string): Promise<RestoreVersionResult>;
+  restoreAsNewSaveToVariation(
+    versionId: string,
+    label: string,
+    target: RestoreVersionTarget,
+  ): Promise<TargetedRestoreVersionResult>;
   shelves(): Promise<Shelf[]>;
   previewShelf(shelfId: string): Promise<VersionPreview>;
   applyShelf(shelfId: string): Promise<ApplyShelfCommandResult>;
@@ -843,6 +868,8 @@ export function createDraftlineHostFacade({
     previewWorkspaceFile: (path) => client.previewWorkspaceFile({ ...workspaceRequest(), path }),
     restoreAsNewSave: (versionId, label) =>
       client.restoreVersionAsNewSave({ ...versionRequest(versionId), label }),
+    restoreAsNewSaveToVariation: (versionId, label, target) =>
+      client.restoreVersionAsNewSaveToVariation({ ...versionRequest(versionId), label, target }),
     shelves: () => client.listShelves(workspacePath),
     previewShelf: (shelfId) => client.previewShelf({ ...workspaceRequest(), shelf_id: shelfId }),
     applyShelf: (shelfId) => client.applyShelf({ ...workspaceRequest(), shelf_id: shelfId }),
@@ -1034,6 +1061,12 @@ export async function restoreVersionAsNewSave(
   request: RestoreVersionRequest,
 ): Promise<RestoreVersionResult> {
   return createDraftlineClient().restoreVersionAsNewSave(request);
+}
+
+export async function restoreVersionAsNewSaveToVariation(
+  request: TargetedRestoreVersionRequest,
+): Promise<TargetedRestoreVersionResult> {
+  return createDraftlineClient().restoreVersionAsNewSaveToVariation(request);
 }
 
 export async function save(request: SaveRequest): Promise<SaveResult> {

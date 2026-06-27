@@ -639,6 +639,31 @@ pub struct VariationSummary {
     pub reachable_version_count: usize,
 }
 
+/// Target variation for restoring a saved version as a new save.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
+pub enum RestoreVersionTarget {
+    /// Restore onto the currently active variation.
+    Current,
+    /// Restore onto an existing local variation and activate it after the save is ready.
+    Existing { variation: VariationId },
+    /// Create a new local variation, restore onto it, and activate it after the save is ready.
+    New {
+        name: String,
+        #[serde(default)]
+        metadata: VariationMetadata,
+    },
+}
+
+/// Result of restoring a version onto a selected target variation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TargetedRestoreVersionResult {
+    pub version: Version,
+    pub target_variation: Variation,
+}
+
 /// A variation discovered on a remote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -3471,6 +3496,87 @@ impl Workspace {
         Ok(version_from_commit(&self.repo.find_commit(oid)?))
     }
 
+    /// Restores a saved version as a new save on a selected target variation.
+    ///
+    /// The target is resolved and preflighted before Draftline writes the restored
+    /// save. Non-current targets are only activated after the target commit has
+    /// been created, avoiding accidental restores onto the previously active
+    /// variation when target creation or resolution fails.
+    pub fn restore_version_as_new_save_to_variation(
+        &self,
+        version: &VersionId,
+        label: impl AsRef<str>,
+        target: RestoreVersionTarget,
+    ) -> Result<TargetedRestoreVersionResult> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(
+            &self.lock_path(),
+            "restore_version_as_new_save_to_variation",
+        )?;
+
+        let source_commit = self.find_version_commit(version)?;
+        let source_tree = source_commit.tree()?;
+        let current_variation = self.current_variation_unchecked()?;
+        let (target_name, target_metadata, parent_oid) =
+            self.resolve_restore_version_target(target, &current_variation)?;
+
+        let report = preflight_report(
+            "restore_version_as_new_save_to_variation",
+            true,
+            self.changed_files_unchecked()?,
+            self.target_tree_hazards(&source_tree)?,
+            Some(format!("{current_variation} -> {target_name}")),
+        );
+        if !report.can_proceed {
+            return Err(DraftlineError::PreflightFailed(Box::new(report)));
+        }
+
+        let operation_id = new_operation_id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::RestoreVersionAsNewSave,
+            original_variation: Some(current_variation),
+            target: Some(format!("{} -> {}", version.as_str(), target_name)),
+            completed: false,
+        })?;
+
+        let parent = self.repo.find_commit(parent_oid)?;
+        let signature = self.workspace_signature()?;
+        let target_ref = format!("refs/heads/{target_name}");
+        let oid = self.repo.commit(
+            Some(&target_ref),
+            &signature,
+            &signature,
+            label.as_ref(),
+            &source_tree,
+            &[&parent],
+        )?;
+        self.write_variation_metadata(&target_name, &target_metadata)?;
+
+        self.repo.checkout_tree(
+            source_tree.as_object(),
+            Some(CheckoutBuilder::new().force()),
+        )?;
+        self.repo.set_head(&target_ref)?;
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::RestoreVersionAsNewSave,
+            original_variation: None,
+            target: Some(format!("{} -> {}", version.as_str(), target_name)),
+            completed: true,
+        })?;
+
+        Ok(TargetedRestoreVersionResult {
+            version: version_from_commit(&self.repo.find_commit(oid)?),
+            target_variation: variation_from_name(
+                target_name.clone(),
+                Some(&target_name),
+                target_metadata,
+            ),
+        })
+    }
+
     /// Reads a version without mutating the live workspace.
     pub fn preview_version(&self, version: &VersionId) -> Result<VersionPreview> {
         self.ensure_no_pending_recovery()?;
@@ -4478,6 +4584,45 @@ impl Workspace {
                     .ok_or(DraftlineError::NoCurrentVariation)
             }
             Err(error) => Err(error.into()),
+        }
+    }
+
+    fn resolve_restore_version_target(
+        &self,
+        target: RestoreVersionTarget,
+        current_variation: &str,
+    ) -> Result<(String, VariationMetadata, Oid)> {
+        match target {
+            RestoreVersionTarget::Current => {
+                let parent_oid = self.repo.head()?.peel_to_commit()?.id();
+                let metadata = self.read_variation_metadata(current_variation)?;
+                Ok((current_variation.to_string(), metadata, parent_oid))
+            }
+            RestoreVersionTarget::Existing { variation } => {
+                let branch = self
+                    .repo
+                    .find_branch(variation.as_str(), BranchType::Local)
+                    .map_err(|error| match error.code() {
+                        git2::ErrorCode::NotFound => {
+                            DraftlineError::VariationNotFound(variation.as_str().to_string())
+                        }
+                        _ => DraftlineError::from(error),
+                    })?;
+                let parent_oid = branch.get().peel_to_commit()?.id();
+                let metadata = self.read_variation_metadata(variation.as_str())?;
+                Ok((variation.as_str().to_string(), metadata, parent_oid))
+            }
+            RestoreVersionTarget::New { name, metadata } => {
+                let name = validate_variation_name(&name)?;
+                match self.repo.find_branch(&name, BranchType::Local) {
+                    Ok(_) => Err(DraftlineError::VariationAlreadyExists(name)),
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                        let parent_oid = self.repo.head()?.peel_to_commit()?.id();
+                        Ok((name, metadata, parent_oid))
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
         }
     }
 
