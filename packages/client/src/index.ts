@@ -25,6 +25,8 @@ export interface DraftlineClient {
   inspectWorkspace(workspacePath: string): Promise<WorkspaceDiagnostics>;
   verifyWorkspace(workspacePath: string): Promise<WorkspaceVerification>;
   listVariations(workspacePath: string): Promise<VariationSummary[]>;
+  preflightRenameVariation(request: RenameVariationRequest): Promise<VariationRenamePreflight>;
+  renameVariation(request: RenameVariationRequest): Promise<RenameVariationResult>;
   listSupportRefs(workspacePath: string, scope: SupportRefScope): Promise<SupportRef[]>;
   listRemotes(workspacePath: string): Promise<RemoteEndpoint[]>;
   listRemoteVariations(request: RemoteRequest): Promise<RemoteVariation[]>;
@@ -115,6 +117,8 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('list_variations', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
+    preflightRenameVariation: (request) => run('preflight_rename_variation', { request }),
+    renameVariation: (request) => run('rename_variation', { request }),
     listSupportRefs: (workspacePath, scope) =>
       run('list_support_refs', {
         request: { workspace_path: workspacePath, scope } satisfies ListSupportRefsRequest,
@@ -259,6 +263,23 @@ export interface VariationSummary {
   variation: Variation;
   head_version?: Version | null;
   reachable_version_count: number;
+}
+
+export interface VariationRenameToken {
+  operation_id: string;
+  source_variation: string;
+  target_variation: string;
+  expected_oid: string;
+  support_ref: string;
+}
+
+export interface VariationRenamePreflight {
+  source_variation: string;
+  target_variation: string;
+  expected_oid: string;
+  support_ref: string;
+  token: VariationRenameToken;
+  can_rename: boolean;
 }
 
 export interface HistoryEntry {
@@ -583,6 +604,12 @@ export interface AdoptRemoteVariationResult {
   postconditions: CommandPostconditions;
 }
 
+export interface RenameVariationResult {
+  preflight: VariationRenamePreflight;
+  variation: Variation;
+  postconditions: CommandPostconditions;
+}
+
 export interface ApplyIncomingReport {
   sync_status: SyncStatus;
   dirty_files: ChangedFile[];
@@ -697,6 +724,12 @@ export interface ListSupportRefsRequest extends WorkspaceRequest {
   scope: SupportRefScope;
 }
 
+export interface RenameVariationRequest extends WorkspaceRequest {
+  source_variation_id: string;
+  target_variation_id: string;
+  token?: VariationRenameToken;
+}
+
 export interface VersionRequest extends WorkspaceRequest {
   version_id: string;
 }
@@ -792,6 +825,12 @@ export interface DraftlineHostFacade {
   fullHistory(): Promise<HistoryEntry[]>;
   changes(): Promise<ChangeSet>;
   variations(): Promise<VariationSummary[]>;
+  preflightRenameVariation(sourceVariationId: string, targetVariationId: string): Promise<VariationRenamePreflight>;
+  renameVariation(
+    sourceVariationId: string,
+    targetVariationId: string,
+    token?: VariationRenameToken,
+  ): Promise<RenameVariationResult>;
   remotes(): Promise<RemoteEndpoint[]>;
   supportRefs(scope: SupportRefScope): Promise<SupportRef[]>;
   diffVersions(fromVersionId: string, toVersionId: string): Promise<VersionDiff>;
@@ -852,6 +891,19 @@ export function createDraftlineHostFacade({
     fullHistory: () => client.getFullHistory(workspacePath),
     changes: () => client.getChanges(workspacePath),
     variations: () => client.listVariations(workspacePath),
+    preflightRenameVariation: (sourceVariationId, targetVariationId) =>
+      client.preflightRenameVariation({
+        ...workspaceRequest(),
+        source_variation_id: sourceVariationId,
+        target_variation_id: targetVariationId,
+      }),
+    renameVariation: (sourceVariationId, targetVariationId, token) =>
+      client.renameVariation({
+        ...workspaceRequest(),
+        source_variation_id: sourceVariationId,
+        target_variation_id: targetVariationId,
+        token,
+      }),
     remotes: () => client.listRemotes(workspacePath),
     supportRefs: (scope) => client.listSupportRefs(workspacePath, scope),
     diffVersions: (fromVersionId, toVersionId) =>
@@ -986,6 +1038,18 @@ export async function verifyWorkspace(workspacePath: string): Promise<WorkspaceV
 
 export async function listVariations(workspacePath: string): Promise<VariationSummary[]> {
   return createDraftlineClient().listVariations(workspacePath);
+}
+
+export async function preflightRenameVariation(
+  request: RenameVariationRequest,
+): Promise<VariationRenamePreflight> {
+  return createDraftlineClient().preflightRenameVariation(request);
+}
+
+export async function renameVariation(
+  request: RenameVariationRequest,
+): Promise<RenameVariationResult> {
+  return createDraftlineClient().renameVariation(request);
 }
 
 export async function listSupportRefs(

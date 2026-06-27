@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use git2::{
     build::{CheckoutBuilder, RepoBuilder},
     BranchType, Commit, DiffFormat, DiffOptions, Direction, FetchPrune, ObjectType, Oid,
-    Repository, Signature, Status, StatusOptions, Tree,
+    Repository, RepositoryInitOptions, Signature, Status, StatusOptions, Tree,
 };
 use serde::{Deserialize, Serialize};
 
@@ -904,6 +904,29 @@ pub struct VariationDeleteToken {
     pub support_ref: String,
 }
 
+/// Preflight for renaming a visible local variation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VariationRenamePreflight {
+    pub source_variation: VariationId,
+    pub target_variation: VariationId,
+    pub expected_oid: String,
+    pub support_ref: String,
+    pub token: VariationRenameToken,
+    pub can_rename: bool,
+}
+
+/// Token tying a local variation rename to a preflighted branch tip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VariationRenameToken {
+    pub operation_id: String,
+    pub source_variation: VariationId,
+    pub target_variation: VariationId,
+    pub expected_oid: String,
+    pub support_ref: String,
+}
+
 /// Preflight for squashing recent versions after archiving the current tip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1012,7 +1035,12 @@ impl Workspace {
 
         let repo = match Repository::open(path.as_ref()) {
             Ok(repo) => repo,
-            Err(_) => Repository::init(path.as_ref())?,
+            Err(_) => {
+                let initial_head = default_initial_variation_name();
+                let mut options = RepositoryInitOptions::new();
+                options.initial_head(&initial_head);
+                Repository::init_opts(path.as_ref(), &options)?
+            }
         };
 
         let root = repo
@@ -1535,6 +1563,12 @@ impl Workspace {
                 self.repair_delete_variation_recovery(&state)?;
                 self.complete_recovery(state, true)
             }
+            RecoveryOperation::RenameVariation => {
+                match self.repair_rename_variation_recovery(&state)? {
+                    Some(changed_workspace) => self.complete_recovery(state, changed_workspace),
+                    None => Ok(self.recovery_unavailable(state)),
+                }
+            }
             RecoveryOperation::ApplyShelf => {
                 let Some(target) = state.target.as_deref() else {
                     return Ok(self.recovery_unavailable(state));
@@ -1639,6 +1673,12 @@ impl Workspace {
                     self.repo.set_head(&branch_ref)?;
                 }
                 self.complete_recovery(state, true)
+            }
+            RecoveryOperation::RenameVariation => {
+                match self.rollback_rename_variation_recovery(&state)? {
+                    Some(changed_workspace) => self.complete_recovery(state, changed_workspace),
+                    None => Ok(self.recovery_unavailable(state)),
+                }
             }
             RecoveryOperation::ApplyShelf => {
                 let changed_files = self.changed_files_unchecked()?;
@@ -3438,6 +3478,129 @@ impl Workspace {
         self.delete_variation_with_token(preflight.token)
     }
 
+    /// Plans renaming a visible local variation, including the archive ref used for recovery.
+    pub fn preflight_rename_variation(
+        &self,
+        source: &VariationId,
+        target: &VariationId,
+    ) -> Result<VariationRenamePreflight> {
+        self.ensure_no_pending_recovery()?;
+        let source_name = validate_variation_name(source.as_str())?;
+        let target_name = validate_variation_name(target.as_str())?;
+        if source_name == target_name {
+            return Err(DraftlineError::VariationAlreadyExists(target_name));
+        }
+
+        let branch = self.find_local_variation_branch(&source_name)?;
+        if self
+            .repo
+            .find_branch(&target_name, BranchType::Local)
+            .is_ok()
+        {
+            return Err(DraftlineError::VariationAlreadyExists(target_name));
+        }
+
+        let operation_id = new_operation_id();
+        let expected_oid = branch.get().peel_to_commit()?.id().to_string();
+        let support_ref = archive_ref("deleted-variations", &source_name, &operation_id);
+        let token = VariationRenameToken {
+            operation_id,
+            source_variation: VariationId::from(source_name.clone()),
+            target_variation: VariationId::from(target_name.clone()),
+            expected_oid: expected_oid.clone(),
+            support_ref: support_ref.clone(),
+        };
+
+        Ok(VariationRenamePreflight {
+            source_variation: VariationId::from(source_name),
+            target_variation: VariationId::from(target_name),
+            expected_oid,
+            support_ref,
+            token,
+            can_rename: true,
+        })
+    }
+
+    /// Renames a preflighted visible local variation while preserving its tip in a support ref.
+    pub fn rename_variation_with_token(&self, token: VariationRenameToken) -> Result<Variation> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "rename_variation")?;
+        let source_name = validate_variation_name(token.source_variation.as_str())?;
+        let target_name = validate_variation_name(token.target_variation.as_str())?;
+        if source_name == target_name {
+            return Err(DraftlineError::VariationAlreadyExists(target_name));
+        }
+        if !is_safe_operation_id(&token.operation_id) {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: "rename operation id issued by preflight".to_string(),
+                actual: token.operation_id,
+            });
+        }
+        let expected_support_ref =
+            archive_ref("deleted-variations", &source_name, &token.operation_id);
+        if token.support_ref != expected_support_ref {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: expected_support_ref,
+                actual: token.support_ref,
+            });
+        }
+        if self
+            .repo
+            .find_branch(&target_name, BranchType::Local)
+            .is_ok()
+        {
+            return Err(DraftlineError::VariationAlreadyExists(target_name));
+        }
+
+        let mut branch = self.find_local_variation_branch(&source_name)?;
+        let target_oid = branch.get().peel_to_commit()?.id();
+        if target_oid.to_string() != token.expected_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{}", source_name, token.expected_oid),
+                actual: format!("{}@{target_oid}", source_name),
+            });
+        }
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id: token.operation_id.clone(),
+            operation: RecoveryOperation::RenameVariation,
+            original_variation: Some(source_name.clone()),
+            target: Some(target_name.clone()),
+            completed: false,
+        })?;
+
+        self.ensure_archive_ref(&token.support_ref, target_oid, "archive renamed variation")?;
+        let source_was_current = self.head_symbolic_variation().as_deref() == Some(&source_name);
+        let metadata = self.read_variation_metadata(&source_name)?;
+        branch.rename(&target_name, false)?;
+        self.write_variation_metadata(&target_name, &metadata)?;
+        self.clear_variation_metadata(&source_name)?;
+        if source_was_current {
+            self.repo.set_head(&format!("refs/heads/{target_name}"))?;
+        }
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id: token.operation_id,
+            operation: RecoveryOperation::RenameVariation,
+            original_variation: None,
+            target: Some(target_name.clone()),
+            completed: true,
+        })?;
+
+        let current = self.current_variation_unchecked().ok();
+        Ok(variation_from_name(target_name, current.as_ref(), metadata))
+    }
+
+    /// Renames a visible local variation.
+    pub fn rename_variation(
+        &self,
+        source: &VariationId,
+        target: &VariationId,
+    ) -> Result<Variation> {
+        let preflight = self.preflight_rename_variation(source, target)?;
+        self.rename_variation_with_token(preflight.token)
+    }
+
     /// Creates a new version from an earlier version without switching variations.
     pub fn restore_version_as_new_save(
         &self,
@@ -4575,7 +4738,7 @@ impl Workspace {
             }
             Err(error) if error.code() == git2::ErrorCode::UnbornBranch => {
                 // New repository with no commits — derive the intended initial branch
-                // name from the HEAD symbolic reference (e.g. refs/heads/master → "master").
+                // name from the HEAD symbolic reference (e.g. refs/heads/main → "main").
                 self.repo
                     .find_reference("HEAD")
                     .ok()
@@ -4585,6 +4748,14 @@ impl Workspace {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn head_symbolic_variation(&self) -> Option<String> {
+        self.repo
+            .find_reference("HEAD")
+            .ok()
+            .and_then(|reference| reference.symbolic_target().map(str::to_string))
+            .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_string))
     }
 
     fn resolve_restore_version_target(
@@ -4760,6 +4931,192 @@ impl Workspace {
             }
         }
         Ok(())
+    }
+
+    fn repair_rename_variation_recovery(&self, state: &RecoveryState) -> Result<Option<bool>> {
+        let Some((source, target)) = self.rename_recovery_names(state)? else {
+            return Ok(None);
+        };
+        let Some(expected_oid) = self.rename_recovery_oid(&source, state)? else {
+            return Ok(None);
+        };
+
+        let source_oid = self.local_variation_oid(&source)?;
+        let target_oid = self.local_variation_oid(&target)?;
+        if target_oid == Some(expected_oid) && source_oid.is_none() {
+            if self.head_symbolic_variation().as_deref() == Some(&source) {
+                self.repo.set_head(&format!("refs/heads/{target}"))?;
+            }
+            let changed_metadata =
+                self.complete_renamed_variation_metadata_if_needed(&source, &target)?;
+            return Ok(Some(changed_metadata));
+        }
+
+        if source_oid == Some(expected_oid) && target_oid.is_none() {
+            self.rename_variation_ref_and_metadata(&source, &target)?;
+            if self.head_symbolic_variation().as_deref() == Some(&source) {
+                self.repo.set_head(&format!("refs/heads/{target}"))?;
+            }
+            return Ok(Some(true));
+        }
+
+        if source_oid == Some(expected_oid) && target_oid == Some(expected_oid) {
+            if self.head_symbolic_variation().as_deref() == Some(&source) {
+                self.repo.set_head(&format!("refs/heads/{target}"))?;
+            }
+            self.complete_renamed_variation_metadata_if_needed(&source, &target)?;
+            let mut source_branch = self.find_local_variation_branch(&source)?;
+            source_branch.delete()?;
+            return Ok(Some(true));
+        }
+
+        if source_oid.is_none() && target_oid.is_none() {
+            self.restore_variation_ref(&target, expected_oid)?;
+            if self.head_symbolic_variation().as_deref() == Some(&source) {
+                self.repo.set_head(&format!("refs/heads/{target}"))?;
+            }
+            return Ok(Some(true));
+        }
+
+        Ok(None)
+    }
+
+    fn rollback_rename_variation_recovery(&self, state: &RecoveryState) -> Result<Option<bool>> {
+        let Some((source, target)) = self.rename_recovery_names(state)? else {
+            return Ok(None);
+        };
+        let Some(expected_oid) = self.rename_recovery_oid(&source, state)? else {
+            return Ok(None);
+        };
+
+        let source_oid = self.local_variation_oid(&source)?;
+        let target_oid = self.local_variation_oid(&target)?;
+        if source_oid == Some(expected_oid) && target_oid.is_none() {
+            if self.head_symbolic_variation().as_deref() == Some(&target) {
+                self.repo.set_head(&format!("refs/heads/{source}"))?;
+            }
+            return Ok(Some(false));
+        }
+
+        if target_oid == Some(expected_oid) && source_oid.is_none() {
+            let target_was_current = self.head_symbolic_variation().as_deref() == Some(&target);
+            let metadata = self.rollback_renamed_variation_metadata(&source, &target)?;
+            self.rename_variation_ref(&target, &source)?;
+            self.write_variation_metadata(&source, &metadata)?;
+            self.clear_variation_metadata(&target)?;
+            if target_was_current {
+                self.repo.set_head(&format!("refs/heads/{source}"))?;
+            }
+            return Ok(Some(true));
+        }
+
+        if source_oid == Some(expected_oid) && target_oid == Some(expected_oid) {
+            if self.head_symbolic_variation().as_deref() == Some(&target) {
+                self.repo.set_head(&format!("refs/heads/{source}"))?;
+            }
+            let metadata = self.rollback_renamed_variation_metadata(&source, &target)?;
+            let mut target_branch = self.find_local_variation_branch(&target)?;
+            target_branch.delete()?;
+            self.write_variation_metadata(&source, &metadata)?;
+            self.clear_variation_metadata(&target)?;
+            return Ok(Some(true));
+        }
+
+        if source_oid.is_none() && target_oid.is_none() {
+            self.restore_variation_ref(&source, expected_oid)?;
+            if self.head_symbolic_variation().as_deref() == Some(&target) {
+                self.repo.set_head(&format!("refs/heads/{source}"))?;
+            }
+            return Ok(Some(true));
+        }
+
+        Ok(None)
+    }
+
+    fn rename_recovery_names(&self, state: &RecoveryState) -> Result<Option<(String, String)>> {
+        let (Some(source), Some(target)) =
+            (state.original_variation.as_deref(), state.target.as_deref())
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            validate_variation_name(source)?,
+            validate_variation_name(target)?,
+        )))
+    }
+
+    fn rename_recovery_oid(&self, source: &str, state: &RecoveryState) -> Result<Option<Oid>> {
+        let archive_ref = archive_ref("deleted-variations", source, &state.operation_id);
+        match self.repo.refname_to_id(&archive_ref) {
+            Ok(oid) => Ok(Some(oid)),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                if let Some(oid) = self.local_variation_oid(source)? {
+                    self.ensure_archive_ref(&archive_ref, oid, "repair renamed variation archive")?;
+                    Ok(Some(oid))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn restore_variation_ref(&self, variation: &str, oid: Oid) -> Result<()> {
+        let commit = self.repo.find_commit(oid)?;
+        self.repo.branch(variation, &commit, false)?;
+        Ok(())
+    }
+
+    fn rename_variation_ref(&self, source: &str, target: &str) -> Result<()> {
+        let mut branch = self.find_local_variation_branch(source)?;
+        branch.rename(target, false)?;
+        Ok(())
+    }
+
+    fn rename_variation_ref_and_metadata(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Result<VariationMetadata> {
+        let metadata = self.read_variation_metadata(source)?;
+        self.rename_variation_ref(source, target)?;
+        self.write_variation_metadata(target, &metadata)?;
+        self.clear_variation_metadata(source)?;
+        Ok(metadata)
+    }
+
+    fn local_variation_oid(&self, variation: &str) -> Result<Option<Oid>> {
+        match self.repo.find_branch(variation, BranchType::Local) {
+            Ok(branch) => Ok(Some(branch.get().peel_to_commit()?.id())),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn find_local_variation_branch(&self, variation: &str) -> Result<git2::Branch<'_>> {
+        self.repo
+            .find_branch(variation, BranchType::Local)
+            .map_err(|error| match error.code() {
+                git2::ErrorCode::NotFound => {
+                    DraftlineError::VariationNotFound(variation.to_string())
+                }
+                _ => DraftlineError::from(error),
+            })
+    }
+
+    fn ensure_archive_ref(&self, ref_name: &str, oid: Oid, log: &str) -> Result<()> {
+        match self.repo.refname_to_id(ref_name) {
+            Ok(existing) if existing == oid => Ok(()),
+            Ok(existing) => Err(DraftlineError::LocalStateChanged {
+                expected: format!("{ref_name}@{oid}"),
+                actual: format!("{ref_name}@{existing}"),
+            }),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                self.repo.reference(ref_name, oid, false, log)?;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn repair_delete_remote_variation_recovery(
@@ -5325,6 +5682,42 @@ impl Workspace {
         )?;
 
         Ok(())
+    }
+
+    fn clear_variation_metadata(&self, variation: &str) -> Result<()> {
+        self.write_variation_metadata(variation, &VariationMetadata::default())
+    }
+
+    fn complete_renamed_variation_metadata_if_needed(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Result<bool> {
+        let source_metadata = self.read_variation_metadata(source)?;
+        let target_metadata = self.read_variation_metadata(target)?;
+        if source_metadata != VariationMetadata::default()
+            && target_metadata == VariationMetadata::default()
+        {
+            self.write_variation_metadata(target, &source_metadata)?;
+            self.clear_variation_metadata(source)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn rollback_renamed_variation_metadata(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Result<VariationMetadata> {
+        let source_metadata = self.read_variation_metadata(source)?;
+        let target_metadata = self.read_variation_metadata(target)?;
+        if target_metadata != VariationMetadata::default() {
+            Ok(target_metadata)
+        } else {
+            Ok(source_metadata)
+        }
     }
 
     fn diff_unsaved_text(&self) -> Result<String> {
@@ -6002,6 +6395,10 @@ impl Workspace {
     }
 }
 
+fn default_initial_variation_name() -> String {
+    "main".to_string()
+}
+
 fn validate_variation_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
 
@@ -6356,6 +6753,13 @@ fn new_operation_id() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     format!("op-{nanos}")
+}
+
+fn is_safe_operation_id(operation_id: &str) -> bool {
+    !operation_id.is_empty()
+        && operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 fn workspace_diagnostic(
@@ -6807,6 +7211,317 @@ mod tests {
         config.set_str("user.email", email).unwrap();
     }
 
+    fn init_workspace_with_initial_branch(root: &Path, branch: &str) -> Workspace {
+        let mut options = RepositoryInitOptions::new();
+        options.initial_head(branch);
+        Repository::init_opts(root, &options).unwrap();
+        Workspace::open(root).unwrap()
+    }
+
+    fn init_bare_remote(root: &Path) -> Repository {
+        let initial_head = default_initial_variation_name();
+        let mut options = RepositoryInitOptions::new();
+        options.bare(true).initial_head(&initial_head);
+        Repository::init_opts(root, &options).unwrap()
+    }
+
+    #[test]
+    fn init_defaults_to_main_instead_of_libgit2_master() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        assert_eq!(
+            workspace.current_variation().unwrap(),
+            default_initial_variation_name()
+        );
+    }
+
+    #[test]
+    fn open_preserves_existing_git_main_branch_as_variation_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = init_workspace_with_initial_branch(temp.path(), "main");
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"# Main");
+        workspace.save_version("Main draft").unwrap();
+
+        assert_eq!(workspace.current_variation().unwrap(), "main");
+        let summaries = workspace.variation_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].variation.name, "main");
+    }
+
+    #[test]
+    fn rename_variation_migrates_current_branch_metadata_and_preserves_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = init_workspace_with_initial_branch(temp.path(), "master");
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"# Master");
+        let saved = workspace.save_version("Master draft").unwrap();
+        workspace
+            .set_variation_metadata(
+                &VariationId::from("master"),
+                VariationMetadata::new()
+                    .with_label("Primary")
+                    .with_slug("primary"),
+            )
+            .unwrap();
+
+        let preflight = workspace
+            .preflight_rename_variation(&VariationId::from("master"), &VariationId::from("main"))
+            .unwrap();
+        assert_eq!(preflight.source_variation.as_str(), "master");
+        assert_eq!(preflight.target_variation.as_str(), "main");
+        assert_eq!(preflight.expected_oid, saved.id().as_str());
+        assert!(preflight
+            .support_ref
+            .starts_with("refs/draftline/deleted-variations/master/"));
+
+        let renamed = workspace
+            .rename_variation_with_token(preflight.token.clone())
+            .unwrap();
+        assert_eq!(renamed.name, "main");
+        assert!(renamed.is_current);
+        assert_eq!(renamed.metadata.label.as_deref(), Some("Primary"));
+        assert_eq!(workspace.current_variation().unwrap(), "main");
+        assert!(workspace
+            .repo
+            .find_branch("master", BranchType::Local)
+            .is_err());
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id("refs/heads/main")
+                .unwrap()
+                .to_string(),
+            saved.id().as_str()
+        );
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id(&preflight.support_ref)
+                .unwrap()
+                .to_string(),
+            saved.id().as_str()
+        );
+        assert_eq!(
+            workspace
+                .variation_metadata(&VariationId::from("main"))
+                .unwrap()
+                .slug
+                .as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            workspace.read_variation_metadata("master").unwrap(),
+            VariationMetadata::default()
+        );
+    }
+
+    #[test]
+    fn rename_variation_rejects_stale_or_tampered_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = init_workspace_with_initial_branch(temp.path(), "master");
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"# Master");
+        workspace.save_version("Master draft").unwrap();
+
+        let preflight = workspace
+            .preflight_rename_variation(&VariationId::from("master"), &VariationId::from("main"))
+            .unwrap();
+
+        write_file(workspace.root(), "post.md", b"# Master\nupdated");
+        workspace.save_version("Updated draft").unwrap();
+        assert!(matches!(
+            workspace.rename_variation_with_token(preflight.token.clone()),
+            Err(DraftlineError::LocalStateChanged { .. })
+        ));
+
+        let fresh = workspace
+            .preflight_rename_variation(&VariationId::from("master"), &VariationId::from("main"))
+            .unwrap();
+        let mut tampered = fresh.token.clone();
+        tampered.support_ref = "refs/heads/not-an-archive".to_string();
+        assert!(matches!(
+            workspace.rename_variation_with_token(tampered),
+            Err(DraftlineError::LocalStateChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn repair_rename_recovery_preserves_metadata_after_ref_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = init_workspace_with_initial_branch(temp.path(), "master");
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"# Master");
+        let saved = workspace.save_version("Master draft").unwrap();
+        let metadata = VariationMetadata::new()
+            .with_label("Primary")
+            .with_slug("primary");
+        workspace
+            .set_variation_metadata(&VariationId::from("master"), metadata.clone())
+            .unwrap();
+        let preflight = workspace
+            .preflight_rename_variation(&VariationId::from("master"), &VariationId::from("main"))
+            .unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: preflight.token.operation_id.clone(),
+                operation: RecoveryOperation::RenameVariation,
+                original_variation: Some("master".to_string()),
+                target: Some("main".to_string()),
+                completed: false,
+            })
+            .unwrap();
+        workspace
+            .ensure_archive_ref(
+                &preflight.support_ref,
+                Oid::from_str(saved.id().as_str()).unwrap(),
+                "archive renamed variation",
+            )
+            .unwrap();
+        workspace.rename_variation_ref("master", "main").unwrap();
+        workspace
+            .write_variation_metadata("master", &metadata)
+            .unwrap();
+        workspace.clear_variation_metadata("main").unwrap();
+
+        let repair = workspace
+            .repair_recovery(&preflight.token.operation_id)
+            .unwrap();
+
+        assert!(repair.completed);
+        assert_eq!(
+            workspace
+                .variation_metadata(&VariationId::from("main"))
+                .unwrap(),
+            metadata
+        );
+        assert_eq!(
+            workspace.read_variation_metadata("master").unwrap(),
+            VariationMetadata::default()
+        );
+    }
+
+    #[test]
+    fn rollback_rename_recovery_preserves_source_metadata_after_ref_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = init_workspace_with_initial_branch(temp.path(), "master");
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"# Master");
+        let saved = workspace.save_version("Master draft").unwrap();
+        let metadata = VariationMetadata::new()
+            .with_label("Primary")
+            .with_slug("primary");
+        workspace
+            .set_variation_metadata(&VariationId::from("master"), metadata.clone())
+            .unwrap();
+        let preflight = workspace
+            .preflight_rename_variation(&VariationId::from("master"), &VariationId::from("main"))
+            .unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: preflight.token.operation_id.clone(),
+                operation: RecoveryOperation::RenameVariation,
+                original_variation: Some("master".to_string()),
+                target: Some("main".to_string()),
+                completed: false,
+            })
+            .unwrap();
+        workspace
+            .ensure_archive_ref(
+                &preflight.support_ref,
+                Oid::from_str(saved.id().as_str()).unwrap(),
+                "archive renamed variation",
+            )
+            .unwrap();
+        workspace.rename_variation_ref("master", "main").unwrap();
+        workspace
+            .write_variation_metadata("master", &metadata)
+            .unwrap();
+        workspace.clear_variation_metadata("main").unwrap();
+
+        let rollback = workspace
+            .rollback_recovery(&preflight.token.operation_id)
+            .unwrap();
+
+        assert!(rollback.completed);
+        assert_eq!(workspace.current_variation().unwrap(), "master");
+        assert!(workspace
+            .repo
+            .find_branch("main", BranchType::Local)
+            .is_err());
+        assert_eq!(
+            workspace
+                .variation_metadata(&VariationId::from("master"))
+                .unwrap(),
+            metadata
+        );
+        assert_eq!(
+            workspace.read_variation_metadata("main").unwrap(),
+            VariationMetadata::default()
+        );
+    }
+
+    #[test]
+    fn rollback_rename_recovery_restores_metadata_after_target_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = init_workspace_with_initial_branch(temp.path(), "master");
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"# Master");
+        let saved = workspace.save_version("Master draft").unwrap();
+        let metadata = VariationMetadata::new()
+            .with_label("Primary")
+            .with_slug("primary");
+        workspace
+            .set_variation_metadata(&VariationId::from("master"), metadata.clone())
+            .unwrap();
+        let preflight = workspace
+            .preflight_rename_variation(&VariationId::from("master"), &VariationId::from("main"))
+            .unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: preflight.token.operation_id.clone(),
+                operation: RecoveryOperation::RenameVariation,
+                original_variation: Some("master".to_string()),
+                target: Some("main".to_string()),
+                completed: false,
+            })
+            .unwrap();
+        workspace
+            .ensure_archive_ref(
+                &preflight.support_ref,
+                Oid::from_str(saved.id().as_str()).unwrap(),
+                "archive renamed variation",
+            )
+            .unwrap();
+        workspace.rename_variation_ref("master", "main").unwrap();
+        workspace
+            .write_variation_metadata("main", &metadata)
+            .unwrap();
+        workspace.clear_variation_metadata("master").unwrap();
+
+        let rollback = workspace
+            .rollback_recovery(&preflight.token.operation_id)
+            .unwrap();
+
+        assert!(rollback.completed);
+        assert_eq!(workspace.current_variation().unwrap(), "master");
+        assert!(workspace
+            .repo
+            .find_branch("main", BranchType::Local)
+            .is_err());
+        assert_eq!(
+            workspace
+                .variation_metadata(&VariationId::from("master"))
+                .unwrap(),
+            metadata
+        );
+        assert_eq!(
+            workspace.read_variation_metadata("main").unwrap(),
+            VariationMetadata::default()
+        );
+    }
+
     #[test]
     fn saves_and_lists_versions() {
         let temp = tempfile::tempdir().unwrap();
@@ -7255,7 +7970,7 @@ mod tests {
             .write_recovery_state(&RecoveryState {
                 operation_id: "interrupted".to_string(),
                 operation: RecoveryOperation::DiscardChanges,
-                original_variation: Some("master".to_string()),
+                original_variation: Some("main".to_string()),
                 target: None,
                 completed: false,
             })
@@ -7355,7 +8070,7 @@ mod tests {
             .write_recovery_state(&RecoveryState {
                 operation_id: "interrupted".to_string(),
                 operation: RecoveryOperation::SwitchVariation,
-                original_variation: Some("master".to_string()),
+                original_variation: Some("main".to_string()),
                 target: Some("alternate".to_string()),
                 completed: false,
             })
@@ -7460,7 +8175,7 @@ mod tests {
             .restore_version_as_new_save(first.id(), "Restore first")
             .unwrap();
 
-        assert_eq!(workspace.current_variation().unwrap(), "master");
+        assert_eq!(workspace.current_variation().unwrap(), "main");
         assert_eq!(restored.label, "Restore first");
         assert_eq!(
             fs::read_to_string(workspace.root().join("post.md")).unwrap(),
@@ -7506,7 +8221,7 @@ mod tests {
         write_file(workspace.root(), "post.md", b"alternate only");
         let alternate_version = workspace.save_version("Alternate only").unwrap();
         workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
 
         let preflight = workspace
@@ -7639,7 +8354,7 @@ mod tests {
     #[test]
     fn publishes_and_reports_up_to_date_with_local_bare_remote() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
         configure_identity(&workspace, "Seth", "seth@example.com");
@@ -7661,7 +8376,7 @@ mod tests {
     #[test]
     fn remote_options_work_for_clone_fetch_and_publish() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
         configure_identity(&workspace, "Seth", "seth@example.com");
@@ -7699,7 +8414,7 @@ mod tests {
     #[test]
     fn fetch_reports_incoming_versions_and_who_changed_them() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -7731,7 +8446,7 @@ mod tests {
     #[test]
     fn publish_refuses_when_remote_has_incoming_changes() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -7762,7 +8477,7 @@ mod tests {
     #[test]
     fn publish_refreshes_remote_before_deciding_safety() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -7792,7 +8507,7 @@ mod tests {
     #[test]
     fn preflight_publish_reports_expected_absent_remote_for_first_publish() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
         configure_identity(&workspace, "Seth", "seth@example.com");
@@ -7815,7 +8530,7 @@ mod tests {
     #[test]
     fn publish_token_refuses_when_remote_appears_after_preflight() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -7858,7 +8573,7 @@ mod tests {
 
         let summary = workspace.workspace_summary().unwrap();
 
-        assert_eq!(summary.active_variation.name, "master");
+        assert_eq!(summary.active_variation.name, "main");
         assert!(summary.active_variation.is_current);
         assert_eq!(summary.versions.len(), 2);
         assert_eq!(summary.versions[0].label, "Draft two");
@@ -7890,7 +8605,7 @@ mod tests {
             .write_recovery_state(&RecoveryState {
                 operation_id: "interrupted".to_string(),
                 operation: RecoveryOperation::SwitchVariation,
-                original_variation: Some("master".to_string()),
+                original_variation: Some("main".to_string()),
                 target: Some("alternate".to_string()),
                 completed: false,
             })
@@ -7918,7 +8633,7 @@ mod tests {
 
         assert_eq!(summary.variations.len(), 3);
         let names: Vec<&str> = summary.variations.iter().map(|v| v.name.as_str()).collect();
-        assert!(names.contains(&"master"));
+        assert!(names.contains(&"main"));
         assert!(names.contains(&"alt-a"));
         assert!(names.contains(&"alt-b"));
     }
@@ -7937,7 +8652,7 @@ mod tests {
                 .current_variation
                 .as_ref()
                 .map(VariationId::as_str),
-            Some("master")
+            Some("main")
         );
         assert!(!inspection.dirty.is_dirty);
         assert!(inspection.remotes.is_empty());
@@ -7980,7 +8695,7 @@ mod tests {
             .write_recovery_state(&RecoveryState {
                 operation_id: "interrupted".to_string(),
                 operation: RecoveryOperation::SwitchVariation,
-                original_variation: Some("master".to_string()),
+                original_variation: Some("main".to_string()),
                 target: Some("alternate".to_string()),
                 completed: false,
             })
@@ -8095,7 +8810,7 @@ mod tests {
             .write_recovery_state(&RecoveryState {
                 operation_id: "interrupted".to_string(),
                 operation: RecoveryOperation::DiscardChanges,
-                original_variation: Some("master".to_string()),
+                original_variation: Some("main".to_string()),
                 target: None,
                 completed: false,
             })
@@ -8124,7 +8839,7 @@ mod tests {
         workspace
             .repo
             .reference(
-                "refs/heads/master",
+                "refs/heads/main",
                 base_oid,
                 true,
                 "simulate interrupted apply",
@@ -8138,7 +8853,7 @@ mod tests {
             .write_recovery_state(&RecoveryState {
                 operation_id: "interrupted".to_string(),
                 operation: RecoveryOperation::ApplyIncoming,
-                original_variation: Some("master".to_string()),
+                original_variation: Some("main".to_string()),
                 target: Some(incoming.id().as_str().to_string()),
                 completed: false,
             })
@@ -8148,7 +8863,7 @@ mod tests {
 
         assert!(repair.completed);
         assert!(repair.changed_workspace);
-        assert_eq!(workspace.current_variation().unwrap(), "master");
+        assert_eq!(workspace.current_variation().unwrap(), "main");
         assert_eq!(
             workspace.repo.head().unwrap().target().unwrap().to_string(),
             incoming.id().as_str()
@@ -8243,7 +8958,7 @@ mod tests {
             .write_recovery_state(&RecoveryState {
                 operation_id: "interrupted".to_string(),
                 operation: RecoveryOperation::RestoreVersionAsNewSave,
-                original_variation: Some("master".to_string()),
+                original_variation: Some("main".to_string()),
                 target: Some(base.id().as_str().to_string()),
                 completed: false,
             })
@@ -8271,7 +8986,7 @@ mod tests {
         workspace.save_version("One").unwrap();
         write_file(workspace.root(), "post.md", b"two");
         let original_tip = workspace.save_version("Two").unwrap();
-        let archive_ref = archive_ref("rewrites/squash", "master", "interrupted");
+        let archive_ref = archive_ref("rewrites/squash", "main", "interrupted");
         workspace
             .repo
             .reference(
@@ -8285,7 +9000,7 @@ mod tests {
             .write_recovery_state(&RecoveryState {
                 operation_id: "interrupted".to_string(),
                 operation: RecoveryOperation::SquashVersions,
-                original_variation: Some("master".to_string()),
+                original_variation: Some("main".to_string()),
                 target: Some(original_tip.id().as_str().to_string()),
                 completed: false,
             })
@@ -8428,7 +9143,7 @@ mod tests {
         workspace.save_version("Alternate adds generated").unwrap();
 
         workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
         write_file(workspace.root(), ".gitignore", b"generated.txt\n");
         workspace.save_version("Ignore generated").unwrap();
@@ -8459,7 +9174,7 @@ mod tests {
         workspace.save_version("Alternate adds generated").unwrap();
 
         workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
         write_file(workspace.root(), ".gitignore", b"generated.txt\n");
         workspace.save_version("Ignore generated").unwrap();
@@ -8723,7 +9438,7 @@ mod tests {
         write_file(workspace.root(), "post.md", b"old option");
         workspace.save_version("Old option").unwrap();
         workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
         workspace.delete_variation(variation.id()).unwrap();
 
@@ -8760,7 +9475,7 @@ mod tests {
     #[test]
     fn remote_variations_can_be_discovered_and_adopted_locally() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -8844,7 +9559,7 @@ mod tests {
     #[test]
     fn remote_variation_diagnostics_reports_local_and_remote_only_variations_after_prune() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -8866,7 +9581,7 @@ mod tests {
         first_workspace.save_version("Deleted branch").unwrap();
         first_workspace.publish_changes("origin").unwrap();
         first_workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
 
         let second = tempfile::tempdir().unwrap();
@@ -8894,7 +9609,7 @@ mod tests {
 
         assert!(diagnostics
             .shared_variations
-            .contains(&VariationId::from("master")));
+            .contains(&VariationId::from("main")));
         assert!(diagnostics
             .local_only_variations
             .contains(&VariationId::from("deleted-remotely")));
@@ -8906,7 +9621,7 @@ mod tests {
     #[test]
     fn replace_remote_history_publishes_support_ref_before_force_with_lease() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
@@ -8940,11 +9655,11 @@ mod tests {
 
         let bare = Repository::open_bare(remote.path()).unwrap();
         assert_eq!(
-            bare.refname_to_id("refs/heads/master").unwrap().to_string(),
+            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
             squashed.id().as_str()
         );
         assert!(bare
-            .references_glob("refs/draftline/rewrites/squash/master/*")
+            .references_glob("refs/draftline/rewrites/squash/main/*")
             .unwrap()
             .filter_map(std::result::Result::ok)
             .any(|reference| reference.target().map(|oid| oid.to_string())
@@ -8954,7 +9669,7 @@ mod tests {
     #[test]
     fn replace_remote_history_refuses_remote_race_after_preflight() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
@@ -8990,7 +9705,7 @@ mod tests {
         assert!(matches!(err, DraftlineError::RemoteRace { .. }));
         let bare = Repository::open_bare(remote.path()).unwrap();
         assert_eq!(
-            bare.refname_to_id("refs/heads/master").unwrap().to_string(),
+            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
             raced_tip.id().as_str()
         );
     }
@@ -8998,7 +9713,7 @@ mod tests {
     #[test]
     fn replace_remote_history_requires_explicit_confirmation() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
@@ -9027,7 +9742,7 @@ mod tests {
         assert!(matches!(err, DraftlineError::ConsentRequired(_)));
         let bare = Repository::open_bare(remote.path()).unwrap();
         assert_eq!(
-            bare.refname_to_id("refs/heads/master").unwrap().to_string(),
+            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
             original_remote_tip.id().as_str()
         );
     }
@@ -9035,7 +9750,7 @@ mod tests {
     #[test]
     fn replace_remote_history_can_retry_after_support_ref_was_already_published() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
@@ -9077,7 +9792,7 @@ mod tests {
 
         let bare = Repository::open_bare(remote.path()).unwrap();
         assert_eq!(
-            bare.refname_to_id("refs/heads/master").unwrap().to_string(),
+            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
             squashed.id().as_str()
         );
     }
@@ -9085,7 +9800,7 @@ mod tests {
     #[test]
     fn preflight_merge_incoming_reports_needs_merge_without_mutating() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -9119,7 +9834,7 @@ mod tests {
     #[test]
     fn merge_incoming_writes_clean_two_parent_version() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -9176,7 +9891,7 @@ mod tests {
     #[test]
     fn preflight_merge_incoming_reports_semantic_conflicts() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -9212,7 +9927,7 @@ mod tests {
     #[test]
     fn merge_incoming_with_resolutions_writes_two_parent_version() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -9275,7 +9990,7 @@ mod tests {
     #[test]
     fn merge_incoming_with_resolutions_requires_matching_resolution() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -9325,7 +10040,7 @@ mod tests {
     #[test]
     fn delete_remote_variation_publishes_support_ref_before_deleting_visible_ref() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
@@ -9343,7 +10058,7 @@ mod tests {
         workspace.save_version("Old option").unwrap();
         workspace.publish_changes("origin").unwrap();
         workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
 
         let preflight = workspace
@@ -9364,7 +10079,7 @@ mod tests {
     #[test]
     fn delete_remote_variation_retries_after_support_ref_was_already_published() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
@@ -9382,7 +10097,7 @@ mod tests {
         workspace.save_version("Old option").unwrap();
         workspace.publish_changes("origin").unwrap();
         workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
 
         let preflight = workspace
@@ -9438,7 +10153,7 @@ mod tests {
     #[test]
     fn repair_remote_delete_recovers_after_visible_ref_was_deleted() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
@@ -9456,7 +10171,7 @@ mod tests {
         workspace.save_version("Old option").unwrap();
         workspace.publish_changes("origin").unwrap();
         workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
 
         let preflight = workspace
@@ -9546,7 +10261,7 @@ mod tests {
     #[test]
     fn repair_remote_delete_finishes_when_visible_ref_is_still_present() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
@@ -9564,7 +10279,7 @@ mod tests {
         workspace.save_version("Old option").unwrap();
         workspace.publish_changes("origin").unwrap();
         workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
 
         let preflight = workspace
@@ -9662,7 +10377,7 @@ mod tests {
     #[test]
     fn delete_remote_variation_refuses_remote_tip_changed_after_preflight() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -9680,7 +10395,7 @@ mod tests {
         first_workspace.save_version("Old option").unwrap();
         first_workspace.publish_changes("origin").unwrap();
         first_workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
         let preflight = first_workspace
             .preflight_delete_remote_variation("origin", variation.id())
@@ -9719,7 +10434,7 @@ mod tests {
     #[test]
     fn delete_remote_variation_support_ref_collision_leaves_no_recovery_residue() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -9737,7 +10452,7 @@ mod tests {
         first_workspace.save_version("Old option").unwrap();
         first_workspace.publish_changes("origin").unwrap();
         first_workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
         let preflight = first_workspace
             .preflight_delete_remote_variation("origin", variation.id())
@@ -9796,7 +10511,7 @@ mod tests {
     #[test]
     fn support_refs_publish_create_only_and_fetch_remote_tracking_refs() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -9879,7 +10594,7 @@ mod tests {
     #[test]
     fn support_ref_publish_preflight_rejects_same_name_different_oid_collision() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -9934,7 +10649,7 @@ mod tests {
     #[test]
     fn publish_support_refs_token_noops_when_same_ref_appears_after_preflight() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let workspace_dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(workspace_dir.path()).unwrap();
@@ -9976,7 +10691,7 @@ mod tests {
     #[test]
     fn publish_support_refs_token_rejects_different_ref_after_preflight() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_workspace = Workspace::init(first.path()).unwrap();
@@ -10088,7 +10803,7 @@ mod tests {
         assert!(preflight
             .affected_refs
             .iter()
-            .any(|reference| reference == "refs/heads/master"));
+            .any(|reference| reference == "refs/heads/main"));
         assert!(
             workspace
                 .verify_purge(preflight.token)
@@ -10199,13 +10914,13 @@ mod tests {
         let history = workspace.history().unwrap();
         assert_eq!(history.len(), 2);
 
-        // HEAD (newest) should be marked as the tip of "master"
+        // HEAD (newest) should be marked as the tip of "main"
         let head_entry = &history[0];
         assert!(head_entry.is_head);
         assert!(head_entry
             .variation_tips
             .iter()
-            .any(|id| id.as_str() == "master"));
+            .any(|id| id.as_str() == "main"));
 
         // older version should show "feature" as a tip
         let older_entry = &history[1];
@@ -10427,9 +11142,9 @@ mod tests {
         write_file(workspace.root(), "post.md", b"feature work");
         let feature_v = workspace.save_version("Feature commit").unwrap();
 
-        // Switch back and add a commit on master too.
+        // Switch back and add a commit on main too.
         workspace
-            .switch_variation(&VariationId::from("master"), SwitchPolicy::AbortIfDirty)
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
             .unwrap();
         write_file(workspace.root(), "post.md", b"main work");
         let main_v = workspace.save_version("Main commit").unwrap();
@@ -10475,25 +11190,25 @@ mod tests {
         write_file(workspace.root(), "post.md", b"second");
         let second = workspace.save_version("Second").unwrap();
 
-        // Create a variation that branches off at "Base" (2 commits on master,
+        // Create a variation that branches off at "Base" (2 commits on main,
         // 1 commit on the new variation).
         workspace
             .create_variation_from(workspace.versions().unwrap().last().unwrap().id(), "side")
             .unwrap();
 
         let summaries = workspace.variation_summaries().unwrap();
-        let master = summaries
+        let main = summaries
             .iter()
-            .find(|s| s.variation.name == "master")
+            .find(|s| s.variation.name == "main")
             .unwrap();
         let side = summaries
             .iter()
             .find(|s| s.variation.name == "side")
             .unwrap();
 
-        assert_eq!(master.reachable_version_count, 2);
+        assert_eq!(main.reachable_version_count, 2);
         assert_eq!(
-            master.head_version.as_ref().map(|v| v.id()),
+            main.head_version.as_ref().map(|v| v.id()),
             Some(second.id())
         );
 
@@ -10521,7 +11236,7 @@ mod tests {
     #[test]
     fn preflight_apply_incoming_reports_fast_forward_available() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_ws = Workspace::init(first.path()).unwrap();
@@ -10554,7 +11269,7 @@ mod tests {
     #[test]
     fn preflight_apply_incoming_blocks_when_workspace_dirty() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_ws = Workspace::init(first.path()).unwrap();
@@ -10588,7 +11303,7 @@ mod tests {
     #[test]
     fn apply_incoming_fast_forwards_local_variation() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let first = tempfile::tempdir().unwrap();
         let first_ws = Workspace::init(first.path()).unwrap();
@@ -10621,7 +11336,7 @@ mod tests {
     #[test]
     fn apply_incoming_returns_zero_when_already_up_to_date() {
         let remote = tempfile::tempdir().unwrap();
-        Repository::init_bare(remote.path()).unwrap();
+        init_bare_remote(remote.path());
 
         let local = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(local.path()).unwrap();
@@ -10683,11 +11398,11 @@ mod tests {
 
         let preflight = workspace.preflight_squash_versions(2).unwrap();
         assert!(preflight.can_squash);
-        assert_eq!(preflight.variation, VariationId::from("master"));
+        assert_eq!(preflight.variation, VariationId::from("main"));
         assert_eq!(preflight.head_oid, original_tip.id().as_str());
         assert!(preflight
             .support_ref
-            .starts_with("refs/draftline/rewrites/squash/master/"));
+            .starts_with("refs/draftline/rewrites/squash/main/"));
         workspace
             .squash_versions_with_token(preflight.token.unwrap(), "Squashed v2+v3")
             .unwrap();
@@ -10700,7 +11415,7 @@ mod tests {
             .any(|reference| {
                 reference
                     .name()
-                    .map(|name| name.starts_with("refs/draftline/rewrites/squash/master/"))
+                    .map(|name| name.starts_with("refs/draftline/rewrites/squash/main/"))
                     .unwrap_or(false)
                     && reference.target() == Some(original_tip.id().as_str().parse().unwrap())
             }));

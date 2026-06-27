@@ -8,17 +8,17 @@ use draftline::tauri_contract::{
     list_remote_variations, list_remotes, list_shelves, list_support_refs, list_variations,
     merge_conflict_view_model, merge_incoming, merge_incoming_with_resolutions,
     merge_incoming_with_resolutions_with_context, open_workspace, preflight_apply_incoming,
-    preflight_apply_shelf, preflight_merge_incoming, preview_shelf, preview_version,
-    preview_version_file, preview_workspace_file, publish_current_variation,
-    restore_version_as_new_save, restore_version_as_new_save_to_variation, save, selected_discard,
-    selected_save, selected_save_with_context, selected_shelve, verify_workspace,
+    preflight_apply_shelf, preflight_merge_incoming, preflight_rename_variation, preview_shelf,
+    preview_version, preview_version_file, preview_workspace_file, publish_current_variation,
+    rename_variation, restore_version_as_new_save, restore_version_as_new_save_to_variation, save,
+    selected_discard, selected_save, selected_save_with_context, selected_shelve, verify_workspace,
     whole_file_use_content_resolutions, CloneWorkspaceRequest, ConflictContentSource,
     CurrentFileRequest, DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
     ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
     PreviewVersionFileRequest, PublishCurrentVariationRequest, RemoteRequest,
-    RemoteVariationRequest, RestoreVersionRequest, SaveRequest, SelectedDiscardRequest,
-    SelectedSaveRequest, SelectedShelveRequest, ShelfRequest, TargetedRestoreVersionRequest,
-    VersionRequest, WorkspaceRequest,
+    RemoteVariationRequest, RenameVariationRequest, RestoreVersionRequest, SaveRequest,
+    SelectedDiscardRequest, SelectedSaveRequest, SelectedShelveRequest, ShelfRequest,
+    TargetedRestoreVersionRequest, VersionRequest, WorkspaceRequest,
 };
 use draftline::{
     ContentPolicy, Contributor, ContributorProfile, MergeConflictResolution, MergeResolutionChoice,
@@ -46,6 +46,12 @@ fn configure_identity(root: &Path) {
     config
         .set_str("user.email", "workbench@example.com")
         .unwrap();
+}
+
+fn init_bare_remote(root: &Path) {
+    let mut options = git2::RepositoryInitOptions::new();
+    options.bare(true).initial_head("main");
+    git2::Repository::init_opts(root, &options).unwrap();
 }
 
 fn assert_object_keys(value: &Value, path: &[&str], expected: &[&str]) {
@@ -230,6 +236,74 @@ fn tauri_contract_renders_workspace_diagnostics() {
     })
     .unwrap();
     assert_eq!(support_refs.len(), 1);
+}
+
+#[test]
+fn tauri_contract_renames_variation_with_preflight_shape() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"# Hello");
+    workspace.save_version("Initial draft").unwrap();
+    let source = workspace.current_variation().unwrap();
+    let target = format!("{source}-renamed");
+    let request = RenameVariationRequest {
+        workspace_path: temp.path().to_path_buf(),
+        source_variation_id: source.clone(),
+        target_variation_id: target.clone(),
+        token: None,
+    };
+
+    let preflight = preflight_rename_variation(request.clone()).unwrap();
+    assert_eq!(preflight.source_variation.as_str(), source);
+    assert_eq!(preflight.target_variation.as_str(), target);
+    assert!(preflight.can_rename);
+
+    let renamed = rename_variation(RenameVariationRequest {
+        token: Some(preflight.token.clone()),
+        ..request
+    })
+    .unwrap();
+    assert_eq!(renamed.preflight.source_variation.as_str(), source);
+    assert_eq!(renamed.variation.name, target);
+    assert!(renamed.variation.is_current);
+    assert!(
+        renamed
+            .postconditions
+            .verification
+            .unwrap()
+            .current_variation_present
+    );
+}
+
+#[test]
+fn tauri_contract_rejects_stale_rename_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"# Hello");
+    workspace.save_version("Initial draft").unwrap();
+    let source = workspace.current_variation().unwrap();
+    let request = RenameVariationRequest {
+        workspace_path: temp.path().to_path_buf(),
+        source_variation_id: source,
+        target_variation_id: "renamed".to_string(),
+        token: None,
+    };
+    let preflight = preflight_rename_variation(request.clone()).unwrap();
+
+    write_file(workspace.root(), "post.md", b"# Hello\nupdated");
+    workspace.save_version("Updated draft").unwrap();
+
+    let error = rename_variation(RenameVariationRequest {
+        token: Some(preflight.token),
+        ..request
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        draftline::DraftlineError::LocalStateChanged { .. }
+    ));
 }
 
 #[test]
@@ -426,7 +500,7 @@ fn tauri_contract_restores_version_to_target_variation() {
 #[test]
 fn tauri_contract_smokes_publish_current_variation() {
     let remote_dir = tempfile::tempdir().unwrap();
-    git2::Repository::init_bare(remote_dir.path()).unwrap();
+    init_bare_remote(remote_dir.path());
 
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::init(temp.path()).unwrap();
@@ -475,7 +549,7 @@ fn tauri_contract_smokes_publish_current_variation() {
 #[test]
 fn tauri_contract_smokes_collaboration_incoming_and_merge() {
     let remote_dir = tempfile::tempdir().unwrap();
-    git2::Repository::init_bare(remote_dir.path()).unwrap();
+    init_bare_remote(remote_dir.path());
 
     let author_dir = tempfile::tempdir().unwrap();
     let author = Workspace::init(author_dir.path()).unwrap();
@@ -567,7 +641,7 @@ fn tauri_contract_smokes_collaboration_incoming_and_merge() {
 #[test]
 fn tauri_contract_smokes_merge_incoming_with_resolutions() {
     let remote_dir = tempfile::tempdir().unwrap();
-    git2::Repository::init_bare(remote_dir.path()).unwrap();
+    init_bare_remote(remote_dir.path());
 
     let author_dir = tempfile::tempdir().unwrap();
     let author = Workspace::init(author_dir.path()).unwrap();
@@ -639,7 +713,7 @@ fn tauri_contract_smokes_merge_incoming_with_resolutions() {
 #[test]
 fn tauri_contract_rejects_stale_merge_resolution_token() {
     let remote_dir = tempfile::tempdir().unwrap();
-    git2::Repository::init_bare(remote_dir.path()).unwrap();
+    init_bare_remote(remote_dir.path());
 
     let author_dir = tempfile::tempdir().unwrap();
     let author = Workspace::init(author_dir.path()).unwrap();
@@ -780,7 +854,7 @@ fn tauri_contract_context_applies_policy_profile_and_events() {
 #[test]
 fn tauri_contract_smokes_setup_and_current_file_commands() {
     let remote_dir = tempfile::tempdir().unwrap();
-    git2::Repository::init_bare(remote_dir.path()).unwrap();
+    init_bare_remote(remote_dir.path());
 
     let author_dir = tempfile::tempdir().unwrap();
     let author = Workspace::init(author_dir.path()).unwrap();
@@ -864,7 +938,7 @@ fn tauri_contract_adopt_workspace_returns_blockers_without_mutating() {
 #[test]
 fn tauri_contract_groups_conflicts_for_host_ui() {
     let remote_dir = tempfile::tempdir().unwrap();
-    git2::Repository::init_bare(remote_dir.path()).unwrap();
+    init_bare_remote(remote_dir.path());
 
     let first_dir = tempfile::tempdir().unwrap();
     let first = Workspace::init(first_dir.path()).unwrap();
@@ -912,7 +986,7 @@ fn tauri_contract_groups_conflicts_for_host_ui() {
 #[test]
 fn tauri_contract_smokes_remote_variation_lifecycle_commands() {
     let remote_dir = tempfile::tempdir().unwrap();
-    git2::Repository::init_bare(remote_dir.path()).unwrap();
+    init_bare_remote(remote_dir.path());
 
     let first_dir = tempfile::tempdir().unwrap();
     let first = Workspace::init(first_dir.path()).unwrap();
