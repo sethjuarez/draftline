@@ -186,3 +186,31 @@ let profile = ContributorProfile::new(
 });
 # let _ = profile;
 ```
+
+## Workspace graph APIs
+
+Hosts that render version history should prefer Draftline's `WorkspaceGraph`
+helpers over reconstructing branch topology from raw Git refs. The graph is a
+Draftline view of variation semantics: node IDs are opaque, refs are overlays,
+and actions are expressed as Draftline commands instead of raw checkout
+operations.
+
+Use the bounded helpers by default:
+
+- `workspace_graph_overview` for compact sidebar/history summaries.
+- `workspace_graph_for_variation` for a focused variation lane.
+- `workspace_graph_refs` for cheap badge/tip refreshes after saves, fetches, or
+  switches.
+- `workspace_graph_around_version`, `workspace_graph_neighborhood`,
+  `search_workspace_graph`, `workspace_graph_path`, and
+  `workspace_graph_common_ancestor` for focused expansion in large histories.
+
+`workspace_graph` returns the full graph and should be opt-in for expanded
+history views. Bounded and searched graphs can be partial; render
+`was_pruned`, `has_more`, `next_cursor`, and each node's boundary metadata so
+hidden parent/child edges are visible to users instead of looking like broken
+rails. Layout hints are advisory and stable for a graph snapshot, but hosts
+should treat them as hints and keep a fallback layout. Action hints carry stable
+action identifiers, the Draftline command to call, whether the action creates a
+version or switches the workspace, and a `disabled_reason` when an action is not
+safe.

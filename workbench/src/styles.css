@@ -45,6 +45,10 @@ input {
   padding: 0.7rem 0.8rem;
 }
 
+input[type='checkbox'] {
+  width: auto;
+}
+
 label {
   color: #9fb3ce;
   font-size: 0.85rem;
@@ -164,6 +168,32 @@ label {
   flex-wrap: wrap;
   gap: 0.6rem;
   margin-top: 1rem;
+}
+
+.graph-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.graph-options label {
+  display: inline-flex;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.graph-list li {
+  align-items: flex-start;
+}
+
+.muted,
+.error-text {
+  color: #9fb3ce;
+}
+
+.error-text {
+  color: #fecaca;
 }
 
 .status-rail {

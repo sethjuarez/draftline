@@ -4,7 +4,7 @@
 //! expose them behind `#[tauri::command]` wrappers while preserving Draftline's
 //! existing preflight, recovery, and verification semantics.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,9 +17,13 @@ use crate::{
     RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
     RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result,
     Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SyncState, SyncStatus, Variation,
-    VariationId, VariationRenamePreflight, VariationRenameToken, VariationSummary, Version,
-    VersionDiff, VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceId,
-    WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
+    VariationId, VariationMetadata, VariationRenamePreflight, VariationRenameToken,
+    VariationSummary, Version, VersionDiff, VersionId, VersionPreview, Workspace,
+    WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor,
+    WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail, WorkspaceGraphOptions,
+    WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRefs,
+    WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection,
+    WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -37,6 +41,22 @@ pub struct DraftlineCommandContext<'callbacks> {
     credential_provider: Option<Box<CredentialProvider<'callbacks>>>,
     event_sink: Option<Box<EventSink<'callbacks>>>,
     next_event_sequence: u64,
+}
+
+impl fmt::Debug for DraftlineCommandContext<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DraftlineCommandContext")
+            .field("content_policy", &self.content_policy)
+            .field("contributor_profile", &self.contributor_profile)
+            .field(
+                "has_credential_provider",
+                &self.credential_provider.is_some(),
+            )
+            .field("has_event_sink", &self.event_sink.is_some())
+            .field("next_event_sequence", &self.next_event_sequence)
+            .finish()
+    }
 }
 
 impl<'callbacks> Default for DraftlineCommandContext<'callbacks> {
@@ -182,6 +202,76 @@ pub struct WorkspaceRequest {
     pub workspace_path: PathBuf,
 }
 
+/// Request for a graph-ready full-history workspace snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGraphRequest {
+    pub workspace_path: PathBuf,
+    #[serde(default)]
+    pub options: WorkspaceGraphOptions,
+}
+
+/// Request for a compressed graph-ready workspace overview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGraphOverviewRequest {
+    pub workspace_path: PathBuf,
+    #[serde(default)]
+    pub options: WorkspaceGraphOverviewOptions,
+}
+
+/// Request for graph nodes around a saved version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGraphAroundVersionRequest {
+    pub workspace_path: PathBuf,
+    pub version_id: String,
+    #[serde(default = "default_graph_radius")]
+    pub radius: usize,
+    #[serde(default)]
+    pub options: WorkspaceGraphOptions,
+}
+
+/// Request for graph nodes by DAG-hop distance around a saved version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGraphNeighborhoodRequest {
+    pub workspace_path: PathBuf,
+    pub version_id: String,
+    #[serde(default = "default_graph_radius")]
+    pub radius: usize,
+    #[serde(default)]
+    pub options: WorkspaceGraphOptions,
+}
+
+/// Request for searching graph nodes and refs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGraphSearchRequest {
+    pub workspace_path: PathBuf,
+    pub query: String,
+    #[serde(default)]
+    pub options: WorkspaceGraphOptions,
+}
+
+/// Request for graph path and compare helpers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGraphPairRequest {
+    pub workspace_path: PathBuf,
+    pub from_version_id: String,
+    pub to_version_id: String,
+    #[serde(default)]
+    pub options: WorkspaceGraphOptions,
+}
+
+/// Request for a focused variation graph lane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceGraphVariationRequest {
+    pub workspace_path: PathBuf,
+    pub variation_id: String,
+    #[serde(default)]
+    pub options: WorkspaceGraphOptions,
+}
+
+fn default_graph_radius() -> usize {
+    25
+}
+
 /// Request for cloning a workspace from a remote endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloneWorkspaceRequest {
@@ -283,6 +373,16 @@ pub struct TargetedRestoreVersionRequest {
     pub target: RestoreVersionTarget,
 }
 
+/// Request for creating a new variation from an existing saved version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateVariationFromVersionRequest {
+    pub workspace_path: PathBuf,
+    pub version_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub metadata: VariationMetadata,
+}
+
 /// Restore result with postcondition state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreVersionResult {
@@ -295,6 +395,13 @@ pub struct RestoreVersionResult {
 pub struct TargetedRestoreVersionCommandResult {
     pub version: Version,
     pub target_variation: Variation,
+    pub postconditions: CommandPostconditions,
+}
+
+/// Variation creation result with postcondition state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateVariationFromVersionResult {
+    pub variation: Variation,
     pub postconditions: CommandPostconditions,
 }
 
@@ -833,6 +940,277 @@ pub fn get_full_history_with_context(
         .full_history()
 }
 
+/// Returns a graph-ready full-history snapshot over Draftline variations.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        include_remotes = request.options.include_remotes,
+        include_support_refs = request.options.include_support_refs
+    )
+)]
+pub fn get_workspace_graph(request: WorkspaceGraphRequest) -> Result<WorkspaceGraph> {
+    get_workspace_graph_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns a graph-ready full-history snapshot using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        include_remotes = request.options.include_remotes,
+        include_support_refs = request.options.include_support_refs
+    )
+)]
+pub fn get_workspace_graph_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphRequest,
+) -> Result<WorkspaceGraph> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph(request.options)
+}
+
+/// Returns graph refs/tips without walking the full node DAG.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_refs(request: WorkspaceGraphRequest) -> Result<WorkspaceGraphRefs> {
+    get_workspace_graph_refs_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns graph refs/tips using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_refs_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphRequest,
+) -> Result<WorkspaceGraphRefs> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph_refs(request.options)
+}
+
+/// Returns graph counts and health signals for rendering strategy.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_summary(
+    request: WorkspaceGraphRequest,
+) -> Result<WorkspaceGraphSummary> {
+    get_workspace_graph_summary_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns graph counts and health signals using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_summary_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphRequest,
+) -> Result<WorkspaceGraphSummary> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph_summary(request.options)
+}
+
+/// Returns a compressed graph overview for large-repo visualization.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_overview(
+    request: WorkspaceGraphOverviewRequest,
+) -> Result<WorkspaceGraph> {
+    get_workspace_graph_overview_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns a compressed graph overview using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_overview_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphOverviewRequest,
+) -> Result<WorkspaceGraph> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph_overview(request.options)
+}
+
+/// Returns a focused graph neighborhood around a version.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_around_version(
+    request: WorkspaceGraphAroundVersionRequest,
+) -> Result<WorkspaceGraph> {
+    get_workspace_graph_around_version_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns a focused graph neighborhood around a version using a configured context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_around_version_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphAroundVersionRequest,
+) -> Result<WorkspaceGraph> {
+    let version = parse_version_id(request.version_id)?;
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph_around_version(&version, request.radius, request.options)
+}
+
+/// Returns one variation's focused graph lane.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_for_variation(
+    request: WorkspaceGraphVariationRequest,
+) -> Result<WorkspaceGraph> {
+    get_workspace_graph_for_variation_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns one variation's focused graph lane using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_for_variation_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphVariationRequest,
+) -> Result<WorkspaceGraph> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph_for_variation(&VariationId::from(request.variation_id), request.options)
+}
+
+/// Returns an agent-oriented graph summary with safe follow-up command hints.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_agent_summary(
+    request: WorkspaceGraphRequest,
+) -> Result<WorkspaceGraphAgentSummary> {
+    get_workspace_graph_agent_summary_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns an agent-oriented graph summary using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_agent_summary_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphRequest,
+) -> Result<WorkspaceGraphAgentSummary> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph_agent_summary(request.options)
+}
+
+/// Returns a DAG-hop graph neighborhood around a version.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_neighborhood(
+    request: WorkspaceGraphNeighborhoodRequest,
+) -> Result<WorkspaceGraph> {
+    get_workspace_graph_neighborhood_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns a DAG-hop graph neighborhood using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_neighborhood_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphNeighborhoodRequest,
+) -> Result<WorkspaceGraph> {
+    let version = parse_version_id(request.version_id)?;
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph_neighborhood(&version, request.radius, request.options)
+}
+
+/// Searches graph nodes and refs.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn search_workspace_graph(
+    request: WorkspaceGraphSearchRequest,
+) -> Result<WorkspaceGraphSearchResult> {
+    search_workspace_graph_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Searches graph nodes and refs using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn search_workspace_graph_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphSearchRequest,
+) -> Result<WorkspaceGraphSearchResult> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .search_workspace_graph(request.query, request.options)
+}
+
+/// Returns a graph path between two versions.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_path(request: WorkspaceGraphPairRequest) -> Result<WorkspaceGraphPath> {
+    get_workspace_graph_path_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns a graph path between two versions using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_path_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphPairRequest,
+) -> Result<WorkspaceGraphPath> {
+    let from = parse_version_id(request.from_version_id)?;
+    let to = parse_version_id(request.to_version_id)?;
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph_path(&from, &to, request.options)
+}
+
+/// Returns the common ancestor of two versions.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_common_ancestor(
+    request: WorkspaceGraphPairRequest,
+) -> Result<WorkspaceGraphCommonAncestor> {
+    get_workspace_graph_common_ancestor_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns the common ancestor of two versions using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_common_ancestor_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphPairRequest,
+) -> Result<WorkspaceGraphCommonAncestor> {
+    let from = parse_version_id(request.from_version_id)?;
+    let to = parse_version_id(request.to_version_id)?;
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph_common_ancestor(&from, &to)
+}
+
+/// Returns one graph node with refs and lightweight detail metadata.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_node(request: VersionRequest) -> Result<WorkspaceGraphNodeDetail> {
+    get_workspace_graph_node_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns one graph node using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_node_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: VersionRequest,
+) -> Result<WorkspaceGraphNodeDetail> {
+    let version = parse_version_id(request.version_id)?;
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph_node(
+            &version,
+            WorkspaceGraphOptions {
+                include_remotes: true,
+                include_support_refs: true,
+                ..WorkspaceGraphOptions::default()
+            },
+        )
+}
+
+/// Returns compare metadata for two graph versions.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_compare_summary(
+    request: WorkspaceGraphPairRequest,
+) -> Result<WorkspaceGraphCompareSummary> {
+    get_workspace_graph_compare_summary_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns compare metadata using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_workspace_graph_compare_summary_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceGraphPairRequest,
+) -> Result<WorkspaceGraphCompareSummary> {
+    let from = parse_version_id(request.from_version_id)?;
+    let to = parse_version_id(request.to_version_id)?;
+    context
+        .open_workspace(&request.workspace_path)?
+        .workspace_graph_compare_summary(&from, &to)
+}
+
 /// Diffs two saved versions.
 #[tracing::instrument(
     err,
@@ -1011,7 +1389,7 @@ pub fn restore_version_as_new_save_with_context(
     let version_id = parse_version_id(request.version_id)?;
     let workspace = context.open_workspace(&request.workspace_path)?;
     let version = workspace.restore_version_as_new_save(&version_id, request.label)?;
-    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
     Ok(RestoreVersionResult {
         version,
         postconditions: collect_postconditions(&workspace, true),
@@ -1055,6 +1433,47 @@ pub fn restore_version_as_new_save_to_variation_with_context(
         version: result.version,
         target_variation: result.target_variation,
         postconditions: collect_postconditions(&workspace, true),
+    })
+}
+
+/// Creates a new local variation from a saved version without switching to it.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        version_id = %request.version_id,
+        variation = %request.name
+    )
+)]
+pub fn create_variation_from_version(
+    request: CreateVariationFromVersionRequest,
+) -> Result<CreateVariationFromVersionResult> {
+    create_variation_from_version_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Creates a new local variation from a saved version using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        version_id = %request.version_id,
+        variation = %request.name
+    )
+)]
+pub fn create_variation_from_version_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: CreateVariationFromVersionRequest,
+) -> Result<CreateVariationFromVersionResult> {
+    let version = parse_version_id(request.version_id)?;
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let variation =
+        workspace.create_variation_from_with_metadata(&version, request.name, request.metadata)?;
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(CreateVariationFromVersionResult {
+        variation,
+        postconditions: collect_postconditions(&workspace, false),
     })
 }
 
@@ -1973,10 +2392,12 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::RecoveryRequired(_) => "recovery_required",
         DraftlineError::RecoveryNotFound(_) => "recovery_not_found",
         DraftlineError::InvalidVariationName(_) => "invalid_variation_name",
+        DraftlineError::InvalidGraphOptions(_) => "invalid_graph_options",
         DraftlineError::VariationAlreadyExists(_) => "variation_already_exists",
         DraftlineError::VariationNotFound(_) => "variation_not_found",
         DraftlineError::CannotDeleteCurrentVariation(_) => "cannot_delete_current_variation",
         DraftlineError::VersionNotFound(_) => "version_not_found",
+        DraftlineError::VersionNotLocallyReachable(_) => "version_not_locally_reachable",
         DraftlineError::NoCurrentVariation => "no_current_variation",
         DraftlineError::WorkspaceLocked => "workspace_locked",
         DraftlineError::UnsupportedSwitchPolicy(_) => "unsupported_switch_policy",

@@ -40,6 +40,9 @@ pub enum DraftlineError {
     #[error("invalid variation name: {0}")]
     InvalidVariationName(String),
 
+    #[error("invalid graph options: {0}")]
+    InvalidGraphOptions(String),
+
     #[error("variation already exists: {0}")]
     VariationAlreadyExists(String),
 
@@ -51,6 +54,9 @@ pub enum DraftlineError {
 
     #[error("version was not found: {0}")]
     VersionNotFound(String),
+
+    #[error("version is not reachable from a local variation: {0}")]
+    VersionNotLocallyReachable(String),
 
     #[error("workspace has no current variation")]
     NoCurrentVariation,

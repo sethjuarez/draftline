@@ -3,27 +3,35 @@ use std::path::{Path, PathBuf};
 
 use draftline::tauri_contract::{
     adopt_remote_variation, adopt_workspace, apply_incoming, apply_shelf, audit_content_policy,
-    clone_workspace, diff_version_to_workspace, diff_versions, diff_workspace_file, fetch_remote,
-    get_changes, get_full_history, get_history, inspect_workspace, into_tauri_result,
-    list_remote_variations, list_remotes, list_shelves, list_support_refs, list_variations,
-    merge_conflict_view_model, merge_incoming, merge_incoming_with_resolutions,
-    merge_incoming_with_resolutions_with_context, open_workspace, preflight_apply_incoming,
-    preflight_apply_shelf, preflight_merge_incoming, preflight_rename_variation, preview_shelf,
-    preview_version, preview_version_file, preview_workspace_file, publish_current_variation,
-    rename_variation, restore_version_as_new_save, restore_version_as_new_save_to_variation, save,
-    selected_discard, selected_save, selected_save_with_context, selected_shelve, verify_workspace,
-    whole_file_use_content_resolutions, CloneWorkspaceRequest, ConflictContentSource,
-    CurrentFileRequest, DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
-    ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
-    PreviewVersionFileRequest, PublishCurrentVariationRequest, RemoteRequest,
-    RemoteVariationRequest, RenameVariationRequest, RestoreVersionRequest, SaveRequest,
-    SelectedDiscardRequest, SelectedSaveRequest, SelectedShelveRequest, ShelfRequest,
-    TargetedRestoreVersionRequest, VersionRequest, WorkspaceRequest,
+    clone_workspace, create_variation_from_version, diff_version_to_workspace, diff_versions,
+    diff_workspace_file, fetch_remote, get_changes, get_full_history, get_history,
+    get_workspace_graph, get_workspace_graph_agent_summary, get_workspace_graph_around_version,
+    get_workspace_graph_common_ancestor, get_workspace_graph_compare_summary,
+    get_workspace_graph_for_variation, get_workspace_graph_neighborhood, get_workspace_graph_node,
+    get_workspace_graph_overview, get_workspace_graph_path, get_workspace_graph_refs,
+    get_workspace_graph_summary, inspect_workspace, into_tauri_result, list_remote_variations,
+    list_remotes, list_shelves, list_support_refs, list_variations, merge_conflict_view_model,
+    merge_incoming, merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
+    open_workspace, preflight_apply_incoming, preflight_apply_shelf, preflight_merge_incoming,
+    preflight_rename_variation, preview_shelf, preview_version, preview_version_file,
+    preview_workspace_file, publish_current_variation, rename_variation,
+    restore_version_as_new_save, restore_version_as_new_save_to_variation, save,
+    search_workspace_graph, selected_discard, selected_save, selected_save_with_context,
+    selected_shelve, verify_workspace, whole_file_use_content_resolutions, CloneWorkspaceRequest,
+    ConflictContentSource, CreateVariationFromVersionRequest, CurrentFileRequest,
+    DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind, ListSupportRefsRequest,
+    MergeIncomingRequest, MergeIncomingWithResolutionsRequest, PreviewVersionFileRequest,
+    PublishCurrentVariationRequest, RemoteRequest, RemoteVariationRequest, RenameVariationRequest,
+    RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
+    SelectedShelveRequest, ShelfRequest, TargetedRestoreVersionRequest, VersionRequest,
+    WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
+    WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest, WorkspaceGraphRequest,
+    WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest, WorkspaceRequest,
 };
 use draftline::{
     ContentPolicy, Contributor, ContributorProfile, MergeConflictResolution, MergeResolutionChoice,
     OperationLockState, RestoreVersionTarget, SupportRefScope, SwitchPolicy, SyncState,
-    VariationId, Workspace,
+    VariationId, Workspace, WorkspaceGraphOverviewOptions,
 };
 use serde_json::Value;
 
@@ -386,6 +394,143 @@ fn tauri_contract_smokes_history_preview_restore_shelf_and_policy_commands() {
     assert_eq!(
         get_full_history(workspace_request.clone()).unwrap().len(),
         2
+    );
+    let graph_request = WorkspaceGraphRequest {
+        workspace_path: temp.path().to_path_buf(),
+        options: Default::default(),
+    };
+    assert_eq!(
+        get_workspace_graph(graph_request.clone())
+            .unwrap()
+            .nodes
+            .len(),
+        2
+    );
+    assert_eq!(
+        get_workspace_graph_refs(graph_request.clone())
+            .unwrap()
+            .refs
+            .len(),
+        1
+    );
+    assert_eq!(
+        get_workspace_graph_summary(graph_request.clone())
+            .unwrap()
+            .total_nodes,
+        2
+    );
+    assert!(get_workspace_graph_agent_summary(graph_request.clone())
+        .unwrap()
+        .suggested_next_commands
+        .contains(&"get_workspace_graph_for_variation".to_string()));
+    assert_eq!(
+        get_workspace_graph_overview(WorkspaceGraphOverviewRequest {
+            workspace_path: temp.path().to_path_buf(),
+            options: WorkspaceGraphOverviewOptions::default(),
+        })
+        .unwrap()
+        .nodes
+        .len(),
+        2
+    );
+    assert_eq!(
+        get_workspace_graph_around_version(WorkspaceGraphAroundVersionRequest {
+            workspace_path: temp.path().to_path_buf(),
+            version_id: second.id().as_str().to_string(),
+            radius: 0,
+            options: Default::default(),
+        })
+        .unwrap()
+        .nodes
+        .len(),
+        1
+    );
+    assert_eq!(
+        get_workspace_graph_for_variation(WorkspaceGraphVariationRequest {
+            workspace_path: temp.path().to_path_buf(),
+            variation_id: "main".to_string(),
+            options: Default::default(),
+        })
+        .unwrap()
+        .nodes
+        .len(),
+        2
+    );
+    assert_eq!(
+        get_workspace_graph_neighborhood(WorkspaceGraphNeighborhoodRequest {
+            workspace_path: temp.path().to_path_buf(),
+            version_id: base.id().as_str().to_string(),
+            radius: 1,
+            options: Default::default(),
+        })
+        .unwrap()
+        .nodes
+        .len(),
+        2
+    );
+    assert_eq!(
+        search_workspace_graph(WorkspaceGraphSearchRequest {
+            workspace_path: temp.path().to_path_buf(),
+            query: "Second".to_string(),
+            options: Default::default(),
+        })
+        .unwrap()
+        .total_matches,
+        1
+    );
+    assert!(
+        get_workspace_graph_path(WorkspaceGraphPairRequest {
+            workspace_path: temp.path().to_path_buf(),
+            from_version_id: second.id().as_str().to_string(),
+            to_version_id: base.id().as_str().to_string(),
+            options: Default::default(),
+        })
+        .unwrap()
+        .found
+    );
+    assert_eq!(
+        get_workspace_graph_common_ancestor(WorkspaceGraphPairRequest {
+            workspace_path: temp.path().to_path_buf(),
+            from_version_id: second.id().as_str().to_string(),
+            to_version_id: base.id().as_str().to_string(),
+            options: Default::default(),
+        })
+        .unwrap()
+        .common_ancestor,
+        Some(base.id().clone())
+    );
+    assert_eq!(
+        get_workspace_graph_node(VersionRequest {
+            workspace_path: temp.path().to_path_buf(),
+            version_id: second.id().as_str().to_string(),
+        })
+        .unwrap()
+        .changed_file_count,
+        Some(1)
+    );
+    assert_eq!(
+        get_workspace_graph_compare_summary(WorkspaceGraphPairRequest {
+            workspace_path: temp.path().to_path_buf(),
+            from_version_id: base.id().as_str().to_string(),
+            to_version_id: second.id().as_str().to_string(),
+            options: Default::default(),
+        })
+        .unwrap()
+        .changed_file_count,
+        1
+    );
+    assert_eq!(
+        create_variation_from_version(CreateVariationFromVersionRequest {
+            workspace_path: temp.path().to_path_buf(),
+            version_id: base.id().as_str().to_string(),
+            name: "from-base".to_string(),
+            metadata: Default::default(),
+        })
+        .unwrap()
+        .variation
+        .id()
+        .clone(),
+        VariationId::from("from-base")
     );
 
     let diff = diff_versions(DiffVersionsRequest {
