@@ -178,6 +178,65 @@ describe('createDraftlineClient', () => {
     await client.getChanges('C:\\repo');
     await client.getHistory('C:\\repo');
     await client.getFullHistory('C:\\repo');
+    await client.getWorkspaceGraph({
+      workspace_path: 'C:\\repo',
+      options: { include_remotes: true, remote: 'origin' },
+    });
+    await client.getWorkspaceGraphRefs({
+      workspace_path: 'C:\\repo',
+      options: { include_support_refs: true },
+    });
+    await client.getWorkspaceGraphSummary({
+      workspace_path: 'C:\\repo',
+      options: { include_remotes: true },
+    });
+    await client.getWorkspaceGraphOverview({
+      workspace_path: 'C:\\repo',
+      options: { include_remotes: true, max_nodes: 50, recent_nodes: 10 },
+    });
+    await client.getWorkspaceGraphAroundVersion({
+      workspace_path: 'C:\\repo',
+      version_id: versionId,
+      radius: 3,
+      options: { include_support_refs: true },
+    });
+    await client.getWorkspaceGraphForVariation({
+      workspace_path: 'C:\\repo',
+      variation_id: 'feature',
+      options: { include_remotes: true },
+    });
+    await client.getWorkspaceGraphAgentSummary({
+      workspace_path: 'C:\\repo',
+      options: { include_remotes: true, include_support_refs: true },
+    });
+    await client.getWorkspaceGraphNeighborhood({
+      workspace_path: 'C:\\repo',
+      version_id: versionId,
+      radius: 2,
+      options: { include_remotes: true },
+    });
+    await client.searchWorkspaceGraph({
+      workspace_path: 'C:\\repo',
+      query: 'feature',
+      options: { limit: 5 },
+    });
+    await client.getWorkspaceGraphPath({
+      workspace_path: 'C:\\repo',
+      from_version_id: versionId,
+      to_version_id: versionId,
+      options: { include_support_refs: true },
+    });
+    await client.getWorkspaceGraphCommonAncestor({
+      workspace_path: 'C:\\repo',
+      from_version_id: versionId,
+      to_version_id: versionId,
+    });
+    await client.getWorkspaceGraphNode(versionRequest);
+    await client.getWorkspaceGraphCompareSummary({
+      workspace_path: 'C:\\repo',
+      from_version_id: versionId,
+      to_version_id: versionId,
+    });
     await client.diffVersions({
       workspace_path: 'C:\\repo',
       from_version_id: versionId,
@@ -192,6 +251,11 @@ describe('createDraftlineClient', () => {
       ...versionRequest,
       label: 'Restore targeted',
       target: { kind: 'existing', variation: 'alternate' },
+    });
+    await client.createVariationFromVersion({
+      ...versionRequest,
+      name: 'graph-branch',
+      metadata: { label: 'Graph branch', slug: 'graph-branch' },
     });
     await client.listShelves('C:\\repo');
     await client.previewShelf(shelfRequest);
@@ -211,6 +275,89 @@ describe('createDraftlineClient', () => {
     });
     expect(invoke).toHaveBeenCalledWith('get_full_history', {
       request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph', {
+      request: {
+        workspace_path: 'C:\\repo',
+        options: { include_remotes: true, remote: 'origin' },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph_refs', {
+      request: {
+        workspace_path: 'C:\\repo',
+        options: { include_support_refs: true },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph_summary', {
+      request: {
+        workspace_path: 'C:\\repo',
+        options: { include_remotes: true },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph_overview', {
+      request: {
+        workspace_path: 'C:\\repo',
+        options: { include_remotes: true, max_nodes: 50, recent_nodes: 10 },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph_around_version', {
+      request: {
+        workspace_path: 'C:\\repo',
+        version_id: versionId,
+        radius: 3,
+        options: { include_support_refs: true },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph_for_variation', {
+      request: {
+        workspace_path: 'C:\\repo',
+        variation_id: 'feature',
+        options: { include_remotes: true },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph_agent_summary', {
+      request: {
+        workspace_path: 'C:\\repo',
+        options: { include_remotes: true, include_support_refs: true },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph_neighborhood', {
+      request: {
+        workspace_path: 'C:\\repo',
+        version_id: versionId,
+        radius: 2,
+        options: { include_remotes: true },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('search_workspace_graph', {
+      request: {
+        workspace_path: 'C:\\repo',
+        query: 'feature',
+        options: { limit: 5 },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph_path', {
+      request: {
+        workspace_path: 'C:\\repo',
+        from_version_id: versionId,
+        to_version_id: versionId,
+        options: { include_support_refs: true },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph_common_ancestor', {
+      request: {
+        workspace_path: 'C:\\repo',
+        from_version_id: versionId,
+        to_version_id: versionId,
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph_node', { request: versionRequest });
+    expect(invoke).toHaveBeenCalledWith('get_workspace_graph_compare_summary', {
+      request: {
+        workspace_path: 'C:\\repo',
+        from_version_id: versionId,
+        to_version_id: versionId,
+      },
     });
     expect(invoke).toHaveBeenCalledWith('diff_versions', {
       request: {
@@ -232,6 +379,13 @@ describe('createDraftlineClient', () => {
         ...versionRequest,
         label: 'Restore targeted',
         target: { kind: 'existing', variation: 'alternate' },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('create_variation_from_version', {
+      request: {
+        ...versionRequest,
+        name: 'graph-branch',
+        metadata: { label: 'Graph branch', slug: 'graph-branch' },
       },
     });
     expect(invoke).toHaveBeenCalledWith('list_shelves', {

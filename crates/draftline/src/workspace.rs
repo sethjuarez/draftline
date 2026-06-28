@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -596,6 +596,330 @@ pub struct AdoptionPreflightReport {
     pub warnings: Vec<WorkspaceDiagnostic>,
     pub safe_next_actions: Vec<SafeNextAction>,
     pub can_adopt: bool,
+}
+
+/// Identifier for one node in a workspace graph snapshot.
+///
+/// This is intentionally opaque to callers. Use [`WorkspaceGraphNode::version`]
+/// when an action needs the underlying saved version ID.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkspaceGraphNodeId(String);
+
+impl WorkspaceGraphNodeId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for WorkspaceGraphNodeId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl From<Oid> for WorkspaceGraphNodeId {
+    fn from(value: Oid) -> Self {
+        Self(format!("node-{value}"))
+    }
+}
+
+/// Read-only action a host may offer for a graph node or ref.
+///
+/// Mutation actions are hints only. Hosts must still use the corresponding
+/// Draftline preflight/execute operation instead of moving refs or the working
+/// directory directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkspaceGraphAction {
+    Preview,
+    CompareToCurrent,
+    RestoreAsNewSave,
+    CreateVariationFromHere,
+    SwitchToVariation,
+    AdoptRemoteVariation,
+    RestoreSupportRefAsVariation,
+}
+
+/// UI-safe details for enabling or explaining a graph action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphActionHint {
+    pub action: WorkspaceGraphAction,
+    pub enabled: bool,
+    pub command: String,
+    pub disabled_reason: Option<String>,
+    pub destructive: bool,
+    pub switches_workspace: bool,
+    pub creates_version: bool,
+}
+
+/// Why a graph node is present in the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkspaceGraphNodeKind {
+    Normal,
+    RemoteOnly,
+    SupportRefOnly,
+}
+
+/// Stable graph layout hints for host renderers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphLayoutHint {
+    pub lane: usize,
+    pub row: usize,
+    pub group: Option<String>,
+    pub display_label: String,
+}
+
+/// Boundary metadata for graph slices that omit related nodes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphBoundary {
+    pub missing_parent_ids: Vec<WorkspaceGraphNodeId>,
+    pub missing_child_ids: Vec<WorkspaceGraphNodeId>,
+    pub hidden_parent_count: usize,
+    pub hidden_child_count: usize,
+}
+
+/// A graph-ready saved version node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphNode {
+    pub id: WorkspaceGraphNodeId,
+    pub version: Version,
+    /// Parent graph node IDs for DAG rendering.
+    ///
+    /// When pagination or focused graph slices are active, a parent ID can point
+    /// to a node outside the current `nodes` response. Merge pages, expand the
+    /// slice, or fetch around that parent before assuming it is missing.
+    pub parent_ids: Vec<WorkspaceGraphNodeId>,
+    pub parent_version_ids: Vec<VersionId>,
+    pub variation_tips: Vec<VariationId>,
+    pub is_head: bool,
+    pub is_current: bool,
+    pub is_tip: bool,
+    pub is_merge: bool,
+    pub is_branch_point: bool,
+    pub child_ids: Vec<WorkspaceGraphNodeId>,
+    pub child_count: usize,
+    pub kind: WorkspaceGraphNodeKind,
+    pub topo_index: usize,
+    pub layout: WorkspaceGraphLayoutHint,
+    pub boundary: WorkspaceGraphBoundary,
+    pub available_actions: Vec<WorkspaceGraphAction>,
+    pub action_hints: Vec<WorkspaceGraphActionHint>,
+}
+
+/// Scope of a ref rendered on top of the workspace graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkspaceGraphRefScope {
+    Local,
+    RemoteTracking,
+}
+
+/// Kind of ref rendered on top of the workspace graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkspaceGraphRefKind {
+    LocalVariation,
+    RemoteVariation,
+    SupportRef,
+}
+
+/// Ref/tip metadata for a workspace graph snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphRef {
+    pub id: String,
+    pub name: String,
+    pub display_label: String,
+    pub kind: WorkspaceGraphRefKind,
+    pub scope: WorkspaceGraphRefScope,
+    pub target: WorkspaceGraphNodeId,
+    pub target_version: VersionId,
+    pub remote: Option<String>,
+    pub variation: Option<VariationId>,
+    pub metadata: Option<VariationMetadata>,
+    pub support_ref_kind: Option<SupportRefKind>,
+    pub group: Option<String>,
+    pub is_current: bool,
+    pub is_user_facing: bool,
+    pub available_actions: Vec<WorkspaceGraphAction>,
+    pub action_hints: Vec<WorkspaceGraphActionHint>,
+}
+
+/// Options for constructing a graph-ready workspace history snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphOptions {
+    #[serde(default)]
+    pub include_remotes: bool,
+    #[serde(default)]
+    pub remote: Option<String>,
+    #[serde(default)]
+    pub include_support_refs: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<usize>,
+}
+
+/// Options for constructing a compressed graph overview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphOverviewOptions {
+    #[serde(flatten)]
+    pub graph: WorkspaceGraphOptions,
+    /// Maximum nodes to keep in the overview after preserving graph landmarks.
+    #[serde(default = "default_workspace_graph_overview_max_nodes")]
+    pub max_nodes: usize,
+    /// Number of recent topological nodes to preserve before landmark pruning.
+    #[serde(default = "default_workspace_graph_overview_recent_nodes")]
+    pub recent_nodes: usize,
+}
+
+impl Default for WorkspaceGraphOverviewOptions {
+    fn default() -> Self {
+        Self {
+            graph: WorkspaceGraphOptions::default(),
+            max_nodes: default_workspace_graph_overview_max_nodes(),
+            recent_nodes: default_workspace_graph_overview_recent_nodes(),
+        }
+    }
+}
+
+/// Ref-only graph surface for cheap tip overlays and navigation labels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphRefs {
+    pub workspace_id: WorkspaceId,
+    pub current_variation: Option<VariationId>,
+    pub current_version: Option<VersionId>,
+    pub dirty: DirtySummary,
+    pub recovery: Option<crate::RecoveryState>,
+    pub state_may_be_inconsistent: bool,
+    pub refs: Vec<WorkspaceGraphRef>,
+    pub graph_fingerprint: String,
+}
+
+/// Counts and health signals for choosing graph rendering strategy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphSummary {
+    pub workspace_id: WorkspaceId,
+    pub current_variation: Option<VariationId>,
+    pub current_version: Option<VersionId>,
+    pub dirty: DirtySummary,
+    pub recovery: Option<crate::RecoveryState>,
+    pub state_may_be_inconsistent: bool,
+    pub total_nodes: usize,
+    pub normal_nodes: usize,
+    pub remote_only_nodes: usize,
+    pub support_ref_only_nodes: usize,
+    pub merge_nodes: usize,
+    pub branch_points: usize,
+    pub local_ref_count: usize,
+    pub remote_ref_count: usize,
+    pub support_ref_count: usize,
+    pub graph_fingerprint: String,
+}
+
+/// Agent-oriented graph summary for deciding safe navigation and next commands.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphAgentSummary {
+    pub summary: WorkspaceGraphSummary,
+    pub suggested_next_commands: Vec<String>,
+    pub warnings: Vec<String>,
+    pub current_ref: Option<WorkspaceGraphRef>,
+    pub nearby_refs: Vec<WorkspaceGraphRef>,
+}
+
+/// Result for graph search queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphSearchResult {
+    pub graph: WorkspaceGraph,
+    pub matched_refs: Vec<WorkspaceGraphRef>,
+    pub query: String,
+    pub matched_node_count: usize,
+    pub total_matches: usize,
+}
+
+/// Path between two graph nodes for compare and ancestry explanations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphPath {
+    pub from_version: VersionId,
+    pub to_version: VersionId,
+    pub node_ids: Vec<WorkspaceGraphNodeId>,
+    pub version_ids: Vec<VersionId>,
+    pub common_ancestor: Option<VersionId>,
+    pub found: bool,
+}
+
+/// Common ancestor result for graph compare/merge UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphCommonAncestor {
+    pub left_version: VersionId,
+    pub right_version: VersionId,
+    pub common_ancestor: Option<VersionId>,
+}
+
+/// Lightweight node details for inspectors and hover cards.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphNodeDetail {
+    pub node: WorkspaceGraphNode,
+    pub refs: Vec<WorkspaceGraphRef>,
+    pub changed_file_count: Option<usize>,
+    pub changed_files: Vec<ChangedFile>,
+}
+
+/// Compare summary without requiring consumers to infer safe graph defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraphCompareSummary {
+    pub from_version: VersionId,
+    pub to_version: VersionId,
+    pub changed_file_count: usize,
+    pub files: Vec<ChangedFile>,
+    pub action_hints: Vec<WorkspaceGraphActionHint>,
+    pub common_ancestor: Option<VersionId>,
+}
+
+/// Full-history DAG view over existing Draftline variation semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceGraph {
+    pub workspace_id: WorkspaceId,
+    pub current_variation: Option<VariationId>,
+    pub current_version: Option<VersionId>,
+    pub dirty: DirtySummary,
+    pub recovery: Option<crate::RecoveryState>,
+    pub state_may_be_inconsistent: bool,
+    pub nodes: Vec<WorkspaceGraphNode>,
+    pub refs: Vec<WorkspaceGraphRef>,
+    /// Page-scoped identity for this graph response.
+    ///
+    /// With pagination, different pages from the same unchanged workspace have
+    /// different snapshot IDs because the hash includes the returned nodes.
+    pub snapshot_id: String,
+    /// True when the response intentionally omitted graph nodes.
+    ///
+    /// For paginated graphs, use `next_cursor` to fetch more. For focused or
+    /// overview graphs, re-query with a wider focus/overview if needed.
+    pub was_pruned: bool,
+    pub has_more: bool,
+    pub next_cursor: Option<usize>,
 }
 
 /// A version annotated with variation-tip context for timeline/graph rendering.
@@ -2276,6 +2600,11 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(name.as_ref())?;
         let commit = self.find_version_commit(version)?;
+        if !self.version_is_reachable_from_local_variation(commit.id())? {
+            return Err(DraftlineError::VersionNotLocallyReachable(
+                version.to_string(),
+            ));
+        }
         self.repo.branch(&name, &commit, false)?;
         self.write_variation_metadata(&name, &metadata)?;
 
@@ -2313,44 +2642,7 @@ impl Workspace {
     /// Lists visible variations discovered on a remote-tracking namespace.
     pub fn remote_variations(&self, remote: impl AsRef<str>) -> Result<Vec<RemoteVariation>> {
         self.ensure_no_pending_recovery()?;
-        let remote = remote.as_ref().to_string();
-        let prefix = format!("refs/remotes/{remote}/");
-        let mut variations = Vec::new();
-
-        for reference in self.repo.references_glob(&format!("{prefix}*"))? {
-            let reference = reference?;
-            if reference.kind() != Some(git2::ReferenceType::Direct) {
-                continue;
-            }
-
-            let Some(ref_name) = reference.name() else {
-                continue;
-            };
-            let Some(name) = ref_name.strip_prefix(&prefix) else {
-                continue;
-            };
-            if name == "HEAD"
-                || name.ends_with("/HEAD")
-                || name == "draftline"
-                || name.starts_with("draftline/")
-            {
-                continue;
-            }
-
-            let head_version = reference
-                .peel_to_commit()
-                .ok()
-                .map(|commit| version_from_commit(&commit));
-            variations.push(RemoteVariation {
-                id: VariationId::from(name),
-                name: name.to_string(),
-                remote: remote.clone(),
-                head_version,
-            });
-        }
-
-        variations.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(variations)
+        self.remote_variations_unchecked(remote)
     }
 
     /// Fetches all visible remote variations and prunes deleted remote-tracking refs.
@@ -3948,6 +4240,754 @@ impl Workspace {
             history_entry_from_commit(&commit, &tips, head_oid)
         })
         .collect()
+    }
+
+    /// Returns a graph-ready full-history snapshot over Draftline variations.
+    ///
+    /// The graph is read-only. It exposes the same version and variation
+    /// semantics as [`Workspace::full_history`] but includes explicit nodes,
+    /// refs, current markers, dirty state, and optional remote/support-ref
+    /// visibility so consuming apps do not need to infer graph structure from
+    /// Git ref names.
+    ///
+    /// When a recovery record is present, the graph is diagnostic: callers
+    /// should render recovery UI and avoid offering mutation actions until the
+    /// recovery is repaired, rolled back, or acknowledged.
+    pub fn workspace_graph(&self, options: WorkspaceGraphOptions) -> Result<WorkspaceGraph> {
+        let recovery = self.recovery_state()?;
+        let state_may_be_inconsistent = recovery.is_some();
+        let current_variation = self
+            .current_variation_unchecked()
+            .ok()
+            .map(VariationId::from);
+        let current_version = self
+            .repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(VersionId::from);
+        let dirty_files = if state_may_be_inconsistent {
+            self.changed_files_unchecked().unwrap_or_default()
+        } else {
+            self.changed_files_unchecked()?
+        };
+        let dirty = DirtySummary {
+            is_dirty: !dirty_files.is_empty(),
+            files: dirty_files,
+        };
+        let local_tips = if state_may_be_inconsistent {
+            self.local_variation_tip_oids().unwrap_or_default()
+        } else {
+            self.local_variation_tip_oids()?
+        };
+        let remote_variations = if options.include_remotes && state_may_be_inconsistent {
+            self.graph_remote_variations(options.remote.as_deref())
+                .unwrap_or_default()
+        } else if options.include_remotes {
+            self.graph_remote_variations(options.remote.as_deref())?
+        } else {
+            Vec::new()
+        };
+        let support_refs = if options.include_support_refs && state_may_be_inconsistent {
+            self.list_local_support_refs()
+                .unwrap_or_default()
+                .into_iter()
+                .chain(self.list_remote_tracking_support_refs().unwrap_or_default())
+                .collect::<Vec<_>>()
+        } else if options.include_support_refs {
+            self.list_local_support_refs()?
+                .into_iter()
+                .chain(self.list_remote_tracking_support_refs()?)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let tips = if state_may_be_inconsistent {
+            self.variation_tips_map().unwrap_or_default()
+        } else {
+            self.variation_tips_map()?
+        };
+        let mut push_oids = local_tips.iter().map(|(_, oid)| *oid).collect::<Vec<_>>();
+        let remote_tip_oids = remote_variations
+            .iter()
+            .filter_map(|remote_variation| {
+                remote_variation
+                    .head_version
+                    .as_ref()
+                    .and_then(|version| Oid::from_str(version.id().as_str()).ok())
+            })
+            .collect::<BTreeSet<_>>();
+        let support_tip_oids = support_refs
+            .iter()
+            .filter_map(|support_ref| Oid::from_str(&support_ref.target_oid).ok())
+            .collect::<BTreeSet<_>>();
+        push_oids.extend(remote_tip_oids.iter().copied());
+        push_oids.extend(support_tip_oids.iter().copied());
+
+        let local_reachable = if state_may_be_inconsistent {
+            self.reachable_oids(local_tips.iter().map(|(_, oid)| *oid))
+                .unwrap_or_default()
+        } else {
+            self.reachable_oids(local_tips.iter().map(|(_, oid)| *oid))?
+        };
+        let support_reachable = if state_may_be_inconsistent {
+            self.reachable_oids(support_tip_oids.iter().copied())
+                .unwrap_or_default()
+        } else {
+            self.reachable_oids(support_tip_oids.iter().copied())?
+        };
+        let mut nodes = Vec::new();
+        let start = options.cursor.unwrap_or_default();
+        let limit = options.limit.unwrap_or(usize::MAX);
+        let end = start.saturating_add(limit);
+        let mut total = 0usize;
+        let head_oid = current_version
+            .as_ref()
+            .and_then(|version| Oid::from_str(version.as_str()).ok());
+
+        let walk_result = (|| -> Result<()> {
+            let mut walk = self.repo.revwalk()?;
+            walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+            for oid in push_oids {
+                walk.push(oid)?;
+            }
+            for oid in walk {
+                let oid = oid?;
+                if total >= start && total < end {
+                    let commit = self.repo.find_commit(oid)?;
+                    nodes.push(workspace_graph_node_from_commit(
+                        &commit,
+                        &tips,
+                        head_oid,
+                        &local_reachable,
+                        &support_reachable,
+                        total,
+                    )?);
+                }
+                total += 1;
+            }
+            Ok(())
+        })();
+        if state_may_be_inconsistent {
+            if walk_result.is_err() {
+                nodes.clear();
+                total = 0;
+            }
+        } else {
+            walk_result?;
+        }
+
+        let refs = if state_may_be_inconsistent {
+            self.build_workspace_graph_refs(&local_tips, &remote_variations, &support_refs)
+                .unwrap_or_default()
+        } else {
+            self.build_workspace_graph_refs(&local_tips, &remote_variations, &support_refs)?
+        };
+        let snapshot_id = workspace_graph_snapshot_id(
+            &current_variation,
+            &current_version,
+            &dirty,
+            &nodes,
+            &refs,
+            total,
+        );
+        let was_pruned = start > 0 || end < total;
+        let has_more = end < total;
+        let next_cursor = has_more.then_some(end);
+
+        let mut graph = WorkspaceGraph {
+            workspace_id: WorkspaceId {
+                root: self.root.clone(),
+            },
+            current_variation,
+            current_version,
+            dirty,
+            recovery,
+            state_may_be_inconsistent,
+            nodes,
+            refs,
+            snapshot_id,
+            was_pruned,
+            has_more,
+            next_cursor,
+        };
+        annotate_workspace_graph(&mut graph);
+        Ok(graph)
+    }
+
+    /// Returns graph refs/tips without walking the full node DAG.
+    ///
+    /// Use this for large-repo overlays, jump lists, and labels before the host
+    /// decides whether it needs a full graph page or focused slice.
+    pub fn workspace_graph_refs(
+        &self,
+        options: WorkspaceGraphOptions,
+    ) -> Result<WorkspaceGraphRefs> {
+        if options.limit.is_some() || options.cursor.is_some() {
+            return Err(DraftlineError::InvalidGraphOptions(
+                "refs-only graph requests do not accept limit or cursor".to_string(),
+            ));
+        }
+        let recovery = self.recovery_state()?;
+        let state_may_be_inconsistent = recovery.is_some();
+        let current_variation = self
+            .current_variation_unchecked()
+            .ok()
+            .map(VariationId::from);
+        let current_version = self
+            .repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(VersionId::from);
+        let dirty_files = if state_may_be_inconsistent {
+            self.changed_files_unchecked().unwrap_or_default()
+        } else {
+            self.changed_files_unchecked()?
+        };
+        let dirty = DirtySummary {
+            is_dirty: !dirty_files.is_empty(),
+            files: dirty_files,
+        };
+        let local_tips = if state_may_be_inconsistent {
+            self.local_variation_tip_oids().unwrap_or_default()
+        } else {
+            self.local_variation_tip_oids()?
+        };
+        let remote_variations = if options.include_remotes && state_may_be_inconsistent {
+            self.graph_remote_variations(options.remote.as_deref())
+                .unwrap_or_default()
+        } else if options.include_remotes {
+            self.graph_remote_variations(options.remote.as_deref())?
+        } else {
+            Vec::new()
+        };
+        let support_refs = if options.include_support_refs && state_may_be_inconsistent {
+            self.list_local_support_refs()
+                .unwrap_or_default()
+                .into_iter()
+                .chain(self.list_remote_tracking_support_refs().unwrap_or_default())
+                .collect::<Vec<_>>()
+        } else if options.include_support_refs {
+            self.list_local_support_refs()?
+                .into_iter()
+                .chain(self.list_remote_tracking_support_refs()?)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let refs = if state_may_be_inconsistent {
+            self.build_workspace_graph_refs(&local_tips, &remote_variations, &support_refs)
+                .unwrap_or_default()
+        } else {
+            self.build_workspace_graph_refs(&local_tips, &remote_variations, &support_refs)?
+        };
+        let graph_fingerprint =
+            workspace_graph_fingerprint(&current_variation, &current_version, &dirty, &refs);
+
+        Ok(WorkspaceGraphRefs {
+            workspace_id: WorkspaceId {
+                root: self.root.clone(),
+            },
+            current_variation,
+            current_version,
+            dirty,
+            recovery,
+            state_may_be_inconsistent,
+            refs,
+            graph_fingerprint,
+        })
+    }
+
+    /// Returns bounded-payload counts and health signals for large-repo graph rendering.
+    ///
+    /// This avoids returning the full node payload, but it still walks the graph
+    /// to count and classify nodes.
+    pub fn workspace_graph_summary(
+        &self,
+        mut options: WorkspaceGraphOptions,
+    ) -> Result<WorkspaceGraphSummary> {
+        options.limit = None;
+        options.cursor = None;
+        let graph = self.workspace_graph(options)?;
+        let mut child_counts: HashMap<WorkspaceGraphNodeId, usize> = HashMap::new();
+        for node in &graph.nodes {
+            for parent in &node.parent_ids {
+                *child_counts.entry(parent.clone()).or_default() += 1;
+            }
+        }
+
+        Ok(workspace_graph_summary_from_graph(&graph, &child_counts))
+    }
+
+    /// Returns a compressed overview that preserves tips, merges, branch points,
+    /// current node, and recent nodes.
+    pub fn workspace_graph_overview(
+        &self,
+        mut options: WorkspaceGraphOverviewOptions,
+    ) -> Result<WorkspaceGraph> {
+        options.graph.limit = None;
+        options.graph.cursor = None;
+        let mut graph = self.workspace_graph(options.graph)?;
+        let mut child_counts: HashMap<WorkspaceGraphNodeId, usize> = HashMap::new();
+        for node in &graph.nodes {
+            for parent in &node.parent_ids {
+                *child_counts.entry(parent.clone()).or_default() += 1;
+            }
+        }
+        let ref_targets = graph
+            .refs
+            .iter()
+            .map(|graph_ref| graph_ref.target.clone())
+            .collect::<BTreeSet<_>>();
+        let mut keep = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.topo_index < options.recent_nodes
+                    || node.is_head
+                    || !node.variation_tips.is_empty()
+                    || node.parent_ids.len() > 1
+                    || child_counts.get(&node.id).copied().unwrap_or_default() > 1
+                    || ref_targets.contains(&node.id)
+            })
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+        if keep.len() > options.max_nodes {
+            let mut kept = graph
+                .nodes
+                .iter()
+                .filter(|node| keep.contains(&node.id))
+                .map(|node| node.id.clone())
+                .take(options.max_nodes)
+                .collect::<BTreeSet<_>>();
+            std::mem::swap(&mut keep, &mut kept);
+        }
+        let original_node_count = graph.nodes.len();
+        graph.nodes.retain(|node| keep.contains(&node.id));
+        graph
+            .refs
+            .retain(|graph_ref| keep.contains(&graph_ref.target));
+        graph.was_pruned = graph.nodes.len() < original_node_count;
+        graph.has_more = false;
+        graph.next_cursor = None;
+        annotate_workspace_graph(&mut graph);
+        graph.snapshot_id = workspace_graph_snapshot_id(
+            &graph.current_variation,
+            &graph.current_version,
+            &graph.dirty,
+            &graph.nodes,
+            &graph.refs,
+            graph.nodes.len(),
+        );
+        Ok(graph)
+    }
+
+    /// Returns a topological-sort window around one version.
+    ///
+    /// `radius` is measured by topo-index distance in the rendered graph order,
+    /// not by DAG hop count, so sibling branch nodes can appear in the slice.
+    pub fn workspace_graph_around_version(
+        &self,
+        version: &VersionId,
+        radius: usize,
+        mut options: WorkspaceGraphOptions,
+    ) -> Result<WorkspaceGraph> {
+        options.limit = None;
+        options.cursor = None;
+        let mut graph = self.workspace_graph(options)?;
+        let Some(center) = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == version)
+            .map(|node| node.topo_index)
+        else {
+            return Err(DraftlineError::VersionNotFound(version.to_string()));
+        };
+        let start = center.saturating_sub(radius);
+        let end = center.saturating_add(radius);
+        let original_node_count = graph.nodes.len();
+        graph
+            .nodes
+            .retain(|node| node.topo_index >= start && node.topo_index <= end);
+        let kept = graph
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+        graph
+            .refs
+            .retain(|graph_ref| kept.contains(&graph_ref.target));
+        graph.was_pruned =
+            graph.nodes.len() < original_node_count || graph_has_missing_parent(&graph);
+        graph.has_more = false;
+        graph.next_cursor = None;
+        annotate_workspace_graph(&mut graph);
+        graph.snapshot_id = workspace_graph_snapshot_id(
+            &graph.current_variation,
+            &graph.current_version,
+            &graph.dirty,
+            &graph.nodes,
+            &graph.refs,
+            graph.nodes.len(),
+        );
+        Ok(graph)
+    }
+
+    /// Returns the ancestor lane for a variation or remote/support ref target.
+    pub fn workspace_graph_for_variation(
+        &self,
+        variation: &VariationId,
+        mut options: WorkspaceGraphOptions,
+    ) -> Result<WorkspaceGraph> {
+        options.include_remotes = true;
+        options.include_support_refs = true;
+        options.limit = None;
+        options.cursor = None;
+        let mut graph = self.workspace_graph(options)?;
+        let Some(target) = graph
+            .refs
+            .iter()
+            .find(|graph_ref| graph_ref.variation.as_ref() == Some(variation))
+            .map(|graph_ref| graph_ref.target.clone())
+        else {
+            return Err(DraftlineError::VariationNotFound(variation.to_string()));
+        };
+
+        let original_node_count = graph.nodes.len();
+        let by_id = graph
+            .nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.parent_ids.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut keep = BTreeSet::new();
+        let mut stack = vec![target];
+        while let Some(id) = stack.pop() {
+            if !keep.insert(id.clone()) {
+                continue;
+            }
+            if let Some(parents) = by_id.get(&id) {
+                stack.extend(parents.iter().cloned());
+            }
+        }
+        graph.nodes.retain(|node| keep.contains(&node.id));
+        graph
+            .refs
+            .retain(|graph_ref| keep.contains(&graph_ref.target));
+        graph.was_pruned =
+            graph.nodes.len() < original_node_count || graph_has_missing_parent(&graph);
+        graph.has_more = false;
+        graph.next_cursor = None;
+        annotate_workspace_graph(&mut graph);
+        graph.snapshot_id = workspace_graph_snapshot_id(
+            &graph.current_variation,
+            &graph.current_version,
+            &graph.dirty,
+            &graph.nodes,
+            &graph.refs,
+            graph.nodes.len(),
+        );
+        Ok(graph)
+    }
+
+    /// Returns an agent-oriented graph summary with safe follow-up command hints.
+    pub fn workspace_graph_agent_summary(
+        &self,
+        options: WorkspaceGraphOptions,
+    ) -> Result<WorkspaceGraphAgentSummary> {
+        let mut refs_options = options.clone();
+        refs_options.limit = None;
+        refs_options.cursor = None;
+        let refs = self.workspace_graph_refs(refs_options)?;
+        let summary = self.workspace_graph_summary(options)?;
+        let current_ref = refs
+            .refs
+            .iter()
+            .find(|graph_ref| {
+                graph_ref.kind == WorkspaceGraphRefKind::LocalVariation
+                    && graph_ref.variation == refs.current_variation
+            })
+            .cloned();
+        let nearby_refs = refs
+            .refs
+            .iter()
+            .filter(|graph_ref| Some(&graph_ref.target_version) == refs.current_version.as_ref())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut warnings = Vec::new();
+        if summary.state_may_be_inconsistent {
+            warnings.push(
+                "workspace has recovery state; avoid graph mutations until repaired".to_string(),
+            );
+        }
+        if summary.remote_only_nodes > 0 {
+            warnings.push(
+                "remote-only graph nodes require adoption before local branching".to_string(),
+            );
+        }
+        if summary.support_ref_only_nodes > 0 {
+            warnings.push(
+                "support-ref-only nodes should be restored through support-ref workflows"
+                    .to_string(),
+            );
+        }
+        let mut suggested_next_commands = vec![
+            "get_workspace_graph_refs".to_string(),
+            "get_workspace_graph_summary".to_string(),
+            "get_workspace_graph_around_version".to_string(),
+            "get_workspace_graph_neighborhood".to_string(),
+            "search_workspace_graph".to_string(),
+            "get_workspace_graph_node".to_string(),
+            "get_workspace_graph_compare_summary".to_string(),
+        ];
+        if summary.local_ref_count > 0 {
+            suggested_next_commands.push("get_workspace_graph_for_variation".to_string());
+        }
+
+        Ok(WorkspaceGraphAgentSummary {
+            summary,
+            suggested_next_commands,
+            warnings,
+            current_ref,
+            nearby_refs,
+        })
+    }
+
+    /// Returns a DAG-hop neighborhood around one version.
+    pub fn workspace_graph_neighborhood(
+        &self,
+        version: &VersionId,
+        radius: usize,
+        mut options: WorkspaceGraphOptions,
+    ) -> Result<WorkspaceGraph> {
+        options.limit = None;
+        options.cursor = None;
+        let mut graph = self.workspace_graph(options)?;
+        let Some(center) = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == version)
+            .map(|node| node.id.clone())
+        else {
+            return Err(DraftlineError::VersionNotFound(version.to_string()));
+        };
+
+        let by_id = graph
+            .nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.clone()))
+            .collect::<HashMap<_, _>>();
+        let original_node_count = graph.nodes.len();
+        let mut keep = BTreeSet::new();
+        let mut queue = VecDeque::from([(center, 0usize)]);
+        while let Some((id, distance)) = queue.pop_front() {
+            if !keep.insert(id.clone()) || distance >= radius {
+                continue;
+            }
+            let Some(node) = by_id.get(&id) else {
+                continue;
+            };
+            for neighbor in node.parent_ids.iter().chain(node.child_ids.iter()) {
+                queue.push_back((neighbor.clone(), distance + 1));
+            }
+        }
+        apply_workspace_graph_node_filter(&mut graph, keep, original_node_count);
+        Ok(graph)
+    }
+
+    /// Searches graph nodes and refs by label, author, ref name, or version prefix.
+    pub fn search_workspace_graph(
+        &self,
+        query: impl AsRef<str>,
+        mut options: WorkspaceGraphOptions,
+    ) -> Result<WorkspaceGraphSearchResult> {
+        let query = query.as_ref().trim().to_string();
+        let limit = options.limit.unwrap_or(50);
+        options.limit = None;
+        options.cursor = None;
+        let mut graph = self.workspace_graph(options)?;
+        let query_lower = query.to_lowercase();
+        let matched_node_ids = graph
+            .nodes
+            .iter()
+            .filter(|node| workspace_graph_node_matches(node, &query_lower))
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        let matched_node_count = matched_node_ids.len();
+        let all_matched_refs = graph
+            .refs
+            .iter()
+            .filter(|graph_ref| workspace_graph_ref_matches(graph_ref, &query_lower))
+            .cloned()
+            .collect::<Vec<_>>();
+        let total_matches = matched_node_count + all_matched_refs.len();
+        let ref_target_ids = all_matched_refs
+            .iter()
+            .map(|graph_ref| graph_ref.target.clone())
+            .collect::<BTreeSet<_>>();
+        let mut keep_order = matched_node_ids;
+        for node in &graph.nodes {
+            if ref_target_ids.contains(&node.id) && !keep_order.contains(&node.id) {
+                keep_order.push(node.id.clone());
+            }
+        }
+        let keep = keep_order.into_iter().take(limit).collect::<BTreeSet<_>>();
+        let matched_refs = all_matched_refs
+            .into_iter()
+            .filter(|graph_ref| keep.contains(&graph_ref.target))
+            .collect::<Vec<_>>();
+        let original_node_count = graph.nodes.len();
+        apply_workspace_graph_node_filter(&mut graph, keep, original_node_count);
+        Ok(WorkspaceGraphSearchResult {
+            graph,
+            matched_refs,
+            query,
+            matched_node_count,
+            total_matches,
+        })
+    }
+
+    /// Returns a graph path between two versions through their common ancestor.
+    pub fn workspace_graph_path(
+        &self,
+        from: &VersionId,
+        to: &VersionId,
+        mut options: WorkspaceGraphOptions,
+    ) -> Result<WorkspaceGraphPath> {
+        options.limit = None;
+        options.cursor = None;
+        let graph = self.workspace_graph(options)?;
+        let from_id = workspace_graph_node_id_from_version(from)?;
+        let to_id = workspace_graph_node_id_from_version(to)?;
+        let by_id = graph
+            .nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.parent_ids.clone()))
+            .collect::<HashMap<_, _>>();
+        let version_by_id = graph
+            .nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.version.id().clone()))
+            .collect::<HashMap<_, _>>();
+        if !by_id.contains_key(&from_id) {
+            return Err(DraftlineError::VersionNotFound(from.to_string()));
+        }
+        if !by_id.contains_key(&to_id) {
+            return Err(DraftlineError::VersionNotFound(to.to_string()));
+        }
+        let ancestor = self
+            .workspace_graph_common_ancestor(from, to)?
+            .common_ancestor;
+        let node_ids = if let Some(ancestor) = ancestor.as_ref() {
+            let ancestor_id = workspace_graph_node_id_from_version(ancestor)?;
+            let mut left = workspace_graph_path_to_ancestor(&by_id, &from_id, &ancestor_id)
+                .unwrap_or_default();
+            let mut right =
+                workspace_graph_path_to_ancestor(&by_id, &to_id, &ancestor_id).unwrap_or_default();
+            right.reverse();
+            left.extend(right.into_iter().skip(1));
+            left
+        } else {
+            Vec::new()
+        };
+        let version_ids = node_ids
+            .iter()
+            .filter_map(|id| version_by_id.get(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(WorkspaceGraphPath {
+            from_version: from.clone(),
+            to_version: to.clone(),
+            found: !node_ids.is_empty(),
+            node_ids,
+            version_ids,
+            common_ancestor: ancestor,
+        })
+    }
+
+    /// Returns the nearest common ancestor of two graph versions.
+    pub fn workspace_graph_common_ancestor(
+        &self,
+        left: &VersionId,
+        right: &VersionId,
+    ) -> Result<WorkspaceGraphCommonAncestor> {
+        let left_oid = Oid::from_str(left.as_str())
+            .map_err(|_| DraftlineError::VersionNotFound(left.to_string()))?;
+        let right_oid = Oid::from_str(right.as_str())
+            .map_err(|_| DraftlineError::VersionNotFound(right.to_string()))?;
+        let common_ancestor = match self.repo.merge_base(left_oid, right_oid) {
+            Ok(oid) => Some(VersionId::from(oid)),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(WorkspaceGraphCommonAncestor {
+            left_version: left.clone(),
+            right_version: right.clone(),
+            common_ancestor,
+        })
+    }
+
+    /// Returns one graph node with refs and a lightweight change summary.
+    pub fn workspace_graph_node(
+        &self,
+        version: &VersionId,
+        mut options: WorkspaceGraphOptions,
+    ) -> Result<WorkspaceGraphNodeDetail> {
+        options.limit = None;
+        options.cursor = None;
+        options.include_remotes = true;
+        options.include_support_refs = true;
+        let graph = self.workspace_graph(options)?;
+        let Some(node) = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == version)
+            .cloned()
+        else {
+            return Err(DraftlineError::VersionNotFound(version.to_string()));
+        };
+        let refs = graph
+            .refs
+            .iter()
+            .filter(|graph_ref| graph_ref.target == node.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let changed_files = if let Some(parent) = node.parent_version_ids.first() {
+            self.diff_versions(parent, version)?.files
+        } else {
+            Vec::new()
+        };
+        Ok(WorkspaceGraphNodeDetail {
+            node,
+            refs,
+            changed_file_count: Some(changed_files.len()),
+            changed_files,
+        })
+    }
+
+    /// Returns compare metadata without requiring a full graph render.
+    pub fn workspace_graph_compare_summary(
+        &self,
+        from: &VersionId,
+        to: &VersionId,
+    ) -> Result<WorkspaceGraphCompareSummary> {
+        let diff = self.diff_versions(from, to)?;
+        let common_ancestor = self
+            .workspace_graph_common_ancestor(from, to)?
+            .common_ancestor;
+        Ok(WorkspaceGraphCompareSummary {
+            from_version: from.clone(),
+            to_version: to.clone(),
+            changed_file_count: diff.files.len(),
+            files: diff.files,
+            action_hints: vec![workspace_graph_action_hint(
+                WorkspaceGraphAction::CompareToCurrent,
+                true,
+                None,
+            )],
+            common_ancestor,
+        })
     }
 
     /// Returns a per-variation snapshot with head version and total version count.
@@ -6378,6 +7418,222 @@ impl Workspace {
         Ok(paths)
     }
 
+    fn local_variation_tip_oids(&self) -> Result<Vec<(VariationId, Oid)>> {
+        let mut tips = Vec::new();
+        for branch in self.repo.branches(Some(BranchType::Local))? {
+            let (branch, _) = branch?;
+            let Some(name) = branch.name()? else {
+                continue;
+            };
+            if let Ok(tip) = branch.get().peel_to_commit() {
+                tips.push((VariationId::from(name), tip.id()));
+            }
+        }
+        tips.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(tips)
+    }
+
+    fn graph_remote_variations(&self, remote: Option<&str>) -> Result<Vec<RemoteVariation>> {
+        if let Some(remote) = remote {
+            self.repo.find_remote(remote)?;
+            return self.remote_variations_unchecked(remote);
+        }
+
+        let mut variations = Vec::new();
+        for remote in self.remotes_unchecked()? {
+            variations.extend(self.remote_variations_unchecked(remote.name)?);
+        }
+        Ok(variations)
+    }
+
+    fn remote_variations_unchecked(&self, remote: impl AsRef<str>) -> Result<Vec<RemoteVariation>> {
+        let remote = remote.as_ref().to_string();
+        let prefix = format!("refs/remotes/{remote}/");
+        let mut variations = Vec::new();
+
+        for reference in self.repo.references_glob(&format!("{prefix}*"))? {
+            let reference = reference?;
+            if reference.kind() != Some(git2::ReferenceType::Direct) {
+                continue;
+            }
+
+            let Some(ref_name) = reference.name() else {
+                continue;
+            };
+            let Some(name) = ref_name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if name == "HEAD"
+                || name.ends_with("/HEAD")
+                || name == "draftline"
+                || name.starts_with("draftline/")
+            {
+                continue;
+            }
+
+            let head_version = reference
+                .peel_to_commit()
+                .ok()
+                .map(|commit| version_from_commit(&commit));
+            variations.push(RemoteVariation {
+                id: VariationId::from(name),
+                name: name.to_string(),
+                remote: remote.clone(),
+                head_version,
+            });
+        }
+
+        variations.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(variations)
+    }
+
+    fn reachable_oids(&self, tips: impl IntoIterator<Item = Oid>) -> Result<BTreeSet<Oid>> {
+        let mut walk = self.repo.revwalk()?;
+        for oid in tips {
+            walk.push(oid)?;
+        }
+        walk.map(|oid| oid.map_err(DraftlineError::from)).collect()
+    }
+
+    fn version_is_reachable_from_local_variation(&self, oid: Oid) -> Result<bool> {
+        Ok(self
+            .reachable_oids(
+                self.local_variation_tip_oids()?
+                    .into_iter()
+                    .map(|(_, tip)| tip),
+            )?
+            .contains(&oid))
+    }
+
+    fn build_workspace_graph_refs(
+        &self,
+        local_tips: &[(VariationId, Oid)],
+        remote_variations: &[RemoteVariation],
+        support_refs: &[SupportRef],
+    ) -> Result<Vec<WorkspaceGraphRef>> {
+        let current = self
+            .current_variation_unchecked()
+            .ok()
+            .map(VariationId::from);
+        let mut refs = Vec::new();
+
+        for (variation, oid) in local_tips {
+            let name = variation.as_str().to_string();
+            let metadata = self.read_variation_metadata(&name)?;
+            refs.push(WorkspaceGraphRef {
+                id: format!("local-variation:{name}"),
+                display_label: metadata.label.clone().unwrap_or_else(|| name.clone()),
+                name: name.clone(),
+                kind: WorkspaceGraphRefKind::LocalVariation,
+                scope: WorkspaceGraphRefScope::Local,
+                target: WorkspaceGraphNodeId::from(*oid),
+                target_version: VersionId::from(*oid),
+                remote: None,
+                variation: Some(variation.clone()),
+                metadata: Some(metadata),
+                support_ref_kind: None,
+                group: Some(name.clone()),
+                is_current: current.as_ref() == Some(variation),
+                is_user_facing: true,
+                available_actions: if current.as_ref() == Some(variation) {
+                    vec![
+                        WorkspaceGraphAction::Preview,
+                        WorkspaceGraphAction::CompareToCurrent,
+                    ]
+                } else {
+                    vec![
+                        WorkspaceGraphAction::Preview,
+                        WorkspaceGraphAction::CompareToCurrent,
+                        WorkspaceGraphAction::SwitchToVariation,
+                    ]
+                },
+                action_hints: workspace_graph_ref_action_hints(
+                    WorkspaceGraphRefKind::LocalVariation,
+                    current.as_ref() == Some(variation),
+                ),
+            });
+        }
+
+        for remote_variation in remote_variations {
+            let Some(head_version) = remote_variation.head_version.as_ref() else {
+                continue;
+            };
+            let Ok(oid) = Oid::from_str(head_version.id().as_str()) else {
+                continue;
+            };
+            refs.push(WorkspaceGraphRef {
+                id: format!(
+                    "remote-variation:{}:{}",
+                    remote_variation.remote, remote_variation.name
+                ),
+                name: remote_variation.name.clone(),
+                display_label: remote_variation.name.clone(),
+                kind: WorkspaceGraphRefKind::RemoteVariation,
+                scope: WorkspaceGraphRefScope::RemoteTracking,
+                target: WorkspaceGraphNodeId::from(oid),
+                target_version: head_version.id().clone(),
+                remote: Some(remote_variation.remote.clone()),
+                variation: Some(remote_variation.id.clone()),
+                metadata: None,
+                support_ref_kind: None,
+                group: Some(format!(
+                    "{}/{}",
+                    remote_variation.remote, remote_variation.name
+                )),
+                is_current: false,
+                is_user_facing: true,
+                available_actions: vec![
+                    WorkspaceGraphAction::Preview,
+                    WorkspaceGraphAction::CompareToCurrent,
+                    WorkspaceGraphAction::AdoptRemoteVariation,
+                ],
+                action_hints: workspace_graph_ref_action_hints(
+                    WorkspaceGraphRefKind::RemoteVariation,
+                    false,
+                ),
+            });
+        }
+
+        for support_ref in support_refs {
+            let Ok(oid) = Oid::from_str(&support_ref.target_oid) else {
+                continue;
+            };
+            refs.push(WorkspaceGraphRef {
+                id: support_ref.id.clone(),
+                name: support_ref.ref_name.clone(),
+                display_label: support_ref
+                    .source_variation
+                    .clone()
+                    .unwrap_or_else(|| support_ref.ref_name.clone()),
+                kind: WorkspaceGraphRefKind::SupportRef,
+                scope: match support_ref.scope {
+                    SupportRefScope::Local => WorkspaceGraphRefScope::Local,
+                    SupportRefScope::RemoteTracking => WorkspaceGraphRefScope::RemoteTracking,
+                },
+                target: WorkspaceGraphNodeId::from(oid),
+                target_version: VersionId::from(oid),
+                remote: remote_from_remote_tracking_ref(&support_ref.ref_name),
+                variation: support_ref
+                    .source_variation
+                    .as_deref()
+                    .map(VariationId::from),
+                metadata: None,
+                support_ref_kind: Some(support_ref.kind.clone()),
+                group: support_ref.source_variation.clone(),
+                is_current: false,
+                is_user_facing: false,
+                available_actions: vec![WorkspaceGraphAction::RestoreSupportRefAsVariation],
+                action_hints: workspace_graph_ref_action_hints(
+                    WorkspaceGraphRefKind::SupportRef,
+                    false,
+                ),
+            });
+        }
+
+        refs.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(refs)
+    }
+
     fn variation_tips_map(&self) -> Result<HashMap<Oid, Vec<VariationId>>> {
         let mut map: HashMap<Oid, Vec<VariationId>> = HashMap::new();
         for branch in self.repo.branches(Some(BranchType::Local))? {
@@ -6736,6 +7992,553 @@ fn history_entry_from_commit(
         is_head,
         parent_ids,
     })
+}
+
+fn workspace_graph_node_from_commit(
+    commit: &Commit<'_>,
+    tips: &HashMap<Oid, Vec<VariationId>>,
+    head_oid: Option<Oid>,
+    local_reachable: &BTreeSet<Oid>,
+    support_reachable: &BTreeSet<Oid>,
+    topo_index: usize,
+) -> Result<WorkspaceGraphNode> {
+    let oid = commit.id();
+    let history_entry = history_entry_from_commit(commit, tips, head_oid)?;
+    let kind = if local_reachable.contains(&oid) {
+        WorkspaceGraphNodeKind::Normal
+    } else if support_reachable.contains(&oid) {
+        WorkspaceGraphNodeKind::SupportRefOnly
+    } else {
+        WorkspaceGraphNodeKind::RemoteOnly
+    };
+    let mut available_actions = vec![
+        WorkspaceGraphAction::Preview,
+        WorkspaceGraphAction::CompareToCurrent,
+    ];
+    if matches!(kind, WorkspaceGraphNodeKind::Normal) {
+        available_actions.extend([
+            WorkspaceGraphAction::RestoreAsNewSave,
+            WorkspaceGraphAction::CreateVariationFromHere,
+        ]);
+    }
+    let display_label = history_entry.version.label.clone();
+    let is_head = history_entry.is_head;
+    let is_merge = history_entry.parent_ids.len() > 1;
+    let is_tip = !history_entry.variation_tips.is_empty();
+    let parent_ids = history_entry
+        .parent_ids
+        .iter()
+        .filter_map(|parent| Oid::from_str(parent.as_str()).ok())
+        .map(WorkspaceGraphNodeId::from)
+        .collect();
+
+    Ok(WorkspaceGraphNode {
+        id: WorkspaceGraphNodeId::from(oid),
+        version: history_entry.version,
+        parent_ids,
+        parent_version_ids: history_entry.parent_ids,
+        variation_tips: history_entry.variation_tips,
+        is_head,
+        is_current: is_head,
+        is_tip,
+        is_merge,
+        is_branch_point: false,
+        child_ids: Vec::new(),
+        child_count: 0,
+        kind: kind.clone(),
+        topo_index,
+        layout: WorkspaceGraphLayoutHint {
+            lane: 0,
+            row: topo_index,
+            group: None,
+            display_label,
+        },
+        boundary: WorkspaceGraphBoundary::default(),
+        available_actions,
+        action_hints: workspace_graph_node_action_hints(&kind),
+    })
+}
+
+fn workspace_graph_snapshot_id(
+    current_variation: &Option<VariationId>,
+    current_version: &Option<VersionId>,
+    dirty: &DirtySummary,
+    nodes: &[WorkspaceGraphNode],
+    refs: &[WorkspaceGraphRef],
+    total_nodes: usize,
+) -> String {
+    let mut input = String::new();
+    input.push_str("current_variation=");
+    input.push_str(
+        current_variation
+            .as_ref()
+            .map(VariationId::as_str)
+            .unwrap_or("none"),
+    );
+    input.push_str("|current_version=");
+    input.push_str(
+        current_version
+            .as_ref()
+            .map(VersionId::as_str)
+            .unwrap_or("none"),
+    );
+    input.push_str("|dirty=");
+    input.push_str(if dirty.is_dirty { "true" } else { "false" });
+    for file in &dirty.files {
+        input.push_str("|dirty_file=");
+        input.push_str(&file.path.to_string_lossy());
+        input.push(':');
+        input.push_str(change_kind_token(&file.kind));
+    }
+    input.push_str("|total=");
+    input.push_str(&total_nodes.to_string());
+    for node in nodes {
+        input.push_str("|node=");
+        input.push_str(node.id.as_str());
+        input.push(':');
+        input.push_str(workspace_graph_node_kind_token(&node.kind));
+        for parent in &node.parent_ids {
+            input.push('<');
+            input.push_str(parent.as_str());
+        }
+    }
+    for graph_ref in refs {
+        input.push_str("|ref=");
+        input.push_str(&graph_ref.id);
+        input.push(':');
+        input.push_str(workspace_graph_ref_kind_token(&graph_ref.kind));
+        input.push(':');
+        input.push_str(workspace_graph_ref_scope_token(&graph_ref.scope));
+        input.push('@');
+        input.push_str(graph_ref.target.as_str());
+    }
+    format!("graph-{:016x}", stable_fnv1a64(input.as_bytes()))
+}
+
+fn workspace_graph_fingerprint(
+    current_variation: &Option<VariationId>,
+    current_version: &Option<VersionId>,
+    dirty: &DirtySummary,
+    refs: &[WorkspaceGraphRef],
+) -> String {
+    let mut input = String::new();
+    input.push_str("current_variation=");
+    input.push_str(
+        current_variation
+            .as_ref()
+            .map(VariationId::as_str)
+            .unwrap_or("none"),
+    );
+    input.push_str("|current_version=");
+    input.push_str(
+        current_version
+            .as_ref()
+            .map(VersionId::as_str)
+            .unwrap_or("none"),
+    );
+    input.push_str("|dirty=");
+    input.push_str(if dirty.is_dirty { "true" } else { "false" });
+    for graph_ref in refs {
+        input.push_str("|ref=");
+        input.push_str(&graph_ref.id);
+        input.push('@');
+        input.push_str(graph_ref.target.as_str());
+    }
+    format!(
+        "graph-fingerprint-{:016x}",
+        stable_fnv1a64(input.as_bytes())
+    )
+}
+
+fn workspace_graph_action_hint(
+    action: WorkspaceGraphAction,
+    enabled: bool,
+    disabled_reason: Option<&str>,
+) -> WorkspaceGraphActionHint {
+    let switches_workspace = matches!(action, WorkspaceGraphAction::SwitchToVariation);
+    let creates_version = matches!(action, WorkspaceGraphAction::RestoreAsNewSave);
+    let command = match action {
+        WorkspaceGraphAction::Preview => "preview_version",
+        WorkspaceGraphAction::CompareToCurrent => "diff_version_to_workspace",
+        WorkspaceGraphAction::RestoreAsNewSave => "restore_version_as_new_save",
+        WorkspaceGraphAction::CreateVariationFromHere => "create_variation_from_version",
+        WorkspaceGraphAction::SwitchToVariation => "switch_variation",
+        WorkspaceGraphAction::AdoptRemoteVariation => "adopt_remote_variation",
+        WorkspaceGraphAction::RestoreSupportRefAsVariation => "restore_support_ref_as_variation",
+    }
+    .to_string();
+    WorkspaceGraphActionHint {
+        action,
+        enabled,
+        command,
+        disabled_reason: disabled_reason.map(ToString::to_string),
+        destructive: false,
+        switches_workspace,
+        creates_version,
+    }
+}
+
+fn workspace_graph_node_action_hints(
+    kind: &WorkspaceGraphNodeKind,
+) -> Vec<WorkspaceGraphActionHint> {
+    let local = matches!(kind, WorkspaceGraphNodeKind::Normal);
+    let disabled_reason = match kind {
+        WorkspaceGraphNodeKind::Normal => None,
+        WorkspaceGraphNodeKind::RemoteOnly => {
+            Some("version is remote-only; adopt the remote variation before local mutations")
+        }
+        WorkspaceGraphNodeKind::SupportRefOnly => Some(
+            "version is only reachable through a support ref; restore the support ref before local mutations",
+        ),
+    };
+    vec![
+        workspace_graph_action_hint(WorkspaceGraphAction::Preview, true, None),
+        workspace_graph_action_hint(WorkspaceGraphAction::CompareToCurrent, true, None),
+        workspace_graph_action_hint(
+            WorkspaceGraphAction::RestoreAsNewSave,
+            local,
+            disabled_reason,
+        ),
+        workspace_graph_action_hint(
+            WorkspaceGraphAction::CreateVariationFromHere,
+            local,
+            disabled_reason,
+        ),
+    ]
+}
+
+fn workspace_graph_ref_action_hints(
+    kind: WorkspaceGraphRefKind,
+    is_current: bool,
+) -> Vec<WorkspaceGraphActionHint> {
+    let switch_reason = is_current.then_some("variation is already current");
+    match kind {
+        WorkspaceGraphRefKind::LocalVariation => vec![
+            workspace_graph_action_hint(WorkspaceGraphAction::Preview, true, None),
+            workspace_graph_action_hint(WorkspaceGraphAction::CompareToCurrent, true, None),
+            workspace_graph_action_hint(
+                WorkspaceGraphAction::SwitchToVariation,
+                !is_current,
+                switch_reason,
+            ),
+        ],
+        WorkspaceGraphRefKind::RemoteVariation => vec![
+            workspace_graph_action_hint(WorkspaceGraphAction::Preview, true, None),
+            workspace_graph_action_hint(WorkspaceGraphAction::CompareToCurrent, true, None),
+            workspace_graph_action_hint(WorkspaceGraphAction::AdoptRemoteVariation, true, None),
+        ],
+        WorkspaceGraphRefKind::SupportRef => vec![workspace_graph_action_hint(
+            WorkspaceGraphAction::RestoreSupportRefAsVariation,
+            true,
+            None,
+        )],
+    }
+}
+
+fn annotate_workspace_graph(graph: &mut WorkspaceGraph) {
+    let node_ids = graph
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut computed_child_ids: HashMap<WorkspaceGraphNodeId, Vec<WorkspaceGraphNodeId>> =
+        HashMap::new();
+    for node in &graph.nodes {
+        for parent in &node.parent_ids {
+            computed_child_ids
+                .entry(parent.clone())
+                .or_default()
+                .push(node.id.clone());
+        }
+    }
+    for children in computed_child_ids.values_mut() {
+        children.sort();
+    }
+    let lane_by_ref = graph
+        .refs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, graph_ref)| {
+            graph_ref
+                .variation
+                .as_ref()
+                .map(|variation| (variation.clone(), index))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for node in &mut graph.nodes {
+        let previous_child_ids = node.child_ids.clone();
+        let children = computed_child_ids
+            .get(&node.id)
+            .cloned()
+            .unwrap_or_default();
+        let missing_parent_ids = node
+            .parent_ids
+            .iter()
+            .filter(|parent| !node_ids.contains(*parent))
+            .cloned()
+            .collect::<Vec<_>>();
+        let missing_child_ids = previous_child_ids
+            .iter()
+            .filter(|child| !node_ids.contains(*child))
+            .cloned()
+            .collect::<Vec<_>>();
+        let primary_variation = node.variation_tips.first().cloned();
+        let lane = primary_variation
+            .as_ref()
+            .and_then(|variation| lane_by_ref.get(variation).copied())
+            .unwrap_or_default();
+        node.child_count = children.len();
+        node.child_ids = children;
+        node.is_branch_point = node.child_count > 1;
+        node.is_tip = !node.variation_tips.is_empty();
+        node.is_merge = node.parent_ids.len() > 1;
+        node.is_current = graph.current_version.as_ref() == Some(node.version.id());
+        node.layout = WorkspaceGraphLayoutHint {
+            lane,
+            row: node.topo_index,
+            group: primary_variation.map(|variation| variation.as_str().to_string()),
+            display_label: node.version.label.clone(),
+        };
+        node.boundary = WorkspaceGraphBoundary {
+            hidden_parent_count: missing_parent_ids.len(),
+            hidden_child_count: missing_child_ids.len(),
+            missing_parent_ids,
+            missing_child_ids,
+        };
+        node.action_hints = workspace_graph_node_action_hints(&node.kind);
+    }
+}
+
+fn apply_workspace_graph_node_filter(
+    graph: &mut WorkspaceGraph,
+    keep: BTreeSet<WorkspaceGraphNodeId>,
+    original_node_count: usize,
+) {
+    graph.nodes.retain(|node| keep.contains(&node.id));
+    graph
+        .refs
+        .retain(|graph_ref| keep.contains(&graph_ref.target));
+    graph.was_pruned = graph.nodes.len() < original_node_count || graph_has_missing_parent(graph);
+    graph.has_more = false;
+    graph.next_cursor = None;
+    annotate_workspace_graph(graph);
+    graph.snapshot_id = workspace_graph_snapshot_id(
+        &graph.current_variation,
+        &graph.current_version,
+        &graph.dirty,
+        &graph.nodes,
+        &graph.refs,
+        graph.nodes.len(),
+    );
+}
+
+fn workspace_graph_node_matches(node: &WorkspaceGraphNode, query: &str) -> bool {
+    query.is_empty()
+        || node.version.id().as_str().contains(query)
+        || node.version.label.to_lowercase().contains(query)
+        || node.version.author.name.to_lowercase().contains(query)
+        || node
+            .version
+            .author
+            .email
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains(query)
+        || node
+            .variation_tips
+            .iter()
+            .any(|variation| variation.as_str().to_lowercase().contains(query))
+}
+
+fn workspace_graph_ref_matches(graph_ref: &WorkspaceGraphRef, query: &str) -> bool {
+    query.is_empty()
+        || graph_ref.id.to_lowercase().contains(query)
+        || graph_ref.name.to_lowercase().contains(query)
+        || graph_ref.display_label.to_lowercase().contains(query)
+        || graph_ref
+            .remote
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains(query)
+        || graph_ref
+            .variation
+            .as_ref()
+            .map(VariationId::as_str)
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains(query)
+}
+
+fn workspace_graph_node_id_from_version(version: &VersionId) -> Result<WorkspaceGraphNodeId> {
+    Oid::from_str(version.as_str())
+        .map(WorkspaceGraphNodeId::from)
+        .map_err(|_| DraftlineError::VersionNotFound(version.to_string()))
+}
+
+fn workspace_graph_path_to_ancestor(
+    by_id: &HashMap<WorkspaceGraphNodeId, Vec<WorkspaceGraphNodeId>>,
+    start: &WorkspaceGraphNodeId,
+    ancestor: &WorkspaceGraphNodeId,
+) -> Option<Vec<WorkspaceGraphNodeId>> {
+    let mut queue = VecDeque::from([(start.clone(), vec![start.clone()])]);
+    let mut seen = BTreeSet::new();
+    while let Some((id, path)) = queue.pop_front() {
+        if id == *ancestor {
+            return Some(path);
+        }
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        for parent in by_id.get(&id).into_iter().flatten() {
+            let mut next_path = path.clone();
+            next_path.push(parent.clone());
+            queue.push_back((parent.clone(), next_path));
+        }
+    }
+    None
+}
+
+fn workspace_graph_summary_from_graph(
+    graph: &WorkspaceGraph,
+    child_counts: &HashMap<WorkspaceGraphNodeId, usize>,
+) -> WorkspaceGraphSummary {
+    let normal_nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == WorkspaceGraphNodeKind::Normal)
+        .count();
+    let remote_only_nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == WorkspaceGraphNodeKind::RemoteOnly)
+        .count();
+    let support_ref_only_nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == WorkspaceGraphNodeKind::SupportRefOnly)
+        .count();
+    let merge_nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| node.parent_ids.len() > 1)
+        .count();
+    let branch_points = graph
+        .nodes
+        .iter()
+        .filter(|node| child_counts.get(&node.id).copied().unwrap_or_default() > 1)
+        .count();
+    let local_ref_count = graph
+        .refs
+        .iter()
+        .filter(|graph_ref| graph_ref.kind == WorkspaceGraphRefKind::LocalVariation)
+        .count();
+    let remote_ref_count = graph
+        .refs
+        .iter()
+        .filter(|graph_ref| graph_ref.kind == WorkspaceGraphRefKind::RemoteVariation)
+        .count();
+    let support_ref_count = graph
+        .refs
+        .iter()
+        .filter(|graph_ref| graph_ref.kind == WorkspaceGraphRefKind::SupportRef)
+        .count();
+
+    WorkspaceGraphSummary {
+        workspace_id: graph.workspace_id.clone(),
+        current_variation: graph.current_variation.clone(),
+        current_version: graph.current_version.clone(),
+        dirty: graph.dirty.clone(),
+        recovery: graph.recovery.clone(),
+        state_may_be_inconsistent: graph.state_may_be_inconsistent,
+        total_nodes: graph.nodes.len(),
+        normal_nodes,
+        remote_only_nodes,
+        support_ref_only_nodes,
+        merge_nodes,
+        branch_points,
+        local_ref_count,
+        remote_ref_count,
+        support_ref_count,
+        graph_fingerprint: workspace_graph_fingerprint(
+            &graph.current_variation,
+            &graph.current_version,
+            &graph.dirty,
+            &graph.refs,
+        ),
+    }
+}
+
+fn graph_has_missing_parent(graph: &WorkspaceGraph) -> bool {
+    let node_ids = graph
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    graph.nodes.iter().any(|node| {
+        node.parent_ids
+            .iter()
+            .any(|parent| !node_ids.contains(parent))
+    })
+}
+
+fn default_workspace_graph_overview_max_nodes() -> usize {
+    200
+}
+
+fn default_workspace_graph_overview_recent_nodes() -> usize {
+    50
+}
+
+fn stable_fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn workspace_graph_node_kind_token(kind: &WorkspaceGraphNodeKind) -> &'static str {
+    match kind {
+        WorkspaceGraphNodeKind::Normal => "normal",
+        WorkspaceGraphNodeKind::RemoteOnly => "remote_only",
+        WorkspaceGraphNodeKind::SupportRefOnly => "support_ref_only",
+    }
+}
+
+fn workspace_graph_ref_kind_token(kind: &WorkspaceGraphRefKind) -> &'static str {
+    match kind {
+        WorkspaceGraphRefKind::LocalVariation => "local_variation",
+        WorkspaceGraphRefKind::RemoteVariation => "remote_variation",
+        WorkspaceGraphRefKind::SupportRef => "support_ref",
+    }
+}
+
+fn workspace_graph_ref_scope_token(scope: &WorkspaceGraphRefScope) -> &'static str {
+    match scope {
+        WorkspaceGraphRefScope::Local => "local",
+        WorkspaceGraphRefScope::RemoteTracking => "remote_tracking",
+    }
+}
+
+fn change_kind_token(kind: &ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Added => "added",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Deleted => "deleted",
+        ChangeKind::Renamed => "renamed",
+        ChangeKind::Conflicted => "conflicted",
+        ChangeKind::TypeChanged => "type_changed",
+    }
+}
+
+fn remote_from_remote_tracking_ref(ref_name: &str) -> Option<String> {
+    let remainder = ref_name.strip_prefix("refs/remotes/")?;
+    let (remote, _) = remainder.split_once('/')?;
+    Some(remote.to_string())
 }
 
 fn remote_summary_from_commit(commit: &Commit<'_>) -> RemoteVersionSummary {
@@ -11175,6 +12978,532 @@ mod tests {
         assert_eq!(v2_entry.parent_ids.len(), 1);
         assert_eq!(&v2_entry.parent_ids[0], v1.id());
         assert!(v1_entry.parent_ids.is_empty());
+    }
+
+    #[test]
+    fn workspace_graph_reports_local_variation_dag_refs_and_dirty_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        workspace
+            .create_variation_from(base.id(), "feature")
+            .unwrap();
+        workspace
+            .switch_variation(&VariationId::from("feature"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"feature work");
+        let feature = workspace.save_version("Feature").unwrap();
+        workspace
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"main work");
+        let main = workspace.save_version("Main").unwrap();
+        write_file(workspace.root(), "post.md", b"unsaved main work");
+
+        let graph = workspace
+            .workspace_graph(WorkspaceGraphOptions::default())
+            .unwrap();
+        let node_versions = graph
+            .nodes
+            .iter()
+            .map(|node| node.version.id())
+            .collect::<Vec<_>>();
+
+        assert!(node_versions.contains(&base.id()));
+        assert!(node_versions.contains(&feature.id()));
+        assert!(node_versions.contains(&main.id()));
+        assert_eq!(graph.current_variation, Some(VariationId::from("main")));
+        assert_eq!(graph.current_version, Some(main.id().clone()));
+        assert!(graph.dirty.is_dirty);
+        assert!(graph.recovery.is_none());
+        assert!(!graph.state_may_be_inconsistent);
+        assert_eq!(graph.refs.len(), 2);
+        assert!(graph.refs.iter().any(|graph_ref| {
+            graph_ref.kind == WorkspaceGraphRefKind::LocalVariation
+                && graph_ref.name == "main"
+                && graph_ref.target_version == *main.id()
+        }));
+        assert!(graph.refs.iter().any(|graph_ref| {
+            graph_ref.kind == WorkspaceGraphRefKind::LocalVariation
+                && graph_ref.name == "feature"
+                && graph_ref.target_version == *feature.id()
+        }));
+
+        let main_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == main.id())
+            .unwrap();
+        let feature_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == feature.id())
+            .unwrap();
+        let base_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == base.id())
+            .unwrap();
+        assert_eq!(main_node.parent_version_ids, vec![base.id().clone()]);
+        assert_eq!(feature_node.parent_version_ids, vec![base.id().clone()]);
+        assert!(base_node.parent_version_ids.is_empty());
+        assert_eq!(
+            main_node.parent_ids,
+            vec![WorkspaceGraphNodeId::from(
+                Oid::from_str(base.id().as_str()).unwrap()
+            )]
+        );
+        assert!(main_node
+            .available_actions
+            .contains(&WorkspaceGraphAction::CreateVariationFromHere));
+        assert!(main_node
+            .available_actions
+            .contains(&WorkspaceGraphAction::RestoreAsNewSave));
+    }
+
+    #[test]
+    fn workspace_graph_helpers_focus_and_summarize_graphs() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        workspace
+            .create_variation_from(base.id(), "feature")
+            .unwrap();
+        workspace
+            .switch_variation(&VariationId::from("feature"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"feature work");
+        let feature = workspace.save_version("Feature").unwrap();
+        workspace
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"main work");
+        let main = workspace.save_version("Main").unwrap();
+
+        let refs = workspace
+            .workspace_graph_refs(WorkspaceGraphOptions::default())
+            .unwrap();
+        assert_eq!(refs.refs.len(), 2);
+        assert!(refs.refs.iter().any(|graph_ref| {
+            graph_ref.name == "main" && graph_ref.is_current && graph_ref.is_user_facing
+        }));
+        assert!(refs.graph_fingerprint.starts_with("graph-fingerprint-"));
+        assert!(matches!(
+            workspace.workspace_graph_refs(WorkspaceGraphOptions {
+                limit: Some(1),
+                ..WorkspaceGraphOptions::default()
+            }),
+            Err(DraftlineError::InvalidGraphOptions(_))
+        ));
+
+        let summary = workspace
+            .workspace_graph_summary(WorkspaceGraphOptions::default())
+            .unwrap();
+        assert_eq!(summary.total_nodes, 3);
+        assert_eq!(summary.normal_nodes, 3);
+        assert_eq!(summary.local_ref_count, 2);
+        assert_eq!(summary.branch_points, 1);
+        assert_eq!(summary.merge_nodes, 0);
+
+        let graph = workspace
+            .workspace_graph(WorkspaceGraphOptions::default())
+            .unwrap();
+        let base_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == base.id())
+            .unwrap();
+        assert!(base_node.is_branch_point);
+        assert_eq!(base_node.child_count, 2);
+        assert!(!base_node.action_hints.is_empty());
+
+        let overview = workspace
+            .workspace_graph_overview(WorkspaceGraphOverviewOptions::default())
+            .unwrap();
+        assert_eq!(overview.nodes.len(), 3);
+        assert!(!overview.was_pruned);
+        assert!(!overview.has_more);
+        assert!(overview
+            .refs
+            .iter()
+            .any(|graph_ref| graph_ref.name == "feature"));
+
+        let around_base = workspace
+            .workspace_graph_around_version(base.id(), 0, WorkspaceGraphOptions::default())
+            .unwrap();
+        assert_eq!(around_base.nodes.len(), 1);
+        assert_eq!(around_base.nodes[0].version.id(), base.id());
+        assert!(around_base.was_pruned);
+        assert!(!around_base.has_more);
+        assert!(around_base.nodes[0].child_ids.is_empty());
+        assert_eq!(around_base.nodes[0].boundary.hidden_child_count, 2);
+        assert_eq!(around_base.nodes[0].boundary.missing_child_ids.len(), 2);
+        let around_node_ids = around_base
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(around_base.nodes[0]
+            .boundary
+            .missing_child_ids
+            .iter()
+            .all(|child| !around_node_ids.contains(child)));
+
+        let neighborhood = workspace
+            .workspace_graph_neighborhood(base.id(), 1, WorkspaceGraphOptions::default())
+            .unwrap();
+        assert_eq!(neighborhood.nodes.len(), 3);
+
+        let search = workspace
+            .search_workspace_graph(
+                "feature",
+                WorkspaceGraphOptions {
+                    limit: Some(10),
+                    ..WorkspaceGraphOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(search
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.version.id() == feature.id()));
+        assert!(search
+            .matched_refs
+            .iter()
+            .any(|graph_ref| graph_ref.name == "feature"));
+        assert_eq!(search.matched_node_count, 1);
+        assert_eq!(search.total_matches, 2);
+        assert!(search.matched_refs.iter().all(|graph_ref| search
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.id == graph_ref.target)));
+
+        let feature_lane = workspace
+            .workspace_graph_for_variation(
+                &VariationId::from("feature"),
+                WorkspaceGraphOptions::default(),
+            )
+            .unwrap();
+        assert!(feature_lane
+            .nodes
+            .iter()
+            .any(|node| node.version.id() == feature.id()));
+        assert!(feature_lane
+            .nodes
+            .iter()
+            .any(|node| node.version.id() == base.id()));
+        assert!(!feature_lane
+            .nodes
+            .iter()
+            .any(|node| node.version.id() == main.id()));
+        assert!(feature_lane.was_pruned);
+        assert!(!feature_lane.has_more);
+
+        let common = workspace
+            .workspace_graph_common_ancestor(main.id(), feature.id())
+            .unwrap();
+        assert_eq!(common.common_ancestor, Some(base.id().clone()));
+        let path = workspace
+            .workspace_graph_path(main.id(), feature.id(), WorkspaceGraphOptions::default())
+            .unwrap();
+        assert!(path.found);
+        assert_eq!(path.common_ancestor, Some(base.id().clone()));
+        assert_eq!(
+            path.version_ids,
+            vec![main.id().clone(), base.id().clone(), feature.id().clone()]
+        );
+        assert!(matches!(
+            workspace.workspace_graph_path(
+                &VersionId::from_canonical_string("0123456789012345678901234567890123456789")
+                    .unwrap(),
+                feature.id(),
+                WorkspaceGraphOptions::default()
+            ),
+            Err(DraftlineError::VersionNotFound(_))
+        ));
+        let detail = workspace
+            .workspace_graph_node(feature.id(), WorkspaceGraphOptions::default())
+            .unwrap();
+        assert_eq!(detail.node.version.id(), feature.id());
+        assert_eq!(detail.changed_file_count, Some(1));
+        let compare = workspace
+            .workspace_graph_compare_summary(base.id(), feature.id())
+            .unwrap();
+        assert_eq!(compare.changed_file_count, 1);
+
+        let agent_summary = workspace
+            .workspace_graph_agent_summary(WorkspaceGraphOptions {
+                limit: Some(1),
+                cursor: Some(1),
+                ..WorkspaceGraphOptions::default()
+            })
+            .unwrap();
+        assert!(agent_summary.warnings.is_empty());
+        assert!(agent_summary
+            .suggested_next_commands
+            .contains(&"get_workspace_graph_for_variation".to_string()));
+        assert_eq!(
+            agent_summary
+                .current_ref
+                .and_then(|graph_ref| graph_ref.variation),
+            Some(VariationId::from("main"))
+        );
+    }
+
+    #[test]
+    fn workspace_graph_paginates_with_stable_topo_indices() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        workspace.save_version("v3").unwrap();
+
+        let first_page = workspace
+            .workspace_graph(WorkspaceGraphOptions {
+                limit: Some(2),
+                ..WorkspaceGraphOptions::default()
+            })
+            .unwrap();
+        let second_page = workspace
+            .workspace_graph(WorkspaceGraphOptions {
+                cursor: first_page.next_cursor,
+                limit: Some(2),
+                ..WorkspaceGraphOptions::default()
+            })
+            .unwrap();
+
+        assert_eq!(first_page.nodes.len(), 2);
+        assert!(first_page.was_pruned);
+        assert!(first_page.has_more);
+        assert_eq!(first_page.nodes[0].topo_index, 0);
+        assert_eq!(first_page.nodes[1].topo_index, 1);
+        assert_eq!(second_page.nodes.len(), 1);
+        assert_eq!(second_page.nodes[0].topo_index, 2);
+        assert!(second_page.was_pruned);
+        assert!(!second_page.has_more);
+    }
+
+    #[test]
+    fn workspace_graph_can_include_remote_only_variation_nodes() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+
+        let first = tempfile::tempdir().unwrap();
+        let first_ws = Workspace::init(first.path()).unwrap();
+        configure_identity(&first_ws, "Seth", "seth@example.com");
+        first_ws
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(first_ws.root(), "post.md", b"base");
+        let base = first_ws.save_version("Base").unwrap();
+        first_ws.publish_changes("origin").unwrap();
+
+        let second = tempfile::tempdir().unwrap();
+        let second_ws =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), second.path()).unwrap();
+        configure_identity(&second_ws, "Maria", "maria@example.com");
+        second_ws
+            .create_variation_from(base.id(), "remote-only")
+            .unwrap();
+        second_ws
+            .switch_variation(
+                &VariationId::from("remote-only"),
+                SwitchPolicy::AbortIfDirty,
+            )
+            .unwrap();
+        write_file(second_ws.root(), "post.md", b"remote only");
+        let remote_only = second_ws.save_version("Remote only").unwrap();
+        second_ws.publish_changes("origin").unwrap();
+
+        first_ws.fetch_all_variations("origin").unwrap();
+        let graph = first_ws
+            .workspace_graph(WorkspaceGraphOptions {
+                include_remotes: true,
+                remote: Some("origin".to_string()),
+                ..WorkspaceGraphOptions::default()
+            })
+            .unwrap();
+
+        let remote_ref = graph
+            .refs
+            .iter()
+            .find(|graph_ref| {
+                graph_ref.kind == WorkspaceGraphRefKind::RemoteVariation
+                    && graph_ref.name == "remote-only"
+            })
+            .unwrap();
+        assert_eq!(remote_ref.remote.as_deref(), Some("origin"));
+        assert_eq!(remote_ref.target_version, *remote_only.id());
+
+        let remote_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == remote_only.id())
+            .unwrap();
+        assert_eq!(remote_node.kind, WorkspaceGraphNodeKind::RemoteOnly);
+        let remote_detail = first_ws
+            .workspace_graph_node(remote_only.id(), WorkspaceGraphOptions::default())
+            .unwrap();
+        assert_eq!(remote_detail.node.kind, WorkspaceGraphNodeKind::RemoteOnly);
+        assert_eq!(remote_detail.changed_file_count, Some(1));
+        assert!(!remote_node
+            .available_actions
+            .contains(&WorkspaceGraphAction::CreateVariationFromHere));
+        assert!(matches!(
+            first_ws
+            .create_variation_from(remote_only.id(), "should-fail")
+                .unwrap_err(),
+            DraftlineError::VersionNotLocallyReachable(version) if version == remote_only.id().as_str()
+        ));
+    }
+
+    #[test]
+    fn workspace_graph_can_include_support_ref_only_nodes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        workspace
+            .create_variation_from(base.id(), "deleted")
+            .unwrap();
+        workspace
+            .switch_variation(&VariationId::from("deleted"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"deleted tip");
+        let deleted_tip = workspace.save_version("Deleted tip").unwrap();
+        workspace
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        workspace
+            .delete_variation(&VariationId::from("deleted"))
+            .unwrap();
+
+        let default_graph = workspace
+            .workspace_graph(WorkspaceGraphOptions::default())
+            .unwrap();
+        assert!(!default_graph
+            .nodes
+            .iter()
+            .any(|node| node.version.id() == deleted_tip.id()));
+
+        let graph = workspace
+            .workspace_graph(WorkspaceGraphOptions {
+                include_support_refs: true,
+                ..WorkspaceGraphOptions::default()
+            })
+            .unwrap();
+        let support_ref = graph
+            .refs
+            .iter()
+            .find(|graph_ref| {
+                graph_ref.kind == WorkspaceGraphRefKind::SupportRef
+                    && graph_ref.variation == Some(VariationId::from("deleted"))
+            })
+            .unwrap();
+        assert_eq!(
+            support_ref.support_ref_kind,
+            Some(SupportRefKind::DeletedVariation)
+        );
+        assert_eq!(support_ref.target_version, *deleted_tip.id());
+
+        let support_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == deleted_tip.id())
+            .unwrap();
+        assert_eq!(support_node.kind, WorkspaceGraphNodeKind::SupportRefOnly);
+        let support_detail = workspace
+            .workspace_graph_node(deleted_tip.id(), WorkspaceGraphOptions::default())
+            .unwrap();
+        assert_eq!(
+            support_detail.node.kind,
+            WorkspaceGraphNodeKind::SupportRefOnly
+        );
+        assert_eq!(support_detail.changed_file_count, Some(1));
+        assert!(!support_node
+            .available_actions
+            .contains(&WorkspaceGraphAction::CreateVariationFromHere));
+        assert!(matches!(
+            workspace
+                .create_variation_from(deleted_tip.id(), "should-fail")
+                .unwrap_err(),
+            DraftlineError::VersionNotLocallyReachable(version) if version == deleted_tip.id().as_str()
+        ));
+    }
+
+    #[test]
+    fn workspace_graph_support_refs_take_priority_over_remote_reachability() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        workspace
+            .create_variation_from(base.id(), "published-deleted")
+            .unwrap();
+        workspace
+            .switch_variation(
+                &VariationId::from("published-deleted"),
+                SwitchPolicy::AbortIfDirty,
+            )
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"published then deleted");
+        let published_deleted = workspace.save_version("Published deleted").unwrap();
+        workspace.publish_changes("origin").unwrap();
+        workspace
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        workspace
+            .delete_variation(&VariationId::from("published-deleted"))
+            .unwrap();
+        workspace.fetch_all_variations("origin").unwrap();
+
+        let graph = workspace
+            .workspace_graph(WorkspaceGraphOptions {
+                include_remotes: true,
+                remote: Some("origin".to_string()),
+                include_support_refs: true,
+                ..WorkspaceGraphOptions::default()
+            })
+            .unwrap();
+        let node = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == published_deleted.id())
+            .unwrap();
+        assert_eq!(node.kind, WorkspaceGraphNodeKind::SupportRefOnly);
+        let support_ref = graph
+            .refs
+            .iter()
+            .find(|graph_ref| {
+                graph_ref.kind == WorkspaceGraphRefKind::SupportRef
+                    && graph_ref.variation == Some(VariationId::from("published-deleted"))
+            })
+            .unwrap();
+        assert!(support_ref
+            .available_actions
+            .contains(&WorkspaceGraphAction::RestoreSupportRefAsVariation));
     }
 
     // ── variation_summaries ───────────────────────────────────────────────────

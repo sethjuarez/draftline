@@ -1,7 +1,8 @@
 use draftline::tauri_contract as contract;
 use draftline::tauri_contract::{
     AdoptRemoteVariationResult, AdoptWorkspaceResult, ApplyIncomingCommandResult,
-    ApplyShelfCommandResult, CloneWorkspaceRequest, CommandPostconditions, CurrentFileRequest,
+    ApplyShelfCommandResult, CloneWorkspaceRequest, CommandPostconditions,
+    CreateVariationFromVersionRequest, CreateVariationFromVersionResult, CurrentFileRequest,
     DeleteShelfResult, DiffVersionsRequest, FetchRemoteResult, ListSupportRefsRequest,
     MergeIncomingCommandResult, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
     PreviewVersionFileRequest, PublishCurrentVariationRequest, PublishCurrentVariationResult,
@@ -10,13 +11,19 @@ use draftline::tauri_contract::{
     SelectedSaveRequest, SelectedSaveResult, SelectedShelveRequest, SelectedShelveResult,
     ShelfRequest, TargetedRestoreVersionCommandResult, TargetedRestoreVersionRequest,
     TauriCommandError, TauriCommandResult, VersionRequest, WorkspaceDiagnostics,
-    WorkspaceOpenResult, WorkspaceRequest,
+    WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
+    WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest, WorkspaceGraphRequest,
+    WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest, WorkspaceOpenResult,
+    WorkspaceRequest,
 };
 use draftline::{
     ApplyIncomingReport, ChangeSet, ContentPolicyAudit, CurrentFileDiff, CurrentFilePreview,
     HistoryEntry, MergeIncomingReport, PreviewFile, RecoveryRepairResult, RemoteEndpoint,
     RemoteVariation, RemoteVariationDiagnostics, Shelf, ShelfApplyReport, SupportRef,
-    VariationSummary, VersionDiff, VersionPreview, WorkspaceVerification,
+    VariationSummary, VersionDiff, VersionPreview, WorkspaceGraph, WorkspaceGraphAgentSummary,
+    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail,
+    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
+    WorkspaceVerification,
 };
 use std::sync::{Mutex, MutexGuard};
 use tauri::{Emitter, Manager};
@@ -34,7 +41,7 @@ fn lock_context(
     })
 }
 
-#[tauri::command]
+#[tauri_plugin_auditaur::auditaur_command]
 fn inspect_workspace(
     state: tauri::State<'_, DraftlineContextState>,
     request: WorkspaceRequest,
@@ -88,7 +95,7 @@ fn list_variations(
     contract::into_tauri_result(contract::list_variations_with_context(&context, request))
 }
 
-#[tauri::command]
+#[tauri_plugin_auditaur::auditaur_command]
 fn list_support_refs(
     state: tauri::State<'_, DraftlineContextState>,
     request: ListSupportRefsRequest,
@@ -169,6 +176,145 @@ fn get_full_history(
     contract::into_tauri_result(contract::get_full_history_with_context(&context, request))
 }
 
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphRequest,
+) -> TauriCommandResult<WorkspaceGraph> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_with_context(&context, request))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph_refs(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphRequest,
+) -> TauriCommandResult<WorkspaceGraphRefs> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_refs_with_context(&context, request))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph_summary(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphRequest,
+) -> TauriCommandResult<WorkspaceGraphSummary> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_summary_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph_overview(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphOverviewRequest,
+) -> TauriCommandResult<WorkspaceGraph> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_overview_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph_around_version(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphAroundVersionRequest,
+) -> TauriCommandResult<WorkspaceGraph> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_around_version_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph_for_variation(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphVariationRequest,
+) -> TauriCommandResult<WorkspaceGraph> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_for_variation_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph_agent_summary(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphRequest,
+) -> TauriCommandResult<WorkspaceGraphAgentSummary> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_agent_summary_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph_neighborhood(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphNeighborhoodRequest,
+) -> TauriCommandResult<WorkspaceGraph> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_neighborhood_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn search_workspace_graph(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphSearchRequest,
+) -> TauriCommandResult<WorkspaceGraphSearchResult> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::search_workspace_graph_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph_path(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphPairRequest,
+) -> TauriCommandResult<WorkspaceGraphPath> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_path_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph_common_ancestor(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphPairRequest,
+) -> TauriCommandResult<WorkspaceGraphCommonAncestor> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_common_ancestor_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph_node(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: VersionRequest,
+) -> TauriCommandResult<WorkspaceGraphNodeDetail> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_node_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_workspace_graph_compare_summary(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceGraphPairRequest,
+) -> TauriCommandResult<WorkspaceGraphCompareSummary> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_workspace_graph_compare_summary_with_context(
+        &context, request,
+    ))
+}
+
 #[tauri::command]
 fn diff_versions(
     state: tauri::State<'_, DraftlineContextState>,
@@ -246,6 +392,18 @@ fn restore_version_as_new_save_to_variation(
 ) -> TauriCommandResult<TargetedRestoreVersionCommandResult> {
     let mut context = lock_context(state.inner())?;
     contract::into_tauri_result(contract::restore_version_as_new_save_to_variation_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn create_variation_from_version(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: CreateVariationFromVersionRequest,
+) -> TauriCommandResult<CreateVariationFromVersionResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::create_variation_from_version_with_context(
         &mut context,
         request,
     ))
@@ -491,6 +649,19 @@ fn main() {
             get_changes,
             get_history,
             get_full_history,
+            get_workspace_graph,
+            get_workspace_graph_refs,
+            get_workspace_graph_summary,
+            get_workspace_graph_overview,
+            get_workspace_graph_around_version,
+            get_workspace_graph_for_variation,
+            get_workspace_graph_agent_summary,
+            get_workspace_graph_neighborhood,
+            search_workspace_graph,
+            get_workspace_graph_path,
+            get_workspace_graph_common_ancestor,
+            get_workspace_graph_node,
+            get_workspace_graph_compare_summary,
             diff_versions,
             diff_version_to_workspace,
             diff_workspace_file,
@@ -499,6 +670,7 @@ fn main() {
             preview_workspace_file,
             restore_version_as_new_save,
             restore_version_as_new_save_to_variation,
+            create_variation_from_version,
             save,
             list_shelves,
             preview_shelf,

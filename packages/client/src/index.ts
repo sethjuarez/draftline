@@ -35,6 +35,31 @@ export interface DraftlineClient {
   getChanges(workspacePath: string): Promise<ChangeSet>;
   getHistory(workspacePath: string): Promise<HistoryEntry[]>;
   getFullHistory(workspacePath: string): Promise<HistoryEntry[]>;
+  getWorkspaceGraph(request: WorkspaceGraphRequest): Promise<WorkspaceGraph>;
+  getWorkspaceGraphRefs(request: WorkspaceGraphRefsRequest): Promise<WorkspaceGraphRefs>;
+  getWorkspaceGraphSummary(request: WorkspaceGraphRequest): Promise<WorkspaceGraphSummary>;
+  getWorkspaceGraphOverview(request: WorkspaceGraphOverviewRequest): Promise<WorkspaceGraph>;
+  getWorkspaceGraphAroundVersion(
+    request: WorkspaceGraphAroundVersionRequest,
+  ): Promise<WorkspaceGraph>;
+  getWorkspaceGraphForVariation(
+    request: WorkspaceGraphVariationRequest,
+  ): Promise<WorkspaceGraph>;
+  getWorkspaceGraphAgentSummary(
+    request: WorkspaceGraphRequest,
+  ): Promise<WorkspaceGraphAgentSummary>;
+  getWorkspaceGraphNeighborhood(
+    request: WorkspaceGraphNeighborhoodRequest,
+  ): Promise<WorkspaceGraph>;
+  searchWorkspaceGraph(request: WorkspaceGraphSearchRequest): Promise<WorkspaceGraphSearchResult>;
+  getWorkspaceGraphPath(request: WorkspaceGraphPairRequest): Promise<WorkspaceGraphPath>;
+  getWorkspaceGraphCommonAncestor(
+    request: WorkspaceGraphPairRequest,
+  ): Promise<WorkspaceGraphCommonAncestor>;
+  getWorkspaceGraphNode(request: VersionRequest): Promise<WorkspaceGraphNodeDetail>;
+  getWorkspaceGraphCompareSummary(
+    request: WorkspaceGraphPairRequest,
+  ): Promise<WorkspaceGraphCompareSummary>;
   diffVersions(request: DiffVersionsRequest): Promise<VersionDiff>;
   diffVersionToWorkspace(request: VersionRequest): Promise<VersionDiff>;
   diffWorkspaceFile(request: CurrentFileRequest): Promise<CurrentFileDiff | null>;
@@ -45,6 +70,9 @@ export interface DraftlineClient {
   restoreVersionAsNewSaveToVariation(
     request: TargetedRestoreVersionRequest,
   ): Promise<TargetedRestoreVersionResult>;
+  createVariationFromVersion(
+    request: CreateVariationFromVersionRequest,
+  ): Promise<CreateVariationFromVersionResult>;
   save(request: SaveRequest): Promise<SaveResult>;
   listShelves(workspacePath: string): Promise<Shelf[]>;
   previewShelf(request: ShelfRequest): Promise<VersionPreview>;
@@ -143,6 +171,25 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('get_full_history', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
+    getWorkspaceGraph: (request) => run('get_workspace_graph', { request }),
+    getWorkspaceGraphRefs: (request) => run('get_workspace_graph_refs', { request }),
+    getWorkspaceGraphSummary: (request) => run('get_workspace_graph_summary', { request }),
+    getWorkspaceGraphOverview: (request) => run('get_workspace_graph_overview', { request }),
+    getWorkspaceGraphAroundVersion: (request) =>
+      run('get_workspace_graph_around_version', { request }),
+    getWorkspaceGraphForVariation: (request) =>
+      run('get_workspace_graph_for_variation', { request }),
+    getWorkspaceGraphAgentSummary: (request) =>
+      run('get_workspace_graph_agent_summary', { request }),
+    getWorkspaceGraphNeighborhood: (request) =>
+      run('get_workspace_graph_neighborhood', { request }),
+    searchWorkspaceGraph: (request) => run('search_workspace_graph', { request }),
+    getWorkspaceGraphPath: (request) => run('get_workspace_graph_path', { request }),
+    getWorkspaceGraphCommonAncestor: (request) =>
+      run('get_workspace_graph_common_ancestor', { request }),
+    getWorkspaceGraphNode: (request) => run('get_workspace_graph_node', { request }),
+    getWorkspaceGraphCompareSummary: (request) =>
+      run('get_workspace_graph_compare_summary', { request }),
     diffVersions: (request) => run('diff_versions', { request }),
     diffVersionToWorkspace: (request) => run('diff_version_to_workspace', { request }),
     diffWorkspaceFile: (request) => run('diff_workspace_file', { request }),
@@ -152,6 +199,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     restoreVersionAsNewSave: (request) => run('restore_version_as_new_save', { request }),
     restoreVersionAsNewSaveToVariation: (request) =>
       run('restore_version_as_new_save_to_variation', { request }),
+    createVariationFromVersion: (request) => run('create_variation_from_version', { request }),
     save: (request) => run('save', { request }),
     listShelves: (workspacePath) =>
       run('list_shelves', {
@@ -287,6 +335,238 @@ export interface HistoryEntry {
   variation_tips: string[];
   is_head: boolean;
   parent_ids: string[];
+}
+
+export type WorkspaceGraphAction =
+  | 'preview'
+  | 'compare_to_current'
+  | 'restore_as_new_save'
+  | 'create_variation_from_here'
+  | 'switch_to_variation'
+  | 'adopt_remote_variation'
+  | 'restore_support_ref_as_variation';
+
+export type WorkspaceGraphNodeKind = 'normal' | 'remote_only' | 'support_ref_only';
+export type WorkspaceGraphRefScope = 'local' | 'remote_tracking';
+export type WorkspaceGraphRefKind = 'local_variation' | 'remote_variation' | 'support_ref';
+
+export interface WorkspaceGraphActionHint {
+  action: WorkspaceGraphAction;
+  enabled: boolean;
+  command: string;
+  disabled_reason?: string | null;
+  destructive: boolean;
+  switches_workspace: boolean;
+  creates_version: boolean;
+}
+
+export interface WorkspaceGraphLayoutHint {
+  lane: number;
+  row: number;
+  group?: string | null;
+  display_label: string;
+}
+
+export interface WorkspaceGraphBoundary {
+  missing_parent_ids: string[];
+  missing_child_ids: string[];
+  hidden_parent_count: number;
+  hidden_child_count: number;
+}
+
+export interface WorkspaceGraphNode {
+  id: string;
+  version: Version;
+  parent_ids: string[];
+  parent_version_ids: string[];
+  variation_tips: string[];
+  is_head: boolean;
+  is_current: boolean;
+  is_tip: boolean;
+  is_merge: boolean;
+  is_branch_point: boolean;
+  child_ids: string[];
+  child_count: number;
+  kind: WorkspaceGraphNodeKind;
+  topo_index: number;
+  layout: WorkspaceGraphLayoutHint;
+  boundary: WorkspaceGraphBoundary;
+  available_actions: WorkspaceGraphAction[];
+  action_hints: WorkspaceGraphActionHint[];
+}
+
+export interface WorkspaceGraphRef {
+  id: string;
+  name: string;
+  display_label: string;
+  kind: WorkspaceGraphRefKind;
+  scope: WorkspaceGraphRefScope;
+  target: string;
+  target_version: string;
+  remote?: string | null;
+  variation?: string | null;
+  metadata?: VariationMetadata | null;
+  support_ref_kind?: SupportRefKind | null;
+  group?: string | null;
+  is_current: boolean;
+  is_user_facing: boolean;
+  available_actions: WorkspaceGraphAction[];
+  action_hints: WorkspaceGraphActionHint[];
+}
+
+export interface WorkspaceGraphOptions {
+  include_remotes?: boolean;
+  remote?: string | null;
+  include_support_refs?: boolean;
+  limit?: number | null;
+  cursor?: number | null;
+}
+
+export interface WorkspaceGraphRequest {
+  workspace_path: string;
+  options?: WorkspaceGraphOptions;
+}
+
+export type WorkspaceGraphRefsOptions = Omit<WorkspaceGraphOptions, 'limit' | 'cursor'>;
+
+export interface WorkspaceGraphRefsRequest {
+  workspace_path: string;
+  options?: WorkspaceGraphRefsOptions;
+}
+
+export interface WorkspaceGraphOverviewOptions extends WorkspaceGraphOptions {
+  max_nodes?: number;
+  recent_nodes?: number;
+}
+
+export interface WorkspaceGraphOverviewRequest {
+  workspace_path: string;
+  options?: WorkspaceGraphOverviewOptions;
+}
+
+export interface WorkspaceGraphAroundVersionRequest {
+  workspace_path: string;
+  version_id: string;
+  radius?: number;
+  options?: WorkspaceGraphOptions;
+}
+
+export interface WorkspaceGraphVariationRequest {
+  workspace_path: string;
+  variation_id: string;
+  options?: WorkspaceGraphOptions;
+}
+
+export interface WorkspaceGraphNeighborhoodRequest {
+  workspace_path: string;
+  version_id: string;
+  radius?: number;
+  options?: WorkspaceGraphOptions;
+}
+
+export interface WorkspaceGraphSearchRequest {
+  workspace_path: string;
+  query: string;
+  options?: WorkspaceGraphOptions;
+}
+
+export interface WorkspaceGraphPairRequest {
+  workspace_path: string;
+  from_version_id: string;
+  to_version_id: string;
+  options?: WorkspaceGraphOptions;
+}
+
+export interface WorkspaceGraphRefs {
+  workspace_id: { root: string };
+  current_variation?: string | null;
+  current_version?: string | null;
+  dirty: DirtySummary;
+  recovery?: RecoveryState | null;
+  state_may_be_inconsistent: boolean;
+  refs: WorkspaceGraphRef[];
+  graph_fingerprint: string;
+}
+
+export interface WorkspaceGraphSummary {
+  workspace_id: { root: string };
+  current_variation?: string | null;
+  current_version?: string | null;
+  dirty: DirtySummary;
+  recovery?: RecoveryState | null;
+  state_may_be_inconsistent: boolean;
+  total_nodes: number;
+  normal_nodes: number;
+  remote_only_nodes: number;
+  support_ref_only_nodes: number;
+  merge_nodes: number;
+  branch_points: number;
+  local_ref_count: number;
+  remote_ref_count: number;
+  support_ref_count: number;
+  graph_fingerprint: string;
+}
+
+export interface WorkspaceGraphAgentSummary {
+  summary: WorkspaceGraphSummary;
+  suggested_next_commands: string[];
+  warnings: string[];
+  current_ref?: WorkspaceGraphRef | null;
+  nearby_refs: WorkspaceGraphRef[];
+}
+
+export interface WorkspaceGraphSearchResult {
+  graph: WorkspaceGraph;
+  matched_refs: WorkspaceGraphRef[];
+  query: string;
+  matched_node_count: number;
+  total_matches: number;
+}
+
+export interface WorkspaceGraphPath {
+  from_version: string;
+  to_version: string;
+  node_ids: string[];
+  version_ids: string[];
+  common_ancestor?: string | null;
+  found: boolean;
+}
+
+export interface WorkspaceGraphCommonAncestor {
+  left_version: string;
+  right_version: string;
+  common_ancestor?: string | null;
+}
+
+export interface WorkspaceGraphNodeDetail {
+  node: WorkspaceGraphNode;
+  refs: WorkspaceGraphRef[];
+  changed_file_count?: number | null;
+  changed_files: ChangedFile[];
+}
+
+export interface WorkspaceGraphCompareSummary {
+  from_version: string;
+  to_version: string;
+  changed_file_count: number;
+  files: ChangedFile[];
+  action_hints: WorkspaceGraphActionHint[];
+  common_ancestor?: string | null;
+}
+
+export interface WorkspaceGraph {
+  workspace_id: { root: string };
+  current_variation?: string | null;
+  current_version?: string | null;
+  dirty: DirtySummary;
+  recovery?: RecoveryState | null;
+  state_may_be_inconsistent: boolean;
+  nodes: WorkspaceGraphNode[];
+  refs: WorkspaceGraphRef[];
+  snapshot_id: string;
+  was_pruned: boolean;
+  has_more: boolean;
+  next_cursor?: number | null;
 }
 
 export interface ChangedFile {
@@ -517,6 +797,11 @@ export interface RestoreVersionResult {
 export interface TargetedRestoreVersionResult {
   version: Version;
   target_variation: Variation;
+  postconditions: CommandPostconditions;
+}
+
+export interface CreateVariationFromVersionResult {
+  variation: Variation;
   postconditions: CommandPostconditions;
 }
 
@@ -755,6 +1040,12 @@ export interface TargetedRestoreVersionRequest extends RestoreVersionRequest {
   target: RestoreVersionTarget;
 }
 
+export interface CreateVariationFromVersionRequest extends WorkspaceRequest {
+  version_id: string;
+  name: string;
+  metadata?: VariationMetadata;
+}
+
 export interface SaveRequest extends WorkspaceRequest {
   label: string;
 }
@@ -823,6 +1114,45 @@ export interface DraftlineHostFacade {
   selectedDiscard(paths: string[]): Promise<SelectedDiscardResult>;
   history(): Promise<HistoryEntry[]>;
   fullHistory(): Promise<HistoryEntry[]>;
+  workspaceGraph(options?: WorkspaceGraphOptions): Promise<WorkspaceGraph>;
+  workspaceGraphRefs(options?: WorkspaceGraphRefsOptions): Promise<WorkspaceGraphRefs>;
+  workspaceGraphSummary(options?: WorkspaceGraphOptions): Promise<WorkspaceGraphSummary>;
+  workspaceGraphOverview(options?: WorkspaceGraphOverviewOptions): Promise<WorkspaceGraph>;
+  workspaceGraphAroundVersion(
+    versionId: string,
+    radius?: number,
+    options?: WorkspaceGraphOptions,
+  ): Promise<WorkspaceGraph>;
+  workspaceGraphForVariation(
+    variationId: string,
+    options?: WorkspaceGraphOptions,
+  ): Promise<WorkspaceGraph>;
+  workspaceGraphAgentSummary(options?: WorkspaceGraphOptions): Promise<WorkspaceGraphAgentSummary>;
+  workspaceGraphNeighborhood(
+    versionId: string,
+    radius?: number,
+    options?: WorkspaceGraphOptions,
+  ): Promise<WorkspaceGraph>;
+  searchWorkspaceGraph(
+    query: string,
+    options?: WorkspaceGraphOptions,
+  ): Promise<WorkspaceGraphSearchResult>;
+  workspaceGraphPath(
+    fromVersionId: string,
+    toVersionId: string,
+    options?: WorkspaceGraphOptions,
+  ): Promise<WorkspaceGraphPath>;
+  workspaceGraphCommonAncestor(
+    fromVersionId: string,
+    toVersionId: string,
+    options?: WorkspaceGraphOptions,
+  ): Promise<WorkspaceGraphCommonAncestor>;
+  workspaceGraphNode(versionId: string): Promise<WorkspaceGraphNodeDetail>;
+  workspaceGraphCompareSummary(
+    fromVersionId: string,
+    toVersionId: string,
+    options?: WorkspaceGraphOptions,
+  ): Promise<WorkspaceGraphCompareSummary>;
   changes(): Promise<ChangeSet>;
   variations(): Promise<VariationSummary[]>;
   preflightRenameVariation(sourceVariationId: string, targetVariationId: string): Promise<VariationRenamePreflight>;
@@ -845,6 +1175,11 @@ export interface DraftlineHostFacade {
     label: string,
     target: RestoreVersionTarget,
   ): Promise<TargetedRestoreVersionResult>;
+  createVariationFromVersion(
+    versionId: string,
+    name: string,
+    metadata?: VariationMetadata,
+  ): Promise<CreateVariationFromVersionResult>;
   shelves(): Promise<Shelf[]>;
   previewShelf(shelfId: string): Promise<VersionPreview>;
   applyShelf(shelfId: string): Promise<ApplyShelfCommandResult>;
@@ -889,6 +1224,59 @@ export function createDraftlineHostFacade({
     selectedDiscard: (paths) => client.selectedDiscard({ ...workspaceRequest(), paths }),
     history: () => client.getHistory(workspacePath),
     fullHistory: () => client.getFullHistory(workspacePath),
+    workspaceGraph: (options) => client.getWorkspaceGraph({ ...workspaceRequest(), options }),
+    workspaceGraphRefs: (options) =>
+      client.getWorkspaceGraphRefs({ ...workspaceRequest(), options }),
+    workspaceGraphSummary: (options) =>
+      client.getWorkspaceGraphSummary({ ...workspaceRequest(), options }),
+    workspaceGraphOverview: (options) =>
+      client.getWorkspaceGraphOverview({ ...workspaceRequest(), options }),
+    workspaceGraphAroundVersion: (versionId, radius, options) =>
+      client.getWorkspaceGraphAroundVersion({
+        ...workspaceRequest(),
+        version_id: versionId,
+        radius,
+        options,
+      }),
+    workspaceGraphForVariation: (variationId, options) =>
+      client.getWorkspaceGraphForVariation({
+        ...workspaceRequest(),
+        variation_id: variationId,
+        options,
+      }),
+    workspaceGraphAgentSummary: (options) =>
+      client.getWorkspaceGraphAgentSummary({ ...workspaceRequest(), options }),
+    workspaceGraphNeighborhood: (versionId, radius, options) =>
+      client.getWorkspaceGraphNeighborhood({
+        ...workspaceRequest(),
+        version_id: versionId,
+        radius,
+        options,
+      }),
+    searchWorkspaceGraph: (query, options) =>
+      client.searchWorkspaceGraph({ ...workspaceRequest(), query, options }),
+    workspaceGraphPath: (fromVersionId, toVersionId, options) =>
+      client.getWorkspaceGraphPath({
+        ...workspaceRequest(),
+        from_version_id: fromVersionId,
+        to_version_id: toVersionId,
+        options,
+      }),
+    workspaceGraphCommonAncestor: (fromVersionId, toVersionId, options) =>
+      client.getWorkspaceGraphCommonAncestor({
+        ...workspaceRequest(),
+        from_version_id: fromVersionId,
+        to_version_id: toVersionId,
+        options,
+      }),
+    workspaceGraphNode: (versionId) => client.getWorkspaceGraphNode(versionRequest(versionId)),
+    workspaceGraphCompareSummary: (fromVersionId, toVersionId, options) =>
+      client.getWorkspaceGraphCompareSummary({
+        ...workspaceRequest(),
+        from_version_id: fromVersionId,
+        to_version_id: toVersionId,
+        options,
+      }),
     changes: () => client.getChanges(workspacePath),
     variations: () => client.listVariations(workspacePath),
     preflightRenameVariation: (sourceVariationId, targetVariationId) =>
@@ -922,6 +1310,8 @@ export function createDraftlineHostFacade({
       client.restoreVersionAsNewSave({ ...versionRequest(versionId), label }),
     restoreAsNewSaveToVariation: (versionId, label, target) =>
       client.restoreVersionAsNewSaveToVariation({ ...versionRequest(versionId), label, target }),
+    createVariationFromVersion: (versionId, name, metadata) =>
+      client.createVariationFromVersion({ ...versionRequest(versionId), name, metadata }),
     shelves: () => client.listShelves(workspacePath),
     previewShelf: (shelfId) => client.previewShelf({ ...workspaceRequest(), shelf_id: shelfId }),
     applyShelf: (shelfId) => client.applyShelf({ ...workspaceRequest(), shelf_id: shelfId }),
@@ -1091,6 +1481,82 @@ export async function getFullHistory(workspacePath: string): Promise<HistoryEntr
   return createDraftlineClient().getFullHistory(workspacePath);
 }
 
+export async function getWorkspaceGraph(request: WorkspaceGraphRequest): Promise<WorkspaceGraph> {
+  return createDraftlineClient().getWorkspaceGraph(request);
+}
+
+export async function getWorkspaceGraphRefs(
+  request: WorkspaceGraphRefsRequest,
+): Promise<WorkspaceGraphRefs> {
+  return createDraftlineClient().getWorkspaceGraphRefs(request);
+}
+
+export async function getWorkspaceGraphSummary(
+  request: WorkspaceGraphRequest,
+): Promise<WorkspaceGraphSummary> {
+  return createDraftlineClient().getWorkspaceGraphSummary(request);
+}
+
+export async function getWorkspaceGraphOverview(
+  request: WorkspaceGraphOverviewRequest,
+): Promise<WorkspaceGraph> {
+  return createDraftlineClient().getWorkspaceGraphOverview(request);
+}
+
+export async function getWorkspaceGraphAroundVersion(
+  request: WorkspaceGraphAroundVersionRequest,
+): Promise<WorkspaceGraph> {
+  return createDraftlineClient().getWorkspaceGraphAroundVersion(request);
+}
+
+export async function getWorkspaceGraphForVariation(
+  request: WorkspaceGraphVariationRequest,
+): Promise<WorkspaceGraph> {
+  return createDraftlineClient().getWorkspaceGraphForVariation(request);
+}
+
+export async function getWorkspaceGraphAgentSummary(
+  request: WorkspaceGraphRequest,
+): Promise<WorkspaceGraphAgentSummary> {
+  return createDraftlineClient().getWorkspaceGraphAgentSummary(request);
+}
+
+export async function getWorkspaceGraphNeighborhood(
+  request: WorkspaceGraphNeighborhoodRequest,
+): Promise<WorkspaceGraph> {
+  return createDraftlineClient().getWorkspaceGraphNeighborhood(request);
+}
+
+export async function searchWorkspaceGraph(
+  request: WorkspaceGraphSearchRequest,
+): Promise<WorkspaceGraphSearchResult> {
+  return createDraftlineClient().searchWorkspaceGraph(request);
+}
+
+export async function getWorkspaceGraphPath(
+  request: WorkspaceGraphPairRequest,
+): Promise<WorkspaceGraphPath> {
+  return createDraftlineClient().getWorkspaceGraphPath(request);
+}
+
+export async function getWorkspaceGraphCommonAncestor(
+  request: WorkspaceGraphPairRequest,
+): Promise<WorkspaceGraphCommonAncestor> {
+  return createDraftlineClient().getWorkspaceGraphCommonAncestor(request);
+}
+
+export async function getWorkspaceGraphNode(
+  request: VersionRequest,
+): Promise<WorkspaceGraphNodeDetail> {
+  return createDraftlineClient().getWorkspaceGraphNode(request);
+}
+
+export async function getWorkspaceGraphCompareSummary(
+  request: WorkspaceGraphPairRequest,
+): Promise<WorkspaceGraphCompareSummary> {
+  return createDraftlineClient().getWorkspaceGraphCompareSummary(request);
+}
+
 export async function diffVersions(request: DiffVersionsRequest): Promise<VersionDiff> {
   return createDraftlineClient().diffVersions(request);
 }
@@ -1131,6 +1597,12 @@ export async function restoreVersionAsNewSaveToVariation(
   request: TargetedRestoreVersionRequest,
 ): Promise<TargetedRestoreVersionResult> {
   return createDraftlineClient().restoreVersionAsNewSaveToVariation(request);
+}
+
+export async function createVariationFromVersion(
+  request: CreateVariationFromVersionRequest,
+): Promise<CreateVariationFromVersionResult> {
+  return createDraftlineClient().createVariationFromVersion(request);
 }
 
 export async function save(request: SaveRequest): Promise<SaveResult> {
