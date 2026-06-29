@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::{PreflightReport, RecoveryState, SyncStatus};
+use crate::{workspace::VariationCreatePreflight, PreflightReport, RecoveryState, SyncStatus};
 
 /// Result type used by Draftline APIs.
 pub type Result<T> = std::result::Result<T, DraftlineError>;
@@ -30,6 +30,9 @@ pub enum DraftlineError {
 
     #[error("operation preflight failed")]
     PreflightFailed(Box<PreflightReport>),
+
+    #[error("variation creation preflight failed")]
+    VariationCreatePreflightFailed(Box<VariationCreatePreflight>),
 
     #[error("workspace has an incomplete Draftline operation")]
     RecoveryRequired(Box<RecoveryState>),

@@ -257,6 +257,24 @@ describe('createDraftlineClient', () => {
       name: 'graph-branch',
       metadata: { label: 'Graph branch', slug: 'graph-branch' },
     });
+    const createToken = {
+      operation_id: 'op-1',
+      from_version: versionId,
+      variation: 'graph-branch',
+      remote: 'origin',
+      expected_source_oid: versionId,
+      expected_remote_oid: null,
+    };
+    await client.preflightCreateVariationFromVersion({
+      ...versionRequest,
+      name: 'graph-branch',
+      remote: 'origin',
+    });
+    await client.createVariationFromVersionGuarded({
+      workspace_path: 'C:\\repo',
+      token: createToken,
+      metadata: { label: 'Graph branch' },
+    });
     await client.listShelves('C:\\repo');
     await client.previewShelf(shelfRequest);
     await client.preflightApplyShelf(shelfRequest);
@@ -386,6 +404,20 @@ describe('createDraftlineClient', () => {
         ...versionRequest,
         name: 'graph-branch',
         metadata: { label: 'Graph branch', slug: 'graph-branch' },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('preflight_create_variation_from_version', {
+      request: {
+        ...versionRequest,
+        name: 'graph-branch',
+        remote: 'origin',
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('create_variation_from_version_guarded', {
+      request: {
+        workspace_path: 'C:\\repo',
+        token: createToken,
+        metadata: { label: 'Graph branch' },
       },
     });
     expect(invoke).toHaveBeenCalledWith('list_shelves', {

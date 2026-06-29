@@ -17,13 +17,13 @@ use crate::{
     RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
     RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result,
     Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SwitchPolicy, SyncState, SyncStatus,
-    Variation, VariationId, VariationMetadata, VariationRenamePreflight, VariationRenameToken,
-    VariationSummary, Version, VersionDiff, VersionId, VersionPreview, Workspace,
-    WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor,
-    WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail, WorkspaceGraphOptions,
-    WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRefs,
-    WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection,
-    WorkspaceSummary, WorkspaceVerification,
+    Variation, VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
+    VariationRenamePreflight, VariationRenameToken, VariationSummary, Version, VersionDiff,
+    VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
+    WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
+    WorkspaceGraphNodeDetail, WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
+    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
+    WorkspaceId, WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -390,6 +390,25 @@ pub struct CreateVariationFromVersionRequest {
     pub metadata: VariationMetadata,
 }
 
+/// Request for remote-aware variation creation preflight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreflightCreateVariationFromVersionRequest {
+    pub workspace_path: PathBuf,
+    pub version_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+}
+
+/// Request for guarded remote-aware variation creation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardedCreateVariationFromVersionRequest {
+    pub workspace_path: PathBuf,
+    pub token: VariationCreateToken,
+    #[serde(default)]
+    pub metadata: VariationMetadata,
+}
+
 /// Restore result with postcondition state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreVersionResult {
@@ -408,6 +427,14 @@ pub struct TargetedRestoreVersionCommandResult {
 /// Variation creation result with postcondition state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateVariationFromVersionResult {
+    pub variation: Variation,
+    pub postconditions: CommandPostconditions,
+}
+
+/// Guarded variation creation result with preflight and postcondition state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardedCreateVariationFromVersionResult {
+    pub preflight: VariationCreatePreflight,
     pub variation: Variation,
     pub postconditions: CommandPostconditions,
 }
@@ -1561,6 +1588,114 @@ pub fn create_variation_from_version_with_context(
     })
 }
 
+/// Preflights remote-aware local variation creation from a saved version.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        version_id = %request.version_id,
+        variation = %request.name,
+        remote = request.remote.as_deref().unwrap_or("<none>")
+    )
+)]
+pub fn preflight_create_variation_from_version(
+    request: PreflightCreateVariationFromVersionRequest,
+) -> Result<VariationCreatePreflight> {
+    preflight_create_variation_from_version_with_context(
+        &mut DraftlineCommandContext::new(),
+        request,
+    )
+}
+
+/// Preflights remote-aware local variation creation using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        version_id = %request.version_id,
+        variation = %request.name,
+        remote = request.remote.as_deref().unwrap_or("<none>")
+    )
+)]
+pub fn preflight_create_variation_from_version_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: PreflightCreateVariationFromVersionRequest,
+) -> Result<VariationCreatePreflight> {
+    let version = parse_version_id(request.version_id)?;
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let mut options = context.remote_options();
+    workspace.preflight_create_variation_from_version_with_options(
+        &version,
+        request.name,
+        request.remote.as_deref(),
+        &mut options,
+    )
+}
+
+/// Creates a local variation only when a remote-aware preflight token is still valid.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        variation = %request.token.variation,
+        remote = request.token.remote.as_deref().unwrap_or("<none>")
+    )
+)]
+pub fn create_variation_from_version_guarded(
+    request: GuardedCreateVariationFromVersionRequest,
+) -> Result<GuardedCreateVariationFromVersionResult> {
+    create_variation_from_version_guarded_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Creates a guarded local variation using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        variation = %request.token.variation,
+        remote = request.token.remote.as_deref().unwrap_or("<none>")
+    )
+)]
+pub fn create_variation_from_version_guarded_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: GuardedCreateVariationFromVersionRequest,
+) -> Result<GuardedCreateVariationFromVersionResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let preflight = {
+        let mut options = context.remote_options();
+        workspace.preflight_create_variation_from_version_with_options(
+            &request.token.from_version,
+            request.token.variation.as_str(),
+            request.token.remote.as_deref(),
+            &mut options,
+        )?
+    };
+    if !preflight.can_create {
+        return Err(DraftlineError::VariationCreatePreflightFailed(Box::new(
+            preflight,
+        )));
+    }
+
+    let variation = {
+        let mut options = context.remote_options();
+        workspace.create_variation_from_version_with_token(
+            request.token,
+            request.metadata,
+            &mut options,
+        )?
+    };
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(GuardedCreateVariationFromVersionResult {
+        preflight,
+        variation,
+        postconditions: collect_postconditions(&workspace, false),
+    })
+}
+
 /// Saves all tracked workspace changes as a new version.
 #[tracing::instrument(
     err(level = tracing::Level::WARN),
@@ -2473,6 +2608,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::AbsolutePath(_) => "absolute_path",
         DraftlineError::WorkspaceDirty => "dirty_workspace",
         DraftlineError::PreflightFailed(_) => "preflight_failed",
+        DraftlineError::VariationCreatePreflightFailed(_) => "variation_create_preflight_failed",
         DraftlineError::RecoveryRequired(_) => "recovery_required",
         DraftlineError::RecoveryNotFound(_) => "recovery_not_found",
         DraftlineError::InvalidVariationName(_) => "invalid_variation_name",
@@ -2508,6 +2644,14 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
                 "serialization_error": error.to_string(),
             })),
         },
+        DraftlineError::VariationCreatePreflightFailed(report) => {
+            match serde_json::to_value(report.as_ref()) {
+                Ok(value) => Some(value),
+                Err(error) => Some(serde_json::json!({
+                    "serialization_error": error.to_string(),
+                })),
+            }
+        }
         DraftlineError::RecoveryRequired(state) => match serde_json::to_value(state.as_ref()) {
             Ok(value) => Some(value),
             Err(error) => Some(serde_json::json!({

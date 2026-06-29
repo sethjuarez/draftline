@@ -72,9 +72,15 @@ export interface DraftlineClient {
   restoreVersionAsNewSaveToVariation(
     request: TargetedRestoreVersionRequest,
   ): Promise<TargetedRestoreVersionResult>;
+  preflightCreateVariationFromVersion(
+    request: PreflightCreateVariationFromVersionRequest,
+  ): Promise<VariationCreatePreflight>;
   createVariationFromVersion(
     request: CreateVariationFromVersionRequest,
   ): Promise<CreateVariationFromVersionResult>;
+  createVariationFromVersionGuarded(
+    request: GuardedCreateVariationFromVersionRequest,
+  ): Promise<GuardedCreateVariationFromVersionResult>;
   save(request: SaveRequest): Promise<SaveResult>;
   listShelves(workspacePath: string): Promise<Shelf[]>;
   previewShelf(request: ShelfRequest): Promise<VersionPreview>;
@@ -203,7 +209,11 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     restoreVersionAsNewSave: (request) => run('restore_version_as_new_save', { request }),
     restoreVersionAsNewSaveToVariation: (request) =>
       run('restore_version_as_new_save_to_variation', { request }),
+    preflightCreateVariationFromVersion: (request) =>
+      run('preflight_create_variation_from_version', { request }),
     createVariationFromVersion: (request) => run('create_variation_from_version', { request }),
+    createVariationFromVersionGuarded: (request) =>
+      run('create_variation_from_version_guarded', { request }),
     save: (request) => run('save', { request }),
     listShelves: (workspacePath) =>
       run('list_shelves', {
@@ -677,6 +687,28 @@ export interface RemoteVariationDiagnostics {
   remote_only_variations: string[];
 }
 
+export interface VariationCreateToken {
+  operation_id: string;
+  from_version: string;
+  variation: string;
+  remote?: string | null;
+  expected_source_oid: string;
+  expected_remote_oid?: string | null;
+}
+
+export interface VariationCreatePreflight {
+  from_version: string;
+  variation: string;
+  remote?: string | null;
+  can_create: boolean;
+  local_collision: boolean;
+  remote_collision: boolean;
+  remote_only_collision: boolean;
+  existing_remote_head?: Version | null;
+  suggested_alternative?: string | null;
+  token?: VariationCreateToken | null;
+}
+
 export interface DirtySummary {
   is_dirty: boolean;
   files: ChangedFile[];
@@ -811,6 +843,12 @@ export interface TargetedRestoreVersionResult {
 }
 
 export interface CreateVariationFromVersionResult {
+  variation: Variation;
+  postconditions: CommandPostconditions;
+}
+
+export interface GuardedCreateVariationFromVersionResult {
+  preflight: VariationCreatePreflight;
   variation: Variation;
   postconditions: CommandPostconditions;
 }
@@ -1060,6 +1098,17 @@ export interface CreateVariationFromVersionRequest extends WorkspaceRequest {
   metadata?: VariationMetadata;
 }
 
+export interface PreflightCreateVariationFromVersionRequest extends WorkspaceRequest {
+  version_id: string;
+  name: string;
+  remote?: string | null;
+}
+
+export interface GuardedCreateVariationFromVersionRequest extends WorkspaceRequest {
+  token: VariationCreateToken;
+  metadata?: VariationMetadata;
+}
+
 export interface SaveRequest extends WorkspaceRequest {
   label: string;
 }
@@ -1196,6 +1245,15 @@ export interface DraftlineHostFacade {
     name: string,
     metadata?: VariationMetadata,
   ): Promise<CreateVariationFromVersionResult>;
+  preflightCreateVariationFromVersion(
+    versionId: string,
+    name: string,
+    remote?: string,
+  ): Promise<VariationCreatePreflight>;
+  createVariationFromVersionGuarded(
+    token: VariationCreateToken,
+    metadata?: VariationMetadata,
+  ): Promise<GuardedCreateVariationFromVersionResult>;
   shelves(): Promise<Shelf[]>;
   previewShelf(shelfId: string): Promise<VersionPreview>;
   applyShelf(shelfId: string): Promise<ApplyShelfCommandResult>;
@@ -1332,6 +1390,10 @@ export function createDraftlineHostFacade({
       client.restoreVersionAsNewSaveToVariation({ ...versionRequest(versionId), label, target }),
     createVariationFromVersion: (versionId, name, metadata) =>
       client.createVariationFromVersion({ ...versionRequest(versionId), name, metadata }),
+    preflightCreateVariationFromVersion: (versionId, name, remote = defaultRemote) =>
+      client.preflightCreateVariationFromVersion({ ...versionRequest(versionId), name, remote }),
+    createVariationFromVersionGuarded: (token, metadata) =>
+      client.createVariationFromVersionGuarded({ ...workspaceRequest(), token, metadata }),
     shelves: () => client.listShelves(workspacePath),
     previewShelf: (shelfId) => client.previewShelf({ ...workspaceRequest(), shelf_id: shelfId }),
     applyShelf: (shelfId) => client.applyShelf({ ...workspaceRequest(), shelf_id: shelfId }),
@@ -1631,10 +1693,22 @@ export async function restoreVersionAsNewSaveToVariation(
   return createDraftlineClient().restoreVersionAsNewSaveToVariation(request);
 }
 
+export async function preflightCreateVariationFromVersion(
+  request: PreflightCreateVariationFromVersionRequest,
+): Promise<VariationCreatePreflight> {
+  return createDraftlineClient().preflightCreateVariationFromVersion(request);
+}
+
 export async function createVariationFromVersion(
   request: CreateVariationFromVersionRequest,
 ): Promise<CreateVariationFromVersionResult> {
   return createDraftlineClient().createVariationFromVersion(request);
+}
+
+export async function createVariationFromVersionGuarded(
+  request: GuardedCreateVariationFromVersionRequest,
+): Promise<GuardedCreateVariationFromVersionResult> {
+  return createDraftlineClient().createVariationFromVersionGuarded(request);
 }
 
 export async function save(request: SaveRequest): Promise<SaveResult> {
