@@ -92,6 +92,14 @@ pub enum DraftlineError {
     #[error("local publish state changed; expected {expected}, actual {actual}")]
     LocalStateChanged { expected: String, actual: String },
 
+    #[error(
+        "remote URL uses {scheme}, but Draftline/libgit2 was built without {required_feature} transport support"
+    )]
+    UnsupportedRemoteTransport {
+        scheme: String,
+        required_feature: &'static str,
+    },
+
     #[error("operation requires explicit confirmation: {0}")]
     ConsentRequired(String),
 

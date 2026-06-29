@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::merge::{MergeConflict, MergeInput, ResolverRegistry};
 use crate::recovery::RecoveryOperation;
-use crate::remote::PushRefExpectation;
+use crate::remote::{ensure_supported_remote_url, PushRefExpectation};
 use crate::{
     path::normalize_workspace_relative, ContentPolicy, Contributor, ContributorProfile,
     DraftlineError, PublishPreflight, PublishResult, PublishToken, RecoveryState, RemoteEndpoint,
@@ -1442,6 +1442,7 @@ impl Workspace {
         content_policy: ContentPolicy,
         options: &mut RemoteOptions<'_>,
     ) -> Result<Self> {
+        ensure_supported_remote_url(remote_url.as_ref())?;
         let mut builder = RepoBuilder::new();
         if options.has_credentials() {
             let fetch_options = options.clone_fetch_options();
@@ -2660,6 +2661,7 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let remote_name = remote.as_ref();
         let mut remote = self.repo.find_remote(remote_name)?;
+        ensure_remote_transport_supported(&remote)?;
         let refspecs = [
             format!("+refs/heads/*:refs/remotes/{remote_name}/*"),
             format!(
@@ -6243,6 +6245,7 @@ impl Workspace {
     ) -> Result<()> {
         let variation = self.current_variation_unchecked()?;
         let mut remote = self.repo.find_remote(remote_name)?;
+        ensure_remote_transport_supported(&remote)?;
         let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
         let mut push_options = options.push_options_with_expectations(vec![PushRefExpectation {
             dst_refname: format!("refs/heads/{variation}"),
@@ -6262,6 +6265,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<()> {
         let mut remote = self.repo.find_remote(remote_name)?;
+        ensure_remote_transport_supported(&remote)?;
         let mut push_options = options.push_options_with_expectations(expectations);
         remote.push(&[refspec], Some(&mut push_options))?;
 
@@ -6275,6 +6279,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<Option<String>> {
         let mut remote = self.repo.find_remote(remote_name)?;
+        ensure_remote_transport_supported(&remote)?;
         let oid = if options.has_credentials() {
             let callbacks = options.remote_callbacks();
             let connection = remote.connect_auth(Direction::Fetch, Some(callbacks), None)?;
@@ -6301,6 +6306,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<()> {
         let mut remote = self.repo.find_remote(remote_name)?;
+        ensure_remote_transport_supported(&remote)?;
         let refspec = format!("+refs/heads/{variation}:refs/remotes/{remote_name}/{variation}");
         let fetch_result = if options.has_credentials() {
             let mut fetch_options = options.fetch_options();
@@ -6461,6 +6467,7 @@ impl Workspace {
     ) -> Result<()> {
         let variation = self.current_variation_unchecked()?;
         let mut remote = self.repo.find_remote(remote.as_ref())?;
+        ensure_remote_transport_supported(&remote)?;
         let fetch_result = if options.has_credentials() {
             let mut fetch_options = options.fetch_options();
             remote.fetch(&[variation.as_str()], Some(&mut fetch_options), None)
@@ -8677,6 +8684,13 @@ fn tree_contains_path(tree: &Tree<'_>, path: &Path) -> Result<bool> {
         Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+fn ensure_remote_transport_supported(remote: &git2::Remote<'_>) -> Result<()> {
+    if let Some(url) = remote.url() {
+        ensure_supported_remote_url(url)?;
+    }
+    Ok(())
 }
 
 fn remote_tracking_oid(repo: &Repository, remote: &str, variation: &str) -> Option<String> {

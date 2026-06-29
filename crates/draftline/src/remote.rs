@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use git2::Oid;
 use serde::{Deserialize, Serialize};
 
-use crate::Result;
+use crate::{DraftlineError, Result};
 
 /// A configured place where a workspace can be shared or backed up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +240,40 @@ impl<'callbacks> RemoteOptions<'callbacks> {
     }
 }
 
+pub(crate) fn ensure_supported_remote_url(url: &str) -> Result<()> {
+    let version = git2::Version::get();
+    ensure_supported_remote_url_with_features(url, version.https(), version.ssh())
+}
+
+fn ensure_supported_remote_url_with_features(url: &str, https: bool, ssh: bool) -> Result<()> {
+    let unsupported = if url.starts_with("https://") && !https {
+        Some(("https", "https"))
+    } else if (url.starts_with("ssh://") || is_scp_like_ssh_url(url)) && !ssh {
+        Some(("ssh", "ssh"))
+    } else {
+        None
+    };
+
+    if let Some((scheme, required_feature)) = unsupported {
+        return Err(DraftlineError::UnsupportedRemoteTransport {
+            scheme: scheme.to_string(),
+            required_feature,
+        });
+    }
+
+    Ok(())
+}
+
+fn is_scp_like_ssh_url(url: &str) -> bool {
+    let Some(at) = url.find('@') else {
+        return false;
+    };
+    let Some(colon) = url[at + 1..].find(':').map(|offset| at + 1 + offset) else {
+        return false;
+    };
+    !url[..colon].contains('/')
+}
+
 fn oid_to_option(oid: Oid) -> Option<String> {
     if oid.is_zero() {
         None
@@ -272,7 +306,7 @@ fn credential_to_git(credential: RemoteCredential) -> Result<git2::Cred> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git2::{Repository, Signature};
+    use git2::{Repository, Signature, Version};
 
     fn commit_file(repo: &Repository, path: &str, content: &[u8], message: &str) -> Oid {
         let workdir = repo.workdir().unwrap();
@@ -316,6 +350,50 @@ mod tests {
         .unwrap();
 
         assert!(credential.has_username());
+    }
+
+    #[test]
+    fn libgit2_build_supports_remote_transports() {
+        let version = Version::get();
+
+        assert!(
+            version.https(),
+            "libgit2 must be built with HTTPS/TLS support for remote fetches"
+        );
+        assert!(
+            version.ssh(),
+            "libgit2 must be built with SSH support for remote credentials"
+        );
+    }
+
+    #[test]
+    fn reports_missing_https_transport_without_exposing_remote_url() {
+        let error = ensure_supported_remote_url_with_features(
+            "https://token@example.test/owner/repo.git",
+            false,
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "remote URL uses https, but Draftline/libgit2 was built without https transport support"
+        );
+    }
+
+    #[test]
+    fn reports_missing_ssh_transport_for_scp_like_urls() {
+        let error = ensure_supported_remote_url_with_features(
+            "git@example.test:owner/repo.git",
+            true,
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "remote URL uses ssh, but Draftline/libgit2 was built without ssh transport support"
+        );
     }
 
     #[test]

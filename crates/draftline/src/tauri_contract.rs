@@ -2407,6 +2407,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::SyncNeedsMerge(_) => "sync_needs_merge",
         DraftlineError::RemoteRace { .. } => "remote_race",
         DraftlineError::LocalStateChanged { .. } => "local_state_changed",
+        DraftlineError::UnsupportedRemoteTransport { .. } => "unsupported_remote_transport",
         DraftlineError::ConsentRequired(_) => "consent_required",
         DraftlineError::InvalidSquashCount(_) => "invalid_squash_count",
         DraftlineError::NotEnoughVersionsToSquash { .. } => "not_enough_versions_to_squash",
