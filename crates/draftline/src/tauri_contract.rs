@@ -10,14 +10,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     merge::MergeConflict, AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult,
-    ChangeSet, ContentPolicy, ContentPolicyAudit, ContributorProfile, CurrentFileDiff,
-    CurrentFilePreview, DirtySummary, DraftlineError, HistoryEntry, MergeConflictResolution,
-    MergeIncomingReport, MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice,
-    OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight, PublishResult,
-    RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
-    RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result,
-    Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SwitchPolicy, SyncState, SyncStatus,
-    Variation, VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
+    ChangeSet, CleanupPlanId, ContentPolicy, ContentPolicyAudit, ContributorProfile,
+    CurrentFileDiff, CurrentFilePreview, DirtySummary, DraftlineError, HistoryCleanupPreview,
+    HistoryCleanupRequest, HistoryCleanupUndoPreflight, HistoryCleanupUndoToken, HistoryEntry,
+    MergeConflictResolution, MergeIncomingReport, MergeIncomingResult, MergeIncomingToken,
+    MergeResolutionChoice, OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight,
+    PublishResult, RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest,
+    RemoteEndpoint, RemoteOptions, RemoteVariation, RemoteVariationDiagnostics,
+    RestoreVersionTarget, Result, RewriteConfirmation, Shelf, ShelfApplyReport,
+    StaleVersionResolution, StaleVersionResolutionRequest, SupportRef, SupportRefScope,
+    SwitchPolicy, SyncState, SyncStatus, TimelineCleanupResult, Variation,
+    VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
     VariationRenamePreflight, VariationRenameToken, VariationSummary, Version, VersionDiff,
     VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
     WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
@@ -338,6 +341,42 @@ pub struct SwitchVariationRequest {
 pub struct VersionRequest {
     pub workspace_path: PathBuf,
     pub version_id: String,
+}
+
+/// Request for previewing a durable history cleanup plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewHistoryCleanupRequest {
+    pub workspace_path: PathBuf,
+    pub cleanup: HistoryCleanupRequest,
+}
+
+/// Request for applying a durable history cleanup plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyHistoryCleanupRequest {
+    pub workspace_path: PathBuf,
+    pub plan_id: String,
+    pub confirmation: RewriteConfirmation,
+}
+
+/// Request for resolving a stale version through cleanup ledgers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveRewrittenVersionRequest {
+    pub workspace_path: PathBuf,
+    pub version_id: String,
+}
+
+/// Request for preflighting history cleanup undo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoHistoryCleanupPreflightRequest {
+    pub workspace_path: PathBuf,
+    pub plan_id: String,
+}
+
+/// Request for applying history cleanup undo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoHistoryCleanupRequest {
+    pub workspace_path: PathBuf,
+    pub token: HistoryCleanupUndoToken,
 }
 
 /// Request for reading diff/preview content for one current workspace file.
@@ -1049,6 +1088,102 @@ pub fn get_full_history_with_context(
     context
         .open_workspace(&request.workspace_path)?
         .full_history()
+}
+
+/// Previews a durable history cleanup plan.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preview_history_cleanup(
+    request: PreviewHistoryCleanupRequest,
+) -> Result<HistoryCleanupPreview> {
+    preview_history_cleanup_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Previews a durable history cleanup plan using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preview_history_cleanup_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: PreviewHistoryCleanupRequest,
+) -> Result<HistoryCleanupPreview> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .preview_history_cleanup(request.cleanup)
+}
+
+/// Applies a durable history cleanup plan.
+#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn apply_history_cleanup(request: ApplyHistoryCleanupRequest) -> Result<TimelineCleanupResult> {
+    apply_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Applies a durable history cleanup plan using a configured host context.
+#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn apply_history_cleanup_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: ApplyHistoryCleanupRequest,
+) -> Result<TimelineCleanupResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let plan_id = CleanupPlanId::from_string(request.plan_id)?;
+    let result = workspace.apply_history_cleanup(plan_id, request.confirmation)?;
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(result)
+}
+
+/// Resolves an old version through applied cleanup ledgers.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn resolve_rewritten_version(
+    request: ResolveRewrittenVersionRequest,
+) -> Result<StaleVersionResolution> {
+    resolve_rewritten_version_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Resolves an old version through applied cleanup ledgers using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn resolve_rewritten_version_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: ResolveRewrittenVersionRequest,
+) -> Result<StaleVersionResolution> {
+    let version = parse_version_id(request.version_id)?;
+    context
+        .open_workspace(&request.workspace_path)?
+        .resolve_rewritten_version(StaleVersionResolutionRequest { version })
+}
+
+/// Preflights undoing a history cleanup.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preflight_undo_history_cleanup(
+    request: UndoHistoryCleanupPreflightRequest,
+) -> Result<HistoryCleanupUndoPreflight> {
+    preflight_undo_history_cleanup_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Preflights undoing a history cleanup using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preflight_undo_history_cleanup_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: UndoHistoryCleanupPreflightRequest,
+) -> Result<HistoryCleanupUndoPreflight> {
+    let plan_id = CleanupPlanId::from_string(request.plan_id)?;
+    context
+        .open_workspace(&request.workspace_path)?
+        .preflight_undo_history_cleanup(plan_id)
+}
+
+/// Undoes a history cleanup from a preflight token.
+#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn undo_history_cleanup(request: UndoHistoryCleanupRequest) -> Result<TimelineCleanupResult> {
+    undo_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Undoes a history cleanup from a preflight token using a configured host context.
+#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn undo_history_cleanup_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: UndoHistoryCleanupRequest,
+) -> Result<TimelineCleanupResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let result = workspace.undo_history_cleanup(request.token)?;
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(result)
 }
 
 /// Returns a graph-ready full-history snapshot over Draftline variations.
@@ -2633,6 +2768,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::NotEnoughVersionsToSquash { .. } => "not_enough_versions_to_squash",
         DraftlineError::InvalidContributorIdentity(_) => "invalid_contributor_identity",
         DraftlineError::InvalidMergeResolution(_) => "invalid_merge_resolution",
+        DraftlineError::InvalidHistoryCleanup(_) => "invalid_history_cleanup",
     }
 }
 

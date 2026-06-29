@@ -2,38 +2,44 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use draftline::tauri_contract::{
-    adopt_remote_variation, adopt_workspace, apply_incoming, apply_shelf, audit_content_policy,
-    clone_workspace, create_variation_from_version, create_variation_from_version_guarded,
-    diff_version_to_workspace, diff_versions, diff_workspace_file, fetch_remote, get_changes,
-    get_full_history, get_history, get_workspace_graph, get_workspace_graph_agent_summary,
-    get_workspace_graph_around_version, get_workspace_graph_common_ancestor,
-    get_workspace_graph_compare_summary, get_workspace_graph_for_variation,
-    get_workspace_graph_neighborhood, get_workspace_graph_node, get_workspace_graph_overview,
-    get_workspace_graph_path, get_workspace_graph_refs, get_workspace_graph_summary,
-    inspect_workspace, into_tauri_result, list_remote_variations, list_remotes, list_shelves,
-    list_support_refs, list_variations, merge_conflict_view_model, merge_incoming,
-    merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context, open_workspace,
-    preflight_apply_incoming, preflight_apply_shelf, preflight_create_variation_from_version,
-    preflight_merge_incoming, preflight_rename_variation, preflight_switch_variation,
+    adopt_remote_variation, adopt_workspace, apply_history_cleanup, apply_incoming, apply_shelf,
+    audit_content_policy, clone_workspace, create_variation_from_version,
+    create_variation_from_version_guarded, diff_version_to_workspace, diff_versions,
+    diff_workspace_file, fetch_remote, get_changes, get_full_history, get_history,
+    get_workspace_graph, get_workspace_graph_agent_summary, get_workspace_graph_around_version,
+    get_workspace_graph_common_ancestor, get_workspace_graph_compare_summary,
+    get_workspace_graph_for_variation, get_workspace_graph_neighborhood, get_workspace_graph_node,
+    get_workspace_graph_overview, get_workspace_graph_path, get_workspace_graph_refs,
+    get_workspace_graph_summary, inspect_workspace, into_tauri_result, list_remote_variations,
+    list_remotes, list_shelves, list_support_refs, list_variations, merge_conflict_view_model,
+    merge_incoming, merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
+    open_workspace, preflight_apply_incoming, preflight_apply_shelf,
+    preflight_create_variation_from_version, preflight_merge_incoming, preflight_rename_variation,
+    preflight_switch_variation, preflight_undo_history_cleanup, preview_history_cleanup,
     preview_shelf, preview_version, preview_version_file, preview_workspace_file,
-    publish_current_variation, rename_variation, restore_version_as_new_save,
-    restore_version_as_new_save_to_variation, save, search_workspace_graph, selected_discard,
-    selected_save, selected_save_with_context, selected_shelve, switch_variation, verify_workspace,
-    whole_file_use_content_resolutions, CloneWorkspaceRequest, ConflictContentSource,
-    CreateVariationFromVersionRequest, CurrentFileRequest, DiffVersionsRequest,
-    DraftlineCommandContext, DraftlineEventKind, GuardedCreateVariationFromVersionRequest,
-    ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
-    PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
-    PublishCurrentVariationRequest, RemoteRequest, RemoteVariationRequest, RenameVariationRequest,
+    publish_current_variation, rename_variation, resolve_rewritten_version,
+    restore_version_as_new_save, restore_version_as_new_save_to_variation, save,
+    search_workspace_graph, selected_discard, selected_save, selected_save_with_context,
+    selected_shelve, switch_variation, undo_history_cleanup, verify_workspace,
+    whole_file_use_content_resolutions, ApplyHistoryCleanupRequest, CloneWorkspaceRequest,
+    ConflictContentSource, CreateVariationFromVersionRequest, CurrentFileRequest,
+    DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
+    GuardedCreateVariationFromVersionRequest, ListSupportRefsRequest, MergeIncomingRequest,
+    MergeIncomingWithResolutionsRequest, PreflightCreateVariationFromVersionRequest,
+    PreviewHistoryCleanupRequest, PreviewVersionFileRequest, PublishCurrentVariationRequest,
+    RemoteRequest, RemoteVariationRequest, RenameVariationRequest, ResolveRewrittenVersionRequest,
     RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
     SelectedShelveRequest, ShelfRequest, SwitchVariationRequest, TargetedRestoreVersionRequest,
-    VersionRequest, WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
+    UndoHistoryCleanupPreflightRequest, UndoHistoryCleanupRequest, VersionRequest,
+    WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
     WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest, WorkspaceGraphRequest,
     WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest, WorkspaceRequest,
 };
 use draftline::{
-    ContentPolicy, Contributor, ContributorProfile, MergeConflictResolution, MergeResolutionChoice,
-    OperationLockState, RestoreVersionTarget, SupportRefScope, SwitchPolicy, SyncState,
+    CleanupBase, CleanupMode, CleanupSafety, CommitRange, ContentPolicy, Contributor,
+    ContributorProfile, HistoryCleanupRequest, MergeConflictResolution, MergeResolutionChoice,
+    MilestoneSpec, OperationLockState, RemoteRewritePolicy, RestoreVersionTarget,
+    RewriteConfirmation, StaleVersionDisposition, SupportRefScope, SwitchPolicy, SyncState,
     VariationId, Workspace, WorkspaceGraphOverviewOptions,
 };
 use serde_json::Value;
@@ -1066,6 +1072,93 @@ fn tauri_contract_serializes_errors_for_frontend_calls() {
     assert!(json["message"].as_str().unwrap().contains("preflight"));
     assert_eq!(json["details"]["operation"], "save_files");
     assert_eq!(json["details"]["can_proceed"], false);
+}
+
+#[test]
+fn tauri_contract_smokes_history_cleanup_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"v1");
+    workspace.save_version("v1").unwrap();
+    write_file(workspace.root(), "post.md", b"v2");
+    let v2 = workspace.save_version("noisy v2").unwrap();
+    write_file(workspace.root(), "post.md", b"v3");
+    let v3 = workspace.save_version("noisy v3").unwrap();
+
+    let cleanup = HistoryCleanupRequest {
+        target_variation: None,
+        base: CleanupBase::Auto,
+        mode: CleanupMode::CompactMilestones {
+            milestones: vec![MilestoneSpec {
+                title: "Clean milestone".to_string(),
+                description: Some("Compacted noisy saves".to_string()),
+                include_range: CommitRange {
+                    start: v2.id().clone(),
+                    end: v3.id().clone(),
+                },
+            }],
+            preserve_named_branches: true,
+            preserve_merge_boundaries: true,
+        },
+        safety: CleanupSafety::default_user_facing(),
+        remote_policy: RemoteRewritePolicy::LocalOnly,
+    };
+
+    let preview = preview_history_cleanup(PreviewHistoryCleanupRequest {
+        workspace_path: temp.path().to_path_buf(),
+        cleanup,
+    })
+    .unwrap();
+    let preview_json = serde_json::to_value(&preview).unwrap();
+    assert_object_keys(
+        &preview_json,
+        &[],
+        &[
+            "commit_map",
+            "graph_diff",
+            "new_head",
+            "old_head",
+            "operations",
+            "plan_id",
+            "planned_backup_ref",
+            "preview_ref",
+            "snapshot_map",
+            "target_variation",
+            "warnings",
+        ],
+    );
+
+    let result = apply_history_cleanup(ApplyHistoryCleanupRequest {
+        workspace_path: temp.path().to_path_buf(),
+        plan_id: preview.plan_id.to_string(),
+        confirmation: RewriteConfirmation::UserConfirmed,
+    })
+    .unwrap();
+    assert_eq!(result.new_head, preview.new_head);
+
+    let resolution = resolve_rewritten_version(ResolveRewrittenVersionRequest {
+        workspace_path: temp.path().to_path_buf(),
+        version_id: v2.id().to_string(),
+    })
+    .unwrap();
+    assert!(matches!(
+        resolution.disposition,
+        StaleVersionDisposition::SquashedInto { .. }
+    ));
+
+    let undo = preflight_undo_history_cleanup(UndoHistoryCleanupPreflightRequest {
+        workspace_path: temp.path().to_path_buf(),
+        plan_id: result.plan_id.to_string(),
+    })
+    .unwrap();
+    assert!(undo.can_undo);
+    let undo_result = undo_history_cleanup(UndoHistoryCleanupRequest {
+        workspace_path: temp.path().to_path_buf(),
+        token: undo.token,
+    })
+    .unwrap();
+    assert_eq!(undo_result.new_head, v3.id().clone());
 }
 
 #[test]

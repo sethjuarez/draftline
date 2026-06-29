@@ -241,6 +241,10 @@ Support refs should be:
 
 | API | Purpose |
 |---|---|
+| `Workspace::preview_history_cleanup(request)` | Durable local-first timeline cleanup preview with candidate commits, hidden preview refs, graph diff, structured warnings, and commit/snapshot remapping ledger. Implemented for linear milestone compaction. |
+| `Workspace::apply_history_cleanup(plan_id, confirmation)` | Applies a preflighted cleanup only when the target visible ref and hidden preview ref still match the durable plan, creating a backup ref before moving visible history. Implemented for local cleanup. |
+| `Workspace::resolve_rewritten_version(request)` | Resolves stale version IDs through applied cleanup ledgers and support refs. Implemented. |
+| `Workspace::preflight_undo_history_cleanup(plan_id)` / `Workspace::undo_history_cleanup(token)` | Restores a cleanup backup ref after checking the current visible ref still matches the applied cleanup. Implemented. |
 | `Workspace::preflight_delete_variation(id)` | Local delete preflight with archive details. Implemented. |
 | `Workspace::delete_variation_with_token(token)` | Local delete after archive. Implemented. |
 | `Workspace::delete_variation(id)` | Compatibility helper that preflights and executes. Implemented. |
@@ -254,6 +258,8 @@ Support refs should be:
 | `Workspace::replace_remote_history(token)` | Lease-protected replacement after confirmation and shared support ref publication. Implemented. |
 
 Shared visible refs should never be deleted or replaced unless the recovery support ref is durably published to the shared remote.
+
+Timeline cleanup is local-first in the initial implementation. Hosts should apply the local cleanup, use the returned `TimelineCleanupResult` remapping ledger to update or mark stale app-owned state, then use `preflight_replace_remote_history` / `replace_remote_history` for shared publication until cleanup apply grows a single remote transaction with support-ref publication, protected-branch diagnostics, and force-with-lease.
 
 ## Phase 7: purge/redaction
 
@@ -318,7 +324,7 @@ This table tracks the intended API shape and the current implementation state. "
 | 6. Shelf lifecycle | shelve in place, list, preview, apply with conflicts, delete | "Put aside" becomes a complete workflow. | Implemented for all-work and selected-file shelves; conflict-resolution apply remains. |
 | 7. Support refs | publish/fetch/list/restore/expire support refs | Shared recovery works across machines. | Implemented for local publish/fetch/list/restore and local expiration; remote retention remains. |
 | 8. Collaboration expansion | remote variation lifecycle and merge incoming | Team workflows cover created/deleted/renamed/diverged variations. | Partial: fetch-all/prune diagnostics, remote list/adopt, merge preflight, and clean merge execution exist; rename inference/conflict execution remain. |
-| 9. Shared cleanup | remote delete and shared history replacement | Team cleanup becomes lease-protected and recoverable. | Implemented for remote delete and current-variation replacement with explicit confirmation plus support-ref-first lease mechanics; broader admin UX remains. |
+| 9. Shared cleanup | timeline cleanup, remote delete, and shared history replacement | Team cleanup becomes previewable, lease-protected, recoverable, and consumable by product timeline UIs. | Partial: local milestone timeline cleanup with durable preview/apply/ledger/resolver/undo is implemented; remote delete and current-variation replacement are implemented with explicit confirmation plus support-ref-first lease mechanics; direct remote cleanup apply and broader admin UX remain. |
 | 10. Admin deletion | purge/redaction | Sensitive-content deletion is explicit and best-effort. | Partial planning only: purge preflight and verify exist; destructive execution is missing. |
 
 ## Open design questions

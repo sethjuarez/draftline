@@ -26,4 +26,5 @@ pub enum RecoveryOperation {
     DeleteRemoteVariation,
     ExpireSupportRefs,
     RenameVariation,
+    HistoryCleanup,
 }

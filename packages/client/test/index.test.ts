@@ -174,10 +174,47 @@ describe('createDraftlineClient', () => {
     const versionRequest = { workspace_path: 'C:\\repo', version_id: versionId };
     const shelfRequest = { workspace_path: 'C:\\repo', shelf_id: 'draft-shelf' };
     const recoveryRequest = { workspace_path: 'C:\\repo', operation_id: 'op-1' };
+    const cleanup = {
+      target_variation: 'main',
+      base: { kind: 'auto' as const },
+      mode: {
+        kind: 'compact_milestones' as const,
+        milestones: [
+          {
+            title: 'Milestone',
+            description: 'Compacted noisy saves',
+            include_range: { start: versionId, end: versionId },
+          },
+        ],
+        preserve_named_branches: true,
+        preserve_merge_boundaries: true,
+      },
+      safety: {
+        create_backup_ref: true,
+        require_clean_worktree: true,
+      },
+      remote_policy: { kind: 'local_only' as const },
+    };
+    const cleanupToken = {
+      plan_id: 'op-1',
+      target_variation: 'main',
+      backup_ref: 'refs/draftline/backups/history-cleanup/main/op-1',
+      expected_current_head: versionId,
+      restore_head: versionId,
+    };
 
     await client.getChanges('C:\\repo');
     await client.getHistory('C:\\repo');
     await client.getFullHistory('C:\\repo');
+    await client.previewHistoryCleanup({ workspace_path: 'C:\\repo', cleanup });
+    await client.applyHistoryCleanup({
+      workspace_path: 'C:\\repo',
+      plan_id: 'op-1',
+      confirmation: 'user_confirmed',
+    });
+    await client.resolveRewrittenVersion(versionRequest);
+    await client.preflightUndoHistoryCleanup({ workspace_path: 'C:\\repo', plan_id: 'op-1' });
+    await client.undoHistoryCleanup({ workspace_path: 'C:\\repo', token: cleanupToken });
     await client.getWorkspaceGraph({
       workspace_path: 'C:\\repo',
       options: { include_remotes: true, remote: 'origin' },
@@ -293,6 +330,25 @@ describe('createDraftlineClient', () => {
     });
     expect(invoke).toHaveBeenCalledWith('get_full_history', {
       request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('preview_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', cleanup },
+    });
+    expect(invoke).toHaveBeenCalledWith('apply_history_cleanup', {
+      request: {
+        workspace_path: 'C:\\repo',
+        plan_id: 'op-1',
+        confirmation: 'user_confirmed',
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('resolve_rewritten_version', {
+      request: versionRequest,
+    });
+    expect(invoke).toHaveBeenCalledWith('preflight_undo_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'op-1' },
+    });
+    expect(invoke).toHaveBeenCalledWith('undo_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', token: cleanupToken },
     });
     expect(invoke).toHaveBeenCalledWith('get_workspace_graph', {
       request: {
