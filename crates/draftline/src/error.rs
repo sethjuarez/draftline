@@ -117,4 +117,7 @@ pub enum DraftlineError {
 
     #[error("invalid merge resolution: {0}")]
     InvalidMergeResolution(String),
+
+    #[error("invalid history cleanup request: {0}")]
+    InvalidHistoryCleanup(String),
 }

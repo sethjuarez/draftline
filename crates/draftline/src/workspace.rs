@@ -443,6 +443,7 @@ pub enum SupportRefScope {
 pub enum SupportRefKind {
     DeletedVariation,
     Rewrite,
+    HistoryCleanupBackup,
 }
 
 /// Hidden support ref that can be used for recovery/admin workflows.
@@ -1349,6 +1350,332 @@ pub struct PurgeVerification {
     pub limitations: Vec<String>,
 }
 
+/// Opaque identifier for a durable history cleanup preview plan.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CleanupPlanId(String);
+
+impl CleanupPlanId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn from_string(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if !is_safe_operation_id(&value) {
+            return Err(DraftlineError::InvalidHistoryCleanup(format!(
+                "unsafe cleanup plan id `{value}`"
+            )));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl std::fmt::Display for CleanupPlanId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Opaque ref name returned by cleanup APIs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RefName(String);
+
+impl RefName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for RefName {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for RefName {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl std::fmt::Display for RefName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Request for previewing a timeline cleanup operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCleanupRequest {
+    pub target_variation: Option<VariationId>,
+    pub base: CleanupBase,
+    pub mode: CleanupMode,
+    pub safety: CleanupSafety,
+    pub remote_policy: RemoteRewritePolicy,
+}
+
+/// Base commit selection for a cleanup rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum CleanupBase {
+    Auto,
+    Version { version: VersionId },
+}
+
+/// Timeline cleanup mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum CleanupMode {
+    CompactMilestones {
+        milestones: Vec<MilestoneSpec>,
+        preserve_named_branches: bool,
+        preserve_merge_boundaries: bool,
+    },
+}
+
+/// User-facing milestone that replaces a noisy commit range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MilestoneSpec {
+    pub title: String,
+    pub description: Option<String>,
+    pub include_range: CommitRange,
+}
+
+/// Inclusive commit range, ordered from oldest to newest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitRange {
+    pub start: VersionId,
+    pub end: VersionId,
+}
+
+/// Safety settings for cleanup operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupSafety {
+    pub create_backup_ref: bool,
+    pub backup_ref_name: Option<RefName>,
+    pub require_clean_worktree: bool,
+}
+
+impl CleanupSafety {
+    pub fn default_user_facing() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for CleanupSafety {
+    fn default() -> Self {
+        Self {
+            create_backup_ref: true,
+            backup_ref_name: None,
+            require_clean_worktree: true,
+        }
+    }
+}
+
+/// Remote rewrite behavior requested for cleanup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RemoteRewritePolicy {
+    #[default]
+    LocalOnly,
+    PushWithLease {
+        remote: String,
+        branch: String,
+    },
+}
+
+/// Confirmation marker required before applying a prepared rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteConfirmation {
+    UserConfirmed,
+}
+
+/// Read-only preview of a durable cleanup plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCleanupPreview {
+    pub plan_id: CleanupPlanId,
+    pub target_variation: VariationId,
+    pub old_head: VersionId,
+    pub new_head: VersionId,
+    pub preview_ref: RefName,
+    pub planned_backup_ref: Option<RefName>,
+    pub operations: Vec<CleanupOperation>,
+    pub graph_diff: CleanupGraphDiff,
+    pub commit_map: Vec<CommitRewriteMap>,
+    pub snapshot_map: Vec<SnapshotRewriteMap>,
+    pub warnings: Vec<CleanupWarning>,
+}
+
+/// One planned cleanup operation shown to product UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupOperation {
+    pub title: String,
+    pub description: Option<String>,
+    pub old_versions: Vec<VersionId>,
+    pub new_version: VersionId,
+}
+
+/// Summary of old versus new graph shape for a cleanup preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupGraphDiff {
+    pub old_head: VersionId,
+    pub new_head: VersionId,
+    pub old_commit_count: usize,
+    pub new_commit_count: usize,
+    pub squashed_commit_count: usize,
+}
+
+/// Mapping from an old commit/version to its cleanup disposition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitRewriteMap {
+    pub old: VersionId,
+    pub new: Option<VersionId>,
+    pub disposition: RewriteDisposition,
+}
+
+/// Mapping from an old snapshot to its cleanup disposition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRewriteMap {
+    pub old: VersionId,
+    pub new: Option<VersionId>,
+    pub disposition: RewriteDisposition,
+}
+
+/// Final applied commit map entry.
+pub type CommitMapEntry = CommitRewriteMap;
+
+/// Final applied snapshot map entry.
+pub type SnapshotMapEntry = SnapshotRewriteMap;
+
+/// Cleanup disposition for an old commit or snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RewriteDisposition {
+    Preserved { new_id: VersionId },
+    SquashedInto { new_id: VersionId },
+    DroppedAsNoise,
+    OrphanedButBackedUp { backup_ref: RefName },
+    ConflictRequiresUserChoice,
+}
+
+/// Machine-readable cleanup warning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupWarning {
+    pub code: CleanupWarningCode,
+    pub message: String,
+    pub related_versions: Vec<VersionId>,
+    pub safe_next_actions: Vec<SafeNextAction>,
+}
+
+/// Stable cleanup warning code for host UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupWarningCode {
+    LocalOnlyRewrite,
+    RemoteRewriteRequiresSeparatePublish,
+    MergeBoundaryRequiresUserChoice,
+    NamedBranchWouldBeAffected,
+    DirtyWorktreeBlocked,
+    PreviewPlanExpired,
+    TargetRefChangedSincePreview,
+    CandidateRefChangedSincePreview,
+    BackupRefAlreadyExists,
+}
+
+/// Result of applying a prepared timeline cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineCleanupResult {
+    pub plan_id: CleanupPlanId,
+    pub old_head: VersionId,
+    pub new_head: VersionId,
+    pub backup_refs: Vec<RefName>,
+    pub ref_updates: Vec<RefUpdate>,
+    pub commit_map: Vec<CommitMapEntry>,
+    pub snapshot_map: Vec<SnapshotMapEntry>,
+    pub warnings: Vec<CleanupWarning>,
+}
+
+/// One ref movement performed by cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefUpdate {
+    pub name: RefName,
+    pub old: Option<VersionId>,
+    pub new: Option<VersionId>,
+}
+
+/// Request for resolving an old version after cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleVersionResolutionRequest {
+    pub version: VersionId,
+}
+
+/// Resolution for an old version after cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleVersionResolution {
+    pub requested: VersionId,
+    pub disposition: StaleVersionDisposition,
+}
+
+/// Machine-readable stale version resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum StaleVersionDisposition {
+    Live { version: VersionId },
+    SquashedInto { version: VersionId },
+    BackedUp { backup_ref: RefName },
+    DroppedAsNoise,
+    Unknown,
+}
+
+/// Preflight for undoing an applied cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCleanupUndoPreflight {
+    pub plan_id: CleanupPlanId,
+    pub target_variation: VariationId,
+    pub backup_ref: RefName,
+    pub expected_current_head: VersionId,
+    pub restore_head: VersionId,
+    pub token: HistoryCleanupUndoToken,
+    pub can_undo: bool,
+}
+
+/// Token tying cleanup undo to a preflighted target state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCleanupUndoToken {
+    pub plan_id: CleanupPlanId,
+    pub target_variation: VariationId,
+    pub backup_ref: RefName,
+    pub expected_current_head: VersionId,
+    pub restore_head: VersionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HistoryCleanupStoredPlan {
+    request: HistoryCleanupRequest,
+    preview: HistoryCleanupPreview,
+}
+
+struct PlannedCompactCleanup {
+    new_head_oid: Oid,
+    operations: Vec<CleanupOperation>,
+    commit_map: Vec<CommitRewriteMap>,
+    snapshot_map: Vec<SnapshotRewriteMap>,
+    warnings: Vec<CleanupWarning>,
+    old_commit_count: usize,
+}
+
+struct CompactCleanupPlanInput<'a> {
+    target_variation: &'a VariationId,
+    old_head_oid: Oid,
+    base: &'a CleanupBase,
+    milestones: &'a [MilestoneSpec],
+    preserve_named_branches: bool,
+    preserve_merge_boundaries: bool,
+}
+
 /// Diff between two versions or between a version and the current workspace.
 ///
 /// Returned by [`Workspace::diff_versions`] and
@@ -1954,7 +2281,9 @@ impl Workspace {
                     Ok(self.recovery_unavailable(state))
                 }
             }
-            RecoveryOperation::SquashVersions => Ok(self.recovery_unavailable(state)),
+            RecoveryOperation::SquashVersions | RecoveryOperation::HistoryCleanup => {
+                Ok(self.recovery_unavailable(state))
+            }
             RecoveryOperation::DeleteRemoteVariation => {
                 self.repair_delete_remote_variation_recovery(state, options)
             }
@@ -2006,7 +2335,7 @@ impl Workspace {
                 }
                 self.complete_recovery(state, true)
             }
-            RecoveryOperation::SquashVersions => {
+            RecoveryOperation::SquashVersions | RecoveryOperation::HistoryCleanup => {
                 let (Some(variation), Some(target)) =
                     (state.original_variation.as_deref(), state.target.as_deref())
                 else {
@@ -5863,6 +6192,394 @@ impl Workspace {
         self.squash_versions_with_token(token, label)
     }
 
+    /// Prepares a durable local timeline cleanup plan without moving visible refs.
+    pub fn preview_history_cleanup(
+        &self,
+        request: HistoryCleanupRequest,
+    ) -> Result<HistoryCleanupPreview> {
+        self.ensure_no_pending_recovery()?;
+        let target_variation = match request.target_variation.clone() {
+            Some(variation) => VariationId::from(validate_variation_name(variation.as_str())?),
+            None => VariationId::from(self.current_variation_unchecked()?),
+        };
+        let target_name = target_variation.as_str();
+        let target_branch = self.find_local_variation_branch(target_name)?;
+        let old_head_oid = target_branch.get().peel_to_commit()?.id();
+
+        if request.safety.require_clean_worktree {
+            let dirty_files = self.changed_files_unchecked()?;
+            if !dirty_files.is_empty() {
+                return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                    "history_cleanup",
+                    false,
+                    dirty_files,
+                    Vec::new(),
+                    None,
+                ))));
+            }
+        }
+
+        let plan_id = CleanupPlanId::from_string(new_operation_id())?;
+        let planned_backup_ref = if request.safety.create_backup_ref {
+            Some(request.safety.backup_ref_name.clone().unwrap_or_else(|| {
+                RefName::from(archive_ref(
+                    "backups/history-cleanup",
+                    target_name,
+                    plan_id.as_str(),
+                ))
+            }))
+        } else {
+            None
+        };
+
+        let (milestones, preserve_named_branches, preserve_merge_boundaries) = match &request.mode {
+            CleanupMode::CompactMilestones {
+                milestones,
+                preserve_named_branches,
+                preserve_merge_boundaries,
+            } => (
+                milestones.as_slice(),
+                *preserve_named_branches,
+                *preserve_merge_boundaries,
+            ),
+        };
+
+        let mut warnings = cleanup_remote_warnings(&request.remote_policy);
+        let planned = self.plan_compact_milestones(CompactCleanupPlanInput {
+            target_variation: &target_variation,
+            old_head_oid,
+            base: &request.base,
+            milestones,
+            preserve_named_branches,
+            preserve_merge_boundaries,
+        })?;
+        warnings.extend(planned.warnings);
+
+        let preview_ref = RefName::from(format!(
+            "refs/draftline/previews/history-cleanup/{target_name}/{}",
+            plan_id.as_str()
+        ));
+        self.repo.reference(
+            preview_ref.as_str(),
+            planned.new_head_oid,
+            false,
+            "prepare history cleanup preview",
+        )?;
+
+        let preview = HistoryCleanupPreview {
+            plan_id,
+            target_variation,
+            old_head: VersionId::from(old_head_oid),
+            new_head: VersionId::from(planned.new_head_oid),
+            preview_ref,
+            planned_backup_ref,
+            operations: planned.operations,
+            graph_diff: CleanupGraphDiff {
+                old_head: VersionId::from(old_head_oid),
+                new_head: VersionId::from(planned.new_head_oid),
+                old_commit_count: planned.old_commit_count,
+                new_commit_count: milestones.len(),
+                squashed_commit_count: planned.old_commit_count.saturating_sub(milestones.len()),
+            },
+            commit_map: planned.commit_map.clone(),
+            snapshot_map: planned.snapshot_map.clone(),
+            warnings,
+        };
+
+        self.write_history_cleanup_plan(&HistoryCleanupStoredPlan {
+            request,
+            preview: preview.clone(),
+        })?;
+
+        Ok(preview)
+    }
+
+    /// Applies a durable cleanup preview after confirming the target state is unchanged.
+    pub fn apply_history_cleanup(
+        &self,
+        plan_id: CleanupPlanId,
+        _confirmation: RewriteConfirmation,
+    ) -> Result<TimelineCleanupResult> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "history_cleanup")?;
+        let stored = self.read_history_cleanup_plan(&plan_id)?;
+        if stored.request.safety.require_clean_worktree {
+            let dirty_files = self.changed_files_unchecked()?;
+            if !dirty_files.is_empty() {
+                return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                    "history_cleanup",
+                    false,
+                    dirty_files,
+                    Vec::new(),
+                    None,
+                ))));
+            }
+        }
+
+        let variation = stored.preview.target_variation.as_str();
+        let branch_ref = format!("refs/heads/{variation}");
+        let old_head_oid = oid_from_version(&stored.preview.old_head)?;
+        let new_head_oid = oid_from_version(&stored.preview.new_head)?;
+        let actual_target = self.repo.refname_to_id(&branch_ref)?;
+        if actual_target != old_head_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{branch_ref}@{old_head_oid}"),
+                actual: format!("{branch_ref}@{actual_target}"),
+            });
+        }
+
+        let actual_preview = self
+            .repo
+            .refname_to_id(stored.preview.preview_ref.as_str())?;
+        if actual_preview != new_head_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{new_head_oid}", stored.preview.preview_ref.as_str()),
+                actual: format!("{}@{actual_preview}", stored.preview.preview_ref.as_str()),
+            });
+        }
+
+        let mut backup_refs = Vec::new();
+        if let Some(backup_ref) = stored.preview.planned_backup_ref.as_ref() {
+            self.ensure_archive_ref(
+                backup_ref.as_str(),
+                old_head_oid,
+                "backup before history cleanup",
+            )?;
+            backup_refs.push(backup_ref.clone());
+        }
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id: plan_id.as_str().to_string(),
+            operation: RecoveryOperation::HistoryCleanup,
+            original_variation: Some(variation.to_string()),
+            target: Some(stored.preview.old_head.to_string()),
+            completed: false,
+        })?;
+
+        self.repo
+            .reference(&branch_ref, new_head_oid, true, "history_cleanup")?;
+        if self.head_symbolic_variation().as_deref() == Some(variation) {
+            self.repo.set_head(&branch_ref)?;
+            self.repo
+                .checkout_head(Some(CheckoutBuilder::new().force()))?;
+        }
+
+        let result = TimelineCleanupResult {
+            plan_id: plan_id.clone(),
+            old_head: stored.preview.old_head.clone(),
+            new_head: stored.preview.new_head.clone(),
+            backup_refs,
+            ref_updates: vec![RefUpdate {
+                name: RefName::from(branch_ref),
+                old: Some(stored.preview.old_head.clone()),
+                new: Some(stored.preview.new_head.clone()),
+            }],
+            commit_map: stored.preview.commit_map.clone(),
+            snapshot_map: stored.preview.snapshot_map.clone(),
+            warnings: stored.preview.warnings.clone(),
+        };
+        self.write_history_cleanup_ledger(&result)?;
+        self.write_recovery_state(&RecoveryState {
+            operation_id: plan_id.as_str().to_string(),
+            operation: RecoveryOperation::HistoryCleanup,
+            original_variation: None,
+            target: Some(stored.preview.new_head.to_string()),
+            completed: true,
+        })?;
+        Ok(result)
+    }
+
+    /// Resolves an old version ID through applied cleanup ledgers and support refs.
+    pub fn resolve_rewritten_version(
+        &self,
+        request: StaleVersionResolutionRequest,
+    ) -> Result<StaleVersionResolution> {
+        let requested_oid = oid_from_version(&request.version)?;
+        if self.version_is_reachable_from_local_variation(requested_oid)? {
+            return Ok(StaleVersionResolution {
+                requested: request.version.clone(),
+                disposition: StaleVersionDisposition::Live {
+                    version: request.version,
+                },
+            });
+        }
+
+        for ledger in self.read_history_cleanup_ledgers()? {
+            if let Some(entry) = ledger
+                .commit_map
+                .iter()
+                .find(|entry| entry.old == request.version)
+            {
+                let disposition = match &entry.disposition {
+                    RewriteDisposition::Preserved { new_id } => StaleVersionDisposition::Live {
+                        version: new_id.clone(),
+                    },
+                    RewriteDisposition::SquashedInto { new_id } => {
+                        StaleVersionDisposition::SquashedInto {
+                            version: new_id.clone(),
+                        }
+                    }
+                    RewriteDisposition::DroppedAsNoise => StaleVersionDisposition::DroppedAsNoise,
+                    RewriteDisposition::OrphanedButBackedUp { backup_ref } => {
+                        StaleVersionDisposition::BackedUp {
+                            backup_ref: backup_ref.clone(),
+                        }
+                    }
+                    RewriteDisposition::ConflictRequiresUserChoice => {
+                        StaleVersionDisposition::Unknown
+                    }
+                };
+                return Ok(StaleVersionResolution {
+                    requested: request.version,
+                    disposition,
+                });
+            }
+        }
+
+        if let Some(support_ref) = self
+            .list_local_support_refs()?
+            .into_iter()
+            .chain(self.list_remote_tracking_support_refs()?)
+            .find(|support_ref| support_ref.target_oid == requested_oid.to_string())
+        {
+            return Ok(StaleVersionResolution {
+                requested: request.version,
+                disposition: StaleVersionDisposition::BackedUp {
+                    backup_ref: RefName::from(support_ref.ref_name),
+                },
+            });
+        }
+
+        Ok(StaleVersionResolution {
+            requested: request.version,
+            disposition: StaleVersionDisposition::Unknown,
+        })
+    }
+
+    /// Plans undoing an applied cleanup by restoring its generated backup ref.
+    pub fn preflight_undo_history_cleanup(
+        &self,
+        plan_id: CleanupPlanId,
+    ) -> Result<HistoryCleanupUndoPreflight> {
+        self.ensure_no_pending_recovery()?;
+        let stored = self.read_history_cleanup_plan(&plan_id)?;
+        let ledger = self.read_history_cleanup_ledger(&plan_id)?;
+        let backup_ref = ledger.backup_refs.first().cloned().ok_or_else(|| {
+            DraftlineError::InvalidHistoryCleanup(format!(
+                "cleanup plan `{plan_id}` did not create a backup ref"
+            ))
+        })?;
+        let restore_oid = self.repo.refname_to_id(backup_ref.as_str())?;
+        let restore_head = VersionId::from(restore_oid);
+        if restore_head != ledger.old_head {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{}", backup_ref.as_str(), ledger.old_head),
+                actual: format!("{}@{restore_head}", backup_ref.as_str()),
+            });
+        }
+        let branch_ref = format!("refs/heads/{}", stored.preview.target_variation.as_str());
+        let current_oid = self.repo.refname_to_id(&branch_ref)?;
+        let expected_current_head = VersionId::from(current_oid);
+        if expected_current_head != ledger.new_head {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{branch_ref}@{}", ledger.new_head),
+                actual: format!("{branch_ref}@{expected_current_head}"),
+            });
+        }
+        let token = HistoryCleanupUndoToken {
+            plan_id: plan_id.clone(),
+            target_variation: stored.preview.target_variation.clone(),
+            backup_ref: backup_ref.clone(),
+            expected_current_head: expected_current_head.clone(),
+            restore_head: restore_head.clone(),
+        };
+        Ok(HistoryCleanupUndoPreflight {
+            plan_id,
+            target_variation: stored.preview.target_variation,
+            backup_ref,
+            expected_current_head,
+            restore_head,
+            token,
+            can_undo: true,
+        })
+    }
+
+    /// Restores a cleanup backup ref after a successful undo preflight.
+    pub fn undo_history_cleanup(
+        &self,
+        token: HistoryCleanupUndoToken,
+    ) -> Result<TimelineCleanupResult> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "undo_history_cleanup")?;
+        let ledger = self.read_history_cleanup_ledger(&token.plan_id)?;
+        let branch_ref = format!("refs/heads/{}", token.target_variation.as_str());
+        let current_oid = self.repo.refname_to_id(&branch_ref)?;
+        let expected_current_oid = oid_from_version(&token.expected_current_head)?;
+        if current_oid != expected_current_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{branch_ref}@{expected_current_oid}"),
+                actual: format!("{branch_ref}@{current_oid}"),
+            });
+        }
+        let restore_oid = self.repo.refname_to_id(token.backup_ref.as_str())?;
+        let expected_restore_oid = oid_from_version(&token.restore_head)?;
+        if restore_oid != expected_restore_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{expected_restore_oid}", token.backup_ref.as_str()),
+                actual: format!("{}@{restore_oid}", token.backup_ref.as_str()),
+            });
+        }
+
+        let undo_operation_id = new_operation_id();
+        let undo_backup_ref = RefName::from(archive_ref(
+            "backups/history-cleanup-undo",
+            token.target_variation.as_str(),
+            &undo_operation_id,
+        ));
+        self.ensure_archive_ref(
+            undo_backup_ref.as_str(),
+            current_oid,
+            "backup before undoing history cleanup",
+        )?;
+        self.write_recovery_state(&RecoveryState {
+            operation_id: undo_operation_id.clone(),
+            operation: RecoveryOperation::HistoryCleanup,
+            original_variation: Some(token.target_variation.to_string()),
+            target: Some(token.expected_current_head.to_string()),
+            completed: false,
+        })?;
+        self.repo
+            .reference(&branch_ref, restore_oid, true, "undo_history_cleanup")?;
+        if self.head_symbolic_variation().as_deref() == Some(token.target_variation.as_str()) {
+            self.repo.set_head(&branch_ref)?;
+            self.repo
+                .checkout_head(Some(CheckoutBuilder::new().force()))?;
+        }
+
+        let result = TimelineCleanupResult {
+            plan_id: token.plan_id,
+            old_head: token.expected_current_head.clone(),
+            new_head: token.restore_head.clone(),
+            backup_refs: vec![token.backup_ref, undo_backup_ref],
+            ref_updates: vec![RefUpdate {
+                name: RefName::from(branch_ref),
+                old: Some(token.expected_current_head),
+                new: Some(token.restore_head),
+            }],
+            commit_map: ledger.commit_map,
+            snapshot_map: ledger.snapshot_map,
+            warnings: ledger.warnings,
+        };
+        self.write_recovery_state(&RecoveryState {
+            operation_id: undo_operation_id,
+            operation: RecoveryOperation::HistoryCleanup,
+            original_variation: None,
+            target: Some(result.new_head.to_string()),
+            completed: true,
+        })?;
+        Ok(result)
+    }
+
     /// Returns a diff between two specific versions.
     ///
     /// The patch field contains a unified diff suitable for display.  When both
@@ -6573,6 +7290,13 @@ impl Workspace {
             SupportRefScope::Local,
             &mut support_refs,
         )?;
+        self.collect_support_refs(
+            "refs/draftline/backups/history-cleanup/*/*",
+            SupportRefKind::HistoryCleanupBackup,
+            "refs/draftline/backups/history-cleanup/",
+            SupportRefScope::Local,
+            &mut support_refs,
+        )?;
 
         support_refs.sort_by(|left, right| left.ref_name.cmp(&right.ref_name));
         Ok(support_refs)
@@ -6591,6 +7315,13 @@ impl Workspace {
             "refs/remotes/*/draftline/rewrites/squash/*/*",
             SupportRefKind::Rewrite,
             "draftline/rewrites/squash/",
+            SupportRefScope::RemoteTracking,
+            &mut support_refs,
+        )?;
+        self.collect_support_refs(
+            "refs/remotes/*/draftline/backups/history-cleanup/*/*",
+            SupportRefKind::HistoryCleanupBackup,
+            "draftline/backups/history-cleanup/",
             SupportRefScope::RemoteTracking,
             &mut support_refs,
         )?;
@@ -6636,6 +7367,7 @@ impl Workspace {
             "refs/heads/*",
             "refs/draftline/deleted-variations/*/*",
             "refs/draftline/rewrites/squash/*/*",
+            "refs/draftline/backups/history-cleanup/*/*",
             "refs/tags/*",
             "refs/notes/*",
             "refs/replace/*",
@@ -7009,6 +7741,303 @@ impl Workspace {
         self.repo
             .find_commit(oid)
             .map_err(|_| DraftlineError::VersionNotFound(version.to_string()))
+    }
+
+    fn plan_compact_milestones(
+        &self,
+        input: CompactCleanupPlanInput<'_>,
+    ) -> Result<PlannedCompactCleanup> {
+        let CompactCleanupPlanInput {
+            target_variation,
+            old_head_oid,
+            base,
+            milestones,
+            preserve_named_branches,
+            preserve_merge_boundaries,
+        } = input;
+
+        if milestones.is_empty() {
+            return Err(DraftlineError::InvalidHistoryCleanup(
+                "compact cleanup requires at least one milestone".to_string(),
+            ));
+        }
+
+        let first_start_oid = oid_from_version(&milestones[0].include_range.start)?;
+        let first_start = self.repo.find_commit(first_start_oid)?;
+        let base_parent_oid = match base {
+            CleanupBase::Auto => first_start.parent(0).ok().map(|parent| parent.id()),
+            CleanupBase::Version { version } => Some(oid_from_version(version)?),
+        };
+        if let (CleanupBase::Version { version }, Some(parent)) =
+            (base, first_start.parent(0).ok().map(|parent| parent.id()))
+        {
+            let requested = oid_from_version(version)?;
+            if requested != parent {
+                return Err(DraftlineError::InvalidHistoryCleanup(format!(
+                    "explicit cleanup base `{requested}` is not the first milestone parent `{parent}`"
+                )));
+            }
+        }
+
+        let last_end = oid_from_version(&milestones[milestones.len() - 1].include_range.end)?;
+        if last_end != old_head_oid {
+            return Err(DraftlineError::InvalidHistoryCleanup(format!(
+                "last cleanup milestone must end at target head `{old_head_oid}`, got `{last_end}`"
+            )));
+        }
+
+        let mut all_old_oids = Vec::new();
+        let mut seen_old_oids = BTreeSet::new();
+        let mut operations = Vec::new();
+        let mut commit_map = Vec::new();
+        let mut previous_new_oid = base_parent_oid;
+        let mut previous_old_end = base_parent_oid;
+        let signature = self.workspace_signature()?;
+
+        for milestone in milestones {
+            let title = milestone.title.trim();
+            if title.is_empty() {
+                return Err(DraftlineError::InvalidHistoryCleanup(
+                    "milestone title is required".to_string(),
+                ));
+            }
+            let old_oids = self.first_parent_range(&milestone.include_range)?;
+            if let Some(expected_parent) = previous_old_end {
+                let start_commit = self.repo.find_commit(old_oids[0])?;
+                let actual_parent = start_commit.parent(0).ok().map(|parent| parent.id());
+                if actual_parent != Some(expected_parent) {
+                    return Err(DraftlineError::InvalidHistoryCleanup(format!(
+                        "milestone `{title}` is not contiguous with the previous cleanup range"
+                    )));
+                }
+            }
+            for oid in &old_oids {
+                if !seen_old_oids.insert(*oid) {
+                    return Err(DraftlineError::InvalidHistoryCleanup(format!(
+                        "cleanup range includes version `{oid}` more than once"
+                    )));
+                }
+                let commit = self.repo.find_commit(*oid)?;
+                if preserve_merge_boundaries && commit.parent_count() > 1 {
+                    return Err(DraftlineError::InvalidHistoryCleanup(format!(
+                        "cleanup milestone `{title}` crosses merge commit `{oid}`"
+                    )));
+                }
+            }
+
+            let end_oid = *old_oids.last().ok_or_else(|| {
+                DraftlineError::InvalidHistoryCleanup("milestone range is empty".to_string())
+            })?;
+            let end_commit = self.repo.find_commit(end_oid)?;
+            let tree = end_commit.tree()?;
+            let parent_commit = previous_new_oid
+                .map(|oid| self.repo.find_commit(oid))
+                .transpose()?;
+            let parents = parent_commit.iter().collect::<Vec<_>>();
+            let message = cleanup_commit_message(title, milestone.description.as_deref());
+            let new_oid = self.repo.commit(
+                None,
+                &signature,
+                &signature,
+                &message,
+                &tree,
+                parents.as_slice(),
+            )?;
+            let new_version = VersionId::from(new_oid);
+            let old_versions = old_oids
+                .iter()
+                .copied()
+                .map(VersionId::from)
+                .collect::<Vec<_>>();
+            operations.push(CleanupOperation {
+                title: title.to_string(),
+                description: milestone
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .map(ToString::to_string),
+                old_versions: old_versions.clone(),
+                new_version: new_version.clone(),
+            });
+            for old_oid in &old_oids {
+                commit_map.push(CommitRewriteMap {
+                    old: VersionId::from(*old_oid),
+                    new: Some(new_version.clone()),
+                    disposition: RewriteDisposition::SquashedInto {
+                        new_id: new_version.clone(),
+                    },
+                });
+            }
+            all_old_oids.extend(old_oids);
+            previous_new_oid = Some(new_oid);
+            previous_old_end = Some(end_oid);
+        }
+
+        let new_head_oid = previous_new_oid.ok_or_else(|| {
+            DraftlineError::InvalidHistoryCleanup("cleanup did not produce a new head".to_string())
+        })?;
+        let old_tree = self.repo.find_commit(old_head_oid)?.tree_id();
+        let new_tree = self.repo.find_commit(new_head_oid)?.tree_id();
+        if old_tree != new_tree {
+            return Err(DraftlineError::InvalidHistoryCleanup(
+                "compact cleanup must preserve final workspace file content".to_string(),
+            ));
+        }
+
+        let mut warnings = Vec::new();
+        if preserve_named_branches {
+            let old_oid_set = all_old_oids.iter().copied().collect::<BTreeSet<_>>();
+            for (variation, tip) in self.local_variation_tip_oids()? {
+                if variation != *target_variation && old_oid_set.contains(&tip) {
+                    warnings.push(cleanup_warning(
+                        CleanupWarningCode::NamedBranchWouldBeAffected,
+                        format!(
+                            "variation `{}` points inside the cleanup range",
+                            variation.as_str()
+                        ),
+                        vec![VersionId::from(tip)],
+                    ));
+                }
+            }
+        }
+
+        let snapshot_map = commit_map
+            .iter()
+            .map(|entry| SnapshotRewriteMap {
+                old: entry.old.clone(),
+                new: entry.new.clone(),
+                disposition: entry.disposition.clone(),
+            })
+            .collect();
+
+        Ok(PlannedCompactCleanup {
+            new_head_oid,
+            operations,
+            commit_map,
+            snapshot_map,
+            warnings,
+            old_commit_count: all_old_oids.len(),
+        })
+    }
+
+    fn first_parent_range(&self, range: &CommitRange) -> Result<Vec<Oid>> {
+        let start_oid = oid_from_version(&range.start)?;
+        let mut commit = self.repo.find_commit(oid_from_version(&range.end)?)?;
+        let mut oids = Vec::new();
+
+        loop {
+            let oid = commit.id();
+            oids.push(oid);
+            if oid == start_oid {
+                break;
+            }
+            commit = commit.parent(0).map_err(|_| {
+                DraftlineError::InvalidHistoryCleanup(format!(
+                    "range end `{}` is not descended from start `{}`",
+                    range.end, range.start
+                ))
+            })?;
+        }
+
+        oids.reverse();
+        Ok(oids)
+    }
+
+    fn history_cleanup_dir(&self) -> PathBuf {
+        self.draftline_dir().join("history-cleanup")
+    }
+
+    fn history_cleanup_plans_dir(&self) -> PathBuf {
+        self.history_cleanup_dir().join("plans")
+    }
+
+    fn history_cleanup_ledgers_dir(&self) -> PathBuf {
+        self.history_cleanup_dir().join("ledgers")
+    }
+
+    fn history_cleanup_plan_path(&self, plan_id: &CleanupPlanId) -> PathBuf {
+        self.history_cleanup_plans_dir()
+            .join(format!("{}.json", plan_id.as_str()))
+    }
+
+    fn history_cleanup_ledger_path(&self, plan_id: &CleanupPlanId) -> PathBuf {
+        self.history_cleanup_ledgers_dir()
+            .join(format!("{}.json", plan_id.as_str()))
+    }
+
+    fn write_history_cleanup_plan(&self, plan: &HistoryCleanupStoredPlan) -> Result<()> {
+        fs::create_dir_all(self.history_cleanup_plans_dir())?;
+        fs::write(
+            self.history_cleanup_plan_path(&plan.preview.plan_id),
+            serde_json::to_vec_pretty(plan)?,
+        )?;
+        Ok(())
+    }
+
+    fn read_history_cleanup_plan(
+        &self,
+        plan_id: &CleanupPlanId,
+    ) -> Result<HistoryCleanupStoredPlan> {
+        let path = self.history_cleanup_plan_path(plan_id);
+        match fs::read(&path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(DraftlineError::InvalidHistoryCleanup(format!(
+                    "cleanup plan `{plan_id}` was not found"
+                )))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn write_history_cleanup_ledger(&self, result: &TimelineCleanupResult) -> Result<()> {
+        fs::create_dir_all(self.history_cleanup_ledgers_dir())?;
+        fs::write(
+            self.history_cleanup_ledger_path(&result.plan_id),
+            serde_json::to_vec_pretty(result)?,
+        )?;
+        Ok(())
+    }
+
+    fn read_history_cleanup_ledger(
+        &self,
+        plan_id: &CleanupPlanId,
+    ) -> Result<TimelineCleanupResult> {
+        let path = self.history_cleanup_ledger_path(plan_id);
+        match fs::read(&path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(DraftlineError::InvalidHistoryCleanup(format!(
+                    "cleanup ledger `{plan_id}` was not found"
+                )))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn read_history_cleanup_ledgers(&self) -> Result<Vec<TimelineCleanupResult>> {
+        let dir = self.history_cleanup_ledgers_dir();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut ledgers = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("json")
+            {
+                continue;
+            }
+            let bytes = fs::read(entry.path())?;
+            ledgers.push(serde_json::from_slice(&bytes)?);
+        }
+        Ok(ledgers)
     }
 
     fn draftline_dir(&self) -> PathBuf {
@@ -8193,6 +9222,51 @@ fn version_from_commit(commit: &Commit<'_>) -> Version {
     }
 }
 
+fn oid_from_version(version: &VersionId) -> Result<Oid> {
+    Oid::from_str(version.as_str())
+        .map_err(|_| DraftlineError::VersionNotFound(version.to_string()))
+}
+
+fn cleanup_commit_message(title: &str, description: Option<&str>) -> String {
+    match description
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+    {
+        Some(description) => format!("{title}\n\n{description}"),
+        None => title.to_string(),
+    }
+}
+
+fn cleanup_warning(
+    code: CleanupWarningCode,
+    message: impl Into<String>,
+    related_versions: Vec<VersionId>,
+) -> CleanupWarning {
+    CleanupWarning {
+        code,
+        message: message.into(),
+        related_versions,
+        safe_next_actions: Vec::new(),
+    }
+}
+
+fn cleanup_remote_warnings(policy: &RemoteRewritePolicy) -> Vec<CleanupWarning> {
+    match policy {
+        RemoteRewritePolicy::LocalOnly => vec![cleanup_warning(
+            CleanupWarningCode::LocalOnlyRewrite,
+            "history cleanup will update only local Draftline refs",
+            Vec::new(),
+        )],
+        RemoteRewritePolicy::PushWithLease { remote, branch } => vec![cleanup_warning(
+            CleanupWarningCode::RemoteRewriteRequiresSeparatePublish,
+            format!(
+                "apply_history_cleanup is local-first; publish `{branch}` to `{remote}` with preflight_replace_remote_history after apply"
+            ),
+            Vec::new(),
+        )],
+    }
+}
+
 fn history_entry_from_commit(
     commit: &Commit<'_>,
     tips: &HashMap<Oid, Vec<VariationId>>,
@@ -9047,11 +10121,13 @@ fn resolved_conflict_content(
 fn is_restorable_support_ref(ref_name: &str) -> bool {
     ref_name.starts_with("refs/draftline/deleted-variations/")
         || ref_name.starts_with("refs/draftline/rewrites/squash/")
+        || ref_name.starts_with("refs/draftline/backups/history-cleanup/")
 }
 
 fn is_remote_tracking_restorable_support_ref(ref_name: &str) -> bool {
     ref_name.contains("/draftline/deleted-variations/")
         || ref_name.contains("/draftline/rewrites/squash/")
+        || ref_name.contains("/draftline/backups/history-cleanup/")
 }
 
 /// Converts a libgit2 `Delta` status to a [`ChangeKind`].
@@ -13977,6 +15053,285 @@ mod tests {
         assert_eq!(result.applied_count, 0);
     }
 
+    // ── history_cleanup ───────────────────────────────────────────────────────
+
+    fn compact_cleanup_request(start: &Version, end: &Version) -> HistoryCleanupRequest {
+        HistoryCleanupRequest {
+            target_variation: None,
+            base: CleanupBase::Auto,
+            mode: CleanupMode::CompactMilestones {
+                milestones: vec![MilestoneSpec {
+                    title: "Clean milestone".to_string(),
+                    description: Some("Compacted noisy saves".to_string()),
+                    include_range: CommitRange {
+                        start: start.id().clone(),
+                        end: end.id().clone(),
+                    },
+                }],
+                preserve_named_branches: true,
+                preserve_merge_boundaries: true,
+            },
+            safety: CleanupSafety::default_user_facing(),
+            remote_policy: RemoteRewritePolicy::LocalOnly,
+        }
+    }
+
+    #[test]
+    fn history_cleanup_compacts_milestones_maps_old_versions_and_undoes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("noisy autosave").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("another noisy autosave").unwrap();
+
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        assert_eq!(preview.target_variation, VariationId::from("main"));
+        assert_eq!(preview.old_head, v3.id().clone());
+        assert_ne!(preview.new_head, preview.old_head);
+        assert_eq!(preview.operations.len(), 1);
+        assert_eq!(
+            preview.operations[0].old_versions,
+            vec![v2.id().clone(), v3.id().clone()]
+        );
+        assert_eq!(preview.graph_diff.old_commit_count, 2);
+        assert_eq!(preview.graph_diff.new_commit_count, 1);
+        assert_eq!(preview.graph_diff.squashed_commit_count, 1);
+        assert!(preview
+            .commit_map
+            .iter()
+            .all(|entry| matches!(entry.disposition, RewriteDisposition::SquashedInto { .. })));
+
+        let result = workspace
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+        assert_eq!(result.old_head, v3.id().clone());
+        assert_eq!(result.new_head, preview.new_head);
+        assert_eq!(
+            workspace
+                .repo
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id()
+                .to_string(),
+            result.new_head.as_str()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "v3"
+        );
+        assert_eq!(result.backup_refs.len(), 1);
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id(result.backup_refs[0].as_str())
+                .unwrap()
+                .to_string(),
+            v3.id().as_str()
+        );
+
+        let resolution = workspace
+            .resolve_rewritten_version(StaleVersionResolutionRequest {
+                version: v2.id().clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            resolution.disposition,
+            StaleVersionDisposition::SquashedInto { ref version } if version == &result.new_head
+        ));
+
+        let undo = workspace
+            .preflight_undo_history_cleanup(result.plan_id.clone())
+            .unwrap();
+        assert!(undo.can_undo);
+        let undo_result = workspace.undo_history_cleanup(undo.token).unwrap();
+        assert_eq!(undo_result.new_head, v3.id().clone());
+        assert_eq!(
+            workspace
+                .repo
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id()
+                .to_string(),
+            v3.id().as_str()
+        );
+    }
+
+    #[test]
+    fn history_cleanup_rejects_dirty_worktree_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        write_file(workspace.root(), "scratch.md", b"dirty");
+
+        let err = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap_err();
+
+        assert!(
+            matches!(err, DraftlineError::PreflightFailed(report) if report.operation == "history_cleanup")
+        );
+    }
+
+    #[test]
+    fn history_cleanup_apply_rejects_changed_target_ref_after_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+
+        write_file(workspace.root(), "post.md", b"v4");
+        workspace.save_version("v4").unwrap();
+        let err = workspace
+            .apply_history_cleanup(preview.plan_id, RewriteConfirmation::UserConfirmed)
+            .unwrap_err();
+
+        assert!(matches!(err, DraftlineError::LocalStateChanged { .. }));
+    }
+
+    #[test]
+    fn history_cleanup_apply_rejects_changed_preview_ref_after_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        let v1 = workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+
+        workspace
+            .repo
+            .reference(
+                preview.preview_ref.as_str(),
+                oid_from_version(v1.id()).unwrap(),
+                true,
+                "tamper cleanup preview",
+            )
+            .unwrap();
+        let err = workspace
+            .apply_history_cleanup(preview.plan_id, RewriteConfirmation::UserConfirmed)
+            .unwrap_err();
+
+        assert!(matches!(err, DraftlineError::LocalStateChanged { .. }));
+    }
+
+    #[test]
+    fn history_cleanup_undo_rejects_work_added_after_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        let result = workspace
+            .apply_history_cleanup(preview.plan_id, RewriteConfirmation::UserConfirmed)
+            .unwrap();
+
+        write_file(workspace.root(), "post.md", b"v4");
+        workspace.save_version("v4").unwrap();
+        let err = workspace
+            .preflight_undo_history_cleanup(result.plan_id)
+            .unwrap_err();
+
+        assert!(matches!(err, DraftlineError::LocalStateChanged { .. }));
+    }
+
+    #[test]
+    fn history_cleanup_recovery_rolls_back_interrupted_branch_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        let branch_ref = "refs/heads/main";
+        let new_head = oid_from_version(&preview.new_head).unwrap();
+        workspace
+            .repo
+            .reference(branch_ref, new_head, true, "simulate interrupted cleanup")
+            .unwrap();
+        workspace.repo.set_head(branch_ref).unwrap();
+        let commit = workspace.repo.find_commit(new_head).unwrap();
+        workspace
+            .repo
+            .checkout_tree(
+                commit.tree().unwrap().as_object(),
+                Some(CheckoutBuilder::new().force()),
+            )
+            .unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: preview.plan_id.to_string(),
+                operation: RecoveryOperation::HistoryCleanup,
+                original_variation: Some("main".to_string()),
+                target: Some(v3.id().to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        let rollback = workspace
+            .rollback_recovery(preview.plan_id.as_str())
+            .unwrap();
+
+        assert!(rollback.completed);
+        assert_eq!(
+            workspace
+                .repo
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id()
+                .to_string(),
+            v3.id().as_str()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "v3"
+        );
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
     // ── squash_versions ───────────────────────────────────────────────────────
 
     #[test]
@@ -14003,6 +15358,73 @@ mod tests {
         // workspace files must still reflect v3 content
         let content = std::fs::read_to_string(workspace.root().join("post.md")).unwrap();
         assert_eq!(content, "v3");
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn history_cleanup_undo_recovery_rolls_back_interrupted_branch_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        let result = workspace
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+        let undo = workspace
+            .preflight_undo_history_cleanup(result.plan_id.clone())
+            .unwrap();
+        let branch_ref = "refs/heads/main";
+        let restore_head = oid_from_version(&undo.restore_head).unwrap();
+        workspace
+            .repo
+            .reference(branch_ref, restore_head, true, "simulate interrupted cleanup undo")
+            .unwrap();
+        workspace.repo.set_head(branch_ref).unwrap();
+        let commit = workspace.repo.find_commit(restore_head).unwrap();
+        workspace
+            .repo
+            .checkout_tree(
+                commit.tree().unwrap().as_object(),
+                Some(CheckoutBuilder::new().force()),
+            )
+            .unwrap();
+        let undo_operation_id = new_operation_id();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: undo_operation_id.clone(),
+                operation: RecoveryOperation::HistoryCleanup,
+                original_variation: Some("main".to_string()),
+                target: Some(result.new_head.to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        let rollback = workspace.rollback_recovery(undo_operation_id).unwrap();
+
+        assert!(rollback.completed);
+        assert_eq!(
+            workspace
+                .repo
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id()
+                .to_string(),
+            result.new_head.as_str()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "v3"
+        );
         assert!(workspace.recovery_state().unwrap().is_none());
     }
 

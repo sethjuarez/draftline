@@ -37,6 +37,15 @@ export interface DraftlineClient {
   getChanges(workspacePath: string): Promise<ChangeSet>;
   getHistory(workspacePath: string): Promise<HistoryEntry[]>;
   getFullHistory(workspacePath: string): Promise<HistoryEntry[]>;
+  previewHistoryCleanup(request: PreviewHistoryCleanupRequest): Promise<HistoryCleanupPreview>;
+  applyHistoryCleanup(request: ApplyHistoryCleanupRequest): Promise<TimelineCleanupResult>;
+  resolveRewrittenVersion(
+    request: ResolveRewrittenVersionRequest,
+  ): Promise<StaleVersionResolution>;
+  preflightUndoHistoryCleanup(
+    request: UndoHistoryCleanupPreflightRequest,
+  ): Promise<HistoryCleanupUndoPreflight>;
+  undoHistoryCleanup(request: UndoHistoryCleanupRequest): Promise<TimelineCleanupResult>;
   getWorkspaceGraph(request: WorkspaceGraphRequest): Promise<WorkspaceGraph>;
   getWorkspaceGraphRefs(request: WorkspaceGraphRefsRequest): Promise<WorkspaceGraphRefs>;
   getWorkspaceGraphSummary(request: WorkspaceGraphRequest): Promise<WorkspaceGraphSummary>;
@@ -181,6 +190,12 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('get_full_history', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
+    previewHistoryCleanup: (request) => run('preview_history_cleanup', { request }),
+    applyHistoryCleanup: (request) => run('apply_history_cleanup', { request }),
+    resolveRewrittenVersion: (request) => run('resolve_rewritten_version', { request }),
+    preflightUndoHistoryCleanup: (request) =>
+      run('preflight_undo_history_cleanup', { request }),
+    undoHistoryCleanup: (request) => run('undo_history_cleanup', { request }),
     getWorkspaceGraph: (request) => run('get_workspace_graph', { request }),
     getWorkspaceGraphRefs: (request) => run('get_workspace_graph_refs', { request }),
     getWorkspaceGraphSummary: (request) => run('get_workspace_graph_summary', { request }),
@@ -283,7 +298,7 @@ export type SafeNextAction =
   | 'configure_remote';
 export type SharingMode = 'local_only' | 'shared_capable';
 export type SupportRefScope = 'local' | 'remote_tracking';
-export type SupportRefKind = 'deleted_variation' | 'rewrite';
+export type SupportRefKind = 'deleted_variation' | 'rewrite' | 'history_cleanup_backup';
 export type SyncState =
   | 'UpToDate'
   | 'LocalAhead'
@@ -355,6 +370,185 @@ export interface HistoryEntry {
   variation_tips: string[];
   is_head: boolean;
   parent_ids: string[];
+}
+
+export type CleanupBase = { kind: 'auto' } | { kind: 'version'; version: string };
+
+export type CleanupMode = {
+  kind: 'compact_milestones';
+  milestones: MilestoneSpec[];
+  preserve_named_branches: boolean;
+  preserve_merge_boundaries: boolean;
+};
+
+export interface MilestoneSpec {
+  title: string;
+  description?: string | null;
+  include_range: CommitRange;
+}
+
+export interface CommitRange {
+  start: string;
+  end: string;
+}
+
+export interface CleanupSafety {
+  create_backup_ref: boolean;
+  backup_ref_name?: string | null;
+  require_clean_worktree: boolean;
+}
+
+export type RemoteRewritePolicy =
+  | { kind: 'local_only' }
+  | { kind: 'push_with_lease'; remote: string; branch: string };
+
+export interface HistoryCleanupRequest {
+  target_variation?: string | null;
+  base: CleanupBase;
+  mode: CleanupMode;
+  safety: CleanupSafety;
+  remote_policy: RemoteRewritePolicy;
+}
+
+export interface PreviewHistoryCleanupRequest {
+  workspace_path: string;
+  cleanup: HistoryCleanupRequest;
+}
+
+export interface ApplyHistoryCleanupRequest {
+  workspace_path: string;
+  plan_id: string;
+  confirmation: RewriteConfirmation;
+}
+
+export interface ResolveRewrittenVersionRequest {
+  workspace_path: string;
+  version_id: string;
+}
+
+export interface UndoHistoryCleanupPreflightRequest {
+  workspace_path: string;
+  plan_id: string;
+}
+
+export interface UndoHistoryCleanupRequest {
+  workspace_path: string;
+  token: HistoryCleanupUndoToken;
+}
+
+export type RewriteConfirmation = 'user_confirmed';
+
+export interface HistoryCleanupPreview {
+  plan_id: string;
+  target_variation: string;
+  old_head: string;
+  new_head: string;
+  preview_ref: string;
+  planned_backup_ref?: string | null;
+  operations: CleanupOperation[];
+  graph_diff: CleanupGraphDiff;
+  commit_map: CommitRewriteMap[];
+  snapshot_map: SnapshotRewriteMap[];
+  warnings: CleanupWarning[];
+}
+
+export interface CleanupOperation {
+  title: string;
+  description?: string | null;
+  old_versions: string[];
+  new_version: string;
+}
+
+export interface CleanupGraphDiff {
+  old_head: string;
+  new_head: string;
+  old_commit_count: number;
+  new_commit_count: number;
+  squashed_commit_count: number;
+}
+
+export interface CommitRewriteMap {
+  old: string;
+  new?: string | null;
+  disposition: RewriteDisposition;
+}
+
+export interface SnapshotRewriteMap {
+  old: string;
+  new?: string | null;
+  disposition: RewriteDisposition;
+}
+
+export type RewriteDisposition =
+  | { kind: 'preserved'; new_id: string }
+  | { kind: 'squashed_into'; new_id: string }
+  | { kind: 'dropped_as_noise' }
+  | { kind: 'orphaned_but_backed_up'; backup_ref: string }
+  | { kind: 'conflict_requires_user_choice' };
+
+export type CleanupWarningCode =
+  | 'local_only_rewrite'
+  | 'remote_rewrite_requires_separate_publish'
+  | 'merge_boundary_requires_user_choice'
+  | 'named_branch_would_be_affected'
+  | 'dirty_worktree_blocked'
+  | 'preview_plan_expired'
+  | 'target_ref_changed_since_preview'
+  | 'candidate_ref_changed_since_preview'
+  | 'backup_ref_already_exists';
+
+export interface CleanupWarning {
+  code: CleanupWarningCode;
+  message: string;
+  related_versions: string[];
+  safe_next_actions: SafeNextAction[];
+}
+
+export interface TimelineCleanupResult {
+  plan_id: string;
+  old_head: string;
+  new_head: string;
+  backup_refs: string[];
+  ref_updates: RefUpdate[];
+  commit_map: CommitRewriteMap[];
+  snapshot_map: SnapshotRewriteMap[];
+  warnings: CleanupWarning[];
+}
+
+export interface RefUpdate {
+  name: string;
+  old?: string | null;
+  new?: string | null;
+}
+
+export interface StaleVersionResolution {
+  requested: string;
+  disposition: StaleVersionDisposition;
+}
+
+export type StaleVersionDisposition =
+  | { kind: 'live'; version: string }
+  | { kind: 'squashed_into'; version: string }
+  | { kind: 'backed_up'; backup_ref: string }
+  | { kind: 'dropped_as_noise' }
+  | { kind: 'unknown' };
+
+export interface HistoryCleanupUndoPreflight {
+  plan_id: string;
+  target_variation: string;
+  backup_ref: string;
+  expected_current_head: string;
+  restore_head: string;
+  token: HistoryCleanupUndoToken;
+  can_undo: boolean;
+}
+
+export interface HistoryCleanupUndoToken {
+  plan_id: string;
+  target_variation: string;
+  backup_ref: string;
+  expected_current_head: string;
+  restore_head: string;
 }
 
 export type WorkspaceGraphAction =
