@@ -25,6 +25,8 @@ export interface DraftlineClient {
   inspectWorkspace(workspacePath: string): Promise<WorkspaceDiagnostics>;
   verifyWorkspace(workspacePath: string): Promise<WorkspaceVerification>;
   listVariations(workspacePath: string): Promise<VariationSummary[]>;
+  preflightSwitchVariation(request: SwitchVariationRequest): Promise<PreflightReport>;
+  switchVariation(request: SwitchVariationRequest): Promise<SwitchVariationResult>;
   preflightRenameVariation(request: RenameVariationRequest): Promise<VariationRenamePreflight>;
   renameVariation(request: RenameVariationRequest): Promise<RenameVariationResult>;
   listSupportRefs(workspacePath: string, scope: SupportRefScope): Promise<SupportRef[]>;
@@ -145,6 +147,8 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('list_variations', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
+    preflightSwitchVariation: (request) => run('preflight_switch_variation', { request }),
+    switchVariation: (request) => run('switch_variation', { request }),
     preflightRenameVariation: (request) => run('preflight_rename_variation', { request }),
     renameVariation: (request) => run('rename_variation', { request }),
     listSupportRefs: (workspacePath, scope) =>
@@ -328,6 +332,12 @@ export interface VariationRenamePreflight {
   support_ref: string;
   token: VariationRenameToken;
   can_rename: boolean;
+}
+
+export interface SwitchVariationResult {
+  preflight: PreflightReport;
+  variation: Variation;
+  postconditions: CommandPostconditions;
 }
 
 export interface HistoryEntry {
@@ -1015,6 +1025,10 @@ export interface RenameVariationRequest extends WorkspaceRequest {
   token?: VariationRenameToken;
 }
 
+export interface SwitchVariationRequest extends WorkspaceRequest {
+  variation_id: string;
+}
+
 export interface VersionRequest extends WorkspaceRequest {
   version_id: string;
 }
@@ -1108,6 +1122,8 @@ export interface DraftlineHostFacade {
   workspacePath: string;
   open(): Promise<WorkspaceOpenResult>;
   inspect(): Promise<WorkspaceDiagnostics>;
+  preflightSwitchVariation(variationId: string): Promise<PreflightReport>;
+  switchVariation(variationId: string): Promise<SwitchVariationResult>;
   save(label: string): Promise<SaveResult>;
   selectedSave(paths: string[], label: string): Promise<SelectedSaveResult>;
   selectedShelve(paths: string[], name: string): Promise<SelectedShelveResult>;
@@ -1218,6 +1234,10 @@ export function createDraftlineHostFacade({
     workspacePath,
     open: () => client.openWorkspace(workspacePath),
     inspect: () => client.inspectWorkspace(workspacePath),
+    preflightSwitchVariation: (variationId) =>
+      client.preflightSwitchVariation({ ...workspaceRequest(), variation_id: variationId }),
+    switchVariation: (variationId) =>
+      client.switchVariation({ ...workspaceRequest(), variation_id: variationId }),
     save: (label) => client.save({ ...workspaceRequest(), label }),
     selectedSave: (paths, label) => client.selectedSave({ ...workspaceRequest(), paths, label }),
     selectedShelve: (paths, name) => client.selectedShelve({ ...workspaceRequest(), paths, name }),
@@ -1455,6 +1475,18 @@ export async function listRemotes(workspacePath: string): Promise<RemoteEndpoint
 
 export async function listRemoteVariations(request: RemoteRequest): Promise<RemoteVariation[]> {
   return createDraftlineClient().listRemoteVariations(request);
+}
+
+export async function preflightSwitchVariation(
+  request: SwitchVariationRequest,
+): Promise<PreflightReport> {
+  return createDraftlineClient().preflightSwitchVariation(request);
+}
+
+export async function switchVariation(
+  request: SwitchVariationRequest,
+): Promise<SwitchVariationResult> {
+  return createDraftlineClient().switchVariation(request);
 }
 
 export async function remoteVariationDiagnostics(

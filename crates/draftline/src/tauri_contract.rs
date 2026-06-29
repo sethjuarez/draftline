@@ -16,8 +16,8 @@ use crate::{
     OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight, PublishResult,
     RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
     RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result,
-    Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SyncState, SyncStatus, Variation,
-    VariationId, VariationMetadata, VariationRenamePreflight, VariationRenameToken,
+    Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SwitchPolicy, SyncState, SyncStatus,
+    Variation, VariationId, VariationMetadata, VariationRenamePreflight, VariationRenameToken,
     VariationSummary, Version, VersionDiff, VersionId, VersionPreview, Workspace,
     WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor,
     WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail, WorkspaceGraphOptions,
@@ -326,6 +326,13 @@ pub struct RenameVariationRequest {
     pub token: Option<VariationRenameToken>,
 }
 
+/// Request for safely switching to an existing local variation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchVariationRequest {
+    pub workspace_path: PathBuf,
+    pub variation_id: String,
+}
+
 /// Request for commands that target one version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionRequest {
@@ -535,6 +542,14 @@ pub struct AdoptRemoteVariationResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenameVariationResult {
     pub preflight: VariationRenamePreflight,
+    pub variation: Variation,
+    pub postconditions: CommandPostconditions,
+}
+
+/// Safe variation switch result with preflight and postcondition state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwitchVariationResult {
+    pub preflight: PreflightReport,
     pub variation: Variation,
     pub postconditions: CommandPostconditions,
 }
@@ -865,6 +880,75 @@ pub fn rename_variation_with_context(
         preflight,
         variation,
         postconditions: collect_postconditions(&workspace, false),
+    })
+}
+
+/// Preflights switching to an existing local variation without mutating workspace files.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        variation_id = %request.variation_id
+    )
+)]
+pub fn preflight_switch_variation(request: SwitchVariationRequest) -> Result<PreflightReport> {
+    preflight_switch_variation_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Preflights switching to an existing local variation using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        variation_id = %request.variation_id
+    )
+)]
+pub fn preflight_switch_variation_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: SwitchVariationRequest,
+) -> Result<PreflightReport> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .preflight_switch_variation(&VariationId::from(request.variation_id))
+}
+
+/// Switches to an existing local variation without saving, shelving, or discarding dirty work.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        variation_id = %request.variation_id
+    )
+)]
+pub fn switch_variation(request: SwitchVariationRequest) -> Result<SwitchVariationResult> {
+    switch_variation_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Switches to an existing local variation using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(
+        workspace_path = %request.workspace_path.display(),
+        variation_id = %request.variation_id
+    )
+)]
+pub fn switch_variation_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: SwitchVariationRequest,
+) -> Result<SwitchVariationResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let variation_id = VariationId::from(request.variation_id);
+    let preflight = workspace.preflight_switch_variation(&variation_id)?;
+    let variation = workspace.switch_variation(&variation_id, SwitchPolicy::AbortIfDirty)?;
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(SwitchVariationResult {
+        preflight,
+        variation,
+        postconditions: collect_postconditions(&workspace, true),
     })
 }
 

@@ -13,17 +13,18 @@ use draftline::tauri_contract::{
     list_remotes, list_shelves, list_support_refs, list_variations, merge_conflict_view_model,
     merge_incoming, merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
     open_workspace, preflight_apply_incoming, preflight_apply_shelf, preflight_merge_incoming,
-    preflight_rename_variation, preview_shelf, preview_version, preview_version_file,
-    preview_workspace_file, publish_current_variation, rename_variation,
+    preflight_rename_variation, preflight_switch_variation, preview_shelf, preview_version,
+    preview_version_file, preview_workspace_file, publish_current_variation, rename_variation,
     restore_version_as_new_save, restore_version_as_new_save_to_variation, save,
     search_workspace_graph, selected_discard, selected_save, selected_save_with_context,
-    selected_shelve, verify_workspace, whole_file_use_content_resolutions, CloneWorkspaceRequest,
-    ConflictContentSource, CreateVariationFromVersionRequest, CurrentFileRequest,
-    DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind, ListSupportRefsRequest,
-    MergeIncomingRequest, MergeIncomingWithResolutionsRequest, PreviewVersionFileRequest,
-    PublishCurrentVariationRequest, RemoteRequest, RemoteVariationRequest, RenameVariationRequest,
-    RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
-    SelectedShelveRequest, ShelfRequest, TargetedRestoreVersionRequest, VersionRequest,
+    selected_shelve, switch_variation, verify_workspace, whole_file_use_content_resolutions,
+    CloneWorkspaceRequest, ConflictContentSource, CreateVariationFromVersionRequest,
+    CurrentFileRequest, DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
+    ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
+    PreviewVersionFileRequest, PublishCurrentVariationRequest, RemoteRequest,
+    RemoteVariationRequest, RenameVariationRequest, RestoreVersionRequest, SaveRequest,
+    SelectedDiscardRequest, SelectedSaveRequest, SelectedShelveRequest, ShelfRequest,
+    SwitchVariationRequest, TargetedRestoreVersionRequest, VersionRequest,
     WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
     WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest, WorkspaceGraphRequest,
     WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest, WorkspaceRequest,
@@ -312,6 +313,50 @@ fn tauri_contract_rejects_stale_rename_token() {
         error,
         draftline::DraftlineError::LocalStateChanged { .. }
     ));
+}
+
+#[test]
+fn tauri_contract_switches_variation_without_creating_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"base");
+    let base = workspace.save_version("Base").unwrap();
+    write_file(workspace.root(), "post.md", b"main");
+    workspace.save_version("Main").unwrap();
+    let original = workspace.current_variation().unwrap();
+    workspace
+        .create_variation_from(base.id(), "alternate")
+        .unwrap();
+    let history_len = workspace.full_history().unwrap().len();
+    let request = SwitchVariationRequest {
+        workspace_path: temp.path().to_path_buf(),
+        variation_id: "alternate".to_string(),
+    };
+
+    let preflight = preflight_switch_variation(request.clone()).unwrap();
+    assert!(preflight.can_proceed);
+    assert_eq!(preflight.operation, "switch_variation");
+
+    let switched = switch_variation(request).unwrap();
+    assert_eq!(switched.variation.name, "alternate");
+    assert!(switched.variation.is_current);
+    assert_eq!(read_file(workspace.root(), "post.md"), "base");
+    assert_eq!(workspace.full_history().unwrap().len(), history_len);
+
+    write_file(workspace.root(), "scratch.md", b"dirty");
+    let dirty_request = SwitchVariationRequest {
+        workspace_path: temp.path().to_path_buf(),
+        variation_id: original,
+    };
+    let dirty_preflight = preflight_switch_variation(dirty_request.clone()).unwrap();
+    assert!(!dirty_preflight.can_proceed);
+    let error = switch_variation(dirty_request).unwrap_err();
+    assert!(matches!(
+        error,
+        draftline::DraftlineError::PreflightFailed(report) if report.operation == "switch_variation"
+    ));
+    assert_eq!(workspace.full_history().unwrap().len(), history_len);
 }
 
 #[test]

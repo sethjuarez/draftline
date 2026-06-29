@@ -9,21 +9,21 @@ use draftline::tauri_contract::{
     RecoveryRequest, RemoteRequest, RemoteVariationRequest, RestoreVersionRequest,
     RestoreVersionResult, SaveRequest, SaveResult, SelectedDiscardRequest, SelectedDiscardResult,
     SelectedSaveRequest, SelectedSaveResult, SelectedShelveRequest, SelectedShelveResult,
-    ShelfRequest, TargetedRestoreVersionCommandResult, TargetedRestoreVersionRequest,
-    TauriCommandError, TauriCommandResult, VersionRequest, WorkspaceDiagnostics,
-    WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
-    WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest, WorkspaceGraphRequest,
-    WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest, WorkspaceOpenResult,
-    WorkspaceRequest,
+    ShelfRequest, SwitchVariationRequest, SwitchVariationResult,
+    TargetedRestoreVersionCommandResult, TargetedRestoreVersionRequest, TauriCommandError,
+    TauriCommandResult, VersionRequest, WorkspaceDiagnostics, WorkspaceGraphAroundVersionRequest,
+    WorkspaceGraphNeighborhoodRequest, WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest,
+    WorkspaceGraphRequest, WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest,
+    WorkspaceOpenResult, WorkspaceRequest,
 };
 use draftline::{
     ApplyIncomingReport, ChangeSet, ContentPolicyAudit, CurrentFileDiff, CurrentFilePreview,
-    HistoryEntry, MergeIncomingReport, PreviewFile, RecoveryRepairResult, RemoteEndpoint,
-    RemoteVariation, RemoteVariationDiagnostics, Shelf, ShelfApplyReport, SupportRef,
-    VariationSummary, VersionDiff, VersionPreview, WorkspaceGraph, WorkspaceGraphAgentSummary,
-    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail,
-    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
-    WorkspaceVerification,
+    HistoryEntry, MergeIncomingReport, PreflightReport, PreviewFile, RecoveryRepairResult,
+    RemoteEndpoint, RemoteVariation, RemoteVariationDiagnostics, Shelf, ShelfApplyReport,
+    SupportRef, VariationSummary, VersionDiff, VersionPreview, WorkspaceGraph,
+    WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
+    WorkspaceGraphNodeDetail, WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult,
+    WorkspaceGraphSummary, WorkspaceVerification,
 };
 use std::sync::{Mutex, MutexGuard};
 use tauri::{Emitter, Manager};
@@ -93,6 +93,29 @@ fn list_variations(
 ) -> TauriCommandResult<Vec<VariationSummary>> {
     let context = lock_context(state.inner())?;
     contract::into_tauri_result(contract::list_variations_with_context(&context, request))
+}
+
+#[tauri::command]
+fn preflight_switch_variation(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: SwitchVariationRequest,
+) -> TauriCommandResult<PreflightReport> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::preflight_switch_variation_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri::command]
+fn switch_variation(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: SwitchVariationRequest,
+) -> TauriCommandResult<SwitchVariationResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::switch_variation_with_context(
+        &mut context,
+        request,
+    ))
 }
 
 #[tauri_plugin_auditaur::auditaur_command]
@@ -641,6 +664,8 @@ fn main() {
             inspect_workspace,
             verify_workspace,
             list_variations,
+            preflight_switch_variation,
+            switch_variation,
             list_support_refs,
             list_remotes,
             list_remote_variations,
