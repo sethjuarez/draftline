@@ -3,29 +3,31 @@ use std::path::{Path, PathBuf};
 
 use draftline::tauri_contract::{
     adopt_remote_variation, adopt_workspace, apply_incoming, apply_shelf, audit_content_policy,
-    clone_workspace, create_variation_from_version, diff_version_to_workspace, diff_versions,
-    diff_workspace_file, fetch_remote, get_changes, get_full_history, get_history,
-    get_workspace_graph, get_workspace_graph_agent_summary, get_workspace_graph_around_version,
-    get_workspace_graph_common_ancestor, get_workspace_graph_compare_summary,
-    get_workspace_graph_for_variation, get_workspace_graph_neighborhood, get_workspace_graph_node,
-    get_workspace_graph_overview, get_workspace_graph_path, get_workspace_graph_refs,
-    get_workspace_graph_summary, inspect_workspace, into_tauri_result, list_remote_variations,
-    list_remotes, list_shelves, list_support_refs, list_variations, merge_conflict_view_model,
-    merge_incoming, merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
-    open_workspace, preflight_apply_incoming, preflight_apply_shelf, preflight_merge_incoming,
-    preflight_rename_variation, preflight_switch_variation, preview_shelf, preview_version,
-    preview_version_file, preview_workspace_file, publish_current_variation, rename_variation,
-    restore_version_as_new_save, restore_version_as_new_save_to_variation, save,
-    search_workspace_graph, selected_discard, selected_save, selected_save_with_context,
-    selected_shelve, switch_variation, verify_workspace, whole_file_use_content_resolutions,
-    CloneWorkspaceRequest, ConflictContentSource, CreateVariationFromVersionRequest,
-    CurrentFileRequest, DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
+    clone_workspace, create_variation_from_version, create_variation_from_version_guarded,
+    diff_version_to_workspace, diff_versions, diff_workspace_file, fetch_remote, get_changes,
+    get_full_history, get_history, get_workspace_graph, get_workspace_graph_agent_summary,
+    get_workspace_graph_around_version, get_workspace_graph_common_ancestor,
+    get_workspace_graph_compare_summary, get_workspace_graph_for_variation,
+    get_workspace_graph_neighborhood, get_workspace_graph_node, get_workspace_graph_overview,
+    get_workspace_graph_path, get_workspace_graph_refs, get_workspace_graph_summary,
+    inspect_workspace, into_tauri_result, list_remote_variations, list_remotes, list_shelves,
+    list_support_refs, list_variations, merge_conflict_view_model, merge_incoming,
+    merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context, open_workspace,
+    preflight_apply_incoming, preflight_apply_shelf, preflight_create_variation_from_version,
+    preflight_merge_incoming, preflight_rename_variation, preflight_switch_variation,
+    preview_shelf, preview_version, preview_version_file, preview_workspace_file,
+    publish_current_variation, rename_variation, restore_version_as_new_save,
+    restore_version_as_new_save_to_variation, save, search_workspace_graph, selected_discard,
+    selected_save, selected_save_with_context, selected_shelve, switch_variation, verify_workspace,
+    whole_file_use_content_resolutions, CloneWorkspaceRequest, ConflictContentSource,
+    CreateVariationFromVersionRequest, CurrentFileRequest, DiffVersionsRequest,
+    DraftlineCommandContext, DraftlineEventKind, GuardedCreateVariationFromVersionRequest,
     ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
-    PreviewVersionFileRequest, PublishCurrentVariationRequest, RemoteRequest,
-    RemoteVariationRequest, RenameVariationRequest, RestoreVersionRequest, SaveRequest,
-    SelectedDiscardRequest, SelectedSaveRequest, SelectedShelveRequest, ShelfRequest,
-    SwitchVariationRequest, TargetedRestoreVersionRequest, VersionRequest,
-    WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
+    PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
+    PublishCurrentVariationRequest, RemoteRequest, RemoteVariationRequest, RenameVariationRequest,
+    RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
+    SelectedShelveRequest, ShelfRequest, SwitchVariationRequest, TargetedRestoreVersionRequest,
+    VersionRequest, WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
     WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest, WorkspaceGraphRequest,
     WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest, WorkspaceRequest,
 };
@@ -826,6 +828,93 @@ fn tauri_contract_smokes_collaboration_incoming_and_merge() {
         "remote branch of work"
     );
     assert!(merged.postconditions.errors.is_empty());
+}
+
+#[test]
+fn tauri_contract_preflights_remote_aware_variation_creation() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    init_bare_remote(remote_dir.path());
+
+    let author_dir = tempfile::tempdir().unwrap();
+    let author = Workspace::init(author_dir.path()).unwrap();
+    configure_identity(author.root());
+    write_file(author.root(), "post.md", b"base");
+    let base = author.save_version("Base").unwrap();
+    author
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    publish_current_variation(PublishCurrentVariationRequest {
+        workspace_path: author_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+    })
+    .unwrap();
+
+    let consumer_dir = tempfile::tempdir().unwrap();
+    let consumer =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), consumer_dir.path())
+            .unwrap();
+    configure_identity(consumer.root());
+
+    let remote_only = author
+        .create_variation_from(base.id(), "cutready-name")
+        .unwrap();
+    author
+        .switch_variation(remote_only.id(), draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    write_file(author.root(), "post.md", b"remote-only");
+    author.save_version("Remote only").unwrap();
+    publish_current_variation(PublishCurrentVariationRequest {
+        workspace_path: author_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+    })
+    .unwrap();
+
+    let collision =
+        preflight_create_variation_from_version(PreflightCreateVariationFromVersionRequest {
+            workspace_path: consumer_dir.path().to_path_buf(),
+            version_id: base.id().to_string(),
+            name: "cutready-name".to_string(),
+            remote: Some("origin".to_string()),
+        })
+        .unwrap();
+    assert!(!collision.can_create);
+    assert!(!collision.local_collision);
+    assert!(collision.remote_collision);
+    assert!(collision.remote_only_collision);
+    assert_eq!(
+        collision
+            .existing_remote_head
+            .as_ref()
+            .map(|version| version.label.as_str()),
+        Some("Remote only")
+    );
+    assert_eq!(
+        collision.suggested_alternative.as_deref(),
+        Some("cutready-name-2")
+    );
+    assert!(collision.token.is_none());
+    assert!(git2::Repository::open(consumer.root())
+        .unwrap()
+        .find_branch("cutready-name", git2::BranchType::Local)
+        .is_err());
+
+    let clean =
+        preflight_create_variation_from_version(PreflightCreateVariationFromVersionRequest {
+            workspace_path: consumer_dir.path().to_path_buf(),
+            version_id: base.id().to_string(),
+            name: "cutready-local".to_string(),
+            remote: Some("origin".to_string()),
+        })
+        .unwrap();
+    assert!(clean.can_create);
+    let created = create_variation_from_version_guarded(GuardedCreateVariationFromVersionRequest {
+        workspace_path: consumer_dir.path().to_path_buf(),
+        token: clean.token.unwrap(),
+        metadata: Default::default(),
+    })
+    .unwrap();
+    assert_eq!(created.variation.name, "cutready-local");
+    assert!(created.postconditions.errors.is_empty());
 }
 
 #[test]

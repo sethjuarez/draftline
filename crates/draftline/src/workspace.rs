@@ -1008,6 +1008,34 @@ pub struct RemoteVariationDiagnostics {
     pub remote_only_variations: Vec<VariationId>,
 }
 
+/// Remote-aware preflight for creating a new local variation from a saved version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VariationCreatePreflight {
+    pub from_version: VersionId,
+    pub variation: VariationId,
+    pub remote: Option<String>,
+    pub can_create: bool,
+    pub local_collision: bool,
+    pub remote_collision: bool,
+    pub remote_only_collision: bool,
+    pub existing_remote_head: Option<Version>,
+    pub suggested_alternative: Option<String>,
+    pub token: Option<VariationCreateToken>,
+}
+
+/// Token tying variation creation to a preflighted local version and remote-tracking state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VariationCreateToken {
+    pub operation_id: String,
+    pub from_version: VersionId,
+    pub variation: VariationId,
+    pub remote: Option<String>,
+    pub expected_source_oid: String,
+    pub expected_remote_oid: Option<String>,
+}
+
 /// Preflight report for applying incoming changes from a remote.
 ///
 /// Returned by [`Workspace::preflight_apply_incoming`].  Lets host UIs show
@@ -2616,6 +2644,108 @@ impl Workspace {
         ))
     }
 
+    /// Preflights creating a local variation from a saved version after refreshing a remote namespace.
+    pub fn preflight_create_variation_from_version(
+        &self,
+        version: &VersionId,
+        name: impl AsRef<str>,
+        remote: Option<&str>,
+    ) -> Result<VariationCreatePreflight> {
+        let mut options = RemoteOptions::new();
+        self.preflight_create_variation_from_version_with_options(
+            version,
+            name,
+            remote,
+            &mut options,
+        )
+    }
+
+    /// Preflights creating a local variation using explicit remote options.
+    pub fn preflight_create_variation_from_version_with_options(
+        &self,
+        version: &VersionId,
+        name: impl AsRef<str>,
+        remote: Option<&str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<VariationCreatePreflight> {
+        self.ensure_no_pending_recovery()?;
+        let name = validate_variation_name(name.as_ref())?;
+        let commit = self.find_version_commit(version)?;
+        if !self.version_is_reachable_from_local_variation(commit.id())? {
+            return Err(DraftlineError::VersionNotLocallyReachable(
+                version.to_string(),
+            ));
+        }
+
+        let remote = remote.map(|remote| remote.to_string());
+        if let Some(remote) = remote.as_deref() {
+            self.fetch_all_variations_with_options(remote, options)?;
+        }
+
+        self.create_variation_preflight_from_fetched_state(
+            version.clone(),
+            name,
+            remote,
+            commit.id().to_string(),
+        )
+    }
+
+    /// Creates a preflighted variation, refusing if local or remote state changed.
+    pub fn create_variation_from_version_with_token(
+        &self,
+        token: VariationCreateToken,
+        metadata: VariationMetadata,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<Variation> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "create_variation_from_version")?;
+        if !is_safe_operation_id(&token.operation_id) {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: "create variation operation id issued by preflight".to_string(),
+                actual: token.operation_id,
+            });
+        }
+
+        let name = validate_variation_name(token.variation.as_str())?;
+        let commit = self.find_version_commit(&token.from_version)?;
+        if commit.id().to_string() != token.expected_source_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: token.expected_source_oid,
+                actual: commit.id().to_string(),
+            });
+        }
+        if !self.version_is_reachable_from_local_variation(commit.id())? {
+            return Err(DraftlineError::VersionNotLocallyReachable(
+                token.from_version.to_string(),
+            ));
+        }
+        if self.repo.find_branch(&name, BranchType::Local).is_ok() {
+            return Err(DraftlineError::VariationAlreadyExists(name));
+        }
+
+        if let Some(remote) = token.remote.as_deref() {
+            self.fetch_all_variations_with_options(remote, options)?;
+            let actual_remote_oid = remote_tracking_oid(&self.repo, remote, &name);
+            if actual_remote_oid != token.expected_remote_oid {
+                return Err(DraftlineError::RemoteRace {
+                    remote: remote.to_string(),
+                    variation: name,
+                    expected: token.expected_remote_oid,
+                    actual: actual_remote_oid,
+                });
+            }
+        }
+
+        self.repo.branch(&name, &commit, false)?;
+        self.write_variation_metadata(&name, &metadata)?;
+
+        Ok(variation_from_name(
+            name,
+            self.current_variation().ok().as_ref(),
+            metadata,
+        ))
+    }
+
     /// Lists local variations.
     pub fn variations(&self) -> Result<Vec<Variation>> {
         self.ensure_no_pending_recovery()?;
@@ -2722,6 +2852,89 @@ impl Workspace {
             local_only_variations,
             remote_only_variations,
         })
+    }
+
+    fn create_variation_preflight_from_fetched_state(
+        &self,
+        from_version: VersionId,
+        name: String,
+        remote: Option<String>,
+        source_oid: String,
+    ) -> Result<VariationCreatePreflight> {
+        let local_collision = self.repo.find_branch(&name, BranchType::Local).is_ok();
+        let existing_remote_oid = remote
+            .as_deref()
+            .and_then(|remote| remote_tracking_oid(&self.repo, remote, &name));
+        let remote_collision = existing_remote_oid.is_some();
+        let existing_remote_head = match (remote.as_deref(), existing_remote_oid.as_deref()) {
+            (Some(remote), Some(_)) => self.remote_variation_head_version(remote, &name)?,
+            _ => None,
+        };
+        let can_create = !local_collision && !remote_collision;
+        let suggested_alternative = if can_create {
+            None
+        } else {
+            self.suggest_variation_alternative(&name, remote.as_deref())?
+        };
+        let token = can_create.then(|| VariationCreateToken {
+            operation_id: new_operation_id(),
+            from_version: from_version.clone(),
+            variation: VariationId::from(name.clone()),
+            remote: remote.clone(),
+            expected_source_oid: source_oid,
+            expected_remote_oid: existing_remote_oid,
+        });
+
+        Ok(VariationCreatePreflight {
+            from_version,
+            variation: VariationId::from(name),
+            remote,
+            can_create,
+            local_collision,
+            remote_collision,
+            remote_only_collision: remote_collision && !local_collision,
+            existing_remote_head,
+            suggested_alternative,
+            token,
+        })
+    }
+
+    fn remote_variation_head_version(
+        &self,
+        remote: &str,
+        variation: &str,
+    ) -> Result<Option<Version>> {
+        let remote_ref = format!("refs/remotes/{remote}/{variation}");
+        match self.repo.find_reference(&remote_ref) {
+            Ok(reference) => {
+                let commit = reference.peel_to_commit()?;
+                Ok(Some(version_from_commit(&commit)))
+            }
+            Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn suggest_variation_alternative(
+        &self,
+        base_name: &str,
+        remote: Option<&str>,
+    ) -> Result<Option<String>> {
+        for suffix in 2..=100 {
+            let candidate = validate_variation_name(&format!("{base_name}-{suffix}"))?;
+            if self.repo.find_branch(&candidate, BranchType::Local).is_ok() {
+                continue;
+            }
+            if remote
+                .and_then(|remote| remote_tracking_oid(&self.repo, remote, &candidate))
+                .is_some()
+            {
+                continue;
+            }
+            return Ok(Some(candidate));
+        }
+
+        Ok(None)
     }
 
     /// Creates a local variation from a remote-tracking variation.
@@ -11329,6 +11542,73 @@ mod tests {
             .unwrap()
             .iter()
             .any(|variation| variation.name == "teammate-option"));
+    }
+
+    #[test]
+    fn guarded_variation_creation_rejects_remote_race_after_preflight() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+
+        let author_dir = tempfile::tempdir().unwrap();
+        let author = Workspace::init(author_dir.path()).unwrap();
+        configure_identity(&author, "Seth", "seth@example.com");
+        author
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(author.root(), "post.md", b"base");
+        let base = author.save_version("Base").unwrap();
+        author.publish_changes("origin").unwrap();
+
+        let consumer_dir = tempfile::tempdir().unwrap();
+        let consumer =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), consumer_dir.path())
+                .unwrap();
+        let mut options = RemoteOptions::new();
+        let preflight = consumer
+            .preflight_create_variation_from_version_with_options(
+                base.id(),
+                "race-name",
+                Some("origin"),
+                &mut options,
+            )
+            .unwrap();
+        assert!(preflight.can_create);
+        assert_eq!(
+            preflight
+                .token
+                .as_ref()
+                .and_then(|token| token.expected_remote_oid.as_deref()),
+            None
+        );
+
+        let raced = author
+            .create_variation_from(base.id(), "race-name")
+            .unwrap();
+        author
+            .switch_variation(raced.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(author.root(), "post.md", b"remote race");
+        author.save_version("Remote race").unwrap();
+        author.publish_changes("origin").unwrap();
+
+        let mut options = RemoteOptions::new();
+        assert!(matches!(
+            consumer.create_variation_from_version_with_token(
+                preflight.token.unwrap(),
+                VariationMetadata::default(),
+                &mut options,
+            ),
+            Err(DraftlineError::RemoteRace {
+                remote,
+                variation,
+                expected: None,
+                actual: Some(_),
+            }) if remote == "origin" && variation == "race-name"
+        ));
+        assert!(consumer
+            .repo
+            .find_branch("race-name", BranchType::Local)
+            .is_err());
     }
 
     #[test]
