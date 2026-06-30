@@ -289,10 +289,11 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | Operation locks prevent concurrent risky operations. `RecoveryState` blocks normal APIs. `workspace_summary` and `inspect` can still surface recovery context. `repair_recovery` and `rollback_recovery` return typed skeleton reports but do not yet perform operation-specific mutations. |
+| Current support | Operation locks prevent concurrent risky operations. `RecoveryState` blocks normal APIs. `workspace_summary` and `inspect` can still surface recovery context. `repair_recovery` and `rollback_recovery` perform metadata-backed repair or rollback for covered operations such as discard, apply incoming, rename, remote delete, and selected history-cleanup states, and return typed blockers when the ledger lacks enough state. |
 | Safety behavior | Draftline avoids pretending the workspace is coherent when an operation may have been interrupted. |
 | Edge cases | `acknowledge_recovery` clears metadata but does not repair or roll back the Git state. Hosts should not present acknowledgment as repair; it can unblock normal APIs while refs and files remain inconsistent. Recovery state is single-slot because only one Draftline risky operation should hold the operation lock at a time. |
-| Gap | Need operation-specific mutation behind the existing repair and rollback APIs. |
+| Tests | `repair_recovery_finishes_discard_changes`, `repair_recovery_completes_apply_incoming_fast_forward`, `rollback_recovery_restores_deleted_variation`, `repair_remote_delete_recovers_after_visible_ref_was_deleted`, and related insufficient-metadata blocker tests. |
+| Gap | Need broader operation metadata coverage so every interrupted risky operation can either repair, roll back, or explain why manual intervention is required. |
 
 ## Flow 14a: out-of-band Git mutation
 
@@ -314,6 +315,7 @@ flowchart TD
 | Covered today? | Partially covered. |
 | Current support | Some states surface through `NoCurrentVariation`, status, `inspect`, `verify_workspace`, `explain_error`, or raw Git errors. |
 | Safety behavior | Draftline refuses normal variation operations when HEAD is detached or no local variation can be identified. |
+| Tests | `tauri_contract_keeps_frontend_json_shape_stable` covers structured inspection output; lower-level error-path tests cover detached/no-current-variation signals. |
 | Gap | Need deeper repair flows for detached HEAD, raw Git branch changes, existing conflicted indexes, and non-Draftline history edits. |
 
 ## Flow 14b: stale or abandoned operation lock
@@ -338,6 +340,7 @@ flowchart TD
 | Current support | `WorkspaceLocked` blocks mutating operations. `inspect_operation_lock` distinguishes active, stale, and legacy/unknown locks. `clear_stale_lock` clears only metadata locks deemed stale. `RecoveryState` may also exist, but acknowledgment does not repair refs/files. |
 | Safety behavior | A host must distinguish an active operation from a stale lock. Clearing a lock should be a guarded recovery action, not a blind retry loop or automatic delete. |
 | Edge cases | A crash can leave both recovery metadata and an operation lock. Multiple host instances may race on the same workspace. Lock metadata needs owner, PID/process identity, timestamp, and enough context to decide stale vs active. |
+| Tests | `clear_stale_lock_removes_only_stale_metadata_lock`. |
 | Gap | Need integrated repair that coordinates lock and recovery state together. |
 
 ## Edge and error scenarios

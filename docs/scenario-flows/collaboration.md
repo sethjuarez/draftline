@@ -34,11 +34,12 @@ sequenceDiagram
 
 | Question | Answer |
 |---|---|
-| Covered today? | Partially covered. |
+| Covered today? | Covered for the current variation. |
 | Correct primitive path | `changes` -> `preflight_publish` -> `publish`, or legacy `publish_changes` / `publish_changes_with_options`. |
-| Safety behavior | `publish_changes` fetches first, checks `sync_status`, and refuses incoming or diverged remote state. Tokenized `publish` also rejects changed local state or changed remote-tracking OID/absence after preflight. Draftline does not force-push. |
-| Edge cases | The library enforces a clean workspace before publish even though push itself does not write local files. `NoRemoteVersion` publishes the current variation as a new remote branch. Authentication is supplied by the host through `RemoteOptions`. `SyncNeedsMerge` can wrap either `IncomingAvailable` or `NeedsMerge`; hosts must inspect `SyncStatus.state` before deciding whether to apply incoming work or start merge. A remote branch can still be deleted, recreated, or rewound after the final fetch but before the normal push refspec reaches the server. |
-| Gap | Need explicit lease/create-only push mechanics and result types for remote branch disappeared, branch recreated, first-publish race, and remote rewind between final fetch and push. |
+| Safety behavior | `publish_changes` fetches first, checks `sync_status`, and refuses incoming or diverged remote state. Tokenized `publish` also rejects changed local state or changed remote-tracking OID/absence after preflight, and uses push expectations so create/update races surface as remote races instead of overwrites. Draftline does not force-push for normal publish. |
+| Edge cases | The library enforces a clean workspace before publish even though push itself does not write local files. `NoRemoteVersion` publishes the current variation as a new remote branch. Authentication is supplied by the host through `RemoteOptions`. `SyncNeedsMerge` can wrap either `IncomingAvailable` or `NeedsMerge`; hosts must inspect `SyncStatus.state` before deciding whether to apply incoming work or start merge. |
+| Tests | `scenario_flow_10_11_12_collaboration_fast_forward_and_clean_merge`, `scenario_flow_1c_11a_11b_remote_bootstrap_variation_diagnostics_and_adoption`, and `tauri_contract_smokes_publish_current_variation`. |
+| Gap | Broader product result copy for branch disappeared, branch recreated, first-publish race, and remote rewind remains future UX work. |
 
 ## Flow 11: receive teammate updates
 
@@ -85,9 +86,10 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | `remote_variations` lists fetched remote-tracking variations, and `adopt_remote_variation` creates a local variation from one. `fetch_remote` and `sync_status` still operate on the current variation. |
+| Current support | `fetch_all_variations` fetches and prunes visible remote variation refs. `remote_variations` lists fetched remote-tracking variations, `remote_variation_diagnostics` reports shared/local-only/remote-only variation sets, and `adopt_remote_variation` creates a local variation from one. `fetch_remote` and `sync_status` still operate on the current variation. |
 | Safety behavior | Draftline avoids surprising local branch creation; adoption is an explicit call. |
-| Gap | Need `fetch_all_variations` or equivalent broad fetch support, plus stale/prune diagnostics for renamed or deleted remote variations. |
+| Tests | `scenario_flow_1c_11a_11b_remote_bootstrap_variation_diagnostics_and_adoption` and `remote_variations_can_be_discovered_and_adopted_locally`. |
+| Gap | Tokenized adoption and richer product copy remain future work. |
 
 ## Flow 11b: remote variation was deleted or renamed
 
@@ -105,10 +107,11 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Not covered as a business scenario. |
-| Current support | Missing remote refs can be ignored during fetch. `remote_variations` can show fetched remote-tracking refs, but current APIs do not yet expose prune/stale lifecycle diagnostics. |
+| Covered today? | Partially covered. |
+| Current support | `fetch_all_variations` fetches and prunes remote-tracking variation refs. `remote_variation_diagnostics` reports local-only variations after remote deletion and remote-only variations after teammate publication. |
 | Safety behavior | Draftline does not delete local variations automatically. |
-| Gap | Need prune semantics, stale-ref diagnostics, and user-facing "remote option removed" guidance. |
+| Tests | `scenario_flow_1c_11a_11b_remote_bootstrap_variation_diagnostics_and_adoption` and `remote_variation_diagnostics_reports_local_and_remote_only_variations_after_prune`. |
+| Gap | Rename inference and user-facing "remote option removed or renamed" guidance remain future work. |
 
 ## Flow 11c: change or remove remote destination
 
@@ -131,6 +134,7 @@ flowchart TD
 | Covered today? | Partially covered. |
 | Current support | `add_remote` creates a remote or updates the URL of an existing one. `remotes` lists configured endpoints. |
 | Safety behavior | Draftline does not push until `publish_changes`, but updating an existing remote URL is currently silent. |
+| Tests | `tauri_contract_smokes_publish_current_variation` covers add-and-publish; no executable remove-remote flow exists. |
 | Gap | Need remote update preflight/confirmation and remove-remote APIs. |
 
 ## Flow 12: reconcile teammate changes
@@ -159,4 +163,5 @@ flowchart TD
 | Covered today? | Partially covered. |
 | Current support | `sync_status` detects `NeedsMerge`; `SyncNeedsMerge` prevents unsafe publish/apply; `preflight_merge_incoming` reports the diverged state without mutating; `merge_incoming` writes a clean two-parent merged version through a preflight token; `MergeOutcome`, `MergeConflict`, `ResolverRegistry`, `PlainTextResolver`, and `MarkdownResolver` model conflict results. |
 | Safety behavior | Draftline blocks overwrite and routes the user into an explicit merge decision. Clean merge execution re-fetches, validates the tokenized local/remote/base OIDs, checks dirty work and target-tree hazards, uses the operation lock, and writes recovery state before moving files/refs. |
+| Tests | `scenario_flow_10_11_12_collaboration_fast_forward_and_clean_merge`, `scenario_flow_12_conflict_preflight_reports_without_mutating`, and `tauri_contract_smokes_collaboration_incoming_and_merge`. |
 | Gap | Need user-driven execution for unresolved conflicts, richer binary/large-file conflict UX, and host copy for choosing, editing, or combining conflicting content. |
