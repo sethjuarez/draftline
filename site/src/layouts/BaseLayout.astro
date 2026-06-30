@@ -1,0 +1,127 @@
+---
+import "../styles/global.css";
+
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="description" content={description} />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://draftline.dev" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="stylesheet" href="/diagram-lightbox.css" />
+    <title>{title}</title>
+    <script is:inline>
+      const savedTheme = localStorage.getItem("draftline-theme");
+      const preferredTheme = window.matchMedia("(prefers-color-scheme: light)").matches
+        ? "light"
+        : "dark";
+      document.documentElement.dataset.theme = savedTheme ?? preferredTheme;
+    </script>
+  </head>
+  <body>
+    <slot />
+    <script>
+      import mermaid from "mermaid";
+
+      const darkMermaid = {
+        background: "#020617",
+        mainBkg: "#111827",
+        primaryColor: "#1e1b4b",
+        primaryTextColor: "#f8fafc",
+        primaryBorderColor: "#06b6d4",
+        lineColor: "#94a3b8",
+        secondaryColor: "#312e81",
+        tertiaryColor: "#0f172a",
+        noteBkgColor: "#1e293b",
+        noteTextColor: "#f8fafc",
+        actorBkg: "#1e1b4b",
+        actorBorder: "#06b6d4",
+        actorTextColor: "#f8fafc",
+      };
+
+      const lightMermaid = {
+        background: "#f8fafc",
+        mainBkg: "#ffffff",
+        primaryColor: "#eef2ff",
+        primaryTextColor: "#0f172a",
+        primaryBorderColor: "#4f46e5",
+        lineColor: "#475569",
+        secondaryColor: "#f5f3ff",
+        tertiaryColor: "#e0f2fe",
+        noteBkgColor: "#ecfeff",
+        noteTextColor: "#0f172a",
+        actorBkg: "#eef2ff",
+        actorBorder: "#4f46e5",
+        actorTextColor: "#0f172a",
+      };
+
+      const currentTheme = () => document.documentElement.dataset.theme ?? "dark";
+      const mermaidVariables = () => (currentTheme() === "light" ? lightMermaid : darkMermaid);
+
+      mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: "strict",
+        theme: "base",
+        themeVariables: mermaidVariables(),
+      });
+
+      const syncThemeToggle = () => {
+        const button = document.querySelector("#theme-toggle");
+        const label = document.querySelector(".theme-toggle-label");
+        if (!button || !label) {
+          return;
+        }
+
+        const nextTheme = currentTheme() === "light" ? "dark" : "light";
+        label.textContent = `${nextTheme === "light" ? "Light" : "Dark"} mode`;
+        button.setAttribute("aria-label", `Switch to ${nextTheme} mode`);
+      };
+
+      const renderMermaid = () => {
+        mermaid.run({ querySelector: ".mermaid" });
+      };
+
+      const setupThemeToggle = () => {
+        const button = document.querySelector("#theme-toggle");
+        if (!button) {
+          return;
+        }
+
+        syncThemeToggle();
+        button.addEventListener("click", () => {
+          const nextTheme = currentTheme() === "light" ? "dark" : "light";
+          localStorage.setItem("draftline-theme", nextTheme);
+          document.documentElement.dataset.theme = nextTheme;
+          window.location.reload();
+        });
+      };
+
+      if (document.readyState === "loading") {
+        document.addEventListener(
+          "DOMContentLoaded",
+          () => {
+            setupThemeToggle();
+            renderMermaid();
+          },
+          { once: true },
+        );
+      } else {
+        setupThemeToggle();
+        renderMermaid();
+      }
+    </script>
+    <script src="/diagram-lightbox.js" defer></script>
+  </body>
+</html>

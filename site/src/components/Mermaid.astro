@@ -1,0 +1,13 @@
+---
+interface Props {
+  diagram: string;
+  title?: string;
+}
+
+const { diagram, title } = Astro.props;
+---
+
+<figure class="mermaid-card">
+  {title ? <figcaption>{title}</figcaption> : null}
+  <pre class="mermaid">{diagram}</pre>
+</figure>
