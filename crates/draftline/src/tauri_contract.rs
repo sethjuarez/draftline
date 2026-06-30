@@ -12,15 +12,16 @@ use crate::{
     merge::MergeConflict, AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult,
     ChangeSet, CleanupPlanId, ContentPolicy, ContentPolicyAudit, ContributorProfile,
     CurrentFileDiff, CurrentFilePreview, DirtySummary, DraftlineError, HistoryCleanupPreview,
-    HistoryCleanupRequest, HistoryCleanupUndoPreflight, HistoryCleanupUndoToken,
-    HistoryCompactionCandidates, HistoryCompactionCandidatesRequest, HistoryEntry,
-    MergeConflictResolution, MergeIncomingReport, MergeIncomingResult, MergeIncomingToken,
-    MergeResolutionChoice, OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight,
-    PublishResult, RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest,
-    RemoteEndpoint, RemoteOptions, RemoteVariation, RemoteVariationDiagnostics,
-    RestoreVersionTarget, Result, RewriteConfirmation, Shelf, ShelfApplyReport,
-    StaleVersionResolution, StaleVersionResolutionRequest, SupportRef, SupportRefScope,
-    SwitchPolicy, SyncState, SyncStatus, TimelineCleanupResult, Variation,
+    HistoryCleanupPublishPreflight, HistoryCleanupPublishResult, HistoryCleanupPublishToken,
+    HistoryCleanupRemoteImpact, HistoryCleanupRequest, HistoryCleanupUndoPreflight,
+    HistoryCleanupUndoToken, HistoryCompactionCandidates, HistoryCompactionCandidatesRequest,
+    HistoryEntry, MergeConflictResolution, MergeIncomingReport, MergeIncomingResult,
+    MergeIncomingToken, MergeResolutionChoice, OperationLockInspection, PreflightReport,
+    PreviewFile, PublishPreflight, PublishResult, RecoveryRepairResult, RecoveryState,
+    RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVariation,
+    RemoteVariationDiagnostics, RestoreVersionTarget, Result, RewriteConfirmation, Shelf,
+    ShelfApplyReport, StaleVersionResolution, StaleVersionResolutionRequest, SupportRef,
+    SupportRefScope, SwitchPolicy, SyncState, SyncStatus, TimelineCleanupResult, Variation,
     VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
     VariationRenamePreflight, VariationRenameToken, VariationSummary, Version, VersionDiff,
     VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
@@ -363,6 +364,30 @@ pub struct HistoryCompactionCandidatesCommandRequest {
 pub struct ApplyHistoryCleanupRequest {
     pub workspace_path: PathBuf,
     pub plan_id: String,
+    pub confirmation: RewriteConfirmation,
+}
+
+/// Request for preflighting cleanup remote impact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCleanupRemoteImpactRequest {
+    pub workspace_path: PathBuf,
+    pub plan_id: String,
+    pub remote: String,
+}
+
+/// Request for explicitly preflighting cleanup rewrite publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishHistoryCleanupPreflightRequest {
+    pub workspace_path: PathBuf,
+    pub plan_id: String,
+    pub remote: String,
+}
+
+/// Request for explicitly publishing a cleanup rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishHistoryCleanupRequest {
+    pub workspace_path: PathBuf,
+    pub token: HistoryCleanupPublishToken,
     pub confirmation: RewriteConfirmation,
 }
 
@@ -1151,6 +1176,66 @@ pub fn apply_history_cleanup_with_context(
     let workspace = context.open_workspace(&request.workspace_path)?;
     let plan_id = CleanupPlanId::from_string(request.plan_id)?;
     let result = workspace.apply_history_cleanup(plan_id, request.confirmation)?;
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(result)
+}
+
+/// Preflights origin-aware cleanup impact for a prepared plan.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preflight_history_cleanup_remote_impact(
+    request: HistoryCleanupRemoteImpactRequest,
+) -> Result<HistoryCleanupRemoteImpact> {
+    preflight_history_cleanup_remote_impact_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Preflights origin-aware cleanup impact using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preflight_history_cleanup_remote_impact_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: HistoryCleanupRemoteImpactRequest,
+) -> Result<HistoryCleanupRemoteImpact> {
+    let plan_id = CleanupPlanId::from_string(request.plan_id)?;
+    context
+        .open_workspace(&request.workspace_path)?
+        .preflight_history_cleanup_remote_impact(plan_id, request.remote)
+}
+
+/// Preflights explicit publication of an applied cleanup rewrite.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preflight_publish_history_cleanup(
+    request: PublishHistoryCleanupPreflightRequest,
+) -> Result<HistoryCleanupPublishPreflight> {
+    preflight_publish_history_cleanup_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Preflights explicit cleanup publication using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preflight_publish_history_cleanup_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: PublishHistoryCleanupPreflightRequest,
+) -> Result<HistoryCleanupPublishPreflight> {
+    let plan_id = CleanupPlanId::from_string(request.plan_id)?;
+    context
+        .open_workspace(&request.workspace_path)?
+        .preflight_publish_history_cleanup(plan_id, request.remote)
+}
+
+/// Publishes an applied cleanup rewrite after explicit confirmation.
+#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn publish_history_cleanup(
+    request: PublishHistoryCleanupRequest,
+) -> Result<HistoryCleanupPublishResult> {
+    publish_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Publishes an applied cleanup rewrite using a configured host context.
+#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn publish_history_cleanup_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: PublishHistoryCleanupRequest,
+) -> Result<HistoryCleanupPublishResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let result = workspace.publish_history_cleanup(request.token, request.confirmation)?;
     context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
     Ok(result)
 }

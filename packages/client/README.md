@@ -37,8 +37,9 @@ await client.mergeIncomingWithResolutions({
 For host code, `createDraftlineHostFacade` binds a client to one workspace path
 and exposes product-level operations such as `save`, `selectedSave`,
 `diffWorkspaceFile`, `previewWorkspaceFile`, `fetchRemote`, `mergeIncoming`,
-`mergeIncomingWithResolutions`, recovery repair/rollback, and remote variation
-adoption without repeating request DTO plumbing in every component.
+`mergeIncomingWithResolutions`, history cleanup preview/apply/undo, recovery
+repair/rollback, and remote variation adoption without repeating request DTO
+plumbing in every component.
 
 ## Workspace graph integration
 
