@@ -202,6 +202,22 @@ describe('createDraftlineClient', () => {
       expected_current_head: versionId,
       restore_head: versionId,
     };
+    const publishToken = {
+      plan_id: 'op-1',
+      remote: 'origin',
+      variation: 'main',
+      expected_remote_oid: versionId,
+      replacement_oid: versionId,
+      support_ref_token: {
+        remote: 'origin',
+        refs: [
+          {
+            ref_name: 'refs/draftline/rewrites/squash/main/op-1',
+            target_oid: versionId,
+          },
+        ],
+      },
+    };
 
     await client.getChanges('C:\\repo');
     await client.getHistory('C:\\repo');
@@ -210,6 +226,21 @@ describe('createDraftlineClient', () => {
     await client.applyHistoryCleanup({
       workspace_path: 'C:\\repo',
       plan_id: 'op-1',
+      confirmation: 'user_confirmed',
+    });
+    await client.preflightHistoryCleanupRemoteImpact({
+      workspace_path: 'C:\\repo',
+      plan_id: 'op-1',
+      remote: 'origin',
+    });
+    await client.preflightPublishHistoryCleanup({
+      workspace_path: 'C:\\repo',
+      plan_id: 'op-1',
+      remote: 'origin',
+    });
+    await client.publishHistoryCleanup({
+      workspace_path: 'C:\\repo',
+      token: publishToken,
       confirmation: 'user_confirmed',
     });
     await client.resolveRewrittenVersion(versionRequest);
@@ -338,6 +369,19 @@ describe('createDraftlineClient', () => {
       request: {
         workspace_path: 'C:\\repo',
         plan_id: 'op-1',
+        confirmation: 'user_confirmed',
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('preflight_history_cleanup_remote_impact', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'op-1', remote: 'origin' },
+    });
+    expect(invoke).toHaveBeenCalledWith('preflight_publish_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'op-1', remote: 'origin' },
+    });
+    expect(invoke).toHaveBeenCalledWith('publish_history_cleanup', {
+      request: {
+        workspace_path: 'C:\\repo',
+        token: publishToken,
         confirmation: 'user_confirmed',
       },
     });
@@ -515,6 +559,51 @@ describe('createDraftlineClient', () => {
     });
     const client = createDraftlineClient({ invoke });
     const facade = createDraftlineHostFacade({ client, workspacePath: 'C:\\repo' });
+    const versionId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const cleanup = {
+      target_variation: 'main',
+      base: { kind: 'auto' as const },
+      mode: {
+        kind: 'compact_milestones' as const,
+        milestones: [
+          {
+            title: 'Milestone',
+            description: 'Compacted noisy saves',
+            include_range: { start: versionId, end: versionId },
+          },
+        ],
+        preserve_named_branches: true,
+        preserve_merge_boundaries: true,
+      },
+      safety: {
+        create_backup_ref: true,
+        require_clean_worktree: true,
+      },
+      remote_policy: { kind: 'local_only' as const },
+    };
+    const cleanupToken = {
+      plan_id: 'op-1',
+      target_variation: 'main',
+      backup_ref: 'refs/draftline/backups/history-cleanup/main/op-1',
+      expected_current_head: versionId,
+      restore_head: versionId,
+    };
+    const publishToken = {
+      plan_id: 'op-1',
+      remote: 'origin',
+      variation: 'main',
+      expected_remote_oid: versionId,
+      replacement_oid: versionId,
+      support_ref_token: {
+        remote: 'origin',
+        refs: [
+          {
+            ref_name: 'refs/draftline/rewrites/squash/main/op-1',
+            target_oid: versionId,
+          },
+        ],
+      },
+    };
 
     await client.openWorkspace('C:\\repo');
     await client.cloneWorkspace({
@@ -547,6 +636,14 @@ describe('createDraftlineClient', () => {
     await facade.preflightRenameVariation('master', 'main');
     await facade.renameVariation('master', 'main', renameToken);
     await facade.save('Facade save');
+    await facade.previewHistoryCleanup(cleanup);
+    await facade.applyHistoryCleanup('op-1');
+    await facade.preflightHistoryCleanupRemoteImpact('op-1');
+    await facade.preflightPublishHistoryCleanup('op-1');
+    await facade.publishHistoryCleanup(publishToken);
+    await facade.resolveRewrittenVersion(versionId);
+    await facade.preflightUndoHistoryCleanup('op-1');
+    await facade.undoHistoryCleanup(cleanupToken);
 
     expect(invoke).toHaveBeenCalledWith('open_workspace', {
       request: { workspace_path: 'C:\\repo' },
@@ -608,6 +705,38 @@ describe('createDraftlineClient', () => {
     });
     expect(invoke).toHaveBeenCalledWith('save', {
       request: { workspace_path: 'C:\\repo', label: 'Facade save' },
+    });
+    expect(invoke).toHaveBeenCalledWith('preview_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', cleanup },
+    });
+    expect(invoke).toHaveBeenCalledWith('apply_history_cleanup', {
+      request: {
+        workspace_path: 'C:\\repo',
+        plan_id: 'op-1',
+        confirmation: 'user_confirmed',
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('preflight_history_cleanup_remote_impact', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'op-1', remote: 'origin' },
+    });
+    expect(invoke).toHaveBeenCalledWith('preflight_publish_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'op-1', remote: 'origin' },
+    });
+    expect(invoke).toHaveBeenCalledWith('publish_history_cleanup', {
+      request: {
+        workspace_path: 'C:\\repo',
+        token: publishToken,
+        confirmation: 'user_confirmed',
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('resolve_rewritten_version', {
+      request: { workspace_path: 'C:\\repo', version_id: versionId },
+    });
+    expect(invoke).toHaveBeenCalledWith('preflight_undo_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'op-1' },
+    });
+    expect(invoke).toHaveBeenCalledWith('undo_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', token: cleanupToken },
     });
   });
 

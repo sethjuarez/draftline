@@ -15,20 +15,23 @@ use draftline::tauri_contract::{
     list_support_refs, list_variations, merge_conflict_view_model, merge_incoming,
     merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context, open_workspace,
     preflight_apply_incoming, preflight_apply_shelf, preflight_create_variation_from_version,
-    preflight_merge_incoming, preflight_rename_variation, preflight_switch_variation,
+    preflight_history_cleanup_remote_impact, preflight_merge_incoming,
+    preflight_publish_history_cleanup, preflight_rename_variation, preflight_switch_variation,
     preflight_undo_history_cleanup, preview_history_cleanup, preview_shelf, preview_version,
-    preview_version_file, preview_workspace_file, publish_current_variation, rename_variation,
-    resolve_rewritten_version, restore_version_as_new_save,
-    restore_version_as_new_save_to_variation, save, search_workspace_graph, selected_discard,
-    selected_save, selected_save_with_context, selected_shelve, switch_variation,
-    undo_history_cleanup, verify_workspace, whole_file_use_content_resolutions,
-    ApplyHistoryCleanupRequest, CloneWorkspaceRequest, ConflictContentSource,
-    CreateVariationFromVersionRequest, CurrentFileRequest, DiffVersionsRequest,
-    DraftlineCommandContext, DraftlineEventKind, GuardedCreateVariationFromVersionRequest,
+    preview_version_file, preview_workspace_file, publish_current_variation,
+    publish_history_cleanup, rename_variation, resolve_rewritten_version,
+    restore_version_as_new_save, restore_version_as_new_save_to_variation, save,
+    search_workspace_graph, selected_discard, selected_save, selected_save_with_context,
+    selected_shelve, switch_variation, undo_history_cleanup, verify_workspace,
+    whole_file_use_content_resolutions, ApplyHistoryCleanupRequest, CloneWorkspaceRequest,
+    ConflictContentSource, CreateVariationFromVersionRequest, CurrentFileRequest,
+    DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
+    GuardedCreateVariationFromVersionRequest, HistoryCleanupRemoteImpactRequest,
     HistoryCompactionCandidatesCommandRequest, ListSupportRefsRequest, MergeIncomingRequest,
     MergeIncomingWithResolutionsRequest, PreflightCreateVariationFromVersionRequest,
     PreviewHistoryCleanupRequest, PreviewVersionFileRequest, PublishCurrentVariationRequest,
-    RemoteRequest, RemoteVariationRequest, RenameVariationRequest, ResolveRewrittenVersionRequest,
+    PublishHistoryCleanupPreflightRequest, PublishHistoryCleanupRequest, RemoteRequest,
+    RemoteVariationRequest, RenameVariationRequest, ResolveRewrittenVersionRequest,
     RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
     SelectedShelveRequest, ShelfRequest, SwitchVariationRequest, TargetedRestoreVersionRequest,
     UndoHistoryCleanupPreflightRequest, UndoHistoryCleanupRequest, VersionRequest,
@@ -1139,6 +1142,7 @@ fn tauri_contract_smokes_history_cleanup_commands() {
         request: HistoryCompactionCandidatesRequest {
             target_variation: None,
             selected_version: v2.id().clone(),
+            remote: None,
             preserve_named_branches: true,
             preserve_merge_boundaries: true,
         },
@@ -1186,6 +1190,123 @@ fn tauri_contract_smokes_history_cleanup_commands() {
     })
     .unwrap();
     assert_eq!(undo_result.new_head, v3.id().clone());
+}
+
+#[test]
+fn tauri_contract_smokes_history_cleanup_remote_publish_commands() {
+    let remote = tempfile::tempdir().unwrap();
+    init_bare_remote(remote.path());
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    workspace
+        .add_remote("origin", remote.path().to_string_lossy())
+        .unwrap();
+    write_file(workspace.root(), "post.md", b"v1");
+    workspace.save_version("v1").unwrap();
+    write_file(workspace.root(), "post.md", b"v2");
+    let v2 = workspace.save_version("noisy v2").unwrap();
+    write_file(workspace.root(), "post.md", b"v3");
+    let v3 = workspace.save_version("noisy v3").unwrap();
+    workspace.publish_changes("origin").unwrap();
+
+    let cleanup = HistoryCleanupRequest {
+        target_variation: None,
+        base: CleanupBase::Auto,
+        mode: CleanupMode::CompactMilestones {
+            milestones: vec![MilestoneSpec {
+                title: "Clean milestone".to_string(),
+                description: Some("Compacted noisy saves".to_string()),
+                include_range: CommitRange {
+                    start: v2.id().clone(),
+                    end: v3.id().clone(),
+                },
+            }],
+            preserve_named_branches: true,
+            preserve_merge_boundaries: true,
+        },
+        safety: CleanupSafety::default_user_facing(),
+        remote_policy: RemoteRewritePolicy::PushWithLease {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        },
+    };
+
+    let preview = preview_history_cleanup(PreviewHistoryCleanupRequest {
+        workspace_path: temp.path().to_path_buf(),
+        cleanup,
+    })
+    .unwrap();
+    let impact = preflight_history_cleanup_remote_impact(HistoryCleanupRemoteImpactRequest {
+        workspace_path: temp.path().to_path_buf(),
+        plan_id: preview.plan_id.to_string(),
+        remote: "origin".to_string(),
+    })
+    .unwrap();
+    assert_object_keys(
+        &serde_json::to_value(&impact).unwrap(),
+        &[],
+        &[
+            "descendants",
+            "local_head",
+            "publish_status",
+            "remote",
+            "replacement_head",
+            "selected",
+            "tracking_ref",
+            "upstream_head",
+            "variation",
+            "warnings",
+        ],
+    );
+
+    let result = apply_history_cleanup(ApplyHistoryCleanupRequest {
+        workspace_path: temp.path().to_path_buf(),
+        plan_id: preview.plan_id.to_string(),
+        confirmation: RewriteConfirmation::UserConfirmed,
+    })
+    .unwrap();
+    let preflight = preflight_publish_history_cleanup(PublishHistoryCleanupPreflightRequest {
+        workspace_path: temp.path().to_path_buf(),
+        plan_id: result.plan_id.to_string(),
+        remote: "origin".to_string(),
+    })
+    .unwrap();
+    assert_object_keys(
+        &serde_json::to_value(&preflight).unwrap(),
+        &[],
+        &[
+            "can_publish",
+            "expected_remote_oid",
+            "plan_id",
+            "remote",
+            "remote_impact",
+            "replacement_oid",
+            "support_refs",
+            "token",
+            "variation",
+        ],
+    );
+
+    let publish = publish_history_cleanup(PublishHistoryCleanupRequest {
+        workspace_path: temp.path().to_path_buf(),
+        token: preflight.token.unwrap(),
+        confirmation: RewriteConfirmation::UserConfirmed,
+    })
+    .unwrap();
+    assert_object_keys(
+        &serde_json::to_value(&publish).unwrap(),
+        &[],
+        &[
+            "expected_remote_oid",
+            "plan_id",
+            "ref_updates",
+            "remote",
+            "replacement_oid",
+            "support_refs",
+            "variation",
+        ],
+    );
 }
 
 #[test]

@@ -1455,6 +1455,8 @@ pub struct CommitRange {
 pub struct HistoryCompactionCandidatesRequest {
     pub target_variation: Option<VariationId>,
     pub selected_version: VersionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
     pub preserve_named_branches: bool,
     pub preserve_merge_boundaries: bool,
 }
@@ -1478,6 +1480,8 @@ pub struct HistoryCompactionCandidate {
     pub requires_descendant_replay: bool,
     pub selected_commit_count: usize,
     pub descendant_rewrite_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_impact: Option<HistoryCleanupRemoteImpact>,
     pub blockers: Vec<CleanupWarning>,
     pub warnings: Vec<CleanupWarning>,
 }
@@ -1550,7 +1554,44 @@ pub struct HistoryCleanupPreview {
     pub graph_diff: CleanupGraphDiff,
     pub commit_map: Vec<CommitRewriteMap>,
     pub snapshot_map: Vec<SnapshotRewriteMap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_impact: Option<HistoryCleanupRemoteImpact>,
     pub warnings: Vec<CleanupWarning>,
+}
+
+/// Origin-aware safety classification for a cleanup range or preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCleanupRemoteImpact {
+    pub remote: Option<String>,
+    pub variation: VariationId,
+    pub tracking_ref: Option<RefName>,
+    pub upstream_head: Option<VersionId>,
+    pub local_head: VersionId,
+    pub replacement_head: Option<VersionId>,
+    pub selected: CleanupPublicationSummary,
+    pub descendants: CleanupPublicationSummary,
+    pub publish_status: CleanupPublishStatus,
+    pub warnings: Vec<CleanupWarning>,
+}
+
+/// Published/private counts for one cleanup commit set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupPublicationSummary {
+    pub published_count: usize,
+    pub private_count: usize,
+    pub published_versions: Vec<VersionId>,
+    pub private_versions: Vec<VersionId>,
+}
+
+/// Host-facing publish guidance for a cleanup preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupPublishStatus {
+    NoUpstream,
+    LocalOnly,
+    NormalPublish,
+    SharedHistoryRewriteRequired,
+    RemoteHasIncoming,
 }
 
 /// One planned cleanup operation shown to product UI.
@@ -1670,6 +1711,46 @@ pub struct TimelineCleanupResult {
     pub commit_map: Vec<CommitMapEntry>,
     pub snapshot_map: Vec<SnapshotMapEntry>,
     pub warnings: Vec<CleanupWarning>,
+}
+
+/// Preflight for explicitly publishing an applied cleanup rewrite to a shared remote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct HistoryCleanupPublishPreflight {
+    pub plan_id: CleanupPlanId,
+    pub remote: String,
+    pub variation: VariationId,
+    pub expected_remote_oid: String,
+    pub replacement_oid: String,
+    pub remote_impact: HistoryCleanupRemoteImpact,
+    pub support_refs: Vec<SupportRef>,
+    pub token: Option<HistoryCleanupPublishToken>,
+    pub can_publish: bool,
+}
+
+/// Token tying cleanup publish to a preflighted local cleanup ledger and remote state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct HistoryCleanupPublishToken {
+    pub plan_id: CleanupPlanId,
+    pub remote: String,
+    pub variation: VariationId,
+    pub expected_remote_oid: String,
+    pub replacement_oid: String,
+    pub support_ref_token: SupportRefPublishToken,
+}
+
+/// Result of publishing a cleanup rewrite to a shared remote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct HistoryCleanupPublishResult {
+    pub plan_id: CleanupPlanId,
+    pub remote: String,
+    pub variation: VariationId,
+    pub expected_remote_oid: String,
+    pub replacement_oid: String,
+    pub support_refs: Vec<SupportRef>,
+    pub ref_updates: Vec<RefUpdate>,
 }
 
 /// One ref movement performed by cleanup.
@@ -3915,7 +3996,7 @@ impl Workspace {
 
         Ok(SupportRefRestorePreflight {
             support_ref,
-            target_variation,
+            target_variation: target_variation.clone(),
             token,
             can_restore: true,
         })
@@ -4886,6 +4967,14 @@ impl Workspace {
             .ok_or_else(|| DraftlineError::VersionNotLocallyReachable(selected_oid.to_string()))?;
         let local_tips = self.local_variation_tip_oids()?;
         let mut candidates = Vec::new();
+        let mut remote_options = RemoteOptions::new();
+        if let Some(remote) = request.remote.as_deref() {
+            self.fetch_remote_variation_ref(
+                remote,
+                target_variation.as_str(),
+                &mut remote_options,
+            )?;
+        }
 
         for (candidate_index, candidate_oid) in chain.iter().copied().enumerate() {
             if candidate_oid == selected_oid {
@@ -4982,6 +5071,14 @@ impl Workspace {
             }
 
             let candidate_commit = self.repo.find_commit(candidate_oid)?;
+            let remote_impact = self.cleanup_remote_impact_for_oids(
+                request.remote.as_deref(),
+                &target_variation,
+                target_head_oid,
+                None,
+                &range_oids,
+                &chain[..end_index],
+            )?;
             candidates.push(HistoryCompactionCandidate {
                 version: version_from_commit(&candidate_commit),
                 include_range: CommitRange {
@@ -4993,13 +5090,14 @@ impl Workspace {
                 requires_descendant_replay: descendant_rewrite_count > 0,
                 selected_commit_count: range_oids.len(),
                 descendant_rewrite_count,
+                remote_impact,
                 blockers,
                 warnings,
             });
         }
 
         Ok(HistoryCompactionCandidates {
-            target_variation,
+            target_variation: target_variation.clone(),
             selected_version: request.selected_version,
             target_head: VersionId::from(target_head_oid),
             candidates,
@@ -6473,6 +6571,14 @@ impl Workspace {
             preserve_named_branches,
             preserve_merge_boundaries,
         })?;
+        let remote_impact_remote =
+            if let RemoteRewritePolicy::PushWithLease { remote, branch } = &request.remote_policy {
+                let mut options = RemoteOptions::new();
+                self.fetch_remote_variation_ref(remote, branch, &mut options)?;
+                Some(remote.as_str())
+            } else {
+                None
+            };
         warnings.extend(planned.warnings);
 
         let preview_ref = RefName::from(format!(
@@ -6488,7 +6594,7 @@ impl Workspace {
 
         let preview = HistoryCleanupPreview {
             plan_id,
-            target_variation,
+            target_variation: target_variation.clone(),
             old_head: VersionId::from(old_head_oid),
             new_head: VersionId::from(planned.new_head_oid),
             preview_ref,
@@ -6509,6 +6615,30 @@ impl Workspace {
             },
             commit_map: planned.commit_map.clone(),
             snapshot_map: planned.snapshot_map.clone(),
+            remote_impact: self.cleanup_remote_impact_for_oids(
+                remote_impact_remote,
+                &target_variation,
+                old_head_oid,
+                Some(planned.new_head_oid),
+                &planned
+                    .commit_map
+                    .iter()
+                    .filter_map(|entry| {
+                        matches!(entry.disposition, RewriteDisposition::SquashedInto { .. })
+                            .then(|| oid_from_version(&entry.old).ok())
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>(),
+                &planned
+                    .commit_map
+                    .iter()
+                    .filter_map(|entry| {
+                        matches!(entry.disposition, RewriteDisposition::Preserved { .. })
+                            .then(|| oid_from_version(&entry.old).ok())
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>(),
+            )?,
             warnings,
         };
 
@@ -6624,6 +6754,196 @@ impl Workspace {
             completed: true,
         })?;
         Ok(result)
+    }
+
+    /// Reports origin-aware publish impact for a prepared cleanup plan.
+    pub fn preflight_history_cleanup_remote_impact(
+        &self,
+        plan_id: CleanupPlanId,
+        remote: impl AsRef<str>,
+    ) -> Result<HistoryCleanupRemoteImpact> {
+        self.ensure_no_pending_recovery()?;
+        let stored = self.read_history_cleanup_plan(&plan_id)?;
+        let remote = remote.as_ref().to_string();
+        let mut options = RemoteOptions::new();
+        self.fetch_remote_variation_ref(
+            &remote,
+            stored.preview.target_variation.as_str(),
+            &mut options,
+        )?;
+        self.cleanup_remote_impact_from_preview(&stored.preview, Some(remote.as_str()))
+    }
+
+    /// Preflights explicitly publishing an applied cleanup rewrite to a shared remote.
+    pub fn preflight_publish_history_cleanup(
+        &self,
+        plan_id: CleanupPlanId,
+        remote: impl AsRef<str>,
+    ) -> Result<HistoryCleanupPublishPreflight> {
+        let mut options = RemoteOptions::new();
+        self.preflight_publish_history_cleanup_with_options(plan_id, remote, &mut options)
+    }
+
+    /// Preflights cleanup publish with explicit remote options.
+    pub fn preflight_publish_history_cleanup_with_options(
+        &self,
+        plan_id: CleanupPlanId,
+        remote: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<HistoryCleanupPublishPreflight> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref().to_string();
+        self.repo.find_remote(&remote)?;
+        let stored = self.read_history_cleanup_plan(&plan_id)?;
+        let ledger = self.read_history_cleanup_ledger(&plan_id)?;
+        let variation = stored.preview.target_variation.clone();
+        let branch_ref = format!("refs/heads/{}", variation.as_str());
+        let actual_local_oid = self.repo.refname_to_id(&branch_ref)?.to_string();
+        if actual_local_oid != ledger.new_head.as_str() {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{branch_ref}@{}", ledger.new_head),
+                actual: format!("{branch_ref}@{actual_local_oid}"),
+            });
+        }
+
+        self.fetch_remote_variation_ref(&remote, variation.as_str(), options)?;
+        let expected_remote_oid = remote_tracking_oid(&self.repo, &remote, variation.as_str())
+            .ok_or_else(|| DraftlineError::VersionNotFound(variation.as_str().to_string()))?;
+        let remote_impact =
+            self.cleanup_remote_impact_from_preview(&stored.preview, Some(&remote))?;
+        if remote_impact.publish_status == CleanupPublishStatus::RemoteHasIncoming {
+            return Err(DraftlineError::RemoteRace {
+                remote,
+                variation: variation.as_str().to_string(),
+                expected: Some(ledger.old_head.to_string()),
+                actual: Some(expected_remote_oid),
+            });
+        }
+
+        let support_ref = archive_ref("rewrites/squash", variation.as_str(), plan_id.as_str());
+        self.ensure_archive_ref(
+            &support_ref,
+            Oid::from_str(&expected_remote_oid)?,
+            "backup before publishing history cleanup rewrite",
+        )?;
+        let support_ref_preflight =
+            self.preflight_publish_support_refs_with_options(&remote, options)?;
+        let support_refs = self
+            .list_local_support_refs()?
+            .into_iter()
+            .filter(|support_ref| {
+                support_ref.kind == SupportRefKind::Rewrite
+                    && support_ref.source_variation.as_deref() == Some(variation.as_str())
+                    && support_ref.target_oid == expected_remote_oid
+            })
+            .collect::<Vec<_>>();
+        let can_publish = !support_refs.is_empty()
+            && remote_impact.publish_status == CleanupPublishStatus::SharedHistoryRewriteRequired;
+        let token = can_publish.then(|| HistoryCleanupPublishToken {
+            plan_id: plan_id.clone(),
+            remote: remote.clone(),
+            variation: variation.clone(),
+            expected_remote_oid: expected_remote_oid.clone(),
+            replacement_oid: ledger.new_head.to_string(),
+            support_ref_token: support_ref_preflight.token,
+        });
+
+        Ok(HistoryCleanupPublishPreflight {
+            plan_id,
+            remote,
+            variation,
+            expected_remote_oid,
+            replacement_oid: ledger.new_head.to_string(),
+            remote_impact,
+            support_refs,
+            token,
+            can_publish,
+        })
+    }
+
+    /// Publishes an applied cleanup rewrite after explicit shared-history confirmation.
+    pub fn publish_history_cleanup(
+        &self,
+        token: HistoryCleanupPublishToken,
+        confirmation: RewriteConfirmation,
+    ) -> Result<HistoryCleanupPublishResult> {
+        let mut options = RemoteOptions::new();
+        self.publish_history_cleanup_with_options(token, confirmation, &mut options)
+    }
+
+    /// Publishes an applied cleanup rewrite with explicit remote options.
+    pub fn publish_history_cleanup_with_options(
+        &self,
+        token: HistoryCleanupPublishToken,
+        _confirmation: RewriteConfirmation,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<HistoryCleanupPublishResult> {
+        self.ensure_no_pending_recovery()?;
+        let ledger = self.read_history_cleanup_ledger(&token.plan_id)?;
+        let branch_ref = format!("refs/heads/{}", token.variation.as_str());
+        let local_oid = self.repo.refname_to_id(&branch_ref)?.to_string();
+        if local_oid != token.replacement_oid || ledger.new_head.as_str() != token.replacement_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{branch_ref}@{}", token.replacement_oid),
+                actual: format!("{branch_ref}@{local_oid}"),
+            });
+        }
+
+        self.publish_support_refs_with_options(token.support_ref_token.clone(), options)?;
+        self.fetch_remote_variation_ref(&token.remote, token.variation.as_str(), options)?;
+        let actual_remote_oid =
+            remote_tracking_oid(&self.repo, &token.remote, token.variation.as_str());
+        if actual_remote_oid.as_deref() != Some(token.expected_remote_oid.as_str()) {
+            return Err(DraftlineError::RemoteRace {
+                remote: token.remote,
+                variation: token.variation.as_str().to_string(),
+                expected: Some(token.expected_remote_oid),
+                actual: actual_remote_oid,
+            });
+        }
+
+        self.push_refspec(
+            &token.remote,
+            &format!(
+                "+refs/heads/{}:refs/heads/{}",
+                token.variation.as_str(),
+                token.variation.as_str()
+            ),
+            vec![PushRefExpectation {
+                dst_refname: format!("refs/heads/{}", token.variation.as_str()),
+                expected_old_oid: Some(token.expected_remote_oid.clone()),
+                expected_new_oid: Some(token.replacement_oid.clone()),
+            }],
+            options,
+        )?;
+
+        let support_refs = token
+            .support_ref_token
+            .refs
+            .into_iter()
+            .map(|item| SupportRef {
+                id: item.ref_name.clone(),
+                ref_name: item.ref_name,
+                kind: SupportRefKind::Rewrite,
+                source_variation: Some(token.variation.as_str().to_string()),
+                target_oid: item.target_oid,
+                scope: SupportRefScope::Local,
+            })
+            .collect::<Vec<_>>();
+
+        Ok(HistoryCleanupPublishResult {
+            plan_id: token.plan_id,
+            remote: token.remote,
+            variation: token.variation,
+            expected_remote_oid: token.expected_remote_oid.clone(),
+            replacement_oid: token.replacement_oid.clone(),
+            support_refs,
+            ref_updates: vec![RefUpdate {
+                name: RefName::from(branch_ref),
+                old: Some(VersionId::from_canonical_string(token.expected_remote_oid)?),
+                new: Some(VersionId::from_canonical_string(token.replacement_oid)?),
+            }],
+        })
     }
 
     /// Resolves an old version ID through applied cleanup ledgers and support refs.
@@ -8366,6 +8686,157 @@ impl Workspace {
 
         oids.reverse();
         Ok(oids)
+    }
+
+    fn cleanup_remote_impact_from_preview(
+        &self,
+        preview: &HistoryCleanupPreview,
+        remote: Option<&str>,
+    ) -> Result<HistoryCleanupRemoteImpact> {
+        let selected = preview
+            .commit_map
+            .iter()
+            .filter_map(|entry| {
+                matches!(entry.disposition, RewriteDisposition::SquashedInto { .. })
+                    .then(|| oid_from_version(&entry.old).ok())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        let descendants = preview
+            .commit_map
+            .iter()
+            .filter_map(|entry| {
+                matches!(entry.disposition, RewriteDisposition::Preserved { .. })
+                    .then(|| oid_from_version(&entry.old).ok())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        self.cleanup_remote_impact_for_oids(
+            remote,
+            &preview.target_variation,
+            oid_from_version(&preview.old_head)?,
+            Some(oid_from_version(&preview.new_head)?),
+            &selected,
+            &descendants,
+        )
+        .and_then(|impact| {
+            impact.ok_or_else(|| {
+                DraftlineError::InvalidHistoryCleanup(
+                    "cleanup remote impact requires a remote".to_string(),
+                )
+            })
+        })
+    }
+
+    fn cleanup_remote_impact_for_oids(
+        &self,
+        remote: Option<&str>,
+        variation: &VariationId,
+        local_head_oid: Oid,
+        replacement_head_oid: Option<Oid>,
+        selected_oids: &[Oid],
+        descendant_oids: &[Oid],
+    ) -> Result<Option<HistoryCleanupRemoteImpact>> {
+        let Some(remote) = remote else {
+            return Ok(None);
+        };
+        let tracking_ref = RefName::from(format!("refs/remotes/{remote}/{}", variation.as_str()));
+        let upstream_head = remote_tracking_oid(&self.repo, remote, variation.as_str())
+            .map(VersionId::from_canonical_string)
+            .transpose()?;
+        let upstream_oid = upstream_head.as_ref().map(oid_from_version).transpose()?;
+        let selected = self.cleanup_publication_summary(upstream_oid, selected_oids)?;
+        let descendants = self.cleanup_publication_summary(upstream_oid, descendant_oids)?;
+        let publish_status = if let Some(upstream_oid) = upstream_oid {
+            if local_head_oid != upstream_oid
+                && !self
+                    .repo
+                    .graph_descendant_of(local_head_oid, upstream_oid)?
+            {
+                CleanupPublishStatus::RemoteHasIncoming
+            } else if selected.published_count > 0 || descendants.published_count > 0 {
+                CleanupPublishStatus::SharedHistoryRewriteRequired
+            } else {
+                CleanupPublishStatus::NormalPublish
+            }
+        } else {
+            CleanupPublishStatus::NoUpstream
+        };
+        let mut warnings = Vec::new();
+        match publish_status {
+            CleanupPublishStatus::NoUpstream => warnings.push(cleanup_warning(
+                CleanupWarningCode::LocalOnlyRewrite,
+                format!(
+                    "remote `{remote}` has no upstream variation `{}`",
+                    variation.as_str()
+                ),
+                Vec::new(),
+            )),
+            CleanupPublishStatus::NormalPublish => {}
+            CleanupPublishStatus::SharedHistoryRewriteRequired => warnings.push(cleanup_warning(
+                CleanupWarningCode::RemoteRewriteRequiresSeparatePublish,
+                "cleanup rewrites commits that are already reachable from the upstream remote"
+                    .to_string(),
+                selected
+                    .published_versions
+                    .iter()
+                    .chain(descendants.published_versions.iter())
+                    .cloned()
+                    .collect(),
+            )),
+            CleanupPublishStatus::RemoteHasIncoming => warnings.push(cleanup_warning(
+                CleanupWarningCode::TargetRefChangedSincePreview,
+                "upstream contains commits that are not in the local cleanup base".to_string(),
+                upstream_head.iter().cloned().collect(),
+            )),
+            CleanupPublishStatus::LocalOnly => {}
+        }
+
+        Ok(Some(HistoryCleanupRemoteImpact {
+            remote: Some(remote.to_string()),
+            variation: variation.clone(),
+            tracking_ref: Some(tracking_ref),
+            upstream_head,
+            local_head: VersionId::from(local_head_oid),
+            replacement_head: replacement_head_oid.map(VersionId::from),
+            selected,
+            descendants,
+            publish_status,
+            warnings,
+        }))
+    }
+
+    fn cleanup_publication_summary(
+        &self,
+        upstream_oid: Option<Oid>,
+        oids: &[Oid],
+    ) -> Result<CleanupPublicationSummary> {
+        let mut published_versions = Vec::new();
+        let mut private_versions = Vec::new();
+        for oid in oids {
+            let version = VersionId::from(*oid);
+            let published = upstream_oid
+                .map(|upstream| {
+                    if upstream == *oid {
+                        Ok(true)
+                    } else {
+                        self.repo.graph_descendant_of(upstream, *oid)
+                    }
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if published {
+                published_versions.push(version);
+            } else {
+                private_versions.push(version);
+            }
+        }
+        Ok(CleanupPublicationSummary {
+            published_count: published_versions.len(),
+            private_count: private_versions.len(),
+            published_versions,
+            private_versions,
+        })
     }
 
     fn history_cleanup_dir(&self) -> PathBuf {
@@ -15682,6 +16153,7 @@ mod tests {
             .history_compaction_candidates(HistoryCompactionCandidatesRequest {
                 target_variation: None,
                 selected_version: v2.id().clone(),
+                remote: None,
                 preserve_named_branches: true,
                 preserve_merge_boundaries: true,
             })
@@ -15707,6 +16179,256 @@ mod tests {
         assert!(v3_candidate.requires_descendant_replay);
         let candidate_json = serde_json::to_value(v3_candidate).unwrap();
         assert_eq!(candidate_json["version"]["id"], v3.id().as_str());
+    }
+
+    #[test]
+    fn history_compaction_candidates_supports_selected_range_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        workspace.save_version("v3").unwrap();
+        write_file(workspace.root(), "post.md", b"v4");
+        let v4 = workspace.save_version("v4").unwrap();
+        write_file(workspace.root(), "post.md", b"v5");
+        let v5 = workspace.save_version("v5").unwrap();
+
+        let candidates = workspace
+            .history_compaction_candidates(HistoryCompactionCandidatesRequest {
+                target_variation: None,
+                selected_version: v4.id().clone(),
+                remote: None,
+                preserve_named_branches: true,
+                preserve_merge_boundaries: true,
+            })
+            .unwrap();
+
+        let v2_candidate = candidates
+            .candidates
+            .iter()
+            .find(|candidate| candidate.version.id() == v2.id())
+            .unwrap();
+        assert_eq!(
+            v2_candidate.selected_role,
+            CompactionSelectionRole::RangeEnd
+        );
+        assert_eq!(v2_candidate.include_range.start, v2.id().clone());
+        assert_eq!(v2_candidate.include_range.end, v4.id().clone());
+        assert_eq!(v2_candidate.selected_commit_count, 3);
+        assert_eq!(v2_candidate.descendant_rewrite_count, 1);
+        assert!(v2_candidate.requires_descendant_replay);
+        assert!(v2_candidate.can_compact);
+        assert_eq!(candidates.target_head, v5.id().clone());
+    }
+
+    #[test]
+    fn history_compaction_candidates_reports_remote_impact_for_published_range() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        write_file(workspace.root(), "post.md", b"v4");
+        let v4 = workspace.save_version("v4").unwrap();
+        workspace.publish_changes("origin").unwrap();
+
+        let candidates = workspace
+            .history_compaction_candidates(HistoryCompactionCandidatesRequest {
+                target_variation: None,
+                selected_version: v2.id().clone(),
+                remote: Some("origin".to_string()),
+                preserve_named_branches: true,
+                preserve_merge_boundaries: true,
+            })
+            .unwrap();
+
+        let v3_candidate = candidates
+            .candidates
+            .iter()
+            .find(|candidate| candidate.version.id() == v3.id())
+            .unwrap();
+        let impact = v3_candidate.remote_impact.as_ref().unwrap();
+        assert_eq!(
+            impact.publish_status,
+            CleanupPublishStatus::SharedHistoryRewriteRequired
+        );
+        assert_eq!(impact.selected.published_count, 2);
+        assert_eq!(impact.descendants.published_count, 1);
+        assert_eq!(impact.upstream_head, Some(v4.id().clone()));
+    }
+
+    #[test]
+    fn history_cleanup_publish_replaces_remote_with_support_ref_and_lease() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        write_file(workspace.root(), "post.md", b"v4");
+        let original_remote_tip = workspace.save_version("v4").unwrap();
+        workspace.publish_changes("origin").unwrap();
+
+        let mut request = compact_cleanup_request(&v2, &v3);
+        request.remote_policy = RemoteRewritePolicy::PushWithLease {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        };
+        let preview = workspace.preview_history_cleanup(request).unwrap();
+        assert_eq!(
+            preview.remote_impact.as_ref().unwrap().publish_status,
+            CleanupPublishStatus::SharedHistoryRewriteRequired
+        );
+        let result = workspace
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+        let preflight = workspace
+            .preflight_publish_history_cleanup(result.plan_id.clone(), "origin")
+            .unwrap();
+        assert!(preflight.can_publish);
+        assert_eq!(
+            preflight.expected_remote_oid,
+            original_remote_tip.id().as_str()
+        );
+        assert_eq!(preflight.replacement_oid, result.new_head.as_str());
+        assert_eq!(preflight.support_refs.len(), 1);
+
+        let publish = workspace
+            .publish_history_cleanup(preflight.token.unwrap(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+        assert_eq!(publish.replacement_oid, result.new_head.as_str());
+
+        let bare = Repository::open_bare(remote.path()).unwrap();
+        assert_eq!(
+            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
+            result.new_head.as_str()
+        );
+        assert!(bare
+            .references_glob("refs/draftline/rewrites/squash/main/*")
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|reference| reference.target().map(|oid| oid.to_string())
+                == Some(original_remote_tip.id().as_str().to_string())));
+    }
+
+    #[test]
+    fn history_cleanup_publish_support_ref_targets_remote_tip_when_local_was_ahead() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        workspace.publish_changes("origin").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        write_file(workspace.root(), "post.md", b"v4");
+        let v4 = workspace.save_version("v4").unwrap();
+
+        let mut request = compact_cleanup_request(&v2, &v3);
+        request.remote_policy = RemoteRewritePolicy::PushWithLease {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        };
+        let preview = workspace.preview_history_cleanup(request).unwrap();
+        let result = workspace
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+
+        let preflight = workspace
+            .preflight_publish_history_cleanup(result.plan_id.clone(), "origin")
+            .unwrap();
+        assert!(preflight.can_publish);
+        assert_eq!(preflight.expected_remote_oid, v2.id().as_str());
+        assert_eq!(preflight.replacement_oid, result.new_head.as_str());
+        assert_eq!(preflight.support_refs[0].target_oid, v2.id().as_str());
+
+        workspace
+            .publish_history_cleanup(preflight.token.unwrap(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+        let bare = Repository::open_bare(remote.path()).unwrap();
+        assert_eq!(
+            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
+            result.new_head.as_str()
+        );
+        assert_ne!(result.new_head, v4.id().clone());
+    }
+
+    #[test]
+    fn history_cleanup_publish_refuses_remote_race_after_preflight() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        workspace.publish_changes("origin").unwrap();
+
+        let mut request = compact_cleanup_request(&v2, &v3);
+        request.remote_policy = RemoteRewritePolicy::PushWithLease {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        };
+        let preview = workspace.preview_history_cleanup(request).unwrap();
+        let result = workspace
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+        let preflight = workspace
+            .preflight_publish_history_cleanup(result.plan_id.clone(), "origin")
+            .unwrap();
+
+        let other = tempfile::tempdir().unwrap();
+        let other_workspace =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), other.path()).unwrap();
+        configure_identity(&other_workspace, "Maria", "maria@example.com");
+        write_file(other_workspace.root(), "post.md", b"remote race");
+        let raced_tip = other_workspace.save_version("Remote race").unwrap();
+        other_workspace.publish_changes("origin").unwrap();
+
+        let err = workspace
+            .publish_history_cleanup(preflight.token.unwrap(), RewriteConfirmation::UserConfirmed)
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::RemoteRace { .. }));
+        let bare = Repository::open_bare(remote.path()).unwrap();
+        assert_eq!(
+            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
+            raced_tip.id().as_str()
+        );
     }
 
     #[test]
