@@ -1828,6 +1828,18 @@ struct PlannedCompactCleanup {
     descendant_rewrite_count: usize,
 }
 
+struct RemoteRewriteIncoming {
+    support_ref: RefName,
+    old_remote_oid: Oid,
+    replacement_oid: Oid,
+    replay_oids: Vec<Oid>,
+}
+
+struct RemoteRewriteApplication {
+    target_oid: Oid,
+    ledger: TimelineCleanupResult,
+}
+
 struct CompactCleanupPlanInput<'a> {
     target_variation: &'a VariationId,
     old_head_oid: Oid,
@@ -5939,8 +5951,20 @@ impl Workspace {
                 sync_status.remote, sync_status.variation
             );
             let remote_oid = self.repo.refname_to_id(&remote_ref)?;
-            let remote_commit = self.repo.find_commit(remote_oid)?;
-            self.target_tree_hazards(&remote_commit.tree()?)?
+            let local_oid = self
+                .repo
+                .refname_to_id(&format!("refs/heads/{}", sync_status.variation))?;
+            let hazard_oid = self
+                .incoming_remote_rewrite(
+                    &sync_status.remote,
+                    &sync_status.variation,
+                    local_oid,
+                    remote_oid,
+                )?
+                .and_then(|rewrite| rewrite.replay_oids.last().copied())
+                .unwrap_or(remote_oid);
+            let hazard_commit = self.repo.find_commit(hazard_oid)?;
+            self.target_tree_hazards(&hazard_commit.tree()?)?
         } else {
             Vec::new()
         };
@@ -6265,6 +6289,7 @@ impl Workspace {
 
         let remote_name = remote.as_ref().to_string();
         self.fetch_remote_unchecked(&remote_name, options)?;
+        self.fetch_support_refs_with_options(&remote_name, options)?;
         let status = self.sync_status(&remote_name)?;
 
         match status.state {
@@ -6281,8 +6306,17 @@ impl Workspace {
         let variation = self.current_variation_unchecked()?;
         let remote_ref = format!("refs/remotes/{remote_name}/{variation}");
         let remote_oid = self.repo.refname_to_id(&remote_ref)?;
-        let remote_commit = self.repo.find_commit(remote_oid)?;
-        let file_hazards = self.target_tree_hazards(&remote_commit.tree()?)?;
+        let local_oid = self
+            .repo
+            .refname_to_id(&format!("refs/heads/{variation}"))?;
+        let incoming_rewrite =
+            self.incoming_remote_rewrite(&remote_name, &variation, local_oid, remote_oid)?;
+        let hazard_oid = incoming_rewrite
+            .as_ref()
+            .and_then(|rewrite| rewrite.replay_oids.last().copied())
+            .unwrap_or(remote_oid);
+        let hazard_commit = self.repo.find_commit(hazard_oid)?;
+        let file_hazards = self.target_tree_hazards(&hazard_commit.tree()?)?;
         if !file_hazards.is_empty() {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
                 "apply_incoming",
@@ -6298,22 +6332,33 @@ impl Workspace {
         let original_oid = self.repo.refname_to_id(&branch_ref).ok();
 
         let operation_id = new_operation_id();
+        let remote_rewrite_application = if let Some(rewrite) = incoming_rewrite.as_ref() {
+            Some(self.prepare_incoming_remote_rewrite(&variation, local_oid, rewrite)?)
+        } else {
+            None
+        };
+        let target_oid = remote_rewrite_application
+            .as_ref()
+            .map(|application| application.target_oid)
+            .unwrap_or(remote_oid);
+        let checkout_commit = self.repo.find_commit(target_oid)?;
+
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
             operation: RecoveryOperation::ApplyIncoming,
             original_variation: Some(variation.clone()),
-            target: Some(remote_oid.to_string()),
+            target: Some(target_oid.to_string()),
             completed: false,
         })?;
 
-        // Fast-forward the local branch ref.
+        // Fast-forward or rewrite the local branch ref to the incoming target.
         self.repo
-            .reference(&branch_ref, remote_oid, true, "apply_incoming fast-forward")?;
+            .reference(&branch_ref, target_oid, true, "apply_incoming")?;
 
         // Bring the working directory up to the new tree.  Roll back the ref if
         // checkout fails so the repo is not left with a moved branch and stale tree.
         if let Err(checkout_err) = self.repo.checkout_tree(
-            remote_commit.tree()?.as_object(),
+            checkout_commit.tree()?.as_object(),
             Some(CheckoutBuilder::new().force()),
         ) {
             if let Some(orig) = original_oid {
@@ -6326,12 +6371,15 @@ impl Workspace {
         }
 
         self.repo.set_head(&branch_ref)?;
+        if let Some(application) = remote_rewrite_application {
+            self.write_history_cleanup_ledger(&application.ledger)?;
+        }
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
             operation: RecoveryOperation::ApplyIncoming,
             original_variation: None,
-            target: Some(remote_oid.to_string()),
+            target: Some(target_oid.to_string()),
             completed: true,
         })?;
 
@@ -6993,17 +7041,43 @@ impl Workspace {
             }
         }
 
-        if let Some(support_ref) = self
+        let support_refs: Vec<_> = self
             .list_local_support_refs()?
             .into_iter()
             .chain(self.list_remote_tracking_support_refs()?)
-            .find(|support_ref| support_ref.target_oid == requested_oid.to_string())
-        {
+            .collect();
+
+        for support_ref in &support_refs {
+            let support_oid = Oid::from_str(&support_ref.target_oid)
+                .map_err(|_| DraftlineError::VersionNotFound(support_ref.target_oid.clone()))?;
+            if support_oid == requested_oid {
+                return Ok(StaleVersionResolution {
+                    requested: request.version.clone(),
+                    disposition: StaleVersionDisposition::BackedUp {
+                        backup_ref: RefName::from(support_ref.ref_name.clone()),
+                    },
+                });
+            }
+        }
+
+        let mut closest_backup_ref: Option<(usize, RefName)> = None;
+        for support_ref in support_refs {
+            let support_oid = Oid::from_str(&support_ref.target_oid)
+                .map_err(|_| DraftlineError::VersionNotFound(support_ref.target_oid.clone()))?;
+            if self.repo.graph_descendant_of(support_oid, requested_oid)? {
+                let distance = self.support_ref_distance_from(support_oid, requested_oid)?;
+                if closest_backup_ref
+                    .as_ref()
+                    .is_none_or(|(best_distance, _)| distance < *best_distance)
+                {
+                    closest_backup_ref = Some((distance, RefName::from(support_ref.ref_name)));
+                }
+            }
+        }
+        if let Some((_, backup_ref)) = closest_backup_ref {
             return Ok(StaleVersionResolution {
                 requested: request.version,
-                disposition: StaleVersionDisposition::BackedUp {
-                    backup_ref: RefName::from(support_ref.ref_name),
-                },
+                disposition: StaleVersionDisposition::BackedUp { backup_ref },
             });
         }
 
@@ -7011,6 +7085,18 @@ impl Workspace {
             requested: request.version,
             disposition: StaleVersionDisposition::Unknown,
         })
+    }
+
+    fn support_ref_distance_from(&self, descendant_oid: Oid, ancestor_oid: Oid) -> Result<usize> {
+        let mut walk = self.repo.revwalk()?;
+        walk.push(descendant_oid)?;
+        walk.hide(ancestor_oid)?;
+        let mut distance = 0;
+        for oid in walk {
+            oid?;
+            distance += 1;
+        }
+        Ok(distance)
     }
 
     /// Plans undoing an applied cleanup by restoring its generated backup ref.
@@ -7970,7 +8056,9 @@ impl Workspace {
     pub fn fetch_remote(&self, remote: impl AsRef<str>) -> Result<()> {
         self.ensure_no_pending_recovery()?;
         let mut options = RemoteOptions::new();
-        self.fetch_remote_unchecked(remote, &mut options)
+        let remote = remote.as_ref().to_string();
+        self.fetch_remote_unchecked(&remote, &mut options)?;
+        self.fetch_support_refs_with_options(&remote, &mut options)
     }
 
     /// Fetches remote version metadata with explicit remote options.
@@ -7980,7 +8068,9 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<()> {
         self.ensure_no_pending_recovery()?;
-        self.fetch_remote_unchecked(remote, options)
+        let remote = remote.as_ref().to_string();
+        self.fetch_remote_unchecked(&remote, options)?;
+        self.fetch_support_refs_with_options(&remote, options)
     }
 
     fn fetch_remote_unchecked(
@@ -8026,12 +8116,19 @@ impl Workspace {
         };
 
         let (ahead, behind) = self.repo.graph_ahead_behind(local, remote_oid)?;
-        let state = match (ahead, behind) {
+        let mut state = match (ahead, behind) {
             (0, 0) => SyncState::UpToDate,
             (_, 0) => SyncState::LocalAhead,
             (0, _) => SyncState::IncomingAvailable,
             _ => SyncState::NeedsMerge,
         };
+        if state == SyncState::NeedsMerge
+            && self
+                .incoming_remote_rewrite(&remote, &variation, local, remote_oid)?
+                .is_some()
+        {
+            state = SyncState::IncomingAvailable;
+        }
 
         Ok(SyncStatus {
             remote,
@@ -9271,6 +9368,142 @@ impl Workspace {
         })?;
 
         Ok(())
+    }
+
+    fn incoming_remote_rewrite(
+        &self,
+        remote: &str,
+        variation: &str,
+        local_oid: Oid,
+        replacement_oid: Oid,
+    ) -> Result<Option<RemoteRewriteIncoming>> {
+        let remote_prefix = format!("refs/remotes/{remote}/draftline/rewrites/squash/{variation}/");
+        'support_refs: for support_ref in self.list_remote_tracking_support_refs()? {
+            if support_ref.kind != SupportRefKind::Rewrite
+                || support_ref.source_variation.as_deref() != Some(variation)
+                || !support_ref.ref_name.starts_with(&remote_prefix)
+            {
+                continue;
+            }
+            let old_remote_oid = Oid::from_str(&support_ref.target_oid)
+                .map_err(|_| DraftlineError::VersionNotFound(support_ref.target_oid.clone()))?;
+            let Ok(old_remote_commit) = self.repo.find_commit(old_remote_oid) else {
+                continue;
+            };
+            let Ok(replacement_commit) = self.repo.find_commit(replacement_oid) else {
+                continue;
+            };
+            if old_remote_commit.tree_id() != replacement_commit.tree_id() {
+                continue;
+            }
+            let replay_oids = if old_remote_oid == local_oid {
+                Vec::new()
+            } else {
+                match self.first_parent_descendants_after(old_remote_oid, local_oid) {
+                    Ok(replay_oids) => replay_oids,
+                    Err(
+                        DraftlineError::HistoryCleanupBlocked(_)
+                        | DraftlineError::InvalidHistoryCleanup(_),
+                    ) => continue,
+                    Err(error) => return Err(error),
+                }
+            };
+            for old_oid in &replay_oids {
+                let old_commit = self.repo.find_commit(*old_oid)?;
+                if old_commit.parent_count() > 1 {
+                    continue 'support_refs;
+                }
+            }
+            return Ok(Some(RemoteRewriteIncoming {
+                support_ref: RefName::from(support_ref.ref_name),
+                old_remote_oid,
+                replacement_oid,
+                replay_oids,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn prepare_incoming_remote_rewrite(
+        &self,
+        variation: &str,
+        local_oid: Oid,
+        rewrite: &RemoteRewriteIncoming,
+    ) -> Result<RemoteRewriteApplication> {
+        let plan_id = CleanupPlanId::from_string(
+            rewrite
+                .support_ref
+                .as_str()
+                .rsplit('/')
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .map(ToString::to_string)
+                .unwrap_or_else(new_operation_id),
+        )?;
+        let mut commit_map = vec![CommitRewriteMap {
+            old: VersionId::from(rewrite.old_remote_oid),
+            new: Some(VersionId::from(rewrite.replacement_oid)),
+            disposition: RewriteDisposition::Preserved {
+                new_id: VersionId::from(rewrite.replacement_oid),
+            },
+        }];
+        let mut parent_oid = rewrite.replacement_oid;
+
+        if !rewrite.replay_oids.is_empty() {
+            for old_oid in &rewrite.replay_oids {
+                let old_commit = self.repo.find_commit(*old_oid)?;
+                let parent_commit = self.repo.find_commit(parent_oid)?;
+                let tree = old_commit.tree()?;
+                let author = old_commit.author();
+                let committer = old_commit.committer();
+                let message = old_commit.message().unwrap_or_default();
+                let new_oid = self.repo.commit(
+                    None,
+                    &author,
+                    &committer,
+                    message,
+                    &tree,
+                    &[&parent_commit],
+                )?;
+                commit_map.push(CommitRewriteMap {
+                    old: VersionId::from(*old_oid),
+                    new: Some(VersionId::from(new_oid)),
+                    disposition: RewriteDisposition::Preserved {
+                        new_id: VersionId::from(new_oid),
+                    },
+                });
+                parent_oid = new_oid;
+            }
+        }
+
+        let ref_updates = vec![RefUpdate {
+            name: RefName::from(format!("refs/heads/{variation}")),
+            old: Some(VersionId::from(local_oid)),
+            new: Some(VersionId::from(parent_oid)),
+        }];
+        let snapshot_map = commit_map
+            .iter()
+            .map(|entry| SnapshotRewriteMap {
+                old: entry.old.clone(),
+                new: entry.new.clone(),
+                disposition: entry.disposition.clone(),
+            })
+            .collect();
+        let ledger = TimelineCleanupResult {
+            plan_id,
+            old_head: VersionId::from(local_oid),
+            new_head: VersionId::from(parent_oid),
+            backup_refs: vec![rewrite.support_ref.clone()],
+            ref_updates,
+            commit_map,
+            snapshot_map,
+            warnings: Vec::new(),
+        };
+
+        Ok(RemoteRewriteApplication {
+            target_oid: parent_oid,
+            ledger,
+        })
     }
 
     fn incoming_versions(&self, local: Oid, remote: Oid) -> Result<Vec<RemoteVersionSummary>> {
@@ -16429,6 +16662,207 @@ mod tests {
             bare.refname_to_id("refs/heads/main").unwrap().to_string(),
             raced_tip.id().as_str()
         );
+    }
+
+    #[test]
+    fn apply_incoming_accepts_published_remote_compaction_when_clean() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+        let author_dir = tempfile::tempdir().unwrap();
+        let author = Workspace::init(author_dir.path()).unwrap();
+        configure_identity(&author, "Seth", "seth@example.com");
+        author
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(author.root(), "post.md", b"v1");
+        author.save_version("v1").unwrap();
+        write_file(author.root(), "post.md", b"v2");
+        let v2 = author.save_version("v2").unwrap();
+        write_file(author.root(), "post.md", b"v3");
+        let old_remote_tip = author.save_version("v3").unwrap();
+        author.publish_changes("origin").unwrap();
+
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), peer_dir.path()).unwrap();
+        configure_identity(&peer, "Maria", "maria@example.com");
+
+        let mut request = compact_cleanup_request(&v2, &old_remote_tip);
+        request.remote_policy = RemoteRewritePolicy::PushWithLease {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        };
+        let preview = author.preview_history_cleanup(request).unwrap();
+        let cleanup = author
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+        let publish = author
+            .preflight_publish_history_cleanup(cleanup.plan_id.clone(), "origin")
+            .unwrap();
+        author
+            .publish_history_cleanup(publish.token.unwrap(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+
+        peer.fetch_remote("origin").unwrap();
+        let status = peer.sync_status("origin").unwrap();
+        assert_eq!(status.state, SyncState::IncomingAvailable);
+        let report = peer.preflight_apply_incoming("origin").unwrap();
+        assert!(report.can_proceed);
+
+        let mut options = RemoteOptions::new();
+        peer.apply_incoming("origin", &mut options).unwrap();
+        let peer_head = peer.repo.head().unwrap().peel_to_commit().unwrap().id();
+        assert_eq!(peer_head.to_string(), cleanup.new_head.as_str());
+        let resolution = peer
+            .resolve_rewritten_version(StaleVersionResolutionRequest {
+                version: v2.id().clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            resolution.disposition,
+            StaleVersionDisposition::BackedUp { .. }
+        ));
+    }
+
+    #[test]
+    fn apply_incoming_replays_local_snapshots_after_published_remote_compaction() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+        let author_dir = tempfile::tempdir().unwrap();
+        let author = Workspace::init(author_dir.path()).unwrap();
+        configure_identity(&author, "Seth", "seth@example.com");
+        author
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(author.root(), "post.md", b"v1");
+        author.save_version("v1").unwrap();
+        write_file(author.root(), "post.md", b"v2");
+        let v2 = author.save_version("v2").unwrap();
+        write_file(author.root(), "post.md", b"v3");
+        let old_remote_tip = author.save_version("v3").unwrap();
+        author.publish_changes("origin").unwrap();
+
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), peer_dir.path()).unwrap();
+        configure_identity(&peer, "Maria", "maria@example.com");
+        write_file(peer.root(), "post.md", b"v4 local");
+        let local_tip = peer.save_version("v4 local").unwrap();
+
+        let mut request = compact_cleanup_request(&v2, &old_remote_tip);
+        request.remote_policy = RemoteRewritePolicy::PushWithLease {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        };
+        let preview = author.preview_history_cleanup(request).unwrap();
+        let cleanup = author
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+        let publish = author
+            .preflight_publish_history_cleanup(cleanup.plan_id.clone(), "origin")
+            .unwrap();
+        author
+            .publish_history_cleanup(publish.token.unwrap(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+
+        let mut options = RemoteOptions::new();
+        let result = peer.apply_incoming("origin", &mut options).unwrap();
+        assert!(result.applied_count > 0);
+        let peer_head = peer.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_ne!(peer_head.id().to_string(), local_tip.id().as_str());
+        assert_eq!(
+            peer_head.parent(0).unwrap().id().to_string(),
+            cleanup.new_head.as_str()
+        );
+        assert_eq!(
+            std::fs::read_to_string(peer.root().join("post.md")).unwrap(),
+            "v4 local"
+        );
+        assert_eq!(
+            peer.sync_status("origin").unwrap().state,
+            SyncState::LocalAhead
+        );
+    }
+
+    #[test]
+    fn remote_compaction_with_non_first_parent_local_work_stays_needs_merge() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+        let author_dir = tempfile::tempdir().unwrap();
+        let author = Workspace::init(author_dir.path()).unwrap();
+        configure_identity(&author, "Seth", "seth@example.com");
+        author
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(author.root(), "post.md", b"v1");
+        let v1 = author.save_version("v1").unwrap();
+        write_file(author.root(), "post.md", b"v2");
+        let v2 = author.save_version("v2").unwrap();
+        write_file(author.root(), "post.md", b"v3");
+        let old_remote_tip = author.save_version("v3").unwrap();
+        author.publish_changes("origin").unwrap();
+
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), peer_dir.path()).unwrap();
+        configure_identity(&peer, "Maria", "maria@example.com");
+        let signature = peer.workspace_signature().unwrap();
+        let v1_commit = peer.find_version_commit(v1.id()).unwrap();
+        let side_tree = v1_commit.tree().unwrap();
+        let side_oid = peer
+            .repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "side local",
+                &side_tree,
+                &[&v1_commit],
+            )
+            .unwrap();
+        let side_commit = peer.repo.find_commit(side_oid).unwrap();
+        let old_remote_commit = peer.find_version_commit(old_remote_tip.id()).unwrap();
+        let merge_tree = side_commit.tree().unwrap();
+        let merge_oid = peer
+            .repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "local merge",
+                &merge_tree,
+                &[&side_commit, &old_remote_commit],
+            )
+            .unwrap();
+        peer.repo
+            .reference("refs/heads/main", merge_oid, true, "test local merge")
+            .unwrap();
+        peer.repo.set_head("refs/heads/main").unwrap();
+        peer.repo
+            .checkout_head(Some(CheckoutBuilder::new().force()))
+            .unwrap();
+
+        let mut request = compact_cleanup_request(&v2, &old_remote_tip);
+        request.remote_policy = RemoteRewritePolicy::PushWithLease {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        };
+        let preview = author.preview_history_cleanup(request).unwrap();
+        let cleanup = author
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+        let publish = author
+            .preflight_publish_history_cleanup(cleanup.plan_id.clone(), "origin")
+            .unwrap();
+        author
+            .publish_history_cleanup(publish.token.unwrap(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+
+        peer.fetch_remote("origin").unwrap();
+        let status = peer.sync_status("origin").unwrap();
+        assert_eq!(status.state, SyncState::NeedsMerge);
+        let report = peer.preflight_apply_incoming("origin").unwrap();
+        assert!(!report.can_proceed);
     }
 
     #[test]

@@ -253,13 +253,18 @@ Support refs should be:
 | `Workspace::preflight_squash_versions(count)` | Local squash preflight with archive details. Implemented. |
 | `Workspace::squash_versions_with_token(token)` | Local squash after archive. Implemented. |
 | `Workspace::squash_versions(count, label)` | Compatibility helper that preflights and executes. Implemented. |
+| `Workspace::history_compaction_candidates(request)` | Finds safe local compaction partner endpoints, blockers, descendant replay counts, and optional remote impact for a selected version. Implemented. |
 | `Workspace::preflight_replace_remote_history(remote)` | Current-variation shared history replacement preflight with support-ref plan. Implemented. |
 | `RemoteHistoryReplaceToken::confirm_shared_history_rewrite()` | Explicit confirmation boundary before shared history replacement. Implemented. |
 | `Workspace::replace_remote_history(token)` | Lease-protected replacement after confirmation and shared support ref publication. Implemented. |
+| `Workspace::preflight_history_cleanup_remote_impact(plan_id, remote)` | Classifies a cleanup plan as no-upstream, local-only, normal publish, shared-history rewrite, or remote-incoming. Implemented. |
+| `Workspace::preflight_publish_history_cleanup(plan_id, remote)` | Captures expected remote OID, replacement OID, and support-ref publish token for a local cleanup that is ready to share. Implemented. |
+| `Workspace::publish_history_cleanup(token, confirmation)` | Publishes cleanup support refs first, then moves the visible remote branch with expected-OID lease protection. Implemented. |
+| `Workspace::fetch_remote(remote)` / `Workspace::apply_incoming(remote)` | Fetch support refs with visible refs and apply recognized incoming compaction rewrites, including safe first-parent replay of local-only snapshots. Implemented. |
 
 Shared visible refs should never be deleted or replaced unless the recovery support ref is durably published to the shared remote.
 
-Timeline cleanup is local-first in the initial implementation. Hosts should apply the local cleanup, use the returned `TimelineCleanupResult` remapping ledger to update or mark stale app-owned state, then use `preflight_replace_remote_history` / `replace_remote_history` for shared publication until cleanup apply grows a single remote transaction with support-ref publication, protected-branch diagnostics, and force-with-lease.
+Timeline cleanup remains local-first for the rewrite itself: hosts preview and apply locally before sharing. Shared publication is explicit through `preflight_publish_history_cleanup` / `publish_history_cleanup`, which publishes support refs before the lease-guarded visible branch move. Incoming shared compaction is handled through normal fetch/sync/apply paths once support refs are fetched; dirty work blocks and ambiguous merge-shaped local history stays in merge flow.
 
 ## Phase 7: purge/redaction
 

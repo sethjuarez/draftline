@@ -50,13 +50,42 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Partially covered. |
-| Current support | `delete_variation` and `squash_versions` preserve old tips under local `refs/draftline/...` refs before destructive ref movement. |
-| Safety behavior | The old commit remains named by a Draftline support ref locally, so it is not left only to reflog or garbage-collection timing on that machine. Cross-machine recovery still requires support-ref sync. |
-| Edge cases | Deleting the current variation is rejected. Squash rejects dirty work, `count < 2`, and ranges without a parent outside the squash range. Squashing a published variation rewrites history, so normal `publish_changes` will reject it as diverged because Draftline does not force-push. |
-| Gap | Local archive listing and `restore_support_ref_as_variation` exist. Still need preflight APIs that explain what will be archived, general support-ref sync to the shared remote, and an explicit replace-remote-history workflow for shared squash. |
+| Covered today? | Covered for local delete, local squash, and local milestone compaction. |
+| Current support | `delete_variation`, `squash_versions`, `history_compaction_candidates`, `preview_history_cleanup`, `apply_history_cleanup`, `resolve_rewritten_version`, `preflight_undo_history_cleanup`, and `undo_history_cleanup` preserve old history under local `refs/draftline/...` refs before destructive ref movement. |
+| Safety behavior | The old commit remains named by a Draftline support ref locally, so it is not left only to reflog or garbage-collection timing on that machine. History cleanup writes a remapping ledger so stale version IDs can resolve after compaction. |
+| Edge cases | Deleting the current variation is rejected. Squash rejects dirty work, `count < 2`, and ranges without a parent outside the squash range. Milestone compaction rejects dirty work, non-contiguous ranges, unsafe merge boundaries, and named-variation hazards according to the request safety policy. |
+| Gap | Product UI still needs clear language for candidate selection, stale-version resolution, undo, and why some merge/named-branch ranges cannot be compacted automatically. |
 
-## Flow 13a: remove or rewrite shared work
+## Flow 13a: compact local version history
+
+Business goal: "Turn several noisy saves into a clean milestone while keeping the final files and a recovery path."
+
+Why this flow exists: authoring timelines often contain useful final content but too many intermediate snapshots. Compaction should simplify the visible history without silently losing recovery or invalidating app-owned references to old versions.
+
+```mermaid
+flowchart TD
+    A[User selects one saved version] --> B[history_compaction_candidates]
+    B --> C{Candidate range safe?}
+    C -- No --> D[Explain blockers and safe next actions]
+    C -- Yes --> E[preview_history_cleanup]
+    E --> F{Workspace still clean and refs unchanged?}
+    F -- No --> G[Block and ask user to retry]
+    F -- Yes --> H[apply_history_cleanup]
+    H --> I[Create backup ref and move visible refs]
+    I --> J[Write remapping ledger]
+    J --> K[resolve_rewritten_version or undo_history_cleanup if needed]
+```
+
+| Question | Answer |
+|---|---|
+| Covered today? | Covered for linear milestone compaction, descendant replay, stale-version resolution, undo, and dirty-work blocking. |
+| Current support | `history_compaction_candidates` reports viable endpoints and blockers. `preview_history_cleanup` creates a durable preview ref, backup plan, graph diff, operations, commit/snapshot maps, affected refs, remote impact when requested, and warnings. `apply_history_cleanup` validates the preview and refs before moving visible refs. `resolve_rewritten_version` and undo APIs preserve follow-up navigation. |
+| Safety behavior | Compaction must preserve final workspace file content. Visible refs move only after backup refs exist and the preview/target refs still match. Dirty work blocks by default so unsaved content is not overwritten by checkout. |
+| Edge cases | Candidate selection must account for selected node role, descendant replay, merge boundaries, named variation refs inside the compacted range, stale preview refs, and target ref movement between preview and apply. |
+| Tests | `scenario_local_milestone_compaction_preview_apply_resolve_and_undo`, `history_cleanup_compacts_milestones_maps_old_versions_and_undoes`, `history_cleanup_compacts_middle_range_and_replays_descendants`, `history_compaction_candidates_reports_viable_partner_nodes`, and related stale-ref/blocker tests. |
+| Gap | Multi-range and richer semantic conflict handling remain future expansion; current support targets linear milestone compaction. |
+
+## Flow 13b: remove or rewrite shared work
 
 Business goal: "Remove an old option or clean up history for everyone, not just on my machine."
 
@@ -80,13 +109,13 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Partially covered. |
-| Current support | `preflight_delete_remote_variation` and `delete_remote_variation` archive the remote tip under a support ref, push that support ref, then delete the visible remote variation. `delete_variation` and `squash_versions` operate on local refs and local archive refs. `publish_changes` refuses non-fast-forward history replacement. |
-| Safety behavior | Shared remote delete is archive-first and visible-ref-delete-last. The implementation fetches and compares expected remote OID before deleting. |
-| Edge cases | Support-ref push can succeed while visible cleanup fails; that is safe but leaves an extra recovery point. Visible shared cleanup must not happen if support-ref publication fails. Explicit lease/create-only push mechanics still need tightening beyond fetch-then-compare plus normal push refspecs. |
-| Gap | Need explicit lease/create-only push mechanics, `preflight_replace_remote_history`, and `replace_remote_history` or equivalent, with teammate-facing product copy. |
+| Covered today? | Covered for shared variation delete, current-variation replacement, and published history-cleanup compaction. |
+| Current support | `preflight_delete_remote_variation` / `delete_remote_variation` archive the remote tip under a support ref, publish that support ref, then delete the visible remote variation. `preflight_replace_remote_history` / `replace_remote_history` and `preflight_publish_history_cleanup` / `publish_history_cleanup` publish support refs before replacing visible history. |
+| Safety behavior | Shared remote cleanup is archive-first and visible-ref-last. Visible ref movement is guarded by expected remote OID / lease checks, and support-ref publication is create-only. |
+| Edge cases | Support-ref push can succeed while visible cleanup fails; that is safe but leaves an extra recovery point. Visible shared cleanup must not happen if support-ref publication fails. A stale visible remote tip must stop publish instead of force-overwriting teammate work. |
+| Gap | Need protected-branch/server-capability diagnostics and teammate-facing product copy for hosts that reject support-ref namespaces or lease-protected replacement. |
 
-## Flow 13b: sync hidden recovery support refs
+## Flow 13c: sync hidden recovery support refs
 
 Business goal: "Make recovery points for shared work available from another machine without showing them as normal variations."
 
@@ -102,13 +131,13 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Partially covered locally; general remote sync is not covered. |
-| Current support | Delete and squash create local support refs under `refs/draftline/...`. `list_support_refs`, `restore_support_ref_as_variation`, `preflight_expire_support_refs`, and `expire_support_refs` cover local support-ref management. Shared remote delete publishes one operation-specific support ref before deleting the visible remote ref. General publish/fetch still uses visible variation refs, not support-ref refspecs. |
+| Covered today? | Covered for create-only support-ref publish, fetch, list, restore, and shared cleanup publish/sync. |
+| Current support | Delete, squash, and history cleanup create support refs under `refs/draftline/...`. `preflight_publish_support_refs`, `publish_support_refs`, `fetch_support_refs`, `list_support_refs`, `restore_support_ref_as_variation`, `preflight_expire_support_refs`, and `expire_support_refs` cover support-ref lifecycle. `fetch_remote` also fetches support refs so sync can detect published compaction rewrites. |
 | Safety behavior | Recovery support refs are hidden from normal views but are part of the shared repository trust boundary once synced. They are not privacy or access-control boundaries. |
 | Edge cases | Remote support refs must be uniquely named, append-only, and fetched without overwriting unsynced local support refs. Hosts must surface remotes that reject `refs/draftline/...` pushes. |
-| Gap | Need general `publish_support_refs` and `fetch_support_refs` with a remote-tracking layout. Local listing and restore already exist. |
+| Gap | Remote support-ref retention remains local/admin oriented; hosted product UI still needs clear "hidden but shared" language. |
 
-## Flow 13c: recover cleanup after clone or device loss
+## Flow 13d: recover cleanup after clone or device loss
 
 Business goal: "I deleted or squashed something on one machine and need it back elsewhere."
 
@@ -126,13 +155,42 @@ flowchart TD
 
 | Question | Answer |
 |---|---|
-| Covered today? | Partially covered locally. |
-| Current support | Local archive refs may exist on the machine where cleanup happened and can be listed/restored locally. They are not generally pushed/fetched today except as part of remote variation delete. |
+| Covered today? | Covered when the cleanup support ref was published to the shared remote. |
+| Current support | Local and remote-tracking archive refs can be listed and restored as a visible variation. Published history cleanup compaction also leaves support refs that another machine can fetch and use for stale-version resolution. |
 | Safety behavior | The intended model is shared hidden support refs: recoverability travels with the shared remote, while normal views remain uncluttered. |
 | Edge cases | Restoring an archived ref must create a new visible variation by default, require a non-conflicting name, fetch before publish, and never overwrite an existing local or remote variation without a separate explicit replace workflow. |
-| Gap | Needs general support-ref sync; local archive restore APIs exist. |
+| Gap | Remote retention/expiration policy for old shared recovery points remains future work. |
 
-## Flow 13d: permanently purge or redact content
+## Flow 13e: sync incoming compacted remote history
+
+Business goal: "A teammate compacted shared history; bring my workspace onto that compacted history without losing local work."
+
+Why this flow exists: a published compaction is an intentional rewrite, not ordinary divergent teammate work. Draftline can recognize the rewrite because the publisher first shared a support ref naming the old remote tip, then moved the visible branch with a lease.
+
+```mermaid
+flowchart TD
+    A[Peer fetches remote] --> B[Fetch visible variation and support refs]
+    B --> C{Remote head replaces archived old tip with same tree?}
+    C -- No --> D[Use normal sync or merge flow]
+    C -- Yes --> E{Workspace dirty?}
+    E -- Yes --> F[Block and offer discard, save, or shelve]
+    E -- No --> G{Local-only first-parent saves on old tip?}
+    G -- No --> H[Move local variation to compacted remote head]
+    G -- Yes --> I[Replay local saves onto compacted head]
+    I --> J[Write cleanup ledger for stale-version resolution]
+    H --> J
+```
+
+| Question | Answer |
+|---|---|
+| Covered today? | Covered for clean peers, dirty-work blocking, first-parent local-ahead replay, and ambiguous history fallback. |
+| Current support | `fetch_remote` fetches support refs; `sync_status` classifies a recognized compaction rewrite as `IncomingAvailable`; `preflight_apply_incoming` remains the host-facing safety gate; `apply_incoming` moves clean peers to the compacted head or replays local-only first-parent saves onto it. |
+| Safety behavior | A compaction rewrite is recognized only when a fetched rewrite support ref points to the old remote tip and the compacted replacement preserves that tip's tree. Dirty work blocks before mutation. Non-first-parent/merge-shaped local work stays in `NeedsMerge` instead of pretending it is safe to replay. |
+| Edge cases | If local files are dirty, hosts should offer discard dirty changes, save/snapshot first, or shelve dirty changes before retrying. If replay cannot be proven first-parent and clean, the normal merge/conflict flow must handle it. |
+| Tests | `scenario_remote_compaction_publish_sync_replay_and_dirty_block`, `apply_incoming_accepts_published_remote_compaction_when_clean`, `apply_incoming_replays_local_snapshots_after_published_remote_compaction`, and `remote_compaction_with_non_first_parent_local_work_stays_needs_merge`. |
+| Gap | Product UI still needs explicit copy for the dirty-work choices and for explaining "incoming compaction" separately from ordinary teammate divergence. |
+
+## Flow 13f: permanently purge or redact content
 
 Business goal: "I accidentally saved sensitive content; remove it permanently."
 
@@ -153,7 +211,7 @@ flowchart TD
 | Safety behavior | Draftline currently optimizes for recoverability, not permanent deletion. Purge must be a destructive, admin-permissioned, best-effort workflow over controlled remotes; Git cannot guarantee removal from existing clones, forks, backups, logs, caches, or offline devices that already fetched the objects. |
 | Gap | Need destructive `purge_content` execution with confirmations, enumeration of visible refs, support refs, tags, notes, replace refs, stash refs, remote-tracking refs, reflogs, alternates, hosting caches, object reachability checks, remote GC coordination, post-purge verification, audit trail, and user copy that does not over-promise deletion from distributed copies. |
 
-## Flow 13e: expire old support refs
+## Flow 13g: expire old support refs
 
 Business goal: "Clean up old recovery points without pretending it is a sensitive-data purge."
 
@@ -176,7 +234,7 @@ flowchart TD
 | Safety behavior | Retention cleanup may remove convenient recovery pointers but should not be framed as sensitive-content deletion. |
 | Gap | Need remote support-ref retention with permissions, audit, and remote GC guidance. |
 
-## Flow 13f: large or binary business assets
+## Flow 13h: large or binary business assets
 
 Business goal: "Save and share images, videos, PDFs, or other heavy assets safely."
 
