@@ -6,6 +6,7 @@ target
 # JavaScript package/build output
 node_modules
 dist
+site/.astro
 client/dist
 workbench/dist
 

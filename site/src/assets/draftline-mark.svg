@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img">
+  <defs>
+    <linearGradient id="draftline-mark-gradient" x1="10" x2="54" y1="8" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6366f1"/>
+      <stop offset="0.52" stop-color="#a855f7"/>
+      <stop offset="1" stop-color="#06b6d4"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="18" fill="#020617"/>
+  <path d="M18 17h16c9.4 0 16 6.3 16 15s-6.6 15-16 15H18V17Zm10 9v12h6.2c4 0 6.8-2.4 6.8-6s-2.8-6-6.8-6H28Z" fill="url(#draftline-mark-gradient)"/>
+  <path d="M18 50h30" stroke="#67e8f9" stroke-width="4" stroke-linecap="round"/>
+</svg>

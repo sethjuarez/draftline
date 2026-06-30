@@ -1,0 +1,141 @@
+---
+import Mermaid from "../components/Mermaid.astro";
+import { flowMatrix, safetyPrinciples, scenarioGroups, statusTone } from "../data/scenarios";
+import BaseLayout from "../layouts/BaseLayout.astro";
+
+const statusCounts = flowMatrix.reduce(
+  (counts, flow) => {
+    const tone = statusTone(flow.status);
+    counts[tone] += 1;
+    return counts;
+  },
+  { covered: 0, partial: 0, planned: 0 },
+);
+
+const safetyDiagram = `flowchart LR
+    A[Business intent] --> B{Read only?}
+    B -- Yes --> C[preview, diff, summary, status]
+    B -- No --> D{Can lose, hide, or share work?}
+    D -- Yes --> E[preflight and explicit choice]
+    D -- No --> F[append-only or ref-creating action]
+    E --> G[operation lock and recovery state]
+    F --> G
+    G --> H{Visible ref deleted or rewritten?}
+    H -- Yes --> I[archive old tip under refs/draftline]
+    H -- No --> J[business-shaped result]
+    I --> J`;
+
+---
+
+<BaseLayout
+  title="Draftline | Git-native versioning for creative workflows"
+  description="Draftline gives apps safe, Git-backed version history for creative and business content without exposing users to Git footguns."
+>
+  <main>
+    <section class="hero">
+      <nav class="nav" aria-label="Primary">
+        <a class="brand" href="/">
+          <span class="brand-mark">D</span>
+          <span>Draftline</span>
+        </a>
+        <div class="nav-links">
+          <a href="#scenarios">Scenarios</a>
+          <a href="/docs/">Docs</a>
+          <a href="https://github.com/sethjuarez/draftline">GitHub</a>
+          <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch color theme">
+            <span class="theme-toggle-icon" aria-hidden="true"></span>
+            <span class="theme-toggle-label">Theme</span>
+          </button>
+        </div>
+      </nav>
+
+      <div class="hero-grid">
+        <div class="hero-copy">
+          <p class="eyebrow">Draftline for app-owned workspaces</p>
+          <h1>Version history for creative apps, without Git footguns.</h1>
+          <p class="lede">
+            Draftline gives Tauri and desktop apps safe, Git-backed saves, variations,
+            collaboration, cleanup, and recovery for folders of creative or business content.
+            Users get product actions like save, try another direction, publish, and restore.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="/docs/">Read the docs</a>
+            <a class="button secondary" href="#scenarios">See scenarios</a>
+            <a class="button secondary" href="https://github.com/sethjuarez/draftline">View source</a>
+          </div>
+        </div>
+        <Mermaid title="The Draftline safety loop" diagram={safetyDiagram} />
+      </div>
+    </section>
+
+    <section class="section stats" aria-label="Scenario coverage">
+      <article>
+        <strong>{flowMatrix.length}</strong>
+        <span>documented product flows</span>
+      </article>
+      <article>
+        <strong>{statusCounts.covered}</strong>
+        <span>covered or scoped-covered flows</span>
+      </article>
+      <article>
+        <strong>{statusCounts.partial}</strong>
+        <span>partially covered flows</span>
+      </article>
+      <article>
+        <strong>{statusCounts.planned}</strong>
+        <span>planned or not-yet-covered flows</span>
+      </article>
+    </section>
+
+    <section class="section split">
+      <div>
+        <p class="eyebrow">Product language first</p>
+        <h2>Users see business actions. Draftline handles the Git-backed shape.</h2>
+      </div>
+      <div class="language-grid">
+        <article><span>Save</span><strong>Commit tracked content</strong></article>
+        <article><span>Try another direction</span><strong>Create a variation</strong></article>
+        <article><span>Go back</span><strong>Restore as a new save</strong></article>
+        <article><span>Share</span><strong>Fetch, compare, publish</strong></article>
+        <article><span>Clean up</span><strong>Archive first, then rewrite</strong></article>
+        <article><span>Recover</span><strong>Use hidden support refs</strong></article>
+      </div>
+    </section>
+
+    <section class="section" id="scenarios">
+      <div class="section-heading">
+        <p class="eyebrow">Scenario map</p>
+        <h2>All core Draftline scenarios, organized by user intent.</h2>
+        <p>
+          These scenario groups mirror the repository's product scenario contract and use Mermaid
+          diagrams to show how each intent moves through Draftline's safe primitives.
+        </p>
+      </div>
+
+      <div class="scenario-grid">
+        {scenarioGroups.map((group) => (
+          <article class="scenario-card">
+            <p class="eyebrow">{group.eyebrow}</p>
+            <h3>{group.title}</h3>
+            <p>{group.summary}</p>
+            <ul>
+              {group.primitives.map((primitive) => <li>{primitive}</li>)}
+            </ul>
+            <Mermaid diagram={group.diagram} />
+            <a href={group.docsPath}>Open in docs</a>
+          </article>
+        ))}
+      </div>
+    </section>
+
+    <section class="section principles">
+      <div>
+        <p class="eyebrow">Safety principles</p>
+        <h2>The rules that keep Git powerful but out of the user's way.</h2>
+      </div>
+      <ol>
+        {safetyPrinciples.map((principle) => <li>{principle}</li>)}
+      </ol>
+    </section>
+  </main>
+</BaseLayout>
