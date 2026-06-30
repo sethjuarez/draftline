@@ -1,6 +1,6 @@
 {
   "name": "@draftline/react",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "React hooks and primitives for Draftline-enabled Tauri applications.",
   "license": "MIT",
   "type": "module",
@@ -30,7 +30,7 @@
     "test": "vitest run --environment jsdom"
   },
   "dependencies": {
-    "@draftline/client": "0.1.9"
+    "@draftline/client": "0.1.10"
   },
   "peerDependencies": {
     "react": "^19.0.0"

@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use crate::{workspace::VariationCreatePreflight, PreflightReport, RecoveryState, SyncStatus};
+use crate::{
+    workspace::{HistoryCleanupBlockReport, VariationCreatePreflight},
+    PreflightReport, RecoveryState, SyncStatus,
+};
 
 /// Result type used by Draftline APIs.
 pub type Result<T> = std::result::Result<T, DraftlineError>;
@@ -120,4 +123,7 @@ pub enum DraftlineError {
 
     #[error("invalid history cleanup request: {0}")]
     InvalidHistoryCleanup(String),
+
+    #[error("history cleanup request is blocked")]
+    HistoryCleanupBlocked(Box<HistoryCleanupBlockReport>),
 }

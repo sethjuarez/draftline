@@ -12,7 +12,8 @@ use crate::{
     merge::MergeConflict, AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult,
     ChangeSet, CleanupPlanId, ContentPolicy, ContentPolicyAudit, ContributorProfile,
     CurrentFileDiff, CurrentFilePreview, DirtySummary, DraftlineError, HistoryCleanupPreview,
-    HistoryCleanupRequest, HistoryCleanupUndoPreflight, HistoryCleanupUndoToken, HistoryEntry,
+    HistoryCleanupRequest, HistoryCleanupUndoPreflight, HistoryCleanupUndoToken,
+    HistoryCompactionCandidates, HistoryCompactionCandidatesRequest, HistoryEntry,
     MergeConflictResolution, MergeIncomingReport, MergeIncomingResult, MergeIncomingToken,
     MergeResolutionChoice, OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight,
     PublishResult, RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest,
@@ -348,6 +349,13 @@ pub struct VersionRequest {
 pub struct PreviewHistoryCleanupRequest {
     pub workspace_path: PathBuf,
     pub cleanup: HistoryCleanupRequest,
+}
+
+/// Request for listing viable compaction partners for a selected version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCompactionCandidatesCommandRequest {
+    pub workspace_path: PathBuf,
+    pub request: HistoryCompactionCandidatesRequest,
 }
 
 /// Request for applying a durable history cleanup plan.
@@ -1088,6 +1096,25 @@ pub fn get_full_history_with_context(
     context
         .open_workspace(&request.workspace_path)?
         .full_history()
+}
+
+/// Returns viable compaction partners for a selected version.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_history_compaction_candidates(
+    request: HistoryCompactionCandidatesCommandRequest,
+) -> Result<HistoryCompactionCandidates> {
+    get_history_compaction_candidates_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns viable compaction partners using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_history_compaction_candidates_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: HistoryCompactionCandidatesCommandRequest,
+) -> Result<HistoryCompactionCandidates> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .history_compaction_candidates(request.request)
 }
 
 /// Previews a durable history cleanup plan.
@@ -2769,6 +2796,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidContributorIdentity(_) => "invalid_contributor_identity",
         DraftlineError::InvalidMergeResolution(_) => "invalid_merge_resolution",
         DraftlineError::InvalidHistoryCleanup(_) => "invalid_history_cleanup",
+        DraftlineError::HistoryCleanupBlocked(_) => "history_cleanup_blocked",
     }
 }
 
@@ -2781,6 +2809,14 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
             })),
         },
         DraftlineError::VariationCreatePreflightFailed(report) => {
+            match serde_json::to_value(report.as_ref()) {
+                Ok(value) => Some(value),
+                Err(error) => Some(serde_json::json!({
+                    "serialization_error": error.to_string(),
+                })),
+            }
+        }
+        DraftlineError::HistoryCleanupBlocked(report) => {
             match serde_json::to_value(report.as_ref()) {
                 Ok(value) => Some(value),
                 Err(error) => Some(serde_json::json!({

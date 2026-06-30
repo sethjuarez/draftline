@@ -37,6 +37,9 @@ export interface DraftlineClient {
   getChanges(workspacePath: string): Promise<ChangeSet>;
   getHistory(workspacePath: string): Promise<HistoryEntry[]>;
   getFullHistory(workspacePath: string): Promise<HistoryEntry[]>;
+  getHistoryCompactionCandidates(
+    request: HistoryCompactionCandidatesCommandRequest,
+  ): Promise<HistoryCompactionCandidates>;
   previewHistoryCleanup(request: PreviewHistoryCleanupRequest): Promise<HistoryCleanupPreview>;
   applyHistoryCleanup(request: ApplyHistoryCleanupRequest): Promise<TimelineCleanupResult>;
   resolveRewrittenVersion(
@@ -190,6 +193,8 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('get_full_history', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
+    getHistoryCompactionCandidates: (request) =>
+      run('get_history_compaction_candidates', { request }),
     previewHistoryCleanup: (request) => run('preview_history_cleanup', { request }),
     applyHistoryCleanup: (request) => run('apply_history_cleanup', { request }),
     resolveRewrittenVersion: (request) => run('resolve_rewritten_version', { request }),
@@ -392,6 +397,39 @@ export interface CommitRange {
   end: string;
 }
 
+export interface HistoryCompactionCandidatesCommandRequest {
+  workspace_path: string;
+  request: HistoryCompactionCandidatesRequest;
+}
+
+export interface HistoryCompactionCandidatesRequest {
+  target_variation?: string | null;
+  selected_version: string;
+  preserve_named_branches: boolean;
+  preserve_merge_boundaries: boolean;
+}
+
+export interface HistoryCompactionCandidates {
+  target_variation: string;
+  selected_version: string;
+  target_head: string;
+  candidates: HistoryCompactionCandidate[];
+}
+
+export interface HistoryCompactionCandidate {
+  version: Version;
+  include_range: CommitRange;
+  selected_role: CompactionSelectionRole;
+  can_compact: boolean;
+  requires_descendant_replay: boolean;
+  selected_commit_count: number;
+  descendant_rewrite_count: number;
+  blockers: CleanupWarning[];
+  warnings: CleanupWarning[];
+}
+
+export type CompactionSelectionRole = 'range_start' | 'range_end';
+
 export interface CleanupSafety {
   create_backup_ref: boolean;
   backup_ref_name?: string | null;
@@ -445,6 +483,10 @@ export interface HistoryCleanupPreview {
   new_head: string;
   preview_ref: string;
   planned_backup_ref?: string | null;
+  selected_commit_count: number;
+  descendant_rewrite_count: number;
+  affected_refs: CleanupAffectedRef[];
+  planned_ref_updates: RefUpdate[];
   operations: CleanupOperation[];
   graph_diff: CleanupGraphDiff;
   commit_map: CommitRewriteMap[];
@@ -495,7 +537,23 @@ export type CleanupWarningCode =
   | 'preview_plan_expired'
   | 'target_ref_changed_since_preview'
   | 'candidate_ref_changed_since_preview'
-  | 'backup_ref_already_exists';
+  | 'backup_ref_already_exists'
+  | 'range_end_not_ancestor_of_target_head'
+  | 'merge_boundary_would_be_rewritten'
+  | 'named_branch_inside_compacted_range';
+
+export type CleanupRefImpact =
+  | 'target_variation_moved'
+  | 'descendant_variation_rewritten'
+  | 'points_inside_compacted_range'
+  | 'remote_tracking_may_need_publish';
+
+export interface CleanupAffectedRef {
+  name: string;
+  old?: string | null;
+  new?: string | null;
+  impact: CleanupRefImpact;
+}
 
 export interface CleanupWarning {
   code: CleanupWarningCode;
@@ -539,6 +597,7 @@ export interface HistoryCleanupUndoPreflight {
   backup_ref: string;
   expected_current_head: string;
   restore_head: string;
+  ref_updates: RefUpdate[];
   token: HistoryCleanupUndoToken;
   can_undo: boolean;
 }

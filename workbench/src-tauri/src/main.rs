@@ -3,8 +3,9 @@ use draftline::tauri_contract::{
     AdoptRemoteVariationResult, AdoptWorkspaceResult, ApplyIncomingCommandResult,
     ApplyShelfCommandResult, CloneWorkspaceRequest, CommandPostconditions,
     CreateVariationFromVersionRequest, CreateVariationFromVersionResult, CurrentFileRequest,
-    DeleteShelfResult, DiffVersionsRequest, FetchRemoteResult, GuardedCreateVariationFromVersionRequest,
-    GuardedCreateVariationFromVersionResult, ListSupportRefsRequest,
+    DeleteShelfResult, DiffVersionsRequest, FetchRemoteResult,
+    GuardedCreateVariationFromVersionRequest, GuardedCreateVariationFromVersionResult,
+    HistoryCompactionCandidatesCommandRequest, ListSupportRefsRequest,
     MergeIncomingCommandResult, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
     PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
     PublishCurrentVariationRequest, PublishCurrentVariationResult,
@@ -20,10 +21,10 @@ use draftline::tauri_contract::{
 };
 use draftline::{
     ApplyIncomingReport, ChangeSet, ContentPolicyAudit, CurrentFileDiff, CurrentFilePreview,
-    HistoryEntry, MergeIncomingReport, PreflightReport, PreviewFile, RecoveryRepairResult,
-    RemoteEndpoint, RemoteVariation, RemoteVariationDiagnostics, Shelf, ShelfApplyReport,
-    SupportRef, VariationCreatePreflight, VariationSummary, VersionDiff, VersionPreview,
-    WorkspaceGraph, WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor,
+    HistoryCompactionCandidates, HistoryEntry, MergeIncomingReport, PreflightReport, PreviewFile,
+    RecoveryRepairResult, RemoteEndpoint, RemoteVariation, RemoteVariationDiagnostics, Shelf,
+    ShelfApplyReport, SupportRef, VariationCreatePreflight, VariationSummary, VersionDiff,
+    VersionPreview, WorkspaceGraph, WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor,
     WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail, WorkspaceGraphPath, WorkspaceGraphRefs,
     WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceVerification,
 };
@@ -199,6 +200,17 @@ fn get_full_history(
 ) -> TauriCommandResult<Vec<HistoryEntry>> {
     let context = lock_context(state.inner())?;
     contract::into_tauri_result(contract::get_full_history_with_context(&context, request))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn get_history_compaction_candidates(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: HistoryCompactionCandidatesCommandRequest,
+) -> TauriCommandResult<HistoryCompactionCandidates> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_history_compaction_candidates_with_context(
+        &context, request,
+    ))
 }
 
 #[tauri_plugin_auditaur::auditaur_command]
@@ -700,6 +712,7 @@ fn main() {
             get_changes,
             get_history,
             get_full_history,
+            get_history_compaction_candidates,
             get_workspace_graph,
             get_workspace_graph_refs,
             get_workspace_graph_summary,

@@ -1450,6 +1450,46 @@ pub struct CommitRange {
     pub end: VersionId,
 }
 
+/// Request for finding viable compaction partners for one selected version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCompactionCandidatesRequest {
+    pub target_variation: Option<VariationId>,
+    pub selected_version: VersionId,
+    pub preserve_named_branches: bool,
+    pub preserve_merge_boundaries: bool,
+}
+
+/// Candidate compaction partners for one selected version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCompactionCandidates {
+    pub target_variation: VariationId,
+    pub selected_version: VersionId,
+    pub target_head: VersionId,
+    pub candidates: Vec<HistoryCompactionCandidate>,
+}
+
+/// One possible second endpoint for a compaction selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCompactionCandidate {
+    pub version: Version,
+    pub include_range: CommitRange,
+    pub selected_role: CompactionSelectionRole,
+    pub can_compact: bool,
+    pub requires_descendant_replay: bool,
+    pub selected_commit_count: usize,
+    pub descendant_rewrite_count: usize,
+    pub blockers: Vec<CleanupWarning>,
+    pub warnings: Vec<CleanupWarning>,
+}
+
+/// Whether the originally selected node becomes the older or newer endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionSelectionRole {
+    RangeStart,
+    RangeEnd,
+}
+
 /// Safety settings for cleanup operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupSafety {
@@ -1502,6 +1542,10 @@ pub struct HistoryCleanupPreview {
     pub new_head: VersionId,
     pub preview_ref: RefName,
     pub planned_backup_ref: Option<RefName>,
+    pub selected_commit_count: usize,
+    pub descendant_rewrite_count: usize,
+    pub affected_refs: Vec<CleanupAffectedRef>,
+    pub planned_ref_updates: Vec<RefUpdate>,
     pub operations: Vec<CleanupOperation>,
     pub graph_diff: CleanupGraphDiff,
     pub commit_map: Vec<CommitRewriteMap>,
@@ -1570,6 +1614,33 @@ pub struct CleanupWarning {
     pub safe_next_actions: Vec<SafeNextAction>,
 }
 
+/// A ref that cleanup will move, preserve by backup, or require user action for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupAffectedRef {
+    pub name: RefName,
+    pub old: Option<VersionId>,
+    pub new: Option<VersionId>,
+    pub impact: CleanupRefImpact,
+}
+
+/// Machine-readable cleanup ref impact for host UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupRefImpact {
+    TargetVariationMoved,
+    DescendantVariationRewritten,
+    PointsInsideCompactedRange,
+    RemoteTrackingMayNeedPublish,
+}
+
+/// Structured diagnostics for cleanup requests that cannot be made safe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCleanupBlockReport {
+    pub operation: String,
+    pub diagnostics: Vec<CleanupWarning>,
+    pub can_proceed: bool,
+}
+
 /// Stable cleanup warning code for host UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1583,6 +1654,9 @@ pub enum CleanupWarningCode {
     TargetRefChangedSincePreview,
     CandidateRefChangedSincePreview,
     BackupRefAlreadyExists,
+    RangeEndNotAncestorOfTargetHead,
+    MergeBoundaryWouldBeRewritten,
+    NamedBranchInsideCompactedRange,
 }
 
 /// Result of applying a prepared timeline cleanup.
@@ -1638,6 +1712,7 @@ pub struct HistoryCleanupUndoPreflight {
     pub backup_ref: RefName,
     pub expected_current_head: VersionId,
     pub restore_head: VersionId,
+    pub ref_updates: Vec<RefUpdate>,
     pub token: HistoryCleanupUndoToken,
     pub can_undo: bool,
 }
@@ -1664,7 +1739,12 @@ struct PlannedCompactCleanup {
     commit_map: Vec<CommitRewriteMap>,
     snapshot_map: Vec<SnapshotRewriteMap>,
     warnings: Vec<CleanupWarning>,
+    affected_refs: Vec<CleanupAffectedRef>,
+    planned_ref_updates: Vec<RefUpdate>,
     old_commit_count: usize,
+    new_commit_count: usize,
+    selected_commit_count: usize,
+    descendant_rewrite_count: usize,
 }
 
 struct CompactCleanupPlanInput<'a> {
@@ -4786,6 +4866,146 @@ impl Workspace {
         .collect()
     }
 
+    /// Returns viable second endpoints for compacting history around one version.
+    pub fn history_compaction_candidates(
+        &self,
+        request: HistoryCompactionCandidatesRequest,
+    ) -> Result<HistoryCompactionCandidates> {
+        self.ensure_no_pending_recovery()?;
+        let target_variation = match request.target_variation {
+            Some(variation) => VariationId::from(validate_variation_name(variation.as_str())?),
+            None => VariationId::from(self.current_variation_unchecked()?),
+        };
+        let target_branch = self.find_local_variation_branch(target_variation.as_str())?;
+        let target_head_oid = target_branch.get().peel_to_commit()?.id();
+        let selected_oid = oid_from_version(&request.selected_version)?;
+        let chain = self.first_parent_chain_to_root(target_head_oid)?;
+        let selected_index = chain
+            .iter()
+            .position(|oid| *oid == selected_oid)
+            .ok_or_else(|| DraftlineError::VersionNotLocallyReachable(selected_oid.to_string()))?;
+        let local_tips = self.local_variation_tip_oids()?;
+        let mut candidates = Vec::new();
+
+        for (candidate_index, candidate_oid) in chain.iter().copied().enumerate() {
+            if candidate_oid == selected_oid {
+                continue;
+            }
+
+            let (start_index, end_index, selected_role) = if candidate_index > selected_index {
+                (
+                    candidate_index,
+                    selected_index,
+                    CompactionSelectionRole::RangeEnd,
+                )
+            } else {
+                (
+                    selected_index,
+                    candidate_index,
+                    CompactionSelectionRole::RangeStart,
+                )
+            };
+            let start_oid = chain[start_index];
+            let end_oid = chain[end_index];
+            let range_oids = chain[end_index..=start_index]
+                .iter()
+                .rev()
+                .copied()
+                .collect::<Vec<_>>();
+            let range_set = range_oids.iter().copied().collect::<BTreeSet<_>>();
+            let descendant_rewrite_count = end_index;
+            let descendant_set = chain[..end_index].iter().copied().collect::<BTreeSet<_>>();
+            let mut blockers = Vec::new();
+            let mut warnings = Vec::new();
+
+            if request.preserve_merge_boundaries {
+                for oid in &range_oids {
+                    let commit = self.repo.find_commit(*oid)?;
+                    if commit.parent_count() > 1 {
+                        blockers.push(cleanup_warning(
+                            CleanupWarningCode::MergeBoundaryRequiresUserChoice,
+                            format!("cleanup range crosses merge commit `{oid}`"),
+                            vec![VersionId::from(*oid)],
+                        ));
+                    }
+                }
+            }
+            for oid in chain[..end_index].iter().copied() {
+                let commit = self.repo.find_commit(oid)?;
+                for parent_index in 1..commit.parent_count() {
+                    let parent = commit.parent(parent_index)?;
+                    let parent_oid = parent.id();
+                    if range_set.contains(&parent_oid) {
+                        blockers.push(cleanup_warning(
+                            CleanupWarningCode::MergeBoundaryWouldBeRewritten,
+                            format!(
+                                "descendant merge commit `{oid}` has a secondary parent inside the compacted range"
+                            ),
+                            vec![VersionId::from(oid), VersionId::from(parent_oid)],
+                        ));
+                    }
+                }
+            }
+
+            for (variation, tip) in &local_tips {
+                if *variation == target_variation {
+                    continue;
+                }
+                if range_set.contains(tip) {
+                    let warning = cleanup_warning(
+                        if request.preserve_named_branches {
+                            CleanupWarningCode::NamedBranchInsideCompactedRange
+                        } else {
+                            CleanupWarningCode::NamedBranchWouldBeAffected
+                        },
+                        format!(
+                            "variation `{}` points inside the compacted range",
+                            variation.as_str()
+                        ),
+                        vec![VersionId::from(*tip)],
+                    );
+                    if request.preserve_named_branches {
+                        blockers.push(warning);
+                    } else {
+                        warnings.push(warning);
+                    }
+                } else if descendant_set.contains(tip) {
+                    warnings.push(cleanup_warning(
+                        CleanupWarningCode::NamedBranchWouldBeAffected,
+                        format!(
+                            "variation `{}` points to a descendant that cleanup would rewrite",
+                            variation.as_str()
+                        ),
+                        vec![VersionId::from(*tip)],
+                    ));
+                }
+            }
+
+            let candidate_commit = self.repo.find_commit(candidate_oid)?;
+            candidates.push(HistoryCompactionCandidate {
+                version: version_from_commit(&candidate_commit),
+                include_range: CommitRange {
+                    start: VersionId::from(start_oid),
+                    end: VersionId::from(end_oid),
+                },
+                selected_role,
+                can_compact: blockers.is_empty(),
+                requires_descendant_replay: descendant_rewrite_count > 0,
+                selected_commit_count: range_oids.len(),
+                descendant_rewrite_count,
+                blockers,
+                warnings,
+            });
+        }
+
+        Ok(HistoryCompactionCandidates {
+            target_variation,
+            selected_version: request.selected_version,
+            target_head: VersionId::from(target_head_oid),
+            candidates,
+        })
+    }
+
     /// Returns a graph-ready full-history snapshot over Draftline variations.
     ///
     /// The graph is read-only. It exposes the same version and variation
@@ -6273,13 +6493,19 @@ impl Workspace {
             new_head: VersionId::from(planned.new_head_oid),
             preview_ref,
             planned_backup_ref,
+            selected_commit_count: planned.selected_commit_count,
+            descendant_rewrite_count: planned.descendant_rewrite_count,
+            affected_refs: planned.affected_refs,
+            planned_ref_updates: planned.planned_ref_updates,
             operations: planned.operations,
             graph_diff: CleanupGraphDiff {
                 old_head: VersionId::from(old_head_oid),
                 new_head: VersionId::from(planned.new_head_oid),
                 old_commit_count: planned.old_commit_count,
-                new_commit_count: milestones.len(),
-                squashed_commit_count: planned.old_commit_count.saturating_sub(milestones.len()),
+                new_commit_count: planned.new_commit_count,
+                squashed_commit_count: planned
+                    .old_commit_count
+                    .saturating_sub(planned.new_commit_count),
             },
             commit_map: planned.commit_map.clone(),
             snapshot_map: planned.snapshot_map.clone(),
@@ -6320,12 +6546,18 @@ impl Workspace {
         let branch_ref = format!("refs/heads/{variation}");
         let old_head_oid = oid_from_version(&stored.preview.old_head)?;
         let new_head_oid = oid_from_version(&stored.preview.new_head)?;
-        let actual_target = self.repo.refname_to_id(&branch_ref)?;
-        if actual_target != old_head_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{branch_ref}@{old_head_oid}"),
-                actual: format!("{branch_ref}@{actual_target}"),
-            });
+        for update in &stored.preview.planned_ref_updates {
+            let Some(expected_old) = update.old.as_ref() else {
+                continue;
+            };
+            let expected_old_oid = oid_from_version(expected_old)?;
+            let actual = self.repo.refname_to_id(update.name.as_str())?;
+            if actual != expected_old_oid {
+                return Err(DraftlineError::LocalStateChanged {
+                    expected: format!("{}@{expected_old_oid}", update.name.as_str()),
+                    actual: format!("{}@{actual}", update.name.as_str()),
+                });
+            }
         }
 
         let actual_preview = self
@@ -6356,8 +6588,17 @@ impl Workspace {
             completed: false,
         })?;
 
-        self.repo
-            .reference(&branch_ref, new_head_oid, true, "history_cleanup")?;
+        for update in &stored.preview.planned_ref_updates {
+            let Some(new) = update.new.as_ref() else {
+                continue;
+            };
+            self.repo.reference(
+                update.name.as_str(),
+                oid_from_version(new)?,
+                true,
+                "history_cleanup",
+            )?;
+        }
         if self.head_symbolic_variation().as_deref() == Some(variation) {
             self.repo.set_head(&branch_ref)?;
             self.repo
@@ -6369,11 +6610,7 @@ impl Workspace {
             old_head: stored.preview.old_head.clone(),
             new_head: stored.preview.new_head.clone(),
             backup_refs,
-            ref_updates: vec![RefUpdate {
-                name: RefName::from(branch_ref),
-                old: Some(stored.preview.old_head.clone()),
-                new: Some(stored.preview.new_head.clone()),
-            }],
+            ref_updates: stored.preview.planned_ref_updates.clone(),
             commit_map: stored.preview.commit_map.clone(),
             snapshot_map: stored.preview.snapshot_map.clone(),
             warnings: stored.preview.warnings.clone(),
@@ -6499,6 +6736,7 @@ impl Workspace {
             backup_ref,
             expected_current_head,
             restore_head,
+            ref_updates: ledger.ref_updates.clone(),
             token,
             can_undo: true,
         })
@@ -6513,13 +6751,19 @@ impl Workspace {
         let _lock = OperationLock::acquire(&self.lock_path(), "undo_history_cleanup")?;
         let ledger = self.read_history_cleanup_ledger(&token.plan_id)?;
         let branch_ref = format!("refs/heads/{}", token.target_variation.as_str());
-        let current_oid = self.repo.refname_to_id(&branch_ref)?;
-        let expected_current_oid = oid_from_version(&token.expected_current_head)?;
-        if current_oid != expected_current_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{branch_ref}@{expected_current_oid}"),
-                actual: format!("{branch_ref}@{current_oid}"),
-            });
+        let current_oid = oid_from_version(&token.expected_current_head)?;
+        for update in &ledger.ref_updates {
+            let Some(expected_new) = update.new.as_ref() else {
+                continue;
+            };
+            let expected_new_oid = oid_from_version(expected_new)?;
+            let actual = self.repo.refname_to_id(update.name.as_str())?;
+            if actual != expected_new_oid {
+                return Err(DraftlineError::LocalStateChanged {
+                    expected: format!("{}@{expected_new_oid}", update.name.as_str()),
+                    actual: format!("{}@{actual}", update.name.as_str()),
+                });
+            }
         }
         let restore_oid = self.repo.refname_to_id(token.backup_ref.as_str())?;
         let expected_restore_oid = oid_from_version(&token.restore_head)?;
@@ -6548,24 +6792,38 @@ impl Workspace {
             target: Some(token.expected_current_head.to_string()),
             completed: false,
         })?;
-        self.repo
-            .reference(&branch_ref, restore_oid, true, "undo_history_cleanup")?;
+        for update in &ledger.ref_updates {
+            let Some(old) = update.old.as_ref() else {
+                continue;
+            };
+            self.repo.reference(
+                update.name.as_str(),
+                oid_from_version(old)?,
+                true,
+                "undo_history_cleanup",
+            )?;
+        }
         if self.head_symbolic_variation().as_deref() == Some(token.target_variation.as_str()) {
             self.repo.set_head(&branch_ref)?;
             self.repo
                 .checkout_head(Some(CheckoutBuilder::new().force()))?;
         }
+        let ref_updates = ledger
+            .ref_updates
+            .iter()
+            .map(|update| RefUpdate {
+                name: update.name.clone(),
+                old: update.new.clone(),
+                new: update.old.clone(),
+            })
+            .collect();
 
         let result = TimelineCleanupResult {
             plan_id: token.plan_id,
             old_head: token.expected_current_head.clone(),
             new_head: token.restore_head.clone(),
             backup_refs: vec![token.backup_ref, undo_backup_ref],
-            ref_updates: vec![RefUpdate {
-                name: RefName::from(branch_ref),
-                old: Some(token.expected_current_head),
-                new: Some(token.restore_head),
-            }],
+            ref_updates,
             commit_map: ledger.commit_map,
             snapshot_map: ledger.snapshot_map,
             warnings: ledger.warnings,
@@ -7780,16 +8038,13 @@ impl Workspace {
         }
 
         let last_end = oid_from_version(&milestones[milestones.len() - 1].include_range.end)?;
-        if last_end != old_head_oid {
-            return Err(DraftlineError::InvalidHistoryCleanup(format!(
-                "last cleanup milestone must end at target head `{old_head_oid}`, got `{last_end}`"
-            )));
-        }
+        let descendant_old_oids = self.first_parent_descendants_after(last_end, old_head_oid)?;
 
         let mut all_old_oids = Vec::new();
         let mut seen_old_oids = BTreeSet::new();
         let mut operations = Vec::new();
         let mut commit_map = Vec::new();
+        let mut oid_rewrites = HashMap::new();
         let mut previous_new_oid = base_parent_oid;
         let mut previous_old_end = base_parent_oid;
         let signature = self.workspace_signature()?;
@@ -7868,10 +8123,76 @@ impl Workspace {
                         new_id: new_version.clone(),
                     },
                 });
+                oid_rewrites.insert(*old_oid, new_oid);
             }
             all_old_oids.extend(old_oids);
             previous_new_oid = Some(new_oid);
             previous_old_end = Some(end_oid);
+        }
+
+        let selected_commit_count = all_old_oids.len();
+        let selected_oid_set = all_old_oids.iter().copied().collect::<BTreeSet<_>>();
+        let descendant_oid_set = descendant_old_oids.iter().copied().collect::<BTreeSet<_>>();
+
+        for old_oid in &descendant_old_oids {
+            let old_commit = self.repo.find_commit(*old_oid)?;
+            let first_parent = old_commit.parent(0).map_err(|_| {
+                DraftlineError::InvalidHistoryCleanup(format!(
+                    "descendant `{old_oid}` has no first parent to replay"
+                ))
+            })?;
+            let first_parent_oid =
+                oid_rewrites
+                    .get(&first_parent.id())
+                    .copied()
+                    .ok_or_else(|| {
+                        DraftlineError::InvalidHistoryCleanup(format!(
+                    "descendant `{old_oid}` is not contiguous with the rewritten cleanup range"
+                ))
+                    })?;
+            let mut parent_oids = vec![first_parent_oid];
+            for index in 1..old_commit.parent_count() {
+                let parent = old_commit.parent(index)?;
+                let parent_oid = parent.id();
+                if selected_oid_set.contains(&parent_oid) {
+                    return Err(cleanup_blocked(
+                        CleanupWarningCode::MergeBoundaryWouldBeRewritten,
+                        format!(
+                            "merge commit `{old_oid}` has a secondary parent inside the compacted range"
+                        ),
+                        vec![VersionId::from(*old_oid), VersionId::from(parent_oid)],
+                    ));
+                }
+                parent_oids.push(oid_rewrites.get(&parent_oid).copied().unwrap_or(parent_oid));
+            }
+
+            let parent_commits = parent_oids
+                .iter()
+                .map(|oid| self.repo.find_commit(*oid).map_err(DraftlineError::from))
+                .collect::<Result<Vec<_>>>()?;
+            let parents = parent_commits.iter().collect::<Vec<_>>();
+            let tree = old_commit.tree()?;
+            let author = old_commit.author();
+            let committer = old_commit.committer();
+            let message = old_commit.message().unwrap_or_default();
+            let new_oid = self.repo.commit(
+                None,
+                &author,
+                &committer,
+                message,
+                &tree,
+                parents.as_slice(),
+            )?;
+            let new_version = VersionId::from(new_oid);
+            commit_map.push(CommitRewriteMap {
+                old: VersionId::from(*old_oid),
+                new: Some(new_version.clone()),
+                disposition: RewriteDisposition::Preserved {
+                    new_id: new_version,
+                },
+            });
+            oid_rewrites.insert(*old_oid, new_oid);
+            previous_new_oid = Some(new_oid);
         }
 
         let new_head_oid = previous_new_oid.ok_or_else(|| {
@@ -7886,21 +8207,74 @@ impl Workspace {
         }
 
         let mut warnings = Vec::new();
-        if preserve_named_branches {
-            let old_oid_set = all_old_oids.iter().copied().collect::<BTreeSet<_>>();
-            for (variation, tip) in self.local_variation_tip_oids()? {
-                if variation != *target_variation && old_oid_set.contains(&tip) {
-                    warnings.push(cleanup_warning(
-                        CleanupWarningCode::NamedBranchWouldBeAffected,
-                        format!(
-                            "variation `{}` points inside the cleanup range",
-                            variation.as_str()
-                        ),
-                        vec![VersionId::from(tip)],
-                    ));
+        let mut affected_refs = Vec::new();
+        let mut planned_ref_updates = Vec::new();
+        let target_ref_update = RefUpdate {
+            name: RefName::from(format!("refs/heads/{}", target_variation.as_str())),
+            old: Some(VersionId::from(old_head_oid)),
+            new: Some(VersionId::from(new_head_oid)),
+        };
+        affected_refs.push(CleanupAffectedRef {
+            name: RefName::from(format!("refs/heads/{}", target_variation.as_str())),
+            old: Some(VersionId::from(old_head_oid)),
+            new: Some(VersionId::from(new_head_oid)),
+            impact: CleanupRefImpact::TargetVariationMoved,
+        });
+
+        for (variation, tip) in self.local_variation_tip_oids()? {
+            if variation == *target_variation {
+                continue;
+            }
+            let ref_name = RefName::from(format!("refs/heads/{}", variation.as_str()));
+            if selected_oid_set.contains(&tip) {
+                let warning = cleanup_warning(
+                    if preserve_named_branches {
+                        CleanupWarningCode::NamedBranchInsideCompactedRange
+                    } else {
+                        CleanupWarningCode::NamedBranchWouldBeAffected
+                    },
+                    format!(
+                        "variation `{}` points inside the compacted range",
+                        variation.as_str()
+                    ),
+                    vec![VersionId::from(tip)],
+                );
+                if preserve_named_branches {
+                    return Err(DraftlineError::HistoryCleanupBlocked(Box::new(
+                        HistoryCleanupBlockReport {
+                            operation: "history_cleanup".to_string(),
+                            diagnostics: vec![warning],
+                            can_proceed: false,
+                        },
+                    )));
                 }
+                warnings.push(warning);
+                affected_refs.push(CleanupAffectedRef {
+                    name: ref_name,
+                    old: Some(VersionId::from(tip)),
+                    new: None,
+                    impact: CleanupRefImpact::PointsInsideCompactedRange,
+                });
+            } else if descendant_oid_set.contains(&tip) {
+                let new_tip = oid_rewrites.get(&tip).copied().ok_or_else(|| {
+                    DraftlineError::InvalidHistoryCleanup(format!(
+                        "rewritten descendant `{tip}` is missing from cleanup map"
+                    ))
+                })?;
+                planned_ref_updates.push(RefUpdate {
+                    name: ref_name.clone(),
+                    old: Some(VersionId::from(tip)),
+                    new: Some(VersionId::from(new_tip)),
+                });
+                affected_refs.push(CleanupAffectedRef {
+                    name: ref_name,
+                    old: Some(VersionId::from(tip)),
+                    new: Some(VersionId::from(new_tip)),
+                    impact: CleanupRefImpact::DescendantVariationRewritten,
+                });
             }
         }
+        planned_ref_updates.push(target_ref_update);
 
         let snapshot_map = commit_map
             .iter()
@@ -7917,8 +8291,58 @@ impl Workspace {
             commit_map,
             snapshot_map,
             warnings,
-            old_commit_count: all_old_oids.len(),
+            affected_refs,
+            planned_ref_updates,
+            old_commit_count: selected_commit_count + descendant_old_oids.len(),
+            new_commit_count: milestones.len() + descendant_old_oids.len(),
+            selected_commit_count,
+            descendant_rewrite_count: descendant_old_oids.len(),
         })
+    }
+
+    fn first_parent_descendants_after(&self, ancestor_oid: Oid, head_oid: Oid) -> Result<Vec<Oid>> {
+        let range = CommitRange {
+            start: VersionId::from(ancestor_oid),
+            end: VersionId::from(head_oid),
+        };
+        let mut oids = match self.first_parent_range(&range) {
+            Ok(oids) => oids,
+            Err(DraftlineError::InvalidHistoryCleanup(_)) => {
+                return Err(DraftlineError::HistoryCleanupBlocked(Box::new(
+                    HistoryCleanupBlockReport {
+                        operation: "history_cleanup".to_string(),
+                        diagnostics: vec![cleanup_warning(
+                            CleanupWarningCode::RangeEndNotAncestorOfTargetHead,
+                            format!(
+                                "cleanup range end `{ancestor_oid}` is not a first-parent ancestor of target head `{head_oid}`"
+                            ),
+                            vec![VersionId::from(ancestor_oid), VersionId::from(head_oid)],
+                        )],
+                        can_proceed: false,
+                    },
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        if !oids.is_empty() {
+            oids.remove(0);
+        }
+        Ok(oids)
+    }
+
+    fn first_parent_chain_to_root(&self, head_oid: Oid) -> Result<Vec<Oid>> {
+        let mut commit = self.repo.find_commit(head_oid)?;
+        let mut oids = Vec::new();
+
+        loop {
+            oids.push(commit.id());
+            let Ok(parent) = commit.parent(0) else {
+                break;
+            };
+            commit = parent;
+        }
+
+        Ok(oids)
     }
 
     fn first_parent_range(&self, range: &CommitRange) -> Result<Vec<Oid>> {
@@ -9248,6 +9672,18 @@ fn cleanup_warning(
         related_versions,
         safe_next_actions: Vec::new(),
     }
+}
+
+fn cleanup_blocked(
+    code: CleanupWarningCode,
+    message: impl Into<String>,
+    related_versions: Vec<VersionId>,
+) -> DraftlineError {
+    DraftlineError::HistoryCleanupBlocked(Box::new(HistoryCleanupBlockReport {
+        operation: "history_cleanup".to_string(),
+        diagnostics: vec![cleanup_warning(code, message, related_versions)],
+        can_proceed: false,
+    }))
 }
 
 fn cleanup_remote_warnings(policy: &RemoteRewritePolicy) -> Vec<CleanupWarning> {
@@ -15167,6 +15603,195 @@ mod tests {
     }
 
     #[test]
+    fn history_cleanup_compacts_middle_range_and_replays_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("noisy autosave").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("another noisy autosave").unwrap();
+        write_file(workspace.root(), "post.md", b"v4");
+        let v4 = workspace.save_version("keep v4").unwrap();
+        write_file(workspace.root(), "post.md", b"v5");
+        let v5 = workspace.save_version("keep v5").unwrap();
+
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+
+        assert_eq!(preview.old_head, v5.id().clone());
+        assert_eq!(preview.selected_commit_count, 2);
+        assert_eq!(preview.descendant_rewrite_count, 2);
+        assert_eq!(preview.graph_diff.old_commit_count, 4);
+        assert_eq!(preview.graph_diff.new_commit_count, 3);
+        assert_eq!(preview.graph_diff.squashed_commit_count, 1);
+        assert_eq!(preview.planned_ref_updates.len(), 1);
+        assert!(preview.commit_map.iter().any(|entry| {
+            entry.old == *v4.id()
+                && matches!(entry.disposition, RewriteDisposition::Preserved { .. })
+        }));
+
+        let result = workspace
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+        assert_eq!(result.old_head, v5.id().clone());
+        assert_eq!(result.new_head, preview.new_head);
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "v5"
+        );
+
+        let squashed = workspace
+            .resolve_rewritten_version(StaleVersionResolutionRequest {
+                version: v2.id().clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            squashed.disposition,
+            StaleVersionDisposition::SquashedInto { .. }
+        ));
+        let preserved = workspace
+            .resolve_rewritten_version(StaleVersionResolutionRequest {
+                version: v4.id().clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            preserved.disposition,
+            StaleVersionDisposition::Live { ref version } if version != v4.id()
+        ));
+    }
+
+    #[test]
+    fn history_compaction_candidates_reports_viable_partner_nodes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        write_file(workspace.root(), "post.md", b"v4");
+        let v4 = workspace.save_version("v4").unwrap();
+
+        let candidates = workspace
+            .history_compaction_candidates(HistoryCompactionCandidatesRequest {
+                target_variation: None,
+                selected_version: v2.id().clone(),
+                preserve_named_branches: true,
+                preserve_merge_boundaries: true,
+            })
+            .unwrap();
+
+        assert_eq!(candidates.target_variation, VariationId::from("main"));
+        assert_eq!(candidates.target_head, v4.id().clone());
+        let v3_candidate = candidates
+            .candidates
+            .iter()
+            .find(|candidate| candidate.version.id() == v3.id())
+            .unwrap();
+        assert_eq!(v3_candidate.version.id(), v3.id());
+        assert!(v3_candidate.can_compact);
+        assert_eq!(
+            v3_candidate.selected_role,
+            CompactionSelectionRole::RangeStart
+        );
+        assert_eq!(v3_candidate.include_range.start, v2.id().clone());
+        assert_eq!(v3_candidate.include_range.end, v3.id().clone());
+        assert_eq!(v3_candidate.selected_commit_count, 2);
+        assert_eq!(v3_candidate.descendant_rewrite_count, 1);
+        assert!(v3_candidate.requires_descendant_replay);
+        let candidate_json = serde_json::to_value(v3_candidate).unwrap();
+        assert_eq!(candidate_json["version"]["id"], v3.id().as_str());
+    }
+
+    #[test]
+    fn history_cleanup_rewrites_descendant_variation_refs_and_undo_restores_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        write_file(workspace.root(), "post.md", b"v4");
+        let v4 = workspace.save_version("v4").unwrap();
+        let v4_commit = workspace.find_version_commit(v4.id()).unwrap();
+        workspace.repo.branch("side", &v4_commit, false).unwrap();
+        drop(v4_commit);
+        write_file(workspace.root(), "post.md", b"v5");
+        let v5 = workspace.save_version("v5").unwrap();
+
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        assert_eq!(preview.planned_ref_updates.len(), 2);
+        assert!(preview.affected_refs.iter().any(|affected| {
+            affected.name.as_str() == "refs/heads/side"
+                && affected.impact == CleanupRefImpact::DescendantVariationRewritten
+        }));
+        let side_new = preview
+            .planned_ref_updates
+            .iter()
+            .find(|update| update.name.as_str() == "refs/heads/side")
+            .and_then(|update| update.new.clone())
+            .unwrap();
+
+        let result = workspace
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+        assert_eq!(
+            workspace.repo.refname_to_id("refs/heads/side").unwrap(),
+            oid_from_version(&side_new).unwrap()
+        );
+
+        let undo = workspace
+            .preflight_undo_history_cleanup(result.plan_id.clone())
+            .unwrap();
+        assert_eq!(undo.ref_updates.len(), 2);
+        let undo_result = workspace.undo_history_cleanup(undo.token).unwrap();
+        assert_eq!(undo_result.new_head, v5.id().clone());
+        assert_eq!(
+            workspace.repo.refname_to_id("refs/heads/side").unwrap(),
+            oid_from_version(v4.id()).unwrap()
+        );
+    }
+
+    #[test]
+    fn history_cleanup_blocks_preserved_variation_inside_compacted_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        let v2_commit = workspace.find_version_commit(v2.id()).unwrap();
+        workspace.repo.branch("side", &v2_commit, false).unwrap();
+        drop(v2_commit);
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        write_file(workspace.root(), "post.md", b"v4");
+        workspace.save_version("v4").unwrap();
+
+        let err = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DraftlineError::HistoryCleanupBlocked(report)
+                if report.diagnostics.iter().any(|diagnostic| diagnostic.code == CleanupWarningCode::NamedBranchInsideCompactedRange)
+        ));
+    }
+
+    #[test]
     fn history_cleanup_rejects_dirty_worktree_by_default() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
@@ -15385,7 +16010,12 @@ mod tests {
         let restore_head = oid_from_version(&undo.restore_head).unwrap();
         workspace
             .repo
-            .reference(branch_ref, restore_head, true, "simulate interrupted cleanup undo")
+            .reference(
+                branch_ref,
+                restore_head,
+                true,
+                "simulate interrupted cleanup undo",
+            )
             .unwrap();
         workspace.repo.set_head(branch_ref).unwrap();
         let commit = workspace.repo.find_commit(restore_head).unwrap();
