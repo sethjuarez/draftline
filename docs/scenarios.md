@@ -101,7 +101,7 @@ flowchart LR
 | Receive work | Apply incoming | Fetch, preflight, fast-forward only | Remote updates are safe only when local history can advance without merge. |
 | Reconcile work | Merge incoming | Three-way merge with semantic conflict model | Divergence needs human-readable conflict decisions, not hidden Git merges. |
 | Go back | Restore as new save | New commit from old tree | Restoring should preserve the audit trail instead of moving history backward. |
-| Clean up | Squash or delete | Archive old tip as a support ref, then rewrite/delete visible ref | Cleanup should simplify UI while preserving a hidden recovery pointer. |
+| Clean up | Compact, squash, or delete | Archive old tip as a support ref, then rewrite/delete visible ref | Cleanup should simplify UI while preserving a hidden recovery pointer and stale-version mapping. |
 | Recover | Recovery prompt | Read ledger, block normal operations, repair/rollback/acknowledge | Interrupted operations should be visible and deliberate. |
 | Permanently remove content | Purge/redact | Not yet exposed | True deletion conflicts with archive-first safety and needs a separate explicit workflow. |
 
@@ -113,8 +113,8 @@ Draftline should distinguish normal business views from the hidden support refs 
 |---|---|---|---|
 | `refs/heads/<variation>` | Visible team variations | Shown in normal variation/history views | Published/fetched as shared work. |
 | `refs/draftline/shelves/...` | Work intentionally set aside | Hidden from normal views; shown in shelf/recovery views | Local-only by default; any sharing must be explicit and separately permissioned. |
-| `refs/draftline/deleted-variations/...` | Recovery points for deleted variations | Hidden from normal views; shown in recovery/admin views | Planned support-ref sync policy; currently local-only. |
-| `refs/draftline/rewrites/...` | Recovery points for history rewrites such as squash | Hidden from normal views; shown in recovery/admin views | Planned support-ref sync policy; currently local-only. |
+| `refs/draftline/deleted-variations/...` | Recovery points for deleted variations | Hidden from normal views; shown in recovery/admin views | Published/fetched explicitly as shared support refs when the user shares cleanup recovery. |
+| `refs/draftline/rewrites/...` | Recovery points for history rewrites such as squash or compaction | Hidden from normal views; shown in recovery/admin views | Published before shared history replacement and fetched with remote sync so incoming compaction can be recognized safely. |
 
 Shared recovery support refs are **not private**. They live inside the same shared repository trust boundary as visible work. They are hidden because they are not primary business objects, not because they contain secret content. Git server ACLs and refspec policy, not naming, determine who can fetch them. If content must not be retained by collaborators, the right scenario is purge/redaction, not delete, squash, or shared recovery.
 

@@ -2,8 +2,11 @@ use std::fs;
 use std::path::Path;
 
 use draftline::{
-    ContentPolicy, DiagnosticCode, DraftlineError, RemoteOptions, RestoreVersionTarget,
-    SupportRefScope, SwitchPolicy, SyncState, VariationId, VariationMetadata, Workspace,
+    CleanupBase, CleanupMode, CleanupPublishStatus, CleanupSafety, CommitRange, ContentPolicy,
+    DiagnosticCode, DraftlineError, HistoryCleanupRequest, HistoryCompactionCandidatesRequest,
+    MilestoneSpec, RemoteOptions, RemoteRewritePolicy, RestoreVersionTarget, RewriteConfirmation,
+    StaleVersionDisposition, StaleVersionResolutionRequest, SupportRefScope, SwitchPolicy,
+    SyncState, VariationId, VariationMetadata, Version, Workspace,
 };
 
 fn write_file(root: &Path, relative: &str, content: &str) {
@@ -31,6 +34,36 @@ fn init_bare_remote(root: &Path) {
     let mut options = git2::RepositoryInitOptions::new();
     options.bare(true).initial_head("main");
     git2::Repository::init_opts(root, &options).unwrap();
+}
+
+fn compact_cleanup_request(start: &Version, end: &Version) -> HistoryCleanupRequest {
+    HistoryCleanupRequest {
+        target_variation: None,
+        base: CleanupBase::Auto,
+        mode: CleanupMode::CompactMilestones {
+            milestones: vec![MilestoneSpec {
+                title: "Clean milestone".to_string(),
+                description: Some("Compacted noisy saves".to_string()),
+                include_range: CommitRange {
+                    start: start.id().clone(),
+                    end: end.id().clone(),
+                },
+            }],
+            preserve_named_branches: true,
+            preserve_merge_boundaries: true,
+        },
+        safety: CleanupSafety::default_user_facing(),
+        remote_policy: RemoteRewritePolicy::PushWithLease {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        },
+    }
+}
+
+fn local_compact_cleanup_request(start: &Version, end: &Version) -> HistoryCleanupRequest {
+    let mut request = compact_cleanup_request(start, end);
+    request.remote_policy = RemoteRewritePolicy::LocalOnly;
+    request
 }
 
 #[test]
@@ -492,6 +525,204 @@ fn scenario_remote_support_refs_roundtrip_restore_and_local_expire() {
         .list_support_refs(SupportRefScope::Local)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn scenario_local_milestone_compaction_preview_apply_resolve_and_undo() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root(), "Scenario Compactor");
+    write_file(workspace.root(), "story.md", "opening");
+    workspace.save_version("Opening").unwrap();
+    write_file(workspace.root(), "story.md", "noisy middle");
+    let noisy_start = workspace.save_version("Noisy middle").unwrap();
+    write_file(workspace.root(), "story.md", "noisy continuation");
+    let noisy_end = workspace.save_version("Noisy continuation").unwrap();
+    write_file(workspace.root(), "story.md", "ready");
+    let original_head = workspace.save_version("Ready").unwrap();
+
+    let candidates = workspace
+        .history_compaction_candidates(HistoryCompactionCandidatesRequest {
+            target_variation: None,
+            selected_version: noisy_start.id().clone(),
+            remote: None,
+            preserve_named_branches: true,
+            preserve_merge_boundaries: true,
+        })
+        .unwrap();
+    let candidate = candidates
+        .candidates
+        .iter()
+        .find(|candidate| candidate.version.id() == noisy_end.id())
+        .unwrap();
+    assert!(candidate.can_compact);
+    assert!(candidate.requires_descendant_replay);
+
+    let preview = workspace
+        .preview_history_cleanup(local_compact_cleanup_request(&noisy_start, &noisy_end))
+        .unwrap();
+    assert_eq!(preview.selected_commit_count, 2);
+    assert_eq!(preview.descendant_rewrite_count, 1);
+    assert!(preview.planned_backup_ref.is_some());
+    assert_eq!(read_file(workspace.root(), "story.md"), "ready");
+
+    let cleanup = workspace
+        .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+        .unwrap();
+    assert_ne!(cleanup.new_head, original_head.id().clone());
+    assert_eq!(read_file(workspace.root(), "story.md"), "ready");
+
+    let stale_noisy = workspace
+        .resolve_rewritten_version(StaleVersionResolutionRequest {
+            version: noisy_start.id().clone(),
+        })
+        .unwrap();
+    assert!(matches!(
+        stale_noisy.disposition,
+        StaleVersionDisposition::SquashedInto { .. }
+    ));
+
+    let undo = workspace
+        .preflight_undo_history_cleanup(cleanup.plan_id.clone())
+        .unwrap();
+    assert!(undo.can_undo);
+    let undo_result = workspace.undo_history_cleanup(undo.token).unwrap();
+    assert_eq!(undo_result.new_head, original_head.id().clone());
+    assert_eq!(read_file(workspace.root(), "story.md"), "ready");
+
+    write_file(workspace.root(), "story.md", "dirty work");
+    let blocked =
+        workspace.preview_history_cleanup(local_compact_cleanup_request(&noisy_start, &noisy_end));
+    assert!(matches!(
+        blocked,
+        Err(DraftlineError::PreflightFailed(report)) if report.operation == "history_cleanup"
+    ));
+}
+
+#[test]
+fn scenario_remote_compaction_publish_sync_replay_and_dirty_block() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    init_bare_remote(remote_dir.path());
+
+    let author_dir = tempfile::tempdir().unwrap();
+    let author = Workspace::init(author_dir.path()).unwrap();
+    configure_identity(author.root(), "Scenario Author");
+    author
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    write_file(author.root(), "story.md", "opening");
+    author.save_version("Opening").unwrap();
+    write_file(author.root(), "story.md", "noisy middle");
+    let noisy_start = author.save_version("Noisy middle").unwrap();
+    write_file(author.root(), "story.md", "ready to share");
+    let old_remote_tip = author.save_version("Ready to share").unwrap();
+    author.publish_changes("origin").unwrap();
+
+    let clean_peer_dir = tempfile::tempdir().unwrap();
+    let clean_peer =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), clean_peer_dir.path())
+            .unwrap();
+    configure_identity(clean_peer.root(), "Scenario Clean Peer");
+
+    let dirty_peer_dir = tempfile::tempdir().unwrap();
+    let dirty_peer =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), dirty_peer_dir.path())
+            .unwrap();
+    configure_identity(dirty_peer.root(), "Scenario Dirty Peer");
+
+    let replay_peer_dir = tempfile::tempdir().unwrap();
+    let replay_peer =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), replay_peer_dir.path())
+            .unwrap();
+    configure_identity(replay_peer.root(), "Scenario Replay Peer");
+    write_file(
+        replay_peer.root(),
+        "story.md",
+        "local work after old remote",
+    );
+    let local_only = replay_peer.save_version("Local-only work").unwrap();
+
+    let preview = author
+        .preview_history_cleanup(compact_cleanup_request(&noisy_start, &old_remote_tip))
+        .unwrap();
+    assert_eq!(
+        preview.remote_impact.as_ref().unwrap().publish_status,
+        CleanupPublishStatus::SharedHistoryRewriteRequired
+    );
+    let cleanup = author
+        .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+        .unwrap();
+    let publish_preflight = author
+        .preflight_publish_history_cleanup(cleanup.plan_id.clone(), "origin")
+        .unwrap();
+    assert!(publish_preflight.can_publish);
+    assert_eq!(publish_preflight.support_refs.len(), 1);
+    author
+        .publish_history_cleanup(
+            publish_preflight.token.unwrap(),
+            RewriteConfirmation::UserConfirmed,
+        )
+        .unwrap();
+
+    clean_peer.fetch_remote("origin").unwrap();
+    assert_eq!(
+        clean_peer.sync_status("origin").unwrap().state,
+        SyncState::IncomingAvailable
+    );
+    assert!(
+        clean_peer
+            .preflight_apply_incoming("origin")
+            .unwrap()
+            .can_proceed
+    );
+    let mut clean_options = RemoteOptions::new();
+    clean_peer
+        .apply_incoming("origin", &mut clean_options)
+        .unwrap();
+    assert_eq!(read_file(clean_peer.root(), "story.md"), "ready to share");
+    let stale_noisy = clean_peer
+        .resolve_rewritten_version(StaleVersionResolutionRequest {
+            version: noisy_start.id().clone(),
+        })
+        .unwrap();
+    assert!(matches!(
+        stale_noisy.disposition,
+        StaleVersionDisposition::BackedUp { .. }
+    ));
+
+    dirty_peer.fetch_remote("origin").unwrap();
+    write_file(dirty_peer.root(), "story.md", "unsaved dirty work");
+    let dirty_report = dirty_peer.preflight_apply_incoming("origin").unwrap();
+    assert!(!dirty_report.can_proceed);
+    assert!(!dirty_report.dirty_files.is_empty());
+    let mut dirty_options = RemoteOptions::new();
+    let dirty_apply = dirty_peer.apply_incoming("origin", &mut dirty_options);
+    assert!(matches!(
+        dirty_apply,
+        Err(DraftlineError::PreflightFailed(report)) if report.operation == "apply_incoming"
+    ));
+
+    let mut replay_options = RemoteOptions::new();
+    replay_peer
+        .apply_incoming("origin", &mut replay_options)
+        .unwrap();
+    assert_eq!(
+        read_file(replay_peer.root(), "story.md"),
+        "local work after old remote"
+    );
+    assert_eq!(
+        replay_peer.sync_status("origin").unwrap().state,
+        SyncState::LocalAhead
+    );
+    let stale_local = replay_peer
+        .resolve_rewritten_version(StaleVersionResolutionRequest {
+            version: local_only.id().clone(),
+        })
+        .unwrap();
+    assert!(matches!(
+        stale_local.disposition,
+        StaleVersionDisposition::Live { .. }
+    ));
 }
 
 #[test]
