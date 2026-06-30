@@ -67,7 +67,34 @@ fn local_compact_cleanup_request(start: &Version, end: &Version) -> HistoryClean
 }
 
 #[test]
-fn scenario_variation_restore_and_support_ref_lifecycle() {
+fn scenario_flow_documentation_matrix_is_executable() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let scenarios = fs::read_to_string(manifest_dir.join("../../docs/scenarios.md")).unwrap();
+    let harness = fs::read_to_string(manifest_dir.join("tests/scenario_flows.rs")).unwrap();
+    let rows = scenarios
+        .lines()
+        .filter(|line| line.starts_with("| Flow ") && line.contains(':'))
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 39, "every documented Flow row must be in the matrix");
+    for row in rows {
+        assert!(
+            row.contains('`'),
+            "matrix row must name executable evidence or an explicit guard test: {row}"
+        );
+        for evidence in row.split('`').skip(1).step_by(2) {
+            if evidence.starts_with("scenario_flow_") {
+                assert!(
+                    harness.contains(&format!("fn {evidence}(")),
+                    "matrix references missing scenario harness test `{evidence}`"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn scenario_flow_6_7_9_13_local_variation_restore_and_support_ref_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::init(temp.path()).unwrap();
     configure_identity(workspace.root(), "Scenario Author");
@@ -316,7 +343,7 @@ fn targeted_restore_fails_without_activating_target_when_restore_cannot_proceed(
 }
 
 #[test]
-fn scenario_shelf_apply_preview_and_delete_roundtrip() {
+fn scenario_flow_12a_shelf_apply_preview_and_delete_roundtrip() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::init(temp.path()).unwrap();
     configure_identity(workspace.root(), "Scenario Shelf");
@@ -349,7 +376,7 @@ fn scenario_shelf_apply_preview_and_delete_roundtrip() {
 }
 
 #[test]
-fn scenario_collaboration_fast_forward_and_clean_merge() {
+fn scenario_flow_10_11_12_collaboration_fast_forward_and_clean_merge() {
     let remote_dir = tempfile::tempdir().unwrap();
     init_bare_remote(remote_dir.path());
 
@@ -415,7 +442,7 @@ fn scenario_collaboration_fast_forward_and_clean_merge() {
 }
 
 #[test]
-fn scenario_collaboration_conflict_preflight_reports_without_mutating() {
+fn scenario_flow_12_conflict_preflight_reports_without_mutating() {
     let remote_dir = tempfile::tempdir().unwrap();
     init_bare_remote(remote_dir.path());
 
@@ -460,7 +487,76 @@ fn scenario_collaboration_conflict_preflight_reports_without_mutating() {
 }
 
 #[test]
-fn scenario_remote_support_refs_roundtrip_restore_and_local_expire() {
+fn scenario_flow_1c_11a_11b_remote_bootstrap_variation_diagnostics_and_adoption() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    init_bare_remote(remote_dir.path());
+
+    let local_dir = tempfile::tempdir().unwrap();
+    let local = Workspace::init(local_dir.path()).unwrap();
+    configure_identity(local.root(), "Scenario Local Author");
+    write_file(local.root(), "story.md", "local-only start");
+    local.save_version("Local-only start").unwrap();
+    local
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    let first_publish = local.preflight_publish("origin").unwrap();
+    assert!(first_publish.can_publish);
+    local.publish(first_publish.token).unwrap();
+
+    let stale_local = local.create_variation("deleted-remotely").unwrap();
+    local
+        .switch_variation(stale_local.id(), SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    write_file(local.root(), "story.md", "branch that will disappear remotely");
+    local.save_version("Deleted remotely").unwrap();
+    local.publish_changes("origin").unwrap();
+    local
+        .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
+        .unwrap();
+
+    let teammate_dir = tempfile::tempdir().unwrap();
+    let teammate =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), teammate_dir.path())
+            .unwrap();
+    configure_identity(teammate.root(), "Scenario Teammate");
+    let teammate_only = teammate.create_variation("teammate-only").unwrap();
+    teammate
+        .switch_variation(teammate_only.id(), SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    write_file(teammate.root(), "story.md", "teammate-only branch");
+    teammate.save_version("Teammate-only branch").unwrap();
+    teammate.publish_changes("origin").unwrap();
+
+    let bare = git2::Repository::open_bare(remote_dir.path()).unwrap();
+    bare.find_reference("refs/heads/deleted-remotely")
+        .unwrap()
+        .delete()
+        .unwrap();
+
+    local.fetch_all_variations("origin").unwrap();
+    let diagnostics = local.remote_variation_diagnostics("origin").unwrap();
+    assert!(diagnostics
+        .shared_variations
+        .contains(&VariationId::from("main")));
+    assert!(diagnostics
+        .local_only_variations
+        .contains(&VariationId::from("deleted-remotely")));
+    assert!(diagnostics
+        .remote_only_variations
+        .contains(&VariationId::from("teammate-only")));
+
+    let remote_variations = local.remote_variations("origin").unwrap();
+    assert!(remote_variations
+        .iter()
+        .any(|variation| variation.name == "teammate-only"));
+    let adopted = local
+        .adopt_remote_variation("origin", &VariationId::from("teammate-only"))
+        .unwrap();
+    assert_eq!(adopted.name, "teammate-only");
+}
+
+#[test]
+fn scenario_flow_13c_13d_remote_support_refs_roundtrip_restore_and_local_expire() {
     let remote_dir = tempfile::tempdir().unwrap();
     init_bare_remote(remote_dir.path());
 
@@ -528,7 +624,7 @@ fn scenario_remote_support_refs_roundtrip_restore_and_local_expire() {
 }
 
 #[test]
-fn scenario_local_milestone_compaction_preview_apply_resolve_and_undo() {
+fn scenario_flow_13a_local_milestone_compaction_preview_apply_resolve_and_undo() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::init(temp.path()).unwrap();
     configure_identity(workspace.root(), "Scenario Compactor");
@@ -600,7 +696,7 @@ fn scenario_local_milestone_compaction_preview_apply_resolve_and_undo() {
 }
 
 #[test]
-fn scenario_remote_compaction_publish_sync_replay_and_dirty_block() {
+fn scenario_flow_13e_remote_compaction_publish_sync_replay_and_dirty_block() {
     let remote_dir = tempfile::tempdir().unwrap();
     init_bare_remote(remote_dir.path());
 
@@ -726,7 +822,7 @@ fn scenario_remote_compaction_publish_sync_replay_and_dirty_block() {
 }
 
 #[test]
-fn scenario_purge_api_is_explicitly_planning_only() {
+fn scenario_flow_13f_purge_api_is_explicitly_planning_only() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::init(temp.path()).unwrap();
     configure_identity(workspace.root(), "Scenario Author");
@@ -754,7 +850,7 @@ fn scenario_purge_api_is_explicitly_planning_only() {
 }
 
 #[test]
-fn scenario_content_policy_api_surfaces_ignored_tracked_content() {
+fn scenario_flow_2b_content_policy_api_surfaces_ignored_tracked_content() {
     let temp = tempfile::tempdir().unwrap();
     let policy = ContentPolicy::new().include("content").unwrap();
     let workspace = Workspace::init_with_policy(temp.path(), policy.clone()).unwrap();

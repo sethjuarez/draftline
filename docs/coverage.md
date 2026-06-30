@@ -6,6 +6,22 @@
 
 Status values are intentionally narrow. `Covered for <scope>` means only that named scope is implemented; the `Remaining gap` column is still out of scope for current consumers.
 
+The canonical per-flow doc-to-test matrix is in [Draftline scenarios](scenarios.md#doc-to-test-coverage-matrix). This page summarizes release-gate evidence by scenario area; if a documented flow has no executable evidence, the matrix must name the unsupported reason and intended future coverage.
+
+## Release-gate scenario evidence
+
+| Coverage area | Documented flows | Primary executable evidence |
+|---|---|---|
+| Remote bootstrap, first publish, remote-only discovery, and prune diagnostics | Flow 1c, Flow 11a, Flow 11b | `scenario_flow_1c_11a_11b_remote_bootstrap_variation_diagnostics_and_adoption`, `remote_variations_can_be_discovered_and_adopted_locally`, `remote_variation_diagnostics_reports_local_and_remote_only_variations_after_prune` |
+| Current-variation publish, incoming fast-forward, and clean merge | Flow 10, Flow 11, Flow 12 | `scenario_flow_10_11_12_collaboration_fast_forward_and_clean_merge`, `scenario_flow_12_conflict_preflight_reports_without_mutating`, `tauri_contract_smokes_publish_current_variation`, `tauri_contract_smokes_collaboration_incoming_and_merge` |
+| Local cleanup, milestone compaction, stale-version resolution, and undo | Flow 13, Flow 13a | `scenario_flow_13a_local_milestone_compaction_preview_apply_resolve_and_undo`, `history_cleanup_compacts_milestones_maps_old_versions_and_undoes`, `history_cleanup_compacts_middle_range_and_replays_descendants` |
+| Shared cleanup and support-ref-first remote rewrite/delete | Flow 13b | `replace_remote_history_publishes_support_ref_before_force_with_lease`, `delete_remote_variation_publishes_support_ref_before_deleting_visible_ref`, `history_cleanup_publish_replaces_remote_with_support_ref_and_lease`, `history_cleanup_publish_refuses_remote_race_after_preflight` |
+| Support-ref sync, restore after clone/device loss, and local expiration | Flow 13c, Flow 13d, Flow 13g | `scenario_flow_13c_13d_remote_support_refs_roundtrip_restore_and_local_expire`, `support_refs_publish_create_only_and_fetch_remote_tracking_refs`, `support_ref_publish_preflight_rejects_same_name_different_oid_collision` |
+| Incoming compacted remote history, dirty blocking, local-ahead replay, and ambiguous merge fallback | Flow 13e | `scenario_flow_13e_remote_compaction_publish_sync_replay_and_dirty_block`, `apply_incoming_accepts_published_remote_compaction_when_clean`, `apply_incoming_replays_local_snapshots_after_published_remote_compaction`, `remote_compaction_with_non_first_parent_local_work_stays_needs_merge` |
+| Content policy, selected work, dirty workspace policy, and target-tree hazards | Flow 2, Flow 2b, Flow 4a, Flow 5, Flow 7, Flow 9a | `scenario_flow_2b_content_policy_api_surfaces_ignored_tracked_content`, `scenario_flow_6_7_9_13_local_variation_restore_and_support_ref_lifecycle`, `tauri_contract_keeps_frontend_json_shape_stable`, `tauri_contract_smokes_history_preview_restore_shelf_and_policy_commands` |
+| Purge planning and explicit non-execution | Flow 13f | `scenario_flow_13f_purge_api_is_explicitly_planning_only` |
+| Recovery, remote-delete repair, and stale locks | Flow 14, Flow 14b | `repair_recovery_finishes_discard_changes`, `repair_recovery_completes_apply_incoming_fast_forward`, `repair_remote_delete_recovers_after_visible_ref_was_deleted`, `clear_stale_lock_removes_only_stale_metadata_lock` |
+
 | Scenario group | Coverage | Current primitives | Remaining gap |
 |---|---|---|---|
 | Start or open workspace | Covered | `init`, `open`, `clone_workspace`, `workspace_summary` | None for MVP. |
