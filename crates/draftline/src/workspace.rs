@@ -708,6 +708,9 @@ pub struct WorkspaceGraphNode {
     pub child_ids: Vec<WorkspaceGraphNodeId>,
     pub child_count: usize,
     pub kind: WorkspaceGraphNodeKind,
+    pub reachable_from_local_variation: bool,
+    pub reachable_from_remote_variation: bool,
+    pub reachable_from_support_ref: bool,
     pub topo_index: usize,
     pub layout: WorkspaceGraphLayoutHint,
     pub boundary: WorkspaceGraphBoundary,
@@ -1698,6 +1701,7 @@ pub enum CleanupWarningCode {
     RangeEndNotAncestorOfTargetHead,
     MergeBoundaryWouldBeRewritten,
     NamedBranchInsideCompactedRange,
+    SelectedVersionNotOnTargetVariation,
 }
 
 /// Result of applying a prepared timeline cleanup.
@@ -3700,6 +3704,9 @@ impl Workspace {
             format!(
                 "+refs/draftline/rewrites/squash/*:refs/remotes/{remote}/draftline/rewrites/squash/*"
             ),
+            format!(
+                "+refs/draftline/backups/history-cleanup/*:refs/remotes/{remote}/draftline/backups/history-cleanup/*"
+            ),
         ];
         let refspec_refs = refspecs.iter().map(String::as_str).collect::<Vec<_>>();
         if options.has_credentials() {
@@ -4976,7 +4983,20 @@ impl Workspace {
         let selected_index = chain
             .iter()
             .position(|oid| *oid == selected_oid)
-            .ok_or_else(|| DraftlineError::VersionNotLocallyReachable(selected_oid.to_string()))?;
+            .ok_or_else(|| {
+                DraftlineError::HistoryCleanupBlocked(Box::new(HistoryCleanupBlockReport {
+                    operation: "history_compaction_candidates".to_string(),
+                    diagnostics: vec![cleanup_warning(
+                        CleanupWarningCode::SelectedVersionNotOnTargetVariation,
+                        format!(
+                            "selected version `{selected_oid}` is not on the first-parent history of variation `{}`",
+                            target_variation.as_str()
+                        ),
+                        vec![VersionId::from(selected_oid), VersionId::from(target_head_oid)],
+                    )],
+                    can_proceed: false,
+                }))
+            })?;
         let local_tips = self.local_variation_tip_oids()?;
         let mut candidates = Vec::new();
         let mut remote_options = RemoteOptions::new();
@@ -5054,22 +5074,14 @@ impl Workspace {
                 }
                 if range_set.contains(tip) {
                     let warning = cleanup_warning(
-                        if request.preserve_named_branches {
-                            CleanupWarningCode::NamedBranchInsideCompactedRange
-                        } else {
-                            CleanupWarningCode::NamedBranchWouldBeAffected
-                        },
+                        CleanupWarningCode::NamedBranchInsideCompactedRange,
                         format!(
                             "variation `{}` points inside the compacted range",
                             variation.as_str()
                         ),
                         vec![VersionId::from(*tip)],
                     );
-                    if request.preserve_named_branches {
-                        blockers.push(warning);
-                    } else {
-                        warnings.push(warning);
-                    }
+                    blockers.push(warning);
                 } else if descendant_set.contains(tip) {
                     warnings.push(cleanup_warning(
                         CleanupWarningCode::NamedBranchWouldBeAffected,
@@ -5211,6 +5223,12 @@ impl Workspace {
         } else {
             self.reachable_oids(support_tip_oids.iter().copied())?
         };
+        let remote_reachable = if state_may_be_inconsistent {
+            self.reachable_oids(remote_tip_oids.iter().copied())
+                .unwrap_or_default()
+        } else {
+            self.reachable_oids(remote_tip_oids.iter().copied())?
+        };
         let mut nodes = Vec::new();
         let start = options.cursor.unwrap_or_default();
         let limit = options.limit.unwrap_or(usize::MAX);
@@ -5235,6 +5253,7 @@ impl Workspace {
                         &tips,
                         head_oid,
                         &local_reachable,
+                        &remote_reachable,
                         &support_reachable,
                         total,
                     )?);
@@ -6964,6 +6983,17 @@ impl Workspace {
             }],
             options,
         )?;
+        self.fetch_remote_variation_ref(&token.remote, token.variation.as_str(), options)?;
+        let published_remote_oid =
+            remote_tracking_oid(&self.repo, &token.remote, token.variation.as_str());
+        if published_remote_oid.as_deref() != Some(token.replacement_oid.as_str()) {
+            return Err(DraftlineError::RemoteRace {
+                remote: token.remote,
+                variation: token.variation.as_str().to_string(),
+                expected: Some(token.replacement_oid),
+                actual: published_remote_oid,
+            });
+        }
 
         let support_refs = token
             .support_ref_token
@@ -8427,7 +8457,7 @@ impl Workspace {
             old_head_oid,
             base,
             milestones,
-            preserve_named_branches,
+            preserve_named_branches: _preserve_named_branches,
             preserve_merge_boundaries,
         } = input;
 
@@ -8623,7 +8653,7 @@ impl Workspace {
             ));
         }
 
-        let mut warnings = Vec::new();
+        let warnings = Vec::new();
         let mut affected_refs = Vec::new();
         let mut planned_ref_updates = Vec::new();
         let target_ref_update = RefUpdate {
@@ -8645,33 +8675,20 @@ impl Workspace {
             let ref_name = RefName::from(format!("refs/heads/{}", variation.as_str()));
             if selected_oid_set.contains(&tip) {
                 let warning = cleanup_warning(
-                    if preserve_named_branches {
-                        CleanupWarningCode::NamedBranchInsideCompactedRange
-                    } else {
-                        CleanupWarningCode::NamedBranchWouldBeAffected
-                    },
+                    CleanupWarningCode::NamedBranchInsideCompactedRange,
                     format!(
                         "variation `{}` points inside the compacted range",
                         variation.as_str()
                     ),
                     vec![VersionId::from(tip)],
                 );
-                if preserve_named_branches {
-                    return Err(DraftlineError::HistoryCleanupBlocked(Box::new(
-                        HistoryCleanupBlockReport {
-                            operation: "history_cleanup".to_string(),
-                            diagnostics: vec![warning],
-                            can_proceed: false,
-                        },
-                    )));
-                }
-                warnings.push(warning);
-                affected_refs.push(CleanupAffectedRef {
-                    name: ref_name,
-                    old: Some(VersionId::from(tip)),
-                    new: None,
-                    impact: CleanupRefImpact::PointsInsideCompactedRange,
-                });
+                return Err(DraftlineError::HistoryCleanupBlocked(Box::new(
+                    HistoryCleanupBlockReport {
+                        operation: "history_cleanup".to_string(),
+                        diagnostics: vec![warning],
+                        can_proceed: false,
+                    },
+                )));
             } else if descendant_oid_set.contains(&tip) {
                 let new_tip = oid_rewrites.get(&tip).copied().ok_or_else(|| {
                     DraftlineError::InvalidHistoryCleanup(format!(
@@ -10433,14 +10450,18 @@ fn workspace_graph_node_from_commit(
     tips: &HashMap<Oid, Vec<VariationId>>,
     head_oid: Option<Oid>,
     local_reachable: &BTreeSet<Oid>,
+    remote_reachable: &BTreeSet<Oid>,
     support_reachable: &BTreeSet<Oid>,
     topo_index: usize,
 ) -> Result<WorkspaceGraphNode> {
     let oid = commit.id();
     let history_entry = history_entry_from_commit(commit, tips, head_oid)?;
-    let kind = if local_reachable.contains(&oid) {
+    let reachable_from_local_variation = local_reachable.contains(&oid);
+    let reachable_from_remote_variation = remote_reachable.contains(&oid);
+    let reachable_from_support_ref = support_reachable.contains(&oid);
+    let kind = if reachable_from_local_variation {
         WorkspaceGraphNodeKind::Normal
-    } else if support_reachable.contains(&oid) {
+    } else if reachable_from_support_ref {
         WorkspaceGraphNodeKind::SupportRefOnly
     } else {
         WorkspaceGraphNodeKind::RemoteOnly
@@ -10480,6 +10501,9 @@ fn workspace_graph_node_from_commit(
         child_ids: Vec::new(),
         child_count: 0,
         kind: kind.clone(),
+        reachable_from_local_variation,
+        reachable_from_remote_variation,
+        reachable_from_support_ref,
         topo_index,
         layout: WorkspaceGraphLayoutHint {
             lane: 0,
@@ -15864,6 +15888,9 @@ mod tests {
             .find(|node| node.version.id() == remote_only.id())
             .unwrap();
         assert_eq!(remote_node.kind, WorkspaceGraphNodeKind::RemoteOnly);
+        assert!(!remote_node.reachable_from_local_variation);
+        assert!(remote_node.reachable_from_remote_variation);
+        assert!(!remote_node.reachable_from_support_ref);
         let remote_detail = first_ws
             .workspace_graph_node(remote_only.id(), WorkspaceGraphOptions::default())
             .unwrap();
@@ -15937,6 +15964,9 @@ mod tests {
             .find(|node| node.version.id() == deleted_tip.id())
             .unwrap();
         assert_eq!(support_node.kind, WorkspaceGraphNodeKind::SupportRefOnly);
+        assert!(!support_node.reachable_from_local_variation);
+        assert!(!support_node.reachable_from_remote_variation);
+        assert!(support_node.reachable_from_support_ref);
         let support_detail = workspace
             .workspace_graph_node(deleted_tip.id(), WorkspaceGraphOptions::default())
             .unwrap();
@@ -16003,6 +16033,9 @@ mod tests {
             .find(|node| node.version.id() == published_deleted.id())
             .unwrap();
         assert_eq!(node.kind, WorkspaceGraphNodeKind::SupportRefOnly);
+        assert!(!node.reachable_from_local_variation);
+        assert!(node.reachable_from_remote_variation);
+        assert!(node.reachable_from_support_ref);
         let support_ref = graph
             .refs
             .iter()
@@ -16415,6 +16448,87 @@ mod tests {
     }
 
     #[test]
+    fn history_compaction_candidates_blocks_selected_version_outside_target_first_parent_chain() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        let v1 = workspace.save_version("v1").unwrap();
+        let v1_commit = workspace.find_version_commit(v1.id()).unwrap();
+        workspace.repo.branch("side", &v1_commit, false).unwrap();
+        drop(v1_commit);
+
+        workspace
+            .switch_variation(&VariationId::from("side"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"side");
+        let side = workspace.save_version("side").unwrap();
+        workspace
+            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        workspace.save_version("v2").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        workspace.save_version("v3").unwrap();
+
+        let err = workspace
+            .history_compaction_candidates(HistoryCompactionCandidatesRequest {
+                target_variation: Some(VariationId::from("main")),
+                selected_version: side.id().clone(),
+                remote: None,
+                preserve_named_branches: true,
+                preserve_merge_boundaries: true,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DraftlineError::HistoryCleanupBlocked(report)
+                if report.operation == "history_compaction_candidates"
+                    && report.diagnostics.iter().any(|diagnostic| diagnostic.code == CleanupWarningCode::SelectedVersionNotOnTargetVariation)
+        ));
+    }
+
+    #[test]
+    fn history_compaction_candidates_blocks_variation_tip_inside_range_even_when_branches_can_move()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        let v2_commit = workspace.find_version_commit(v2.id()).unwrap();
+        workspace.repo.branch("side", &v2_commit, false).unwrap();
+        drop(v2_commit);
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+        write_file(workspace.root(), "post.md", b"v4");
+        workspace.save_version("v4").unwrap();
+
+        let candidates = workspace
+            .history_compaction_candidates(HistoryCompactionCandidatesRequest {
+                target_variation: None,
+                selected_version: v2.id().clone(),
+                remote: None,
+                preserve_named_branches: false,
+                preserve_merge_boundaries: true,
+            })
+            .unwrap();
+        let v3_candidate = candidates
+            .candidates
+            .iter()
+            .find(|candidate| candidate.version.id() == v3.id())
+            .unwrap();
+
+        assert!(!v3_candidate.can_compact);
+        assert!(v3_candidate.blockers.iter().any(|diagnostic| {
+            diagnostic.code == CleanupWarningCode::NamedBranchInsideCompactedRange
+        }));
+    }
+
+    #[test]
     fn history_compaction_candidates_supports_selected_range_end() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
@@ -16555,6 +16669,14 @@ mod tests {
         let bare = Repository::open_bare(remote.path()).unwrap();
         assert_eq!(
             bare.refname_to_id("refs/heads/main").unwrap().to_string(),
+            result.new_head.as_str()
+        );
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id("refs/remotes/origin/main")
+                .unwrap()
+                .to_string(),
             result.new_head.as_str()
         );
         assert!(bare
@@ -16945,6 +17067,46 @@ mod tests {
             DraftlineError::HistoryCleanupBlocked(report)
                 if report.diagnostics.iter().any(|diagnostic| diagnostic.code == CleanupWarningCode::NamedBranchInsideCompactedRange)
         ));
+    }
+
+    #[test]
+    fn history_cleanup_blocks_variation_inside_compacted_range_even_when_named_branches_can_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("v2").unwrap();
+        let v2_commit = workspace.find_version_commit(v2.id()).unwrap();
+        workspace.repo.branch("side", &v2_commit, false).unwrap();
+        drop(v2_commit);
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("v3").unwrap();
+
+        let mut request = compact_cleanup_request(&v2, &v3);
+        let CleanupMode::CompactMilestones {
+            preserve_named_branches,
+            ..
+        } = &mut request.mode;
+        *preserve_named_branches = false;
+        let err = workspace.preview_history_cleanup(request).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DraftlineError::HistoryCleanupBlocked(report)
+                if report.diagnostics.iter().any(|diagnostic| diagnostic.code == CleanupWarningCode::NamedBranchInsideCompactedRange)
+        ));
+        let graph = workspace
+            .workspace_graph(WorkspaceGraphOptions::default())
+            .unwrap();
+        let side_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == v2.id())
+            .unwrap();
+        assert!(side_node.reachable_from_local_variation);
+        assert_eq!(side_node.kind, WorkspaceGraphNodeKind::Normal);
     }
 
     #[test]
