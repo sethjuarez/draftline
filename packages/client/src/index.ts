@@ -602,7 +602,8 @@ export type CleanupWarningCode =
   | 'backup_ref_already_exists'
   | 'range_end_not_ancestor_of_target_head'
   | 'merge_boundary_would_be_rewritten'
-  | 'named_branch_inside_compacted_range';
+  | 'named_branch_inside_compacted_range'
+  | 'selected_version_not_on_target_variation';
 
 export type CleanupRefImpact =
   | 'target_variation_moved'
@@ -754,6 +755,9 @@ export interface WorkspaceGraphNode {
   child_ids: string[];
   child_count: number;
   kind: WorkspaceGraphNodeKind;
+  reachable_from_local_variation?: boolean;
+  reachable_from_remote_variation?: boolean;
+  reachable_from_support_ref?: boolean;
   topo_index: number;
   layout: WorkspaceGraphLayoutHint;
   boundary: WorkspaceGraphBoundary;
