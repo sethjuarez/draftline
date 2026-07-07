@@ -1,0 +1,216 @@
+name: Build iOS package
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_build:
+        description: "Type build to create the DraftlineMobile XCFramework artifact"
+        required: true
+        type: string
+      release_tag:
+        description: "Optional GitHub release tag to upload the iOS package assets"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build DraftlineMobile XCFramework
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+      IOS_DEVICE_TARGET: aarch64-apple-ios
+      IOS_SIM_ARM64_TARGET: aarch64-apple-ios-sim
+      IOS_SIM_X86_64_TARGET: x86_64-apple-ios
+      PACKAGE_NAME: DraftlineMobile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Confirm build intent
+        run: |
+          if [ "${{ inputs.confirm_build }}" != "build" ]; then
+            echo "Refusing to build without confirm_build=build"
+            exit 1
+          fi
+
+      - name: Install stable Rust and iOS targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add \
+            "$IOS_DEVICE_TARGET" \
+            "$IOS_SIM_ARM64_TARGET" \
+            "$IOS_SIM_X86_64_TARGET"
+
+      - name: Install cbindgen
+        run: cargo install cbindgen --locked
+
+      - name: Generate C header
+        run: |
+          mkdir -p build/ios/include
+          cbindgen \
+            --crate draftline \
+            --lang c \
+            --output build/ios/include/draftline_mobile.h
+
+      - name: Configure Apple C toolchains
+        run: |
+          {
+            echo "SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)"
+            echo "CC_aarch64_apple_ios=$(xcrun --sdk iphoneos -f clang)"
+            echo "AR_aarch64_apple_ios=$(xcrun --sdk iphoneos -f ar)"
+            echo "CFLAGS_aarch64_apple_ios=-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=$IPHONEOS_DEPLOYMENT_TARGET"
+            echo "CC_aarch64_apple_ios_sim=$(xcrun --sdk iphonesimulator -f clang)"
+            echo "AR_aarch64_apple_ios_sim=$(xcrun --sdk iphonesimulator -f ar)"
+            echo "CFLAGS_aarch64_apple_ios_sim=-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -mios-simulator-version-min=$IPHONEOS_DEPLOYMENT_TARGET"
+            echo "CC_x86_64_apple_ios=$(xcrun --sdk iphonesimulator -f clang)"
+            echo "AR_x86_64_apple_ios=$(xcrun --sdk iphonesimulator -f ar)"
+            echo "CFLAGS_x86_64_apple_ios=-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -mios-simulator-version-min=$IPHONEOS_DEPLOYMENT_TARGET"
+          } >> "$GITHUB_ENV"
+
+      - name: Build Rust static libraries
+        run: |
+          cargo build -p draftline --release --features vendored-mobile-git --target "$IOS_DEVICE_TARGET"
+          cargo build -p draftline --release --features vendored-mobile-git --target "$IOS_SIM_ARM64_TARGET"
+          cargo build -p draftline --release --features vendored-mobile-git --target "$IOS_SIM_X86_64_TARGET"
+
+      - name: Create universal simulator library
+        run: |
+          mkdir -p build/ios/simulator-universal
+          lipo -create \
+            "target/$IOS_SIM_ARM64_TARGET/release/libdraftline.a" \
+            "target/$IOS_SIM_X86_64_TARGET/release/libdraftline.a" \
+            -output build/ios/simulator-universal/libdraftline.a
+          lipo -info build/ios/simulator-universal/libdraftline.a
+
+      - name: Create XCFramework
+        run: |
+          rm -rf "build/ios/$PACKAGE_NAME.xcframework"
+          xcodebuild -create-xcframework \
+            -library "target/$IOS_DEVICE_TARGET/release/libdraftline.a" \
+            -headers build/ios/include \
+            -library build/ios/simulator-universal/libdraftline.a \
+            -headers build/ios/include \
+            -output "build/ios/$PACKAGE_NAME.xcframework"
+
+      - name: Package SwiftPM binary artifact
+        id: package
+        run: |
+          mkdir -p build/spm/Binaries
+          cp -R "build/ios/$PACKAGE_NAME.xcframework" build/spm/Binaries/
+          cat > build/spm/Package.swift <<'SWIFT'
+          // swift-tools-version: 5.9
+          import PackageDescription
+
+          let package = Package(
+              name: "DraftlineMobile",
+              platforms: [.iOS(.v15)],
+              products: [
+                  .library(name: "DraftlineMobile", targets: ["DraftlineMobile"])
+              ],
+              targets: [
+                  .binaryTarget(
+                      name: "DraftlineMobile",
+                      path: "Binaries/DraftlineMobile.xcframework"
+                  )
+              ]
+          )
+          SWIFT
+          ditto -c -k --sequesterRsrc --keepParent \
+            "build/ios/$PACKAGE_NAME.xcframework" \
+            "build/ios/$PACKAGE_NAME.xcframework.zip"
+          checksum=$(swift package compute-checksum "build/ios/$PACKAGE_NAME.xcframework.zip")
+          release_tag="${{ inputs.release_tag }}"
+          if [ -z "$release_tag" ]; then
+            release_tag="<tag>"
+          fi
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+          echo "$checksum" > build/ios/DraftlineMobile.xcframework.checksum
+          cp build/ios/include/draftline_mobile.h build/ios/draftline_mobile.h
+          cat > build/ios/swiftpm-binary-target.txt <<EOF
+          .binaryTarget(
+              name: "DraftlineMobile",
+              url: "https://github.com/${{ github.repository }}/releases/download/$release_tag/$PACKAGE_NAME.xcframework.zip",
+              checksum: "$checksum"
+          )
+          EOF
+          cat > build/ios/Package.swift <<EOF
+          // swift-tools-version: 5.9
+          import PackageDescription
+
+          let package = Package(
+              name: "DraftlineMobile",
+              platforms: [.iOS(.v15)],
+              products: [
+                  .library(name: "DraftlineMobile", targets: ["DraftlineMobile"])
+              ],
+              targets: [
+                  .binaryTarget(
+                      name: "DraftlineMobile",
+                      url: "https://github.com/${{ github.repository }}/releases/download/$release_tag/$PACKAGE_NAME.xcframework.zip",
+                      checksum: "$checksum"
+                  )
+              ]
+          )
+          EOF
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DraftlineMobile-ios-package
+          path: |
+            build/ios/DraftlineMobile.xcframework.zip
+            build/ios/DraftlineMobile.xcframework.checksum
+            build/ios/draftline_mobile.h
+            build/ios/swiftpm-binary-target.txt
+            build/ios/Package.swift
+            build/spm/Package.swift
+          if-no-files-found: error
+
+      - name: Upload release assets
+        if: inputs.release_tag != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes "DraftlineMobile iOS package artifact. SwiftPM checksum: ${{ steps.package.outputs.checksum }}"
+          fi
+          gh release upload "$RELEASE_TAG" \
+            "build/ios/$PACKAGE_NAME.xcframework.zip" \
+            "build/ios/$PACKAGE_NAME.xcframework.checksum" \
+            "build/ios/draftline_mobile.h" \
+            "build/ios/swiftpm-binary-target.txt" \
+            "build/ios/Package.swift" \
+            --clobber
+
+      - name: Write package summary
+        run: |
+          {
+            echo "## DraftlineMobile iOS package"
+            echo
+            echo "- Artifact: \`DraftlineMobile.xcframework.zip\`"
+            echo "- SwiftPM checksum: \`${{ steps.package.outputs.checksum }}\`"
+            echo "- Header: embedded as \`draftline_mobile.h\` in the XCFramework headers"
+            echo "- Release tag: \`${{ inputs.release_tag || 'not uploaded' }}\`"
+            echo
+            echo "SwiftPM binary target:"
+            echo
+            echo '```swift'
+            cat build/ios/swiftpm-binary-target.txt
+            echo '```'
+            echo
+            echo "SwiftPM package manifest:"
+            echo
+            echo '```swift'
+            cat build/ios/Package.swift
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

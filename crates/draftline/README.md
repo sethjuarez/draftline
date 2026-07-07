@@ -187,6 +187,35 @@ let profile = ContributorProfile::new(
 # let _ = profile;
 ```
 
+## Native mobile bridge
+
+The `draftline::mobile_ffi` module exposes a small C ABI foundation for native
+mobile hosts such as Swift/iOS apps. It keeps Draftline as the owner of workspace
+versioning and sync semantics while giving the host an opaque workspace handle,
+C-safe status/error results, a host-provided `ContentPolicy`, a credential
+callback shape, and JSON return values for structured Draftline types.
+
+The first mobile slice supports opening/initializing or cloning a workspace,
+reading and writing policy-tracked workspace files, saving a version, local
+workspace status, fetch, sync status, fast-forward apply incoming, guarded
+publish preflight, and tokenized publish. Product-specific file types and content
+rules stay outside Draftline; mobile hosts pass their policy at open/clone time.
+
+For iOS integration, build Draftline as a Rust static library for the desired
+Apple targets, generate/bind the C declarations, and wrap the opaque handle in a
+small Swift type that frees returned strings and handles. Remaining integration
+work is packaging rather than new Draftline semantics: target-specific
+`libgit2`/OpenSSL or platform TLS linkage, XCFramework assembly, generated Swift
+bindings, and app-owned credential storage/UI.
+
+Draftline's `Build iOS package` GitHub Actions workflow is manual-only. Run it
+with `confirm_build=build` to produce `DraftlineMobile.xcframework.zip`,
+`draftline_mobile.h`, a checksum file, and SwiftPM manifest snippets as workflow
+artifacts. Provide `release_tag` to publish those same files as GitHub Release
+assets. The workflow builds device and simulator static libraries with
+`vendored-mobile-git`, assembles an XCFramework, and prints the exact SwiftPM
+checksum to the run summary.
+
 ## Workspace graph APIs
 
 Hosts that render version history should prefer Draftline's `WorkspaceGraph`
