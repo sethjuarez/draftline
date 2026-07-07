@@ -76,6 +76,7 @@
 pub mod content_policy;
 pub mod error;
 pub mod merge;
+pub mod mobile_ffi;
 pub mod path;
 pub mod profile;
 pub mod recovery;
