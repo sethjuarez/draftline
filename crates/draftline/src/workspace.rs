@@ -325,6 +325,9 @@ pub enum SafeNextAction {
     DiscardChanges,
     RepairRecovery,
     ConfigureRemote,
+    PublishHistoryCleanup,
+    UndoHistoryCleanup,
+    AbandonHistoryCleanup,
 }
 
 /// Stable diagnostic codes for workspace inspection.
@@ -1702,6 +1705,7 @@ pub enum CleanupWarningCode {
     MergeBoundaryWouldBeRewritten,
     NamedBranchInsideCompactedRange,
     SelectedVersionNotOnTargetVariation,
+    PendingHistoryCleanup,
 }
 
 /// Result of applying a prepared timeline cleanup.
@@ -1715,6 +1719,24 @@ pub struct TimelineCleanupResult {
     pub commit_map: Vec<CommitMapEntry>,
     pub snapshot_map: Vec<SnapshotMapEntry>,
     pub warnings: Vec<CleanupWarning>,
+}
+
+/// Durable record for an applied cleanup that still needs explicit publish, undo, or abandon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PendingHistoryCleanup {
+    pub plan_id: CleanupPlanId,
+    pub target_variation: VariationId,
+    pub expected_local_head: VersionId,
+    pub replacement_head: VersionId,
+    pub backup_refs: Vec<RefName>,
+    pub ref_updates: Vec<RefUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_impact: Option<HistoryCleanupRemoteImpact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_status: Option<CleanupPublishStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_remote_oid: Option<VersionId>,
 }
 
 /// Preflight for explicitly publishing an applied cleanup rewrite to a shared remote.
@@ -5960,6 +5982,7 @@ impl Workspace {
     /// ```
     pub fn preflight_apply_incoming(&self, remote: impl AsRef<str>) -> Result<ApplyIncomingReport> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("preflight_apply_incoming")?;
         let sync_status = self.sync_status(remote)?;
         let dirty_files = self.changed_files_unchecked()?;
 
@@ -6001,6 +6024,7 @@ impl Workspace {
     /// Preflights a diverged incoming merge without mutating workspace state.
     pub fn preflight_merge_incoming(&self, remote: impl AsRef<str>) -> Result<MergeIncomingReport> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("preflight_merge_incoming")?;
         let sync_status = self.sync_status(remote)?;
         let dirty_files = self.changed_files_unchecked()?;
         let mut file_hazards = Vec::new();
@@ -6068,6 +6092,7 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("merge_incoming")?;
         let _lock = OperationLock::acquire(&self.lock_path(), "merge_incoming")?;
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
@@ -6193,6 +6218,9 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation(
+            "merge_incoming_with_resolutions",
+        )?;
         let _lock = OperationLock::acquire(&self.lock_path(), "merge_incoming_with_resolutions")?;
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
@@ -6293,6 +6321,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<ApplyIncomingResult> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("apply_incoming")?;
         let _lock = OperationLock::acquire(&self.lock_path(), "apply_incoming")?;
 
         let dirty_files = self.changed_files_unchecked()?;
@@ -6726,6 +6755,10 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "history_cleanup")?;
         let stored = self.read_history_cleanup_plan(&plan_id)?;
+        self.ensure_no_pending_history_cleanup(
+            "history_cleanup",
+            Some(stored.preview.target_variation.as_str()),
+        )?;
         if stored.request.safety.require_clean_worktree {
             let dirty_files = self.changed_files_unchecked()?;
             if !dirty_files.is_empty() {
@@ -6813,6 +6846,32 @@ impl Workspace {
             warnings: stored.preview.warnings.clone(),
         };
         self.write_history_cleanup_ledger(&result)?;
+        if stored
+            .preview
+            .remote_impact
+            .as_ref()
+            .is_some_and(history_cleanup_needs_pending_resolution)
+        {
+            self.upsert_pending_history_cleanup(PendingHistoryCleanup {
+                plan_id: plan_id.clone(),
+                target_variation: stored.preview.target_variation.clone(),
+                expected_local_head: stored.preview.old_head.clone(),
+                replacement_head: stored.preview.new_head.clone(),
+                backup_refs: result.backup_refs.clone(),
+                ref_updates: result.ref_updates.clone(),
+                remote_impact: stored.preview.remote_impact.clone(),
+                publish_status: stored
+                    .preview
+                    .remote_impact
+                    .as_ref()
+                    .map(|impact| impact.publish_status.clone()),
+                expected_remote_oid: stored
+                    .preview
+                    .remote_impact
+                    .as_ref()
+                    .and_then(|impact| impact.upstream_head.clone()),
+            })?;
+        }
         self.write_recovery_state(&RecoveryState {
             operation_id: plan_id.as_str().to_string(),
             operation: RecoveryOperation::HistoryCleanup,
@@ -6914,6 +6973,11 @@ impl Workspace {
             replacement_oid: ledger.new_head.to_string(),
             support_ref_token: support_ref_preflight.token,
         });
+        self.update_pending_history_cleanup_publish_state(
+            &plan_id,
+            remote_impact.clone(),
+            VersionId::from_canonical_string(expected_remote_oid.clone()).ok(),
+        )?;
 
         Ok(HistoryCleanupPublishPreflight {
             plan_id,
@@ -6995,6 +7059,7 @@ impl Workspace {
             });
         }
 
+        self.clear_pending_history_cleanup(&token.plan_id)?;
         let support_refs = token
             .support_ref_token
             .refs
@@ -7255,7 +7320,7 @@ impl Workspace {
             .collect();
 
         let result = TimelineCleanupResult {
-            plan_id: token.plan_id,
+            plan_id: token.plan_id.clone(),
             old_head: token.expected_current_head.clone(),
             new_head: token.restore_head.clone(),
             backup_refs: vec![token.backup_ref, undo_backup_ref],
@@ -7271,7 +7336,79 @@ impl Workspace {
             target: Some(result.new_head.to_string()),
             completed: true,
         })?;
+        self.clear_pending_history_cleanup(&token.plan_id)?;
         Ok(result)
+    }
+
+    /// Lists durable pending history cleanups, optionally scoped to a target variation.
+    pub fn pending_history_cleanups(
+        &self,
+        target_variation: Option<&VariationId>,
+    ) -> Result<Vec<PendingHistoryCleanup>> {
+        let mut pending = self.read_pending_history_cleanups()?;
+        if let Some(target_variation) = target_variation {
+            pending.retain(|cleanup| &cleanup.target_variation == target_variation);
+        }
+        Ok(pending)
+    }
+
+    /// Publishes a pending cleanup by preflighting the current remote state first.
+    pub fn publish_pending_history_cleanup(
+        &self,
+        plan_id: CleanupPlanId,
+        remote: impl AsRef<str>,
+        confirmation: RewriteConfirmation,
+    ) -> Result<HistoryCleanupPublishResult> {
+        let mut options = RemoteOptions::new();
+        let preflight =
+            self.preflight_publish_history_cleanup_with_options(plan_id, remote, &mut options)?;
+        let Some(token) = preflight.token else {
+            return Err(DraftlineError::HistoryCleanupBlocked(Box::new(
+                HistoryCleanupBlockReport {
+                    operation: "publish_pending_history_cleanup".to_string(),
+                    diagnostics: vec![CleanupWarning {
+                        code: CleanupWarningCode::PendingHistoryCleanup,
+                        message: "pending history cleanup cannot be published in the current remote state"
+                            .to_string(),
+                        related_versions: vec![preflight.remote_impact.local_head],
+                        safe_next_actions: vec![
+                            SafeNextAction::UndoHistoryCleanup,
+                            SafeNextAction::AbandonHistoryCleanup,
+                        ],
+                    }],
+                    can_proceed: false,
+                },
+            )));
+        };
+        self.publish_history_cleanup_with_options(token, confirmation, &mut options)
+    }
+
+    /// Undoes a pending cleanup by preflighting the current local state first.
+    pub fn undo_pending_history_cleanup(
+        &self,
+        plan_id: CleanupPlanId,
+    ) -> Result<TimelineCleanupResult> {
+        let preflight = self.preflight_undo_history_cleanup(plan_id)?;
+        self.undo_history_cleanup(preflight.token)
+    }
+
+    /// Explicitly clears a pending cleanup marker without changing Git refs.
+    pub fn abandon_pending_history_cleanup(
+        &self,
+        plan_id: CleanupPlanId,
+    ) -> Result<PendingHistoryCleanup> {
+        let mut pending = self.read_pending_history_cleanups()?;
+        let Some(index) = pending
+            .iter()
+            .position(|cleanup| cleanup.plan_id == plan_id)
+        else {
+            return Err(DraftlineError::InvalidHistoryCleanup(format!(
+                "pending cleanup `{plan_id}` was not found"
+            )));
+        };
+        let abandoned = pending.remove(index);
+        self.write_pending_history_cleanups(&pending)?;
+        Ok(abandoned)
     }
 
     /// Returns a diff between two specific versions.
@@ -8189,6 +8326,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishPreflight> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("publish_changes")?;
         let report = preflight_report(
             "publish_changes",
             false,
@@ -8244,6 +8382,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishResult> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("publish_changes")?;
         let report = preflight_report(
             "publish_changes",
             false,
@@ -8306,6 +8445,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishResult> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("publish_changes")?;
         let report = preflight_report(
             "publish_changes",
             false,
@@ -8965,6 +9105,10 @@ impl Workspace {
         self.history_cleanup_dir().join("ledgers")
     }
 
+    fn pending_history_cleanup_path(&self) -> PathBuf {
+        self.history_cleanup_dir().join("pending.json")
+    }
+
     fn history_cleanup_plan_path(&self, plan_id: &CleanupPlanId) -> PathBuf {
         self.history_cleanup_plans_dir()
             .join(format!("{}.json", plan_id.as_str()))
@@ -9047,6 +9191,119 @@ impl Workspace {
             ledgers.push(serde_json::from_slice(&bytes)?);
         }
         Ok(ledgers)
+    }
+
+    fn read_pending_history_cleanups(&self) -> Result<Vec<PendingHistoryCleanup>> {
+        let path = self.pending_history_cleanup_path();
+        match fs::read(&path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn write_pending_history_cleanups(&self, pending: &[PendingHistoryCleanup]) -> Result<()> {
+        fs::create_dir_all(self.history_cleanup_dir())?;
+        fs::write(
+            self.pending_history_cleanup_path(),
+            serde_json::to_vec_pretty(pending)?,
+        )?;
+        Ok(())
+    }
+
+    fn upsert_pending_history_cleanup(&self, cleanup: PendingHistoryCleanup) -> Result<()> {
+        let mut pending = self.read_pending_history_cleanups()?;
+        pending.retain(|existing| existing.plan_id != cleanup.plan_id);
+        pending.push(cleanup);
+        self.write_pending_history_cleanups(&pending)
+    }
+
+    fn update_pending_history_cleanup_publish_state(
+        &self,
+        plan_id: &CleanupPlanId,
+        remote_impact: HistoryCleanupRemoteImpact,
+        expected_remote_oid: Option<VersionId>,
+    ) -> Result<()> {
+        let mut pending = self.read_pending_history_cleanups()?;
+        if let Some(cleanup) = pending
+            .iter_mut()
+            .find(|cleanup| &cleanup.plan_id == plan_id)
+        {
+            cleanup.publish_status = Some(remote_impact.publish_status.clone());
+            cleanup.remote_impact = Some(remote_impact);
+            cleanup.expected_remote_oid = expected_remote_oid;
+            self.write_pending_history_cleanups(&pending)?;
+        }
+        Ok(())
+    }
+
+    fn clear_pending_history_cleanup(&self, plan_id: &CleanupPlanId) -> Result<()> {
+        let mut pending = self.read_pending_history_cleanups()?;
+        let original_len = pending.len();
+        pending.retain(|cleanup| &cleanup.plan_id != plan_id);
+        if pending.len() != original_len {
+            self.write_pending_history_cleanups(&pending)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_no_pending_history_cleanup_for_current_variation(
+        &self,
+        operation: &str,
+    ) -> Result<()> {
+        let variation = self.current_variation_unchecked().ok();
+        self.ensure_no_pending_history_cleanup(operation, variation.as_deref())
+    }
+
+    fn ensure_no_pending_history_cleanup(
+        &self,
+        operation: &str,
+        target_variation: Option<&str>,
+    ) -> Result<()> {
+        let pending = self.read_pending_history_cleanups()?;
+        let blockers = pending
+            .into_iter()
+            .filter(|cleanup| {
+                target_variation
+                    .is_none_or(|variation| cleanup.target_variation.as_str() == variation)
+            })
+            .collect::<Vec<_>>();
+        if blockers.is_empty() {
+            return Ok(());
+        }
+
+        let diagnostics = blockers
+            .into_iter()
+            .map(|cleanup| {
+                let mut safe_next_actions = Vec::new();
+                if cleanup.publish_status == Some(CleanupPublishStatus::SharedHistoryRewriteRequired) {
+                    safe_next_actions.push(SafeNextAction::PublishHistoryCleanup);
+                }
+                safe_next_actions.push(SafeNextAction::UndoHistoryCleanup);
+                safe_next_actions.push(SafeNextAction::AbandonHistoryCleanup);
+
+                CleanupWarning {
+                    code: CleanupWarningCode::PendingHistoryCleanup,
+                    message: format!(
+                        "history cleanup `{}` is pending for variation `{}`; publish, undo, or explicitly abandon it before running `{operation}`",
+                        cleanup.plan_id,
+                        cleanup.target_variation.as_str()
+                    ),
+                    related_versions: vec![
+                        cleanup.expected_local_head.clone(),
+                        cleanup.replacement_head.clone(),
+                    ],
+                    safe_next_actions,
+                }
+            })
+            .collect();
+        Err(DraftlineError::HistoryCleanupBlocked(Box::new(
+            HistoryCleanupBlockReport {
+                operation: operation.to_string(),
+                diagnostics,
+                can_proceed: false,
+            },
+        )))
     }
 
     fn draftline_dir(&self) -> PathBuf {
@@ -10422,6 +10679,14 @@ fn cleanup_remote_warnings(policy: &RemoteRewritePolicy) -> Vec<CleanupWarning> 
             Vec::new(),
         )],
     }
+}
+
+fn history_cleanup_needs_pending_resolution(impact: &HistoryCleanupRemoteImpact) -> bool {
+    matches!(
+        impact.publish_status,
+        CleanupPublishStatus::SharedHistoryRewriteRequired
+            | CleanupPublishStatus::RemoteHasIncoming
+    )
 }
 
 fn history_entry_from_commit(

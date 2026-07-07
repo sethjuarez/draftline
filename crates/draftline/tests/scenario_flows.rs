@@ -76,7 +76,11 @@ fn scenario_flow_documentation_matrix_is_executable() {
         .filter(|line| line.starts_with("| Flow ") && line.contains(':'))
         .collect::<Vec<_>>();
 
-    assert_eq!(rows.len(), 39, "every documented Flow row must be in the matrix");
+    assert_eq!(
+        rows.len(),
+        39,
+        "every documented Flow row must be in the matrix"
+    );
     for row in rows {
         assert!(
             row.contains('`'),
@@ -507,7 +511,11 @@ fn scenario_flow_1c_11a_11b_remote_bootstrap_variation_diagnostics_and_adoption(
     local
         .switch_variation(stale_local.id(), SwitchPolicy::AbortIfDirty)
         .unwrap();
-    write_file(local.root(), "story.md", "branch that will disappear remotely");
+    write_file(
+        local.root(),
+        "story.md",
+        "branch that will disappear remotely",
+    );
     local.save_version("Deleted remotely").unwrap();
     local.publish_changes("origin").unwrap();
     local
@@ -667,6 +675,9 @@ fn scenario_flow_13a_local_milestone_compaction_preview_apply_resolve_and_undo()
         .unwrap();
     assert_ne!(cleanup.new_head, original_head.id().clone());
     assert_eq!(read_file(workspace.root(), "story.md"), "ready");
+    let reopened = Workspace::open(temp.path()).unwrap();
+    let pending = reopened.pending_history_cleanups(None).unwrap();
+    assert!(pending.is_empty());
 
     let stale_noisy = workspace
         .resolve_rewritten_version(StaleVersionResolutionRequest {
@@ -685,6 +696,7 @@ fn scenario_flow_13a_local_milestone_compaction_preview_apply_resolve_and_undo()
     let undo_result = workspace.undo_history_cleanup(undo.token).unwrap();
     assert_eq!(undo_result.new_head, original_head.id().clone());
     assert_eq!(read_file(workspace.root(), "story.md"), "ready");
+    assert!(workspace.pending_history_cleanups(None).unwrap().is_empty());
 
     write_file(workspace.root(), "story.md", "dirty work");
     let blocked =
@@ -748,6 +760,16 @@ fn scenario_flow_13e_remote_compaction_publish_sync_replay_and_dirty_block() {
     let cleanup = author
         .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
         .unwrap();
+    let pending = Workspace::open(author.root())
+        .unwrap()
+        .pending_history_cleanups(None)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].plan_id, cleanup.plan_id);
+    assert_eq!(
+        pending[0].publish_status,
+        Some(CleanupPublishStatus::SharedHistoryRewriteRequired)
+    );
     let publish_preflight = author
         .preflight_publish_history_cleanup(cleanup.plan_id.clone(), "origin")
         .unwrap();
@@ -759,6 +781,7 @@ fn scenario_flow_13e_remote_compaction_publish_sync_replay_and_dirty_block() {
             RewriteConfirmation::UserConfirmed,
         )
         .unwrap();
+    assert!(author.pending_history_cleanups(None).unwrap().is_empty());
 
     clean_peer.fetch_remote("origin").unwrap();
     assert_eq!(
@@ -819,6 +842,135 @@ fn scenario_flow_13e_remote_compaction_publish_sync_replay_and_dirty_block() {
         stale_local.disposition,
         StaleVersionDisposition::Live { .. }
     ));
+}
+
+#[test]
+fn pending_history_cleanup_blocks_normal_sync_and_survives_failed_publish() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    init_bare_remote(remote_dir.path());
+
+    let author_dir = tempfile::tempdir().unwrap();
+    let author = Workspace::init(author_dir.path()).unwrap();
+    configure_identity(author.root(), "Scenario Author");
+    author
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    write_file(author.root(), "story.md", "opening");
+    author.save_version("Opening").unwrap();
+    write_file(author.root(), "story.md", "noisy middle");
+    let noisy_start = author.save_version("Noisy middle").unwrap();
+    write_file(author.root(), "story.md", "ready to share");
+    let old_remote_tip = author.save_version("Ready to share").unwrap();
+    author.publish_changes("origin").unwrap();
+
+    let peer_dir = tempfile::tempdir().unwrap();
+    let peer =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), peer_dir.path()).unwrap();
+    configure_identity(peer.root(), "Scenario Peer");
+
+    let preview = author
+        .preview_history_cleanup(compact_cleanup_request(&noisy_start, &old_remote_tip))
+        .unwrap();
+    let cleanup = author
+        .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+        .unwrap();
+    let reopened = Workspace::open(author.root()).unwrap();
+    assert_eq!(
+        reopened.pending_history_cleanups(None).unwrap()[0].replacement_head,
+        cleanup.new_head
+    );
+
+    let mut options = RemoteOptions::new();
+    let blocked_apply = reopened.apply_incoming("origin", &mut options);
+    assert!(matches!(
+        blocked_apply,
+        Err(DraftlineError::HistoryCleanupBlocked(report))
+            if report.operation == "apply_incoming"
+    ));
+    let blocked_merge = reopened.preflight_merge_incoming("origin");
+    assert!(matches!(
+        blocked_merge,
+        Err(DraftlineError::HistoryCleanupBlocked(report))
+            if report.operation == "preflight_merge_incoming"
+    ));
+    let blocked_publish = reopened.preflight_publish("origin");
+    assert!(matches!(
+        blocked_publish,
+        Err(DraftlineError::HistoryCleanupBlocked(report))
+            if report.operation == "publish_changes"
+    ));
+
+    let publish_preflight = reopened
+        .preflight_publish_history_cleanup(cleanup.plan_id.clone(), "origin")
+        .unwrap();
+    write_file(peer.root(), "story.md", "peer update after old remote");
+    peer.save_version("Peer update").unwrap();
+    peer.publish_changes("origin").unwrap();
+
+    let failed_publish = reopened.publish_history_cleanup(
+        publish_preflight.token.unwrap(),
+        RewriteConfirmation::UserConfirmed,
+    );
+    assert!(matches!(
+        failed_publish,
+        Err(DraftlineError::RemoteRace { .. })
+    ));
+    let pending_after_failure = Workspace::open(author.root())
+        .unwrap()
+        .pending_history_cleanups(None)
+        .unwrap();
+    assert_eq!(pending_after_failure.len(), 1);
+    assert_eq!(pending_after_failure[0].plan_id, cleanup.plan_id);
+}
+
+#[test]
+fn private_history_cleanup_does_not_block_normal_publish() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    init_bare_remote(remote_dir.path());
+
+    let author_dir = tempfile::tempdir().unwrap();
+    let author = Workspace::init(author_dir.path()).unwrap();
+    configure_identity(author.root(), "Scenario Author");
+    author
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    write_file(author.root(), "story.md", "published base");
+    author.save_version("Published base").unwrap();
+    author.publish_changes("origin").unwrap();
+
+    write_file(author.root(), "story.md", "private noisy middle");
+    let private_start = author.save_version("Private noisy middle").unwrap();
+    write_file(author.root(), "story.md", "private ready");
+    let private_end = author.save_version("Private ready").unwrap();
+
+    let preview = author
+        .preview_history_cleanup(compact_cleanup_request(&private_start, &private_end))
+        .unwrap();
+    assert_eq!(
+        preview.remote_impact.as_ref().unwrap().publish_status,
+        CleanupPublishStatus::NormalPublish
+    );
+
+    let cleanup = author
+        .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+        .unwrap();
+    assert!(author.pending_history_cleanups(None).unwrap().is_empty());
+
+    let mut options = RemoteOptions::new();
+    let publish = author
+        .publish_changes_with_options("origin", &mut options)
+        .unwrap();
+    assert!(publish.published_versions > 0);
+    assert!(author.pending_history_cleanups(None).unwrap().is_empty());
+    assert_eq!(
+        author.sync_status("origin").unwrap().state,
+        SyncState::UpToDate
+    );
+
+    let undo = author
+        .preflight_undo_history_cleanup(cleanup.plan_id.clone())
+        .unwrap();
+    assert!(undo.can_undo);
 }
 
 #[test]

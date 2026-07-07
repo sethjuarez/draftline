@@ -42,6 +42,9 @@ export interface DraftlineClient {
   ): Promise<HistoryCompactionCandidates>;
   previewHistoryCleanup(request: PreviewHistoryCleanupRequest): Promise<HistoryCleanupPreview>;
   applyHistoryCleanup(request: ApplyHistoryCleanupRequest): Promise<TimelineCleanupResult>;
+  listPendingHistoryCleanups(
+    request: ListPendingHistoryCleanupsRequest,
+  ): Promise<PendingHistoryCleanup[]>;
   preflightHistoryCleanupRemoteImpact(
     request: HistoryCleanupRemoteImpactRequest,
   ): Promise<HistoryCleanupRemoteImpact>;
@@ -51,6 +54,9 @@ export interface DraftlineClient {
   publishHistoryCleanup(
     request: PublishHistoryCleanupRequest,
   ): Promise<HistoryCleanupPublishResult>;
+  publishPendingHistoryCleanup(
+    request: PublishPendingHistoryCleanupRequest,
+  ): Promise<HistoryCleanupPublishResult>;
   resolveRewrittenVersion(
     request: ResolveRewrittenVersionRequest,
   ): Promise<StaleVersionResolution>;
@@ -58,6 +64,10 @@ export interface DraftlineClient {
     request: UndoHistoryCleanupPreflightRequest,
   ): Promise<HistoryCleanupUndoPreflight>;
   undoHistoryCleanup(request: UndoHistoryCleanupRequest): Promise<TimelineCleanupResult>;
+  undoPendingHistoryCleanup(request: UndoPendingHistoryCleanupRequest): Promise<TimelineCleanupResult>;
+  abandonPendingHistoryCleanup(
+    request: AbandonPendingHistoryCleanupRequest,
+  ): Promise<PendingHistoryCleanup>;
   getWorkspaceGraph(request: WorkspaceGraphRequest): Promise<WorkspaceGraph>;
   getWorkspaceGraphRefs(request: WorkspaceGraphRefsRequest): Promise<WorkspaceGraphRefs>;
   getWorkspaceGraphSummary(request: WorkspaceGraphRequest): Promise<WorkspaceGraphSummary>;
@@ -206,15 +216,22 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('get_history_compaction_candidates', { request }),
     previewHistoryCleanup: (request) => run('preview_history_cleanup', { request }),
     applyHistoryCleanup: (request) => run('apply_history_cleanup', { request }),
+    listPendingHistoryCleanups: (request) =>
+      run('list_pending_history_cleanups', { request }),
     preflightHistoryCleanupRemoteImpact: (request) =>
       run('preflight_history_cleanup_remote_impact', { request }),
     preflightPublishHistoryCleanup: (request) =>
       run('preflight_publish_history_cleanup', { request }),
     publishHistoryCleanup: (request) => run('publish_history_cleanup', { request }),
+    publishPendingHistoryCleanup: (request) =>
+      run('publish_pending_history_cleanup', { request }),
     resolveRewrittenVersion: (request) => run('resolve_rewritten_version', { request }),
     preflightUndoHistoryCleanup: (request) =>
       run('preflight_undo_history_cleanup', { request }),
     undoHistoryCleanup: (request) => run('undo_history_cleanup', { request }),
+    undoPendingHistoryCleanup: (request) => run('undo_pending_history_cleanup', { request }),
+    abandonPendingHistoryCleanup: (request) =>
+      run('abandon_pending_history_cleanup', { request }),
     getWorkspaceGraph: (request) => run('get_workspace_graph', { request }),
     getWorkspaceGraphRefs: (request) => run('get_workspace_graph_refs', { request }),
     getWorkspaceGraphSummary: (request) => run('get_workspace_graph_summary', { request }),
@@ -314,7 +331,10 @@ export type SafeNextAction =
   | 'save_first'
   | 'discard_changes'
   | 'repair_recovery'
-  | 'configure_remote';
+  | 'configure_remote'
+  | 'publish_history_cleanup'
+  | 'undo_history_cleanup'
+  | 'abandon_history_cleanup';
 export type SharingMode = 'local_only' | 'shared_capable';
 export type SupportRefScope = 'local' | 'remote_tracking';
 export type SupportRefKind = 'deleted_variation' | 'rewrite' | 'history_cleanup_backup';
@@ -475,6 +495,11 @@ export interface ApplyHistoryCleanupRequest {
   confirmation: RewriteConfirmation;
 }
 
+export interface ListPendingHistoryCleanupsRequest {
+  workspace_path: string;
+  target_variation?: string | null;
+}
+
 export interface HistoryCleanupRemoteImpactRequest {
   workspace_path: string;
   plan_id: string;
@@ -493,6 +518,13 @@ export interface PublishHistoryCleanupRequest {
   confirmation: RewriteConfirmation;
 }
 
+export interface PublishPendingHistoryCleanupRequest {
+  workspace_path: string;
+  plan_id: string;
+  remote: string;
+  confirmation: RewriteConfirmation;
+}
+
 export interface ResolveRewrittenVersionRequest {
   workspace_path: string;
   version_id: string;
@@ -506,6 +538,16 @@ export interface UndoHistoryCleanupPreflightRequest {
 export interface UndoHistoryCleanupRequest {
   workspace_path: string;
   token: HistoryCleanupUndoToken;
+}
+
+export interface UndoPendingHistoryCleanupRequest {
+  workspace_path: string;
+  plan_id: string;
+}
+
+export interface AbandonPendingHistoryCleanupRequest {
+  workspace_path: string;
+  plan_id: string;
 }
 
 export type RewriteConfirmation = 'user_confirmed';
@@ -603,7 +645,8 @@ export type CleanupWarningCode =
   | 'range_end_not_ancestor_of_target_head'
   | 'merge_boundary_would_be_rewritten'
   | 'named_branch_inside_compacted_range'
-  | 'selected_version_not_on_target_variation';
+  | 'selected_version_not_on_target_variation'
+  | 'pending_history_cleanup';
 
 export type CleanupRefImpact =
   | 'target_variation_moved'
@@ -634,6 +677,18 @@ export interface TimelineCleanupResult {
   commit_map: CommitRewriteMap[];
   snapshot_map: SnapshotRewriteMap[];
   warnings: CleanupWarning[];
+}
+
+export interface PendingHistoryCleanup {
+  plan_id: string;
+  target_variation: string;
+  expected_local_head: string;
+  replacement_head: string;
+  backup_refs: string[];
+  ref_updates: RefUpdate[];
+  remote_impact?: HistoryCleanupRemoteImpact | null;
+  publish_status?: CleanupPublishStatus | null;
+  expected_remote_oid?: string | null;
 }
 
 export interface HistoryCleanupPublishPreflight {
@@ -1163,10 +1218,38 @@ export interface TauriCommandError {
   details?: JsonValue;
 }
 
+export interface HistoryCleanupBlockReport {
+  operation: string;
+  diagnostics: CleanupWarning[];
+  can_proceed: false;
+}
+
+export interface HistoryCleanupBlockedError {
+  code: 'history_cleanup_blocked';
+  message: string;
+  details: HistoryCleanupBlockReport;
+}
+
+export type DraftlineCommandError = HistoryCleanupBlockedError | TauriCommandError;
+
+export function isHistoryCleanupBlockedError(
+  error: unknown,
+): error is HistoryCleanupBlockedError {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === 'history_cleanup_blocked' &&
+    'details' in error &&
+    typeof (error as { details?: unknown }).details === 'object' &&
+    (error as { details?: unknown }).details !== null
+  );
+}
+
 export interface CommandPostconditions {
   remaining_changes?: ChangeSet | null;
   verification?: WorkspaceVerification | null;
-  errors: TauriCommandError[];
+  errors: DraftlineCommandError[];
 }
 
 export interface Shelf {
@@ -1541,6 +1624,7 @@ export interface DraftlineHostFacade {
   fullHistory(): Promise<HistoryEntry[]>;
   previewHistoryCleanup(cleanup: HistoryCleanupRequest): Promise<HistoryCleanupPreview>;
   applyHistoryCleanup(planId: string): Promise<TimelineCleanupResult>;
+  pendingHistoryCleanups(targetVariation?: string): Promise<PendingHistoryCleanup[]>;
   preflightHistoryCleanupRemoteImpact(
     planId: string,
     remote?: string,
@@ -1552,9 +1636,15 @@ export interface DraftlineHostFacade {
   publishHistoryCleanup(
     token: HistoryCleanupPublishToken,
   ): Promise<HistoryCleanupPublishResult>;
+  publishPendingHistoryCleanup(
+    planId: string,
+    remote?: string,
+  ): Promise<HistoryCleanupPublishResult>;
   resolveRewrittenVersion(versionId: string): Promise<StaleVersionResolution>;
   preflightUndoHistoryCleanup(planId: string): Promise<HistoryCleanupUndoPreflight>;
   undoHistoryCleanup(token: HistoryCleanupUndoToken): Promise<TimelineCleanupResult>;
+  undoPendingHistoryCleanup(planId: string): Promise<TimelineCleanupResult>;
+  abandonPendingHistoryCleanup(planId: string): Promise<PendingHistoryCleanup>;
   workspaceGraph(options?: WorkspaceGraphOptions): Promise<WorkspaceGraph>;
   workspaceGraphRefs(options?: WorkspaceGraphRefsOptions): Promise<WorkspaceGraphRefs>;
   workspaceGraphSummary(options?: WorkspaceGraphOptions): Promise<WorkspaceGraphSummary>;
@@ -1686,6 +1776,11 @@ export function createDraftlineHostFacade({
         plan_id: planId,
         confirmation: 'user_confirmed',
       }),
+    pendingHistoryCleanups: (targetVariation) =>
+      client.listPendingHistoryCleanups({
+        ...workspaceRequest(),
+        target_variation: targetVariation,
+      }),
     preflightHistoryCleanupRemoteImpact: (planId, remote = defaultRemote) =>
       client.preflightHistoryCleanupRemoteImpact({ ...workspaceRequest(), plan_id: planId, remote }),
     preflightPublishHistoryCleanup: (planId, remote = defaultRemote) =>
@@ -1696,10 +1791,21 @@ export function createDraftlineHostFacade({
         token,
         confirmation: 'user_confirmed',
       }),
+    publishPendingHistoryCleanup: (planId, remote = defaultRemote) =>
+      client.publishPendingHistoryCleanup({
+        ...workspaceRequest(),
+        plan_id: planId,
+        remote,
+        confirmation: 'user_confirmed',
+      }),
     resolveRewrittenVersion: (versionId) => client.resolveRewrittenVersion(versionRequest(versionId)),
     preflightUndoHistoryCleanup: (planId) =>
       client.preflightUndoHistoryCleanup({ ...workspaceRequest(), plan_id: planId }),
     undoHistoryCleanup: (token) => client.undoHistoryCleanup({ ...workspaceRequest(), token }),
+    undoPendingHistoryCleanup: (planId) =>
+      client.undoPendingHistoryCleanup({ ...workspaceRequest(), plan_id: planId }),
+    abandonPendingHistoryCleanup: (planId) =>
+      client.abandonPendingHistoryCleanup({ ...workspaceRequest(), plan_id: planId }),
     workspaceGraph: (options) => client.getWorkspaceGraph({ ...workspaceRequest(), options }),
     workspaceGraphRefs: (options) =>
       client.getWorkspaceGraphRefs({ ...workspaceRequest(), options }),
