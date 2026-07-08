@@ -195,11 +195,19 @@ versioning and sync semantics while giving the host an opaque workspace handle,
 C-safe status/error results, a host-provided `ContentPolicy`, a credential
 callback shape, and JSON return values for structured Draftline types.
 
-The first mobile slice supports opening/initializing or cloning a workspace,
-reading and writing policy-tracked workspace files, saving a version, local
-workspace status, fetch, sync status, fast-forward apply incoming, guarded
-publish preflight, and tokenized publish. Product-specific file types and content
-rules stay outside Draftline; mobile hosts pass their policy at open/clone time.
+The mobile bridge supports opening/initializing or cloning a workspace, reading
+and writing policy-tracked workspace files, saving a version, local workspace
+status, fetch, sync status, fast-forward apply incoming, guarded publish
+preflight, tokenized publish, local shelf/unshelve workflows, and tokenized
+incoming merge conflict recovery. Shelf functions accept `paths_json` as a JSON
+array of workspace-relative paths, or `NULL` to target all dirty
+policy-tracked files. Merge functions return the same conflict/token/resolution
+JSON shapes as the Tauri/client contract so native hosts can preflight, render a
+conflict view model, and submit explicit `MergeConflictResolution` JSON without
+adding C structs for each DTO; mutating mobile functions return the underlying
+Rust result DTOs rather than Tauri command postcondition wrappers. Product-specific
+file types and content rules stay outside Draftline; mobile hosts pass their
+policy at open/clone time.
 
 For iOS integration, build Draftline as a Rust static library for the desired
 Apple targets, generate/bind the C declarations, and wrap the opaque handle in a
