@@ -209,6 +209,22 @@ Rust result DTOs rather than Tauri command postcondition wrappers. Product-speci
 file types and content rules stay outside Draftline; mobile hosts pass their
 policy at open/clone time.
 
+Mobile remote operations are bounded natively so hosts do not have to rely on a
+Swift/Java/Kotlin-side timeout while a synchronous FFI call remains blocked in
+libgit2. `draftline_mobile_workspace_clone`,
+`draftline_mobile_workspace_fetch_remote`,
+`draftline_mobile_workspace_apply_incoming_json`,
+`draftline_mobile_workspace_merge_incoming_json`,
+`draftline_mobile_workspace_merge_incoming_with_resolutions_json`,
+`draftline_mobile_workspace_preflight_publish_json`, and
+`draftline_mobile_workspace_publish_json` apply a default 20 second native
+network timeout. Each has a `_with_timeout` variant that accepts a trailing
+`timeout_ms`; pass `0` only when the host intentionally wants to disable the
+native timeout for that call. Timeout failures return
+`DraftlineMobileStatusCode::RemoteTimeout`, authentication and credential
+callback failures return `CredentialRejected`, and transport failures return
+`RemoteNetwork` so mobile apps can map them to offline/retry UX.
+
 For iOS integration, build Draftline as a Rust static library for the desired
 Apple targets, generate/bind the C declarations, and wrap the opaque handle in a
 small Swift type that frees returned strings and handles. Remaining integration
@@ -222,7 +238,8 @@ with `confirm_build=build` to produce `DraftlineMobile.xcframework.zip`,
 artifacts. Provide `release_tag` to publish those same files as GitHub Release
 assets. The workflow builds device and simulator static libraries with
 `vendored-mobile-git`, assembles an XCFramework, and prints the exact SwiftPM
-checksum to the run summary.
+checksum to the run summary. Mobile hosts consuming a binary target must bump the
+XCFramework URL/tag and checksum together after a DraftlineMobile release.
 
 ## Workspace graph APIs
 

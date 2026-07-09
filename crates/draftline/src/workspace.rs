@@ -1998,7 +1998,8 @@ impl Workspace {
     ) -> Result<Self> {
         ensure_supported_remote_url(remote_url.as_ref())?;
         let mut builder = RepoBuilder::new();
-        if options.has_credentials() {
+        let _timeout_guard = options.server_timeout_guard()?;
+        if options.has_network_callbacks() {
             let fetch_options = options.clone_fetch_options();
             builder.fetch_options(fetch_options);
         }
@@ -3330,15 +3331,17 @@ impl Workspace {
             ),
         ];
         let refspec_refs = refspecs.iter().map(String::as_str).collect::<Vec<_>>();
-        if options.has_credentials() {
-            let mut fetch_options = options.fetch_options();
+        let _timeout_guard = options.server_timeout_guard()?;
+        let fetch_result = if options.has_network_callbacks() {
+            let mut fetch_options = options.fetch_options("fetch_all_variations");
             fetch_options.prune(FetchPrune::On);
-            remote.fetch(&refspec_refs, Some(&mut fetch_options), None)?;
+            remote.fetch(&refspec_refs, Some(&mut fetch_options), None)
         } else {
             let mut fetch_options = git2::FetchOptions::new();
             fetch_options.prune(FetchPrune::On);
-            remote.fetch(&refspec_refs, Some(&mut fetch_options), None)?;
-        }
+            remote.fetch(&refspec_refs, Some(&mut fetch_options), None)
+        };
+        options.map_git_result("fetch_all_variations", fetch_result)?;
         Ok(())
     }
 
@@ -3731,12 +3734,14 @@ impl Workspace {
             ),
         ];
         let refspec_refs = refspecs.iter().map(String::as_str).collect::<Vec<_>>();
-        if options.has_credentials() {
-            let mut fetch_options = options.fetch_options();
-            git_remote.fetch(&refspec_refs, Some(&mut fetch_options), None)?;
+        let _timeout_guard = options.server_timeout_guard()?;
+        let fetch_result = if options.has_network_callbacks() {
+            let mut fetch_options = options.fetch_options("fetch_support_refs");
+            git_remote.fetch(&refspec_refs, Some(&mut fetch_options), None)
         } else {
-            git_remote.fetch(&refspec_refs, None, None)?;
-        }
+            git_remote.fetch(&refspec_refs, None, None)
+        };
+        options.map_git_result("fetch_support_refs", fetch_result)?;
         Ok(())
     }
 
@@ -8032,12 +8037,19 @@ impl Workspace {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
         let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
-        let mut push_options = options.push_options_with_expectations(vec![PushRefExpectation {
-            dst_refname: format!("refs/heads/{variation}"),
-            expected_old_oid,
-            expected_new_oid: Some(expected_new_oid),
-        }]);
-        remote.push(&[refspec.as_str()], Some(&mut push_options))?;
+        let _timeout_guard = options.server_timeout_guard()?;
+        let push_result = {
+            let mut push_options = options.push_options_with_expectations(
+                "push_current_variation",
+                vec![PushRefExpectation {
+                    dst_refname: format!("refs/heads/{variation}"),
+                    expected_old_oid,
+                    expected_new_oid: Some(expected_new_oid),
+                }],
+            );
+            remote.push(&[refspec.as_str()], Some(&mut push_options))
+        };
+        options.map_git_result("push_current_variation", push_result)?;
 
         Ok(())
     }
@@ -8051,8 +8063,13 @@ impl Workspace {
     ) -> Result<()> {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
-        let mut push_options = options.push_options_with_expectations(expectations);
-        remote.push(&[refspec], Some(&mut push_options))?;
+        let _timeout_guard = options.server_timeout_guard()?;
+        let push_result = {
+            let mut push_options =
+                options.push_options_with_expectations("push_refspec", expectations);
+            remote.push(&[refspec], Some(&mut push_options))
+        };
+        options.map_git_result("push_refspec", push_result)?;
 
         Ok(())
     }
@@ -8065,8 +8082,9 @@ impl Workspace {
     ) -> Result<Option<String>> {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
-        let oid = if options.has_credentials() {
-            let callbacks = options.remote_callbacks();
+        let _timeout_guard = options.server_timeout_guard()?;
+        let oid = if options.has_network_callbacks() {
+            let callbacks = options.remote_callbacks("remote_advertised_oid");
             let connection = remote.connect_auth(Direction::Fetch, Some(callbacks), None)?;
             connection
                 .list()?
@@ -8093,8 +8111,9 @@ impl Workspace {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
         let refspec = format!("+refs/heads/{variation}:refs/remotes/{remote_name}/{variation}");
-        let fetch_result = if options.has_credentials() {
-            let mut fetch_options = options.fetch_options();
+        let _timeout_guard = options.server_timeout_guard()?;
+        let fetch_result = if options.has_network_callbacks() {
+            let mut fetch_options = options.fetch_options("fetch_remote_variation_ref");
             remote.fetch(&[refspec.as_str()], Some(&mut fetch_options), None)
         } else {
             remote.fetch(&[refspec.as_str()], None, None)
@@ -8102,7 +8121,7 @@ impl Workspace {
 
         if let Err(error) = fetch_result {
             if error.code() != git2::ErrorCode::NotFound {
-                return Err(error.into());
+                return options.map_git_result("fetch_remote_variation_ref", Err(error));
             }
         }
 
@@ -8272,15 +8291,16 @@ impl Workspace {
         let variation = self.current_variation_unchecked()?;
         let mut remote = self.repo.find_remote(remote.as_ref())?;
         ensure_remote_transport_supported(&remote)?;
-        let fetch_result = if options.has_credentials() {
-            let mut fetch_options = options.fetch_options();
+        let _timeout_guard = options.server_timeout_guard()?;
+        let fetch_result = if options.has_network_callbacks() {
+            let mut fetch_options = options.fetch_options("fetch_remote");
             remote.fetch(&[variation.as_str()], Some(&mut fetch_options), None)
         } else {
             remote.fetch(&[variation.as_str()], None, None)
         };
         if let Err(error) = fetch_result {
             if error.code() != git2::ErrorCode::NotFound {
-                return Err(error.into());
+                return options.map_git_result("fetch_remote", Err(error));
             }
         }
         Ok(())

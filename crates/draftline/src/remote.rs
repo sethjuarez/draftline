@@ -1,4 +1,11 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    time::{Duration, Instant},
+};
 
 use git2::Oid;
 use serde::{Deserialize, Serialize};
@@ -110,9 +117,10 @@ pub struct RemoteCredentialRequest<'a> {
 }
 
 /// Options for remote operations such as clone, fetch, and publish.
-#[derive(Default)]
 pub struct RemoteOptions<'callbacks> {
     credentials: Option<Box<RemoteCredentialCallback<'callbacks>>>,
+    timeout: Option<Duration>,
+    timed_out: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +132,81 @@ pub(crate) struct PushRefExpectation {
 
 type RemoteCredentialCallback<'callbacks> =
     dyn FnMut(RemoteCredentialRequest<'_>) -> Result<RemoteCredential> + 'callbacks;
+
+static LIBGIT2_TIMEOUT_MUTEX: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Copy)]
+struct RemoteTimeoutDeadline {
+    operation: &'static str,
+    timeout: Duration,
+    started_at: Instant,
+}
+
+pub(crate) struct Libgit2TimeoutGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous_connect_timeout_ms: i32,
+    previous_server_timeout_ms: i32,
+}
+
+impl Drop for Libgit2TimeoutGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = git2::opts::set_server_connect_timeout_in_milliseconds(
+                self.previous_connect_timeout_ms,
+            );
+            let _ = git2::opts::set_server_timeout_in_milliseconds(self.previous_server_timeout_ms);
+        }
+    }
+}
+
+impl RemoteTimeoutDeadline {
+    fn new(operation: &'static str, timeout: Duration) -> Self {
+        Self {
+            operation,
+            timeout,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn is_expired(self) -> bool {
+        self.started_at.elapsed() >= self.timeout
+    }
+
+    fn mark_if_expired(self, timed_out: &AtomicBool) -> bool {
+        if self.is_expired() {
+            timed_out.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn check(self, timed_out: &AtomicBool) -> std::result::Result<(), git2::Error> {
+        if self.mark_if_expired(timed_out) {
+            Err(git2::Error::new(
+                git2::ErrorCode::Timeout,
+                git2::ErrorClass::Net,
+                format!(
+                    "remote operation timed out after {}ms while running {}",
+                    duration_millis_u64(self.timeout),
+                    self.operation
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Default for RemoteOptions<'_> {
+    fn default() -> Self {
+        Self {
+            credentials: None,
+            timeout: None,
+            timed_out: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
 
 impl<'callbacks> RemoteOptions<'callbacks> {
     pub fn new() -> Self {
@@ -157,17 +240,28 @@ impl<'callbacks> RemoteOptions<'callbacks> {
         self
     }
 
-    pub(crate) fn fetch_options(&mut self) -> git2::FetchOptions<'_> {
+    /// Bounds libgit2 network operations with a native socket timeout.
+    ///
+    /// The timeout applies to connection setup, socket reads/writes, and Draftline's
+    /// progress/credential callbacks. Hosts should still keep credential callbacks
+    /// fast because Rust cannot preempt a synchronous foreign callback once entered.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub(crate) fn fetch_options(&mut self, operation: &'static str) -> git2::FetchOptions<'_> {
         let mut options = git2::FetchOptions::new();
-        options.remote_callbacks(self.remote_callbacks());
+        options.remote_callbacks(self.remote_callbacks(operation));
         options
     }
 
     pub(crate) fn push_options_with_expectations(
         &mut self,
+        operation: &'static str,
         expectations: Vec<PushRefExpectation>,
     ) -> git2::PushOptions<'_> {
-        let mut callbacks = self.remote_callbacks();
+        let mut callbacks = self.remote_callbacks(operation);
         callbacks.push_negotiation(move |updates| {
             if updates.len() != expectations.len() {
                 return Err(git2::Error::from_str(
@@ -209,18 +303,87 @@ impl<'callbacks> RemoteOptions<'callbacks> {
     }
 
     pub(crate) fn clone_fetch_options(&mut self) -> git2::FetchOptions<'_> {
-        self.fetch_options()
+        self.fetch_options("clone_workspace")
     }
 
-    pub(crate) fn has_credentials(&self) -> bool {
-        self.credentials.is_some()
+    pub(crate) fn has_network_callbacks(&self) -> bool {
+        self.credentials.is_some() || self.timeout.is_some()
     }
 
-    pub(crate) fn remote_callbacks(&mut self) -> git2::RemoteCallbacks<'_> {
+    pub(crate) fn server_timeout_guard(&self) -> Result<Option<Libgit2TimeoutGuard>> {
+        let Some(timeout) = self.timeout else {
+            return Ok(None);
+        };
+        let timeout_ms = duration_millis_i32(timeout);
+        let lock = LIBGIT2_TIMEOUT_MUTEX.lock().map_err(|_| {
+            DraftlineError::Git(git2::Error::from_str(
+                "libgit2 timeout guard mutex was poisoned",
+            ))
+        })?;
+        let previous_connect_timeout_ms =
+            unsafe { git2::opts::get_server_connect_timeout_in_milliseconds()? };
+        let previous_server_timeout_ms =
+            unsafe { git2::opts::get_server_timeout_in_milliseconds()? };
+        unsafe {
+            git2::opts::set_server_connect_timeout_in_milliseconds(timeout_ms)?;
+            git2::opts::set_server_timeout_in_milliseconds(timeout_ms)?;
+        }
+
+        Ok(Some(Libgit2TimeoutGuard {
+            _lock: lock,
+            previous_connect_timeout_ms,
+            previous_server_timeout_ms,
+        }))
+    }
+
+    pub(crate) fn map_git_result<T>(
+        &self,
+        operation: &'static str,
+        result: std::result::Result<T, git2::Error>,
+    ) -> Result<T> {
+        result.map_err(|error| {
+            if self.timed_out.load(Ordering::SeqCst) || git_error_is_timeout(&error) {
+                self.timeout_error(operation)
+            } else {
+                error.into()
+            }
+        })
+    }
+
+    pub(crate) fn timeout_error(&self, operation: &'static str) -> DraftlineError {
+        DraftlineError::RemoteOperationTimedOut {
+            operation: operation.to_string(),
+            timeout_ms: self.timeout.map(duration_millis_u64).unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn remote_callbacks(
+        &mut self,
+        operation: &'static str,
+    ) -> git2::RemoteCallbacks<'_> {
         let mut callbacks = git2::RemoteCallbacks::new();
+        self.timed_out.store(false, Ordering::SeqCst);
+        let deadline = self
+            .timeout
+            .map(|timeout| RemoteTimeoutDeadline::new(operation, timeout));
+
+        if let Some(deadline) = deadline {
+            let timed_out = Arc::clone(&self.timed_out);
+            callbacks.transfer_progress(move |_| !deadline.mark_if_expired(&timed_out));
+
+            let timed_out = Arc::clone(&self.timed_out);
+            callbacks.sideband_progress(move |_| !deadline.mark_if_expired(&timed_out));
+
+            let timed_out = Arc::clone(&self.timed_out);
+            callbacks.update_tips(move |_, _, _| !deadline.mark_if_expired(&timed_out));
+        }
 
         if let Some(credentials) = self.credentials.as_mut() {
+            let timed_out = Arc::clone(&self.timed_out);
             callbacks.credentials(move |url, username_from_url, allowed| {
+                if let Some(deadline) = deadline {
+                    deadline.check(&timed_out)?;
+                }
                 let request = RemoteCredentialRequest {
                     url,
                     username_from_url,
@@ -238,6 +401,20 @@ impl<'callbacks> RemoteOptions<'callbacks> {
 
         callbacks
     }
+}
+
+fn duration_millis_i32(duration: Duration) -> i32 {
+    duration.as_millis().clamp(1, i32::MAX as u128) as i32
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn git_error_is_timeout(error: &git2::Error) -> bool {
+    error.code() == git2::ErrorCode::Timeout
+        || error.message().to_ascii_lowercase().contains("timed out")
+        || error.message().to_ascii_lowercase().contains("timeout")
 }
 
 pub(crate) fn ensure_supported_remote_url(url: &str) -> Result<()> {
@@ -397,6 +574,41 @@ mod tests {
     }
 
     #[test]
+    fn timeout_deadline_returns_git_timeout_error() {
+        let timed_out = AtomicBool::new(false);
+        let deadline = RemoteTimeoutDeadline::new("fetch_remote", Duration::ZERO);
+
+        let error = deadline.check(&timed_out).unwrap_err();
+
+        assert_eq!(error.code(), git2::ErrorCode::Timeout);
+        assert!(timed_out.load(Ordering::SeqCst));
+        assert!(error.message().contains("fetch_remote"));
+    }
+
+    #[test]
+    fn remote_options_maps_git_timeout_to_draftline_timeout() {
+        let options = RemoteOptions::new().with_timeout(Duration::from_millis(25));
+        let error = options
+            .map_git_result::<()>(
+                "fetch_remote",
+                Err(git2::Error::new(
+                    git2::ErrorCode::Timeout,
+                    git2::ErrorClass::Net,
+                    "socket timed out",
+                )),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DraftlineError::RemoteOperationTimedOut {
+                ref operation,
+                timeout_ms: 25
+            } if operation == "fetch_remote"
+        ));
+    }
+
+    #[test]
     fn push_expectations_reject_create_only_when_remote_ref_exists() {
         let remote_dir = tempfile::tempdir().unwrap();
         Repository::init_bare(remote_dir.path()).unwrap();
@@ -418,11 +630,14 @@ mod tests {
             .remote("origin", remote_dir.path().to_str().unwrap())
             .unwrap();
         let mut remote_options = RemoteOptions::new();
-        let mut options = remote_options.push_options_with_expectations(vec![PushRefExpectation {
-            dst_refname: "refs/heads/master".to_string(),
-            expected_old_oid: None,
-            expected_new_oid: Some(second_oid.to_string()),
-        }]);
+        let mut options = remote_options.push_options_with_expectations(
+            "push_expectations_reject_create_only_when_remote_ref_exists",
+            vec![PushRefExpectation {
+                dst_refname: "refs/heads/master".to_string(),
+                expected_old_oid: None,
+                expected_new_oid: Some(second_oid.to_string()),
+            }],
+        );
 
         let error = second_remote
             .push(&["refs/heads/master:refs/heads/master"], Some(&mut options))
