@@ -1147,18 +1147,18 @@ pub fn get_history_compaction_candidates_with_context(
 pub fn preview_history_cleanup(
     request: PreviewHistoryCleanupRequest,
 ) -> Result<HistoryCleanupPreview> {
-    preview_history_cleanup_with_context(&DraftlineCommandContext::new(), request)
+    preview_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
 }
 
 /// Previews a durable history cleanup plan using a configured host context.
 #[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
 pub fn preview_history_cleanup_with_context(
-    context: &DraftlineCommandContext<'_>,
+    context: &mut DraftlineCommandContext<'_>,
     request: PreviewHistoryCleanupRequest,
 ) -> Result<HistoryCleanupPreview> {
-    context
-        .open_workspace(&request.workspace_path)?
-        .preview_history_cleanup(request.cleanup)
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let mut options = context.remote_options();
+    workspace.preview_history_cleanup_with_options(request.cleanup, &mut options)
 }
 
 /// Applies a durable history cleanup plan.
@@ -1185,19 +1185,26 @@ pub fn apply_history_cleanup_with_context(
 pub fn preflight_history_cleanup_remote_impact(
     request: HistoryCleanupRemoteImpactRequest,
 ) -> Result<HistoryCleanupRemoteImpact> {
-    preflight_history_cleanup_remote_impact_with_context(&DraftlineCommandContext::new(), request)
+    preflight_history_cleanup_remote_impact_with_context(
+        &mut DraftlineCommandContext::new(),
+        request,
+    )
 }
 
 /// Preflights origin-aware cleanup impact using a configured host context.
 #[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
 pub fn preflight_history_cleanup_remote_impact_with_context(
-    context: &DraftlineCommandContext<'_>,
+    context: &mut DraftlineCommandContext<'_>,
     request: HistoryCleanupRemoteImpactRequest,
 ) -> Result<HistoryCleanupRemoteImpact> {
     let plan_id = CleanupPlanId::from_string(request.plan_id)?;
-    context
-        .open_workspace(&request.workspace_path)?
-        .preflight_history_cleanup_remote_impact(plan_id, request.remote)
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let mut options = context.remote_options();
+    workspace.preflight_history_cleanup_remote_impact_with_options(
+        plan_id,
+        request.remote,
+        &mut options,
+    )
 }
 
 /// Preflights explicit publication of an applied cleanup rewrite.
@@ -1205,19 +1212,19 @@ pub fn preflight_history_cleanup_remote_impact_with_context(
 pub fn preflight_publish_history_cleanup(
     request: PublishHistoryCleanupPreflightRequest,
 ) -> Result<HistoryCleanupPublishPreflight> {
-    preflight_publish_history_cleanup_with_context(&DraftlineCommandContext::new(), request)
+    preflight_publish_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
 }
 
 /// Preflights explicit cleanup publication using a configured host context.
 #[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
 pub fn preflight_publish_history_cleanup_with_context(
-    context: &DraftlineCommandContext<'_>,
+    context: &mut DraftlineCommandContext<'_>,
     request: PublishHistoryCleanupPreflightRequest,
 ) -> Result<HistoryCleanupPublishPreflight> {
     let plan_id = CleanupPlanId::from_string(request.plan_id)?;
-    context
-        .open_workspace(&request.workspace_path)?
-        .preflight_publish_history_cleanup(plan_id, request.remote)
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let mut options = context.remote_options();
+    workspace.preflight_publish_history_cleanup_with_options(plan_id, request.remote, &mut options)
 }
 
 /// Publishes an applied cleanup rewrite after explicit confirmation.
@@ -1235,7 +1242,14 @@ pub fn publish_history_cleanup_with_context(
     request: PublishHistoryCleanupRequest,
 ) -> Result<HistoryCleanupPublishResult> {
     let workspace = context.open_workspace(&request.workspace_path)?;
-    let result = workspace.publish_history_cleanup(request.token, request.confirmation)?;
+    let result = {
+        let mut options = context.remote_options();
+        workspace.publish_history_cleanup_with_options(
+            request.token,
+            request.confirmation,
+            &mut options,
+        )?
+    };
     context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
     Ok(result)
 }

@@ -6582,6 +6582,16 @@ impl Workspace {
         &self,
         request: HistoryCleanupRequest,
     ) -> Result<HistoryCleanupPreview> {
+        let mut options = RemoteOptions::new();
+        self.preview_history_cleanup_with_options(request, &mut options)
+    }
+
+    /// Prepares a durable timeline cleanup plan with explicit remote options.
+    pub fn preview_history_cleanup_with_options(
+        &self,
+        request: HistoryCleanupRequest,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<HistoryCleanupPreview> {
         self.ensure_no_pending_recovery()?;
         let target_variation = match request.target_variation.clone() {
             Some(variation) => VariationId::from(validate_variation_name(variation.as_str())?),
@@ -6640,8 +6650,7 @@ impl Workspace {
         })?;
         let remote_impact_remote =
             if let RemoteRewritePolicy::PushWithLease { remote, branch } = &request.remote_policy {
-                let mut options = RemoteOptions::new();
-                self.fetch_remote_variation_ref(remote, branch, &mut options)?;
+                self.fetch_remote_variation_ref(remote, branch, options)?;
                 Some(remote.as_str())
             } else {
                 None
@@ -6829,14 +6838,24 @@ impl Workspace {
         plan_id: CleanupPlanId,
         remote: impl AsRef<str>,
     ) -> Result<HistoryCleanupRemoteImpact> {
+        let mut options = RemoteOptions::new();
+        self.preflight_history_cleanup_remote_impact_with_options(plan_id, remote, &mut options)
+    }
+
+    /// Reports origin-aware publish impact with explicit remote options.
+    pub fn preflight_history_cleanup_remote_impact_with_options(
+        &self,
+        plan_id: CleanupPlanId,
+        remote: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<HistoryCleanupRemoteImpact> {
         self.ensure_no_pending_recovery()?;
         let stored = self.read_history_cleanup_plan(&plan_id)?;
         let remote = remote.as_ref().to_string();
-        let mut options = RemoteOptions::new();
         self.fetch_remote_variation_ref(
             &remote,
             stored.preview.target_variation.as_str(),
-            &mut options,
+            options,
         )?;
         self.cleanup_remote_impact_from_preview(&stored.preview, Some(remote.as_str()))
     }
