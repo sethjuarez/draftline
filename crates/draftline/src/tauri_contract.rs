@@ -3017,6 +3017,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidSquashCount(_) => "invalid_squash_count",
         DraftlineError::NotEnoughVersionsToSquash { .. } => "not_enough_versions_to_squash",
         DraftlineError::InvalidContributorIdentity(_) => "invalid_contributor_identity",
+        DraftlineError::RemoteOperationTimedOut { .. } => "remote_operation_timed_out",
         DraftlineError::InvalidMergeResolution(_) => "invalid_merge_resolution",
         DraftlineError::InvalidHistoryCleanup(_) => "invalid_history_cleanup",
         DraftlineError::HistoryCleanupBlocked(_) => "history_cleanup_blocked",

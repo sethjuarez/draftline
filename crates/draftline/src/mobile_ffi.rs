@@ -12,6 +12,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     path::PathBuf,
     ptr, slice,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,7 @@ use crate::{
 };
 
 type FfiResult<T> = std::result::Result<T, FfiFailure>;
+const DEFAULT_MOBILE_REMOTE_TIMEOUT_MS: u64 = 20_000;
 
 /// Opaque workspace handle owned by Draftline and passed across the C ABI.
 pub struct DraftlineMobileWorkspace {
@@ -40,6 +42,8 @@ pub enum DraftlineMobileStatusCode {
     DraftlineError = 4,
     Panic = 5,
     CredentialRejected = 6,
+    RemoteTimeout = 7,
+    RemoteNetwork = 8,
 }
 
 /// C-safe status with an optional heap-allocated error message.
@@ -140,7 +144,8 @@ impl FfiFailure {
 
 impl From<DraftlineError> for FfiFailure {
     fn from(error: DraftlineError) -> Self {
-        Self::new(DraftlineMobileStatusCode::DraftlineError, error.to_string())
+        let code = status_code_for_draftline_error(&error);
+        Self::new(code, error.to_string())
     }
 }
 
@@ -169,6 +174,35 @@ fn panic_status() -> DraftlineMobileStatus {
         DraftlineMobileStatusCode::Panic,
         "Draftline mobile bridge operation panicked",
     ))
+}
+
+fn status_code_for_draftline_error(error: &DraftlineError) -> DraftlineMobileStatusCode {
+    match error {
+        DraftlineError::RemoteOperationTimedOut { .. } => DraftlineMobileStatusCode::RemoteTimeout,
+        DraftlineError::Git(git_error) if git_error.code() == git2::ErrorCode::Timeout => {
+            DraftlineMobileStatusCode::RemoteTimeout
+        }
+        DraftlineError::InvalidContributorIdentity(_) => {
+            DraftlineMobileStatusCode::CredentialRejected
+        }
+        DraftlineError::Git(git_error)
+            if matches!(
+                git_error.code(),
+                git2::ErrorCode::Auth | git2::ErrorCode::Certificate
+            ) =>
+        {
+            DraftlineMobileStatusCode::CredentialRejected
+        }
+        DraftlineError::Git(git_error)
+            if matches!(
+                git_error.class(),
+                git2::ErrorClass::Net | git2::ErrorClass::Http | git2::ErrorClass::Ssh
+            ) =>
+        {
+            DraftlineMobileStatusCode::RemoteNetwork
+        }
+        _ => DraftlineMobileStatusCode::DraftlineError,
+    }
 }
 
 fn into_c_string(value: impl Into<String>) -> *mut c_char {
@@ -308,11 +342,37 @@ fn with_remote_options<'a>(
     callback: DraftlineMobileCredentialCallback,
     user_data: *mut c_void,
 ) -> RemoteOptions<'a> {
-    if let Some(callback) = callback {
+    with_remote_options_with_timeout(
+        callback,
+        user_data,
+        Some(Duration::from_millis(DEFAULT_MOBILE_REMOTE_TIMEOUT_MS)),
+    )
+}
+
+fn with_remote_options_with_timeout<'a>(
+    callback: DraftlineMobileCredentialCallback,
+    user_data: *mut c_void,
+    timeout: Option<Duration>,
+) -> RemoteOptions<'a> {
+    let options = if let Some(callback) = callback {
         RemoteOptions::new()
             .with_credentials(move |request| credential_from_callback(callback, user_data, request))
     } else {
         RemoteOptions::new()
+    };
+
+    if let Some(timeout) = timeout {
+        options.with_timeout(timeout)
+    } else {
+        options
+    }
+}
+
+fn mobile_timeout(timeout_ms: u64) -> Option<Duration> {
+    if timeout_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(timeout_ms))
     }
 }
 
@@ -541,6 +601,50 @@ pub unsafe extern "C" fn draftline_mobile_workspace_clone(
     }
 }
 
+/// Clones a shared workspace with an explicit native network timeout in milliseconds.
+///
+/// `timeout_ms == 0` disables Draftline's native network timeout for this call.
+///
+/// # Safety
+///
+/// String pointers must be valid null-terminated UTF-8. `policy`, when non-null,
+/// and callback pointers must remain valid for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn draftline_mobile_workspace_clone_with_timeout(
+    remote_url: *const c_char,
+    path: *const c_char,
+    policy: *const DraftlineMobileContentPolicy,
+    credential_callback: DraftlineMobileCredentialCallback,
+    credential_user_data: *mut c_void,
+    timeout_ms: u64,
+) -> DraftlineMobileWorkspaceResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        workspace_result((|| {
+            let remote_url = required_str(remote_url, "remote_url")?;
+            let path = required_str(path, "path")?;
+            let policy = content_policy_from_ptr(policy)?;
+            let mut options = with_remote_options_with_timeout(
+                credential_callback,
+                credential_user_data,
+                mobile_timeout(timeout_ms),
+            );
+            Workspace::clone_workspace_with_policy_and_options(
+                remote_url,
+                path,
+                policy,
+                &mut options,
+            )
+            .map_err(FfiFailure::from)
+        })())
+    })) {
+        Ok(result) => result,
+        Err(_) => DraftlineMobileWorkspaceResult {
+            status: panic_status(),
+            workspace: ptr::null_mut(),
+        },
+    }
+}
+
 /// Reads a policy-tracked UTF-8 file from the workspace.
 ///
 /// # Safety
@@ -702,6 +806,42 @@ pub unsafe extern "C" fn draftline_mobile_workspace_fetch_remote(
     }
 }
 
+/// Fetches remote-tracking state with an explicit native network timeout in milliseconds.
+///
+/// `timeout_ms == 0` disables Draftline's native network timeout for this call.
+///
+/// # Safety
+///
+/// `workspace` must be valid and `remote` must be valid null-terminated UTF-8.
+/// Callback pointers must remain valid for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn draftline_mobile_workspace_fetch_remote_with_timeout(
+    workspace: *mut DraftlineMobileWorkspace,
+    remote: *const c_char,
+    credential_callback: DraftlineMobileCredentialCallback,
+    credential_user_data: *mut c_void,
+    timeout_ms: u64,
+) -> DraftlineMobileStatus {
+    match catch_unwind(AssertUnwindSafe(|| {
+        status_result((|| {
+            let handle = workspace_from_handle(workspace)?;
+            let remote = required_str(remote, "remote")?;
+            let mut options = with_remote_options_with_timeout(
+                credential_callback,
+                credential_user_data,
+                mobile_timeout(timeout_ms),
+            );
+            handle
+                .workspace
+                .fetch_remote_with_options(remote, &mut options)
+                .map_err(FfiFailure::from)
+        })())
+    })) {
+        Ok(result) => result,
+        Err(_) => panic_status(),
+    }
+}
+
 /// Returns current variation sync status for a fetched remote as JSON.
 ///
 /// # Safety
@@ -778,6 +918,46 @@ pub unsafe extern "C" fn draftline_mobile_workspace_apply_incoming_json(
             let handle = workspace_from_handle(workspace)?;
             let remote = required_str(remote, "remote")?;
             let mut options = with_remote_options(credential_callback, credential_user_data);
+            let result = handle
+                .workspace
+                .apply_incoming(remote, &mut options)
+                .map_err(FfiFailure::from)?;
+            serde_json::to_string(&result).map_err(FfiFailure::from)
+        })())
+    })) {
+        Ok(result) => result,
+        Err(_) => DraftlineMobileStringResult {
+            status: panic_status(),
+            value: ptr::null_mut(),
+        },
+    }
+}
+
+/// Applies incoming changes with an explicit native network timeout in milliseconds.
+///
+/// `timeout_ms == 0` disables Draftline's native network timeout for this call.
+///
+/// # Safety
+///
+/// `workspace` must be valid and `remote` must be valid null-terminated UTF-8.
+/// Callback pointers must remain valid for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn draftline_mobile_workspace_apply_incoming_json_with_timeout(
+    workspace: *mut DraftlineMobileWorkspace,
+    remote: *const c_char,
+    credential_callback: DraftlineMobileCredentialCallback,
+    credential_user_data: *mut c_void,
+    timeout_ms: u64,
+) -> DraftlineMobileStringResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        string_result((|| {
+            let handle = workspace_from_handle(workspace)?;
+            let remote = required_str(remote, "remote")?;
+            let mut options = with_remote_options_with_timeout(
+                credential_callback,
+                credential_user_data,
+                mobile_timeout(timeout_ms),
+            );
             let result = handle
                 .workspace
                 .apply_incoming(remote, &mut options)
@@ -1098,6 +1278,50 @@ pub unsafe extern "C" fn draftline_mobile_workspace_merge_incoming_json(
     }
 }
 
+/// Writes a clean incoming merge with an explicit native network timeout in milliseconds.
+///
+/// `timeout_ms == 0` disables Draftline's native network timeout for this call.
+///
+/// # Safety
+///
+/// `workspace` must be valid. String pointers must be valid null-terminated UTF-8.
+/// Callback pointers must remain valid for this call.
+#[no_mangle]
+pub unsafe extern "C" fn draftline_mobile_workspace_merge_incoming_json_with_timeout(
+    workspace: *mut DraftlineMobileWorkspace,
+    token_json: *const c_char,
+    label: *const c_char,
+    credential_callback: DraftlineMobileCredentialCallback,
+    credential_user_data: *mut c_void,
+    timeout_ms: u64,
+) -> DraftlineMobileStringResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        string_result((|| {
+            let handle = workspace_from_handle(workspace)?;
+            let token_json = required_str(token_json, "token_json")?;
+            let label = required_str(label, "label")?;
+            let token: MergeIncomingToken =
+                serde_json::from_str(token_json).map_err(FfiFailure::from)?;
+            let mut options = with_remote_options_with_timeout(
+                credential_callback,
+                credential_user_data,
+                mobile_timeout(timeout_ms),
+            );
+            let result = handle
+                .workspace
+                .merge_incoming(token, label, &mut options)
+                .map_err(FfiFailure::from)?;
+            serde_json::to_string(&result).map_err(FfiFailure::from)
+        })())
+    })) {
+        Ok(result) => result,
+        Err(_) => DraftlineMobileStringResult {
+            status: panic_status(),
+            value: ptr::null_mut(),
+        },
+    }
+}
+
 /// Writes an incoming merge with explicit resolution JSON and returns result JSON.
 ///
 /// # Safety
@@ -1125,6 +1349,55 @@ pub unsafe extern "C" fn draftline_mobile_workspace_merge_incoming_with_resoluti
             let resolutions: Vec<MergeConflictResolution> =
                 serde_json::from_str(resolutions_json).map_err(FfiFailure::from)?;
             let mut options = with_remote_options(credential_callback, credential_user_data);
+            let result = handle
+                .workspace
+                .merge_incoming_with_resolutions(token, label, resolutions, &mut options)
+                .map_err(FfiFailure::from)?;
+            serde_json::to_string(&result).map_err(FfiFailure::from)
+        })())
+    })) {
+        Ok(result) => result,
+        Err(_) => DraftlineMobileStringResult {
+            status: panic_status(),
+            value: ptr::null_mut(),
+        },
+    }
+}
+
+/// Writes an incoming merge with explicit resolutions and a native network timeout.
+///
+/// `timeout_ms == 0` disables Draftline's native network timeout for this call.
+///
+/// # Safety
+///
+/// `workspace` must be valid. String pointers must be valid null-terminated UTF-8.
+/// `resolutions_json` must be a JSON array of `MergeConflictResolution` values.
+/// Callback pointers must remain valid for this call.
+#[no_mangle]
+pub unsafe extern "C" fn draftline_mobile_workspace_merge_incoming_with_resolutions_json_with_timeout(
+    workspace: *mut DraftlineMobileWorkspace,
+    token_json: *const c_char,
+    label: *const c_char,
+    resolutions_json: *const c_char,
+    credential_callback: DraftlineMobileCredentialCallback,
+    credential_user_data: *mut c_void,
+    timeout_ms: u64,
+) -> DraftlineMobileStringResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        string_result((|| {
+            let handle = workspace_from_handle(workspace)?;
+            let token_json = required_str(token_json, "token_json")?;
+            let label = required_str(label, "label")?;
+            let resolutions_json = required_str(resolutions_json, "resolutions_json")?;
+            let token: MergeIncomingToken =
+                serde_json::from_str(token_json).map_err(FfiFailure::from)?;
+            let resolutions: Vec<MergeConflictResolution> =
+                serde_json::from_str(resolutions_json).map_err(FfiFailure::from)?;
+            let mut options = with_remote_options_with_timeout(
+                credential_callback,
+                credential_user_data,
+                mobile_timeout(timeout_ms),
+            );
             let result = handle
                 .workspace
                 .merge_incoming_with_resolutions(token, label, resolutions, &mut options)
@@ -1173,6 +1446,46 @@ pub unsafe extern "C" fn draftline_mobile_workspace_preflight_publish_json(
     }
 }
 
+/// Preflights guarded publication with an explicit native network timeout in milliseconds.
+///
+/// `timeout_ms == 0` disables Draftline's native network timeout for this call.
+///
+/// # Safety
+///
+/// `workspace` must be valid and `remote` must be valid null-terminated UTF-8.
+/// Callback pointers must remain valid for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn draftline_mobile_workspace_preflight_publish_json_with_timeout(
+    workspace: *mut DraftlineMobileWorkspace,
+    remote: *const c_char,
+    credential_callback: DraftlineMobileCredentialCallback,
+    credential_user_data: *mut c_void,
+    timeout_ms: u64,
+) -> DraftlineMobileStringResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        string_result((|| {
+            let handle = workspace_from_handle(workspace)?;
+            let remote = required_str(remote, "remote")?;
+            let mut options = with_remote_options_with_timeout(
+                credential_callback,
+                credential_user_data,
+                mobile_timeout(timeout_ms),
+            );
+            let preflight = handle
+                .workspace
+                .preflight_publish_with_options(remote, &mut options)
+                .map_err(FfiFailure::from)?;
+            serde_json::to_string(&preflight).map_err(FfiFailure::from)
+        })())
+    })) {
+        Ok(result) => result,
+        Err(_) => DraftlineMobileStringResult {
+            status: panic_status(),
+            value: ptr::null_mut(),
+        },
+    }
+}
+
 /// Publishes with a JSON token returned by preflight publish.
 ///
 /// # Safety
@@ -1193,6 +1506,48 @@ pub unsafe extern "C" fn draftline_mobile_workspace_publish_json(
             let token: PublishToken =
                 serde_json::from_str(publish_token_json).map_err(FfiFailure::from)?;
             let mut options = with_remote_options(credential_callback, credential_user_data);
+            let result = handle
+                .workspace
+                .publish_with_options(token, &mut options)
+                .map_err(FfiFailure::from)?;
+            serde_json::to_string(&result).map_err(FfiFailure::from)
+        })())
+    })) {
+        Ok(result) => result,
+        Err(_) => DraftlineMobileStringResult {
+            status: panic_status(),
+            value: ptr::null_mut(),
+        },
+    }
+}
+
+/// Publishes with an explicit native network timeout in milliseconds.
+///
+/// `timeout_ms == 0` disables Draftline's native network timeout for this call.
+///
+/// # Safety
+///
+/// `workspace` must be valid and `publish_token_json` must be valid
+/// null-terminated UTF-8. Callback pointers must remain valid for this call.
+#[no_mangle]
+pub unsafe extern "C" fn draftline_mobile_workspace_publish_json_with_timeout(
+    workspace: *mut DraftlineMobileWorkspace,
+    publish_token_json: *const c_char,
+    credential_callback: DraftlineMobileCredentialCallback,
+    credential_user_data: *mut c_void,
+    timeout_ms: u64,
+) -> DraftlineMobileStringResult {
+    match catch_unwind(AssertUnwindSafe(|| {
+        string_result((|| {
+            let handle = workspace_from_handle(workspace)?;
+            let publish_token_json = required_str(publish_token_json, "publish_token_json")?;
+            let token: PublishToken =
+                serde_json::from_str(publish_token_json).map_err(FfiFailure::from)?;
+            let mut options = with_remote_options_with_timeout(
+                credential_callback,
+                credential_user_data,
+                mobile_timeout(timeout_ms),
+            );
             let result = handle
                 .workspace
                 .publish_with_options(token, &mut options)
@@ -1255,6 +1610,40 @@ mod tests {
 
     unsafe fn result_to_json(result: DraftlineMobileStringResult) -> Value {
         serde_json::from_str(&result_to_string(result)).unwrap()
+    }
+
+    #[test]
+    fn mobile_timeout_zero_disables_explicit_timeout() {
+        assert_eq!(mobile_timeout(0), None);
+        assert_eq!(mobile_timeout(1), Some(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn mobile_status_maps_timeout_errors() {
+        let failure = FfiFailure::from(DraftlineError::RemoteOperationTimedOut {
+            operation: "fetch_remote".to_string(),
+            timeout_ms: 20_000,
+        });
+
+        assert_eq!(failure.code, DraftlineMobileStatusCode::RemoteTimeout);
+        assert!(failure.message.contains("fetch_remote"));
+    }
+
+    #[test]
+    fn mobile_status_maps_auth_and_network_errors() {
+        let auth = FfiFailure::from(DraftlineError::Git(git2::Error::new(
+            git2::ErrorCode::Auth,
+            git2::ErrorClass::Net,
+            "authentication failed",
+        )));
+        let network = FfiFailure::from(DraftlineError::Git(git2::Error::new(
+            git2::ErrorCode::GenericError,
+            git2::ErrorClass::Net,
+            "network unavailable",
+        )));
+
+        assert_eq!(auth.code, DraftlineMobileStatusCode::CredentialRejected);
+        assert_eq!(network.code, DraftlineMobileStatusCode::RemoteNetwork);
     }
 
     #[test]

@@ -11,6 +11,7 @@ on:
 permissions:
   contents: read
   id-token: write
+  packages: write
 
 jobs:
   publish:
@@ -21,6 +22,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Refuse non-main publish
+        run: |
+          if [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "Refusing to publish npm packages from $GITHUB_REF_NAME; publish workflows must run from main"
+            exit 1
+          fi
 
       - name: Confirm publish intent
         run: |
@@ -76,3 +84,56 @@ jobs:
       - name: Publish @draftline/react
         if: steps.npm.outputs.publish_react == 'true'
         run: npm publish --workspace @draftline/react --provenance --access public
+
+      - name: Setup Node for GitHub Packages
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: "@sethjuarez"
+
+      - name: Check published GitHub Packages versions
+        id: github_packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          client_version=$(node -p "require('./packages/client/package.json').version")
+          react_version=$(node -p "require('./packages/react/package.json').version")
+
+          if npm view "@sethjuarez/draftline-client@${client_version}" version --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+            echo "publish_client=false" >> "$GITHUB_OUTPUT"
+            echo "@sethjuarez/draftline-client ${client_version} is already published"
+          else
+            echo "publish_client=true" >> "$GITHUB_OUTPUT"
+            echo "@sethjuarez/draftline-client ${client_version} is not published yet"
+          fi
+
+          if npm view "@sethjuarez/draftline-react@${react_version}" version --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+            echo "publish_react=false" >> "$GITHUB_OUTPUT"
+            echo "@sethjuarez/draftline-react ${react_version} is already published"
+          else
+            echo "publish_react=true" >> "$GITHUB_OUTPUT"
+            echo "@sethjuarez/draftline-react ${react_version} is not published yet"
+          fi
+
+      - name: Stage @sethjuarez/draftline-client
+        if: steps.github_packages.outputs.publish_client == 'true'
+        run: node scripts/stage-github-package.mjs packages/client @sethjuarez/draftline-client .github-package-staging/client
+
+      - name: Publish @sethjuarez/draftline-client
+        if: steps.github_packages.outputs.publish_client == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish .github-package-staging/client --access public
+
+      - name: Stage @sethjuarez/draftline-react
+        if: steps.github_packages.outputs.publish_react == 'true'
+        run: |
+          client_version=$(node -p "require('./packages/client/package.json').version")
+          node scripts/stage-github-package.mjs packages/react @sethjuarez/draftline-react .github-package-staging/react "@draftline/client=npm:@sethjuarez/draftline-client@${client_version}"
+
+      - name: Publish @sethjuarez/draftline-react
+        if: steps.github_packages.outputs.publish_react == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish .github-package-staging/react --access public

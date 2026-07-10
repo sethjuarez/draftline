@@ -118,6 +118,9 @@ pub enum DraftlineError {
     #[error("invalid contributor identity: {0}")]
     InvalidContributorIdentity(String),
 
+    #[error("remote operation timed out after {timeout_ms}ms while running {operation}")]
+    RemoteOperationTimedOut { operation: String, timeout_ms: u64 },
+
     #[error("invalid merge resolution: {0}")]
     InvalidMergeResolution(String),
 

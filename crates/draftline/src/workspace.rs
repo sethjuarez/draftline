@@ -8,7 +8,7 @@ use git2::{
     BranchType, Commit, DiffFormat, DiffOptions, Direction, FetchPrune, ObjectType, Oid,
     Repository, RepositoryInitOptions, Signature, Status, StatusOptions, Tree,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::merge::{MergeConflict, MergeInput, ResolverRegistry};
 use crate::recovery::RecoveryOperation;
@@ -173,6 +173,7 @@ impl From<&str> for VariationId {
 /// A changed file in the workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedFile {
+    #[serde(serialize_with = "serialize_workspace_path")]
     pub path: PathBuf,
     pub kind: ChangeKind,
     pub is_binary: bool,
@@ -231,6 +232,7 @@ pub struct PreflightReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FileHazard {
+    #[serde(serialize_with = "serialize_workspace_path")]
     pub path: PathBuf,
     pub kind: FileHazardKind,
 }
@@ -255,6 +257,7 @@ pub struct VersionPreview {
 /// File content from a read-only version preview.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewFile {
+    #[serde(serialize_with = "serialize_workspace_path")]
     pub path: PathBuf,
     pub content: Option<String>,
     pub is_binary: bool,
@@ -263,6 +266,7 @@ pub struct PreviewFile {
 /// Current live workspace content for one tracked file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CurrentFilePreview {
+    #[serde(serialize_with = "serialize_workspace_path")]
     pub path: PathBuf,
     pub content: Option<String>,
     pub is_binary: bool,
@@ -1998,7 +2002,8 @@ impl Workspace {
     ) -> Result<Self> {
         ensure_supported_remote_url(remote_url.as_ref())?;
         let mut builder = RepoBuilder::new();
-        if options.has_credentials() {
+        let _timeout_guard = options.server_timeout_guard()?;
+        if options.has_network_callbacks() {
             let fetch_options = options.clone_fetch_options();
             builder.fetch_options(fetch_options);
         }
@@ -3330,15 +3335,17 @@ impl Workspace {
             ),
         ];
         let refspec_refs = refspecs.iter().map(String::as_str).collect::<Vec<_>>();
-        if options.has_credentials() {
-            let mut fetch_options = options.fetch_options();
+        let _timeout_guard = options.server_timeout_guard()?;
+        let fetch_result = if options.has_network_callbacks() {
+            let mut fetch_options = options.fetch_options("fetch_all_variations");
             fetch_options.prune(FetchPrune::On);
-            remote.fetch(&refspec_refs, Some(&mut fetch_options), None)?;
+            remote.fetch(&refspec_refs, Some(&mut fetch_options), None)
         } else {
             let mut fetch_options = git2::FetchOptions::new();
             fetch_options.prune(FetchPrune::On);
-            remote.fetch(&refspec_refs, Some(&mut fetch_options), None)?;
-        }
+            remote.fetch(&refspec_refs, Some(&mut fetch_options), None)
+        };
+        options.map_git_result("fetch_all_variations", fetch_result)?;
         Ok(())
     }
 
@@ -3731,12 +3738,14 @@ impl Workspace {
             ),
         ];
         let refspec_refs = refspecs.iter().map(String::as_str).collect::<Vec<_>>();
-        if options.has_credentials() {
-            let mut fetch_options = options.fetch_options();
-            git_remote.fetch(&refspec_refs, Some(&mut fetch_options), None)?;
+        let _timeout_guard = options.server_timeout_guard()?;
+        let fetch_result = if options.has_network_callbacks() {
+            let mut fetch_options = options.fetch_options("fetch_support_refs");
+            git_remote.fetch(&refspec_refs, Some(&mut fetch_options), None)
         } else {
-            git_remote.fetch(&refspec_refs, None, None)?;
-        }
+            git_remote.fetch(&refspec_refs, None, None)
+        };
+        options.map_git_result("fetch_support_refs", fetch_result)?;
         Ok(())
     }
 
@@ -5982,6 +5991,7 @@ impl Workspace {
     /// ```
     pub fn preflight_apply_incoming(&self, remote: impl AsRef<str>) -> Result<ApplyIncomingReport> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("preflight_apply_incoming")?;
         let sync_status = self.sync_status(remote)?;
         let dirty_files = self.changed_files_unchecked()?;
 
@@ -6023,6 +6033,7 @@ impl Workspace {
     /// Preflights a diverged incoming merge without mutating workspace state.
     pub fn preflight_merge_incoming(&self, remote: impl AsRef<str>) -> Result<MergeIncomingReport> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("preflight_merge_incoming")?;
         let sync_status = self.sync_status(remote)?;
         let dirty_files = self.changed_files_unchecked()?;
         let mut file_hazards = Vec::new();
@@ -6090,6 +6101,7 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("merge_incoming")?;
         let _lock = OperationLock::acquire(&self.lock_path(), "merge_incoming")?;
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
@@ -6215,6 +6227,9 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation(
+            "merge_incoming_with_resolutions",
+        )?;
         let _lock = OperationLock::acquire(&self.lock_path(), "merge_incoming_with_resolutions")?;
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
@@ -6315,6 +6330,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<ApplyIncomingResult> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("apply_incoming")?;
         let _lock = OperationLock::acquire(&self.lock_path(), "apply_incoming")?;
 
         let dirty_files = self.changed_files_unchecked()?;
@@ -6757,6 +6773,10 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "history_cleanup")?;
         let stored = self.read_history_cleanup_plan(&plan_id)?;
+        self.ensure_no_pending_history_cleanup(
+            "history_cleanup",
+            Some(stored.preview.target_variation.as_str()),
+        )?;
         if stored.request.safety.require_clean_worktree {
             let dirty_files = self.changed_files_unchecked()?;
             if !dirty_files.is_empty() {
@@ -8032,12 +8052,19 @@ impl Workspace {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
         let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
-        let mut push_options = options.push_options_with_expectations(vec![PushRefExpectation {
-            dst_refname: format!("refs/heads/{variation}"),
-            expected_old_oid,
-            expected_new_oid: Some(expected_new_oid),
-        }]);
-        remote.push(&[refspec.as_str()], Some(&mut push_options))?;
+        let _timeout_guard = options.server_timeout_guard()?;
+        let push_result = {
+            let mut push_options = options.push_options_with_expectations(
+                "push_current_variation",
+                vec![PushRefExpectation {
+                    dst_refname: format!("refs/heads/{variation}"),
+                    expected_old_oid,
+                    expected_new_oid: Some(expected_new_oid),
+                }],
+            );
+            remote.push(&[refspec.as_str()], Some(&mut push_options))
+        };
+        options.map_git_result("push_current_variation", push_result)?;
 
         Ok(())
     }
@@ -8051,8 +8078,13 @@ impl Workspace {
     ) -> Result<()> {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
-        let mut push_options = options.push_options_with_expectations(expectations);
-        remote.push(&[refspec], Some(&mut push_options))?;
+        let _timeout_guard = options.server_timeout_guard()?;
+        let push_result = {
+            let mut push_options =
+                options.push_options_with_expectations("push_refspec", expectations);
+            remote.push(&[refspec], Some(&mut push_options))
+        };
+        options.map_git_result("push_refspec", push_result)?;
 
         Ok(())
     }
@@ -8065,8 +8097,9 @@ impl Workspace {
     ) -> Result<Option<String>> {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
-        let oid = if options.has_credentials() {
-            let callbacks = options.remote_callbacks();
+        let _timeout_guard = options.server_timeout_guard()?;
+        let oid = if options.has_network_callbacks() {
+            let callbacks = options.remote_callbacks("remote_advertised_oid");
             let connection = remote.connect_auth(Direction::Fetch, Some(callbacks), None)?;
             connection
                 .list()?
@@ -8093,8 +8126,9 @@ impl Workspace {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
         let refspec = format!("+refs/heads/{variation}:refs/remotes/{remote_name}/{variation}");
-        let fetch_result = if options.has_credentials() {
-            let mut fetch_options = options.fetch_options();
+        let _timeout_guard = options.server_timeout_guard()?;
+        let fetch_result = if options.has_network_callbacks() {
+            let mut fetch_options = options.fetch_options("fetch_remote_variation_ref");
             remote.fetch(&[refspec.as_str()], Some(&mut fetch_options), None)
         } else {
             remote.fetch(&[refspec.as_str()], None, None)
@@ -8102,7 +8136,7 @@ impl Workspace {
 
         if let Err(error) = fetch_result {
             if error.code() != git2::ErrorCode::NotFound {
-                return Err(error.into());
+                return options.map_git_result("fetch_remote_variation_ref", Err(error));
             }
         }
 
@@ -8272,15 +8306,16 @@ impl Workspace {
         let variation = self.current_variation_unchecked()?;
         let mut remote = self.repo.find_remote(remote.as_ref())?;
         ensure_remote_transport_supported(&remote)?;
-        let fetch_result = if options.has_credentials() {
-            let mut fetch_options = options.fetch_options();
+        let _timeout_guard = options.server_timeout_guard()?;
+        let fetch_result = if options.has_network_callbacks() {
+            let mut fetch_options = options.fetch_options("fetch_remote");
             remote.fetch(&[variation.as_str()], Some(&mut fetch_options), None)
         } else {
             remote.fetch(&[variation.as_str()], None, None)
         };
         if let Err(error) = fetch_result {
             if error.code() != git2::ErrorCode::NotFound {
-                return Err(error.into());
+                return options.map_git_result("fetch_remote", Err(error));
             }
         }
         Ok(())
@@ -8350,6 +8385,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishPreflight> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("publish_changes")?;
         let report = preflight_report(
             "publish_changes",
             false,
@@ -8405,6 +8441,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishResult> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("publish_changes")?;
         let report = preflight_report(
             "publish_changes",
             false,
@@ -8467,6 +8504,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishResult> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("publish_changes")?;
         let report = preflight_report(
             "publish_changes",
             false,
@@ -9266,6 +9304,65 @@ impl Workspace {
             self.write_pending_history_cleanups(&pending)?;
         }
         Ok(())
+    }
+
+    fn ensure_no_pending_history_cleanup_for_current_variation(
+        &self,
+        operation: &str,
+    ) -> Result<()> {
+        let variation = self.current_variation_unchecked().ok();
+        self.ensure_no_pending_history_cleanup(operation, variation.as_deref())
+    }
+
+    fn ensure_no_pending_history_cleanup(
+        &self,
+        operation: &str,
+        target_variation: Option<&str>,
+    ) -> Result<()> {
+        let pending = self.read_pending_history_cleanups()?;
+        let blockers = pending
+            .into_iter()
+            .filter(|cleanup| {
+                target_variation
+                    .is_none_or(|variation| cleanup.target_variation.as_str() == variation)
+            })
+            .collect::<Vec<_>>();
+        if blockers.is_empty() {
+            return Ok(());
+        }
+
+        let diagnostics = blockers
+            .into_iter()
+            .map(|cleanup| {
+                let mut safe_next_actions = Vec::new();
+                if cleanup.publish_status == Some(CleanupPublishStatus::SharedHistoryRewriteRequired) {
+                    safe_next_actions.push(SafeNextAction::PublishHistoryCleanup);
+                }
+                safe_next_actions.push(SafeNextAction::UndoHistoryCleanup);
+                safe_next_actions.push(SafeNextAction::AbandonHistoryCleanup);
+
+                CleanupWarning {
+                    code: CleanupWarningCode::PendingHistoryCleanup,
+                    message: format!(
+                        "history cleanup `{}` is pending for variation `{}`; publish, undo, or explicitly abandon it before running `{operation}`",
+                        cleanup.plan_id,
+                        cleanup.target_variation.as_str()
+                    ),
+                    related_versions: vec![
+                        cleanup.expected_local_head.clone(),
+                        cleanup.replacement_head.clone(),
+                    ],
+                    safe_next_actions,
+                }
+            })
+            .collect();
+        Err(DraftlineError::HistoryCleanupBlocked(Box::new(
+            HistoryCleanupBlockReport {
+                operation: operation.to_string(),
+                diagnostics,
+                can_proceed: false,
+            },
+        )))
     }
 
     fn draftline_dir(&self) -> PathBuf {
@@ -10508,6 +10605,18 @@ fn remove_workspace_path_if_exists(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn serialize_workspace_path<S>(path: &Path, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let value = path
+        .iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    serializer.serialize_str(&value)
 }
 
 fn collect_preview_files(

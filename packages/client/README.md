@@ -41,6 +41,19 @@ and exposes product-level operations such as `save`, `selectedSave`,
 repair/rollback, and remote variation adoption without repeating request DTO
 plumbing in every component.
 
+## Pending history cleanup
+
+After `applyHistoryCleanup`, Draftline persists pending cleanup state until the
+cleanup is published, undone, or explicitly abandoned. Host apps should call
+`listPendingHistoryCleanups` or facade `pendingHistoryCleanups` on workspace
+load/refresh and route normal sync UI to `publishPendingHistoryCleanup` or
+`undoPendingHistoryCleanup` while a pending record exists.
+
+Normal sync operations return a structured `history_cleanup_blocked` error when
+they would invalidate pending cleanup state. Use `isHistoryCleanupBlockedError`
+to narrow the error and read `details.operation`, `details.diagnostics`, and the
+safe next actions.
+
 ## Workspace graph integration
 
 `@draftline/client` exports the graph DTOs and helper return types directly,

@@ -32,6 +32,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Refuse non-main release build
+        run: |
+          if [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "Refusing to build or upload release package assets from $GITHUB_REF_NAME; release workflows must run from main"
+            exit 1
+          fi
+
       - name: Confirm build intent
         run: |
           if [ "${{ inputs.confirm_build }}" != "build" ]; then

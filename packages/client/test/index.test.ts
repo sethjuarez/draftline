@@ -5,6 +5,7 @@ import {
   createMergeConflictViewModel,
   createDraftlineClient,
   createWholeFileUseContentResolutions,
+  isHistoryCleanupBlockedError,
   type DraftlineInvoke,
   type MergeIncomingReport,
   type VariationRenameToken,
@@ -228,6 +229,10 @@ describe('createDraftlineClient', () => {
       plan_id: 'op-1',
       confirmation: 'user_confirmed',
     });
+    await client.listPendingHistoryCleanups({
+      workspace_path: 'C:\\repo',
+      target_variation: 'main',
+    });
     await client.preflightHistoryCleanupRemoteImpact({
       workspace_path: 'C:\\repo',
       plan_id: 'op-1',
@@ -243,9 +248,17 @@ describe('createDraftlineClient', () => {
       token: publishToken,
       confirmation: 'user_confirmed',
     });
+    await client.publishPendingHistoryCleanup({
+      workspace_path: 'C:\\repo',
+      plan_id: 'op-1',
+      remote: 'origin',
+      confirmation: 'user_confirmed',
+    });
     await client.resolveRewrittenVersion(versionRequest);
     await client.preflightUndoHistoryCleanup({ workspace_path: 'C:\\repo', plan_id: 'op-1' });
     await client.undoHistoryCleanup({ workspace_path: 'C:\\repo', token: cleanupToken });
+    await client.undoPendingHistoryCleanup({ workspace_path: 'C:\\repo', plan_id: 'op-1' });
+    await client.abandonPendingHistoryCleanup({ workspace_path: 'C:\\repo', plan_id: 'op-1' });
     await client.getWorkspaceGraph({
       workspace_path: 'C:\\repo',
       options: { include_remotes: true, remote: 'origin' },
@@ -372,6 +385,9 @@ describe('createDraftlineClient', () => {
         confirmation: 'user_confirmed',
       },
     });
+    expect(invoke).toHaveBeenCalledWith('list_pending_history_cleanups', {
+      request: { workspace_path: 'C:\\repo', target_variation: 'main' },
+    });
     expect(invoke).toHaveBeenCalledWith('preflight_history_cleanup_remote_impact', {
       request: { workspace_path: 'C:\\repo', plan_id: 'op-1', remote: 'origin' },
     });
@@ -385,6 +401,14 @@ describe('createDraftlineClient', () => {
         confirmation: 'user_confirmed',
       },
     });
+    expect(invoke).toHaveBeenCalledWith('publish_pending_history_cleanup', {
+      request: {
+        workspace_path: 'C:\\repo',
+        plan_id: 'op-1',
+        remote: 'origin',
+        confirmation: 'user_confirmed',
+      },
+    });
     expect(invoke).toHaveBeenCalledWith('resolve_rewritten_version', {
       request: versionRequest,
     });
@@ -393,6 +417,12 @@ describe('createDraftlineClient', () => {
     });
     expect(invoke).toHaveBeenCalledWith('undo_history_cleanup', {
       request: { workspace_path: 'C:\\repo', token: cleanupToken },
+    });
+    expect(invoke).toHaveBeenCalledWith('undo_pending_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'op-1' },
+    });
+    expect(invoke).toHaveBeenCalledWith('abandon_pending_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'op-1' },
     });
     expect(invoke).toHaveBeenCalledWith('get_workspace_graph', {
       request: {
@@ -638,12 +668,16 @@ describe('createDraftlineClient', () => {
     await facade.save('Facade save');
     await facade.previewHistoryCleanup(cleanup);
     await facade.applyHistoryCleanup('op-1');
+    await facade.pendingHistoryCleanups('main');
     await facade.preflightHistoryCleanupRemoteImpact('op-1');
     await facade.preflightPublishHistoryCleanup('op-1');
     await facade.publishHistoryCleanup(publishToken);
+    await facade.publishPendingHistoryCleanup('op-1');
     await facade.resolveRewrittenVersion(versionId);
     await facade.preflightUndoHistoryCleanup('op-1');
     await facade.undoHistoryCleanup(cleanupToken);
+    await facade.undoPendingHistoryCleanup('op-1');
+    await facade.abandonPendingHistoryCleanup('op-1');
 
     expect(invoke).toHaveBeenCalledWith('open_workspace', {
       request: { workspace_path: 'C:\\repo' },
@@ -716,6 +750,9 @@ describe('createDraftlineClient', () => {
         confirmation: 'user_confirmed',
       },
     });
+    expect(invoke).toHaveBeenCalledWith('list_pending_history_cleanups', {
+      request: { workspace_path: 'C:\\repo', target_variation: 'main' },
+    });
     expect(invoke).toHaveBeenCalledWith('preflight_history_cleanup_remote_impact', {
       request: { workspace_path: 'C:\\repo', plan_id: 'op-1', remote: 'origin' },
     });
@@ -729,6 +766,14 @@ describe('createDraftlineClient', () => {
         confirmation: 'user_confirmed',
       },
     });
+    expect(invoke).toHaveBeenCalledWith('publish_pending_history_cleanup', {
+      request: {
+        workspace_path: 'C:\\repo',
+        plan_id: 'op-1',
+        remote: 'origin',
+        confirmation: 'user_confirmed',
+      },
+    });
     expect(invoke).toHaveBeenCalledWith('resolve_rewritten_version', {
       request: { workspace_path: 'C:\\repo', version_id: versionId },
     });
@@ -738,6 +783,37 @@ describe('createDraftlineClient', () => {
     expect(invoke).toHaveBeenCalledWith('undo_history_cleanup', {
       request: { workspace_path: 'C:\\repo', token: cleanupToken },
     });
+    expect(invoke).toHaveBeenCalledWith('undo_pending_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'op-1' },
+    });
+    expect(invoke).toHaveBeenCalledWith('abandon_pending_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'op-1' },
+    });
+  });
+
+  it('narrows structured history cleanup blocker errors', () => {
+    const error = {
+      code: 'history_cleanup_blocked',
+      message: 'history cleanup request is blocked',
+      details: {
+        operation: 'apply_incoming',
+        diagnostics: [
+          {
+            code: 'pending_history_cleanup',
+            message: 'publish, undo, or abandon first',
+            related_versions: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+            safe_next_actions: ['publish_history_cleanup', 'undo_history_cleanup'],
+          },
+        ],
+        can_proceed: false,
+      },
+    };
+
+    expect(isHistoryCleanupBlockedError(error)).toBe(true);
+    if (isHistoryCleanupBlockedError(error)) {
+      expect(error.details.operation).toBe('apply_incoming');
+      expect(error.details.diagnostics[0]?.code).toBe('pending_history_cleanup');
+    }
   });
 
   it('groups merge conflicts and creates safest whole-file use_content resolutions', () => {

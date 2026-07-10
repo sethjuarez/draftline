@@ -21,6 +21,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Refuse non-main publish
+        run: |
+          if [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "Refusing to publish crates from $GITHUB_REF_NAME; publish workflows must run from main"
+            exit 1
+          fi
+
       - name: Confirm publish intent
         run: |
           if [ "${{ inputs.confirm_publish }}" != "publish" ]; then
