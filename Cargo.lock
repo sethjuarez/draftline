@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "draftline"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "git2",
  "serde",
