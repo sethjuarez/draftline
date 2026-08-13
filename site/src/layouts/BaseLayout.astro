@@ -20,14 +20,17 @@ const { title, description } = Astro.props;
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://draftline.dev" />
     <meta name="twitter:card" content="summary_large_image" />
+    <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/diagram-lightbox.css" />
     <title>{title}</title>
     <script is:inline>
-      const savedTheme = localStorage.getItem("draftline-theme");
+      // Share theme state with Starlight (docs) so the toggle feels like one site.
+      const stored = localStorage.getItem("starlight-theme");
       const preferredTheme = window.matchMedia("(prefers-color-scheme: light)").matches
         ? "light"
         : "dark";
-      document.documentElement.dataset.theme = savedTheme ?? preferredTheme;
+      document.documentElement.dataset.theme =
+        stored === "light" || stored === "dark" ? stored : preferredTheme;
     </script>
   </head>
   <body>
@@ -40,14 +43,14 @@ const { title, description } = Astro.props;
         mainBkg: "#111827",
         primaryColor: "#1e1b4b",
         primaryTextColor: "#f8fafc",
-        primaryBorderColor: "#06b6d4",
+        primaryBorderColor: "#2dd4bf",
         lineColor: "#94a3b8",
         secondaryColor: "#312e81",
         tertiaryColor: "#0f172a",
         noteBkgColor: "#1e293b",
         noteTextColor: "#f8fafc",
         actorBkg: "#1e1b4b",
-        actorBorder: "#06b6d4",
+        actorBorder: "#2dd4bf",
         actorTextColor: "#f8fafc",
       };
 
@@ -56,14 +59,14 @@ const { title, description } = Astro.props;
         mainBkg: "#ffffff",
         primaryColor: "#eef2ff",
         primaryTextColor: "#0f172a",
-        primaryBorderColor: "#4f46e5",
+        primaryBorderColor: "#0f766e",
         lineColor: "#475569",
         secondaryColor: "#f5f3ff",
         tertiaryColor: "#e0f2fe",
         noteBkgColor: "#ecfeff",
         noteTextColor: "#0f172a",
         actorBkg: "#eef2ff",
-        actorBorder: "#4f46e5",
+        actorBorder: "#0f766e",
         actorTextColor: "#0f172a",
       };
 
@@ -102,7 +105,7 @@ const { title, description } = Astro.props;
         syncThemeToggle();
         button.addEventListener("click", () => {
           const nextTheme = currentTheme() === "light" ? "dark" : "light";
-          localStorage.setItem("draftline-theme", nextTheme);
+          localStorage.setItem("starlight-theme", nextTheme);
           document.documentElement.dataset.theme = nextTheme;
           window.location.reload();
         });

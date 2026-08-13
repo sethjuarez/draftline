@@ -11412,19 +11412,17 @@ fn inspect_operation_lock_path(path: &Path) -> Result<OperationLockInspection> {
         "workspace has an operation lock",
     )];
 
-    let metadata = match fs::read(path) {
-        Ok(bytes) => match serde_json::from_slice::<OperationLockMetadata>(&bytes) {
-            Ok(metadata) => Some(metadata),
-            Err(error) => {
-                diagnostics.push(workspace_diagnostic(
-                    DiagnosticCode::WorkspaceReadFailed,
-                    DiagnosticSeverity::Warning,
-                    format!("operation lock metadata is unreadable: {error}"),
-                ));
-                None
-            }
-        },
-        Err(error) => return Err(error.into()),
+    let bytes = fs::read(path)?;
+    let metadata = match serde_json::from_slice::<OperationLockMetadata>(&bytes) {
+        Ok(metadata) => Some(metadata),
+        Err(error) => {
+            diagnostics.push(workspace_diagnostic(
+                DiagnosticCode::WorkspaceReadFailed,
+                DiagnosticSeverity::Warning,
+                format!("operation lock metadata is unreadable: {error}"),
+            ));
+            None
+        }
     };
 
     let is_stale = metadata

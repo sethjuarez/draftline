@@ -11,6 +11,11 @@
   --color-violet-500: #a855f7;
   --color-cyan-500: #06b6d4;
   --color-cyan-300: #67e8f9;
+  /* Brand teal, derived from the logo mark (#1f6f5c). teal-500 is the gradient
+     terminus; teal-300 is the on-dark accent (links/focus/wayfinding). */
+  --color-teal-700: #1f6f5c;
+  --color-teal-500: #14b8a6;
+  --color-teal-300: #54d4b6;
   --color-amber-500: #f97316;
   --color-amber-300: #fdba74;
   --color-emerald-500: #10b981;
@@ -21,8 +26,9 @@
   --surface-page: var(--color-ink-900);
   --surface-card: rgba(17, 24, 39, 0.82);
   --surface-card-strong: rgba(30, 41, 59, 0.94);
-  --surface-glow-primary: rgba(99, 102, 241, 0.28);
-  --surface-glow-accent: rgba(6, 182, 212, 0.18);
+  /* Opaque equivalent of --surface-card composited over --surface-canvas,
+     used to knock out Mermaid edge-label boxes so they vanish into the card. */
+  --mermaid-label-bg: #0e1524;
 
   --text-primary: var(--color-white);
   --text-secondary: var(--color-slate-300);
@@ -31,13 +37,13 @@
 
   --brand-primary: var(--color-indigo-500);
   --brand-secondary: var(--color-violet-500);
-  --brand-accent: var(--color-cyan-300);
+  --brand-accent: var(--color-teal-300);
   --status-covered: var(--color-emerald-300);
   --status-partial: var(--color-amber-300);
   --status-planned: var(--color-rose-300);
 
   --border-subtle: rgba(203, 213, 225, 0.18);
-  --border-focus: var(--color-cyan-300);
+  --border-focus: var(--color-teal-300);
   --shadow-elevated: 0 24px 80px rgba(0, 0, 0, 0.4);
 
   --font-family-sans:
@@ -73,18 +79,17 @@
   --surface-page: #eef2ff;
   --surface-card: rgba(255, 255, 255, 0.86);
   --surface-card-strong: rgba(238, 242, 255, 0.96);
-  --surface-glow-primary: rgba(99, 102, 241, 0.18);
-  --surface-glow-accent: rgba(6, 182, 212, 0.16);
+  --mermaid-label-bg: #fefeff;
   --text-primary: #0f172a;
   --text-secondary: #334155;
   --text-muted: #64748b;
   --text-inverse: #f8fafc;
-  --brand-accent: #0369a1;
+  --brand-accent: #0f766e;
   --status-covered: #047857;
   --status-partial: #c2410c;
   --status-planned: #be123c;
   --border-subtle: rgba(15, 23, 42, 0.14);
-  --border-focus: #0891b2;
+  --border-focus: #0f766e;
   --shadow-elevated: 0 24px 80px rgba(15, 23, 42, 0.13);
 }
 
@@ -98,10 +103,7 @@ html {
 
 body {
   margin: 0;
-  background:
-    radial-gradient(circle at 16% 10%, var(--surface-glow-primary), transparent 28rem),
-    radial-gradient(circle at 84% 18%, var(--surface-glow-accent), transparent 26rem),
-    linear-gradient(180deg, var(--surface-canvas) 0%, var(--surface-page) 46%, var(--surface-canvas) 100%);
+  background: var(--surface-canvas);
   color: var(--text-primary);
 }
 
@@ -156,10 +158,14 @@ main {
   width: 36px;
   height: 36px;
   place-items: center;
-  border: 1px solid rgba(103, 232, 249, 0.55);
   border-radius: var(--radius-sm);
-  background: linear-gradient(135deg, rgba(99, 102, 241, 0.32), rgba(168, 85, 247, 0.24));
-  color: var(--brand-accent);
+  overflow: hidden;
+}
+
+.brand-mark svg {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
 .nav a {
@@ -195,10 +201,24 @@ main {
 }
 
 .theme-toggle-icon {
-  width: 0.75rem;
-  height: 0.75rem;
-  border-radius: 999px;
-  background: linear-gradient(135deg, var(--brand-primary), var(--brand-secondary), var(--color-cyan-500));
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+}
+
+/* Show the icon for the theme the button switches TO, matching the label
+   ("Light mode" pairs with a sun in dark; "Dark mode" pairs with a moon). */
+.theme-toggle-sun,
+.theme-toggle-moon {
+  display: none;
+}
+
+:root:not([data-theme="light"]) .theme-toggle-sun {
+  display: block;
+}
+
+:root[data-theme="light"] .theme-toggle-moon {
+  display: block;
 }
 
 .hero-grid,
@@ -212,6 +232,17 @@ main {
 
 .hero-copy {
   max-width: 740px;
+}
+
+/* Hero copy is now the only grid child; give the safety-loop diagram the full
+   container width below it so the wide LR flow reads clearly and stays a short,
+   editorial band instead of a cramped column. */
+.hero > .hero-grid {
+  grid-template-columns: 1fr;
+}
+
+.hero > .mermaid-card {
+  margin-top: var(--space-6);
 }
 
 .eyebrow {
@@ -253,6 +284,38 @@ h3 {
   line-height: 1.75;
 }
 
+/*
+ * Mermaid renders HTML labels inside <foreignObject> as <p>/<span>. Those inherit
+ * the page's larger paragraph size (e.g. .scenario-card p = 18px) even though
+ * Mermaid measured and sized every node box at its own 16px. The wider text then
+ * overflows the box and gets clipped ("User opens wo…"). Reset label typography so
+ * the rendered text matches the size Mermaid measured with.
+ */
+.mermaid-card .mermaid :is(p, span) {
+  font-size: inherit;
+  line-height: normal;
+  margin: 0;
+}
+
+/* Blend Mermaid edge-label knockout boxes into the card surface so the
+   "Yes/No/folders" labels read as floating captions, not gray chips. The box
+   stays opaque (to mask the connector line behind the text) and is painted in
+   --mermaid-label-bg, the opaque equivalent of the card surface the diagram
+   sits on. Mermaid injects these with #id specificity, so !important is
+   required. */
+.mermaid-card .mermaid :is(.edgeLabel, .edgeLabel p, .edgeLabel span) {
+  background: var(--mermaid-label-bg) !important;
+  background-color: var(--mermaid-label-bg) !important;
+  color: var(--text-secondary) !important;
+}
+.mermaid-card .mermaid .edgeLabel :is(text, tspan) {
+  fill: var(--text-secondary) !important;
+}
+.mermaid-card .mermaid :is(.edgeLabel rect, .labelBkg) {
+  fill: var(--mermaid-label-bg) !important;
+  opacity: 1 !important;
+}
+
 .lede {
   max-width: 720px;
   margin: var(--space-4) 0 0;
@@ -288,12 +351,12 @@ h3 {
 
 .button.primary {
   border-color: transparent;
-  background: linear-gradient(135deg, var(--brand-primary), var(--brand-secondary) 52%, var(--color-cyan-500));
-  color: var(--text-primary);
+  background: var(--color-teal-700);
+  color: #ffffff;
 }
 
-:root[data-theme="light"] .button.primary {
-  color: #ffffff;
+.button.primary:hover {
+  background: color-mix(in srgb, var(--color-teal-700), white 12%);
 }
 
 .button.secondary {
@@ -309,33 +372,37 @@ h3 {
   margin: 0;
   overflow: hidden;
   border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: var(--surface-card);
-  box-shadow: var(--shadow-elevated);
 }
 
 .mermaid-card figcaption {
   border-bottom: 1px solid var(--border-subtle);
-  padding: 16px 20px;
+  padding: 12px 16px;
   color: var(--text-secondary);
   font-size: 0.9rem;
   font-weight: 800;
 }
 
+/*
+ * Block container (not grid/place-items:center): lets Mermaid's own sizing work.
+ * The rendered <svg> carries width="100%" plus an inline max-width equal to its
+ * natural width, so in a block box that percentage resolves against the card's
+ * definite width and the diagram fills it. A grid + place-items:center container
+ * instead shrink-wrapped the item to the SVG's intrinsic 300px default, collapsing
+ * every diagram to a tiny strip.
+ */
 .mermaid-card .mermaid {
-  display: grid;
-  min-height: 260px;
-  place-items: center;
+  display: block;
   margin: 0;
-  padding: var(--space-4);
+  padding: var(--space-3);
+  text-align: center;
   overflow-x: auto;
 }
 
 .mermaid-card .mermaid svg {
-  width: 100%;
-  min-width: min(36rem, 100%);
-  max-width: none;
-  height: auto;
+  height: auto !important;
+  margin-inline: auto;
 }
 
 .section {
@@ -442,7 +509,15 @@ h3 {
 }
 
 .scenario-card .mermaid-card {
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   box-shadow: none;
+}
+
+.scenario-card .mermaid-card .mermaid {
+  padding: var(--space-2) 0 0;
 }
 
 .flow-table {

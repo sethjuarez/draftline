@@ -18,6 +18,7 @@ export default defineConfig({
     }),
     starlight({
       title: "Draftline",
+      favicon: "/favicon.svg",
       logo: {
         src: "./src/assets/draftline-mark.svg",
       },

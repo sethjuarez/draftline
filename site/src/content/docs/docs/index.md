@@ -1,19 +1,6 @@
 ---
 title: Draftline documentation
 description: Safe Git-native versioning primitives for creative and business-content apps.
-template: splash
-hero:
-  tagline: Git-native versioning for app-owned content
-  image:
-    file: ../../../assets/draftline-mark.svg
-  actions:
-    - text: Explore scenarios
-      link: /docs/scenarios/
-      icon: right-arrow
-      variant: primary
-    - text: View on GitHub
-      link: https://github.com/sethjuarez/draftline
-      icon: external
 ---
 
 Draftline is a Rust library for apps that need safe version history for folders of creative content:
@@ -22,6 +9,9 @@ posts, docs, demo plans, AI writing workspaces, prompt files, assets, and other 
 It uses Git as the storage layer, but its public model is shaped around product actions: **save a
 version**, **try another direction**, **publish work**, **get updates**, **restore safely**, and
 **clean up without losing recovery paths**.
+
+New here? Start with the [scenario map](/docs/scenarios/), or browse the
+[source on GitHub](https://github.com/sethjuarez/draftline).
 
 ## What Draftline gives apps
 

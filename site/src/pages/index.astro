@@ -35,7 +35,14 @@ const safetyDiagram = `flowchart LR
     <section class="hero">
       <nav class="nav" aria-label="Primary">
         <a class="brand" href="/">
-          <span class="brand-mark">D</span>
+          <span class="brand-mark" aria-hidden="true">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Draftline">
+              <rect width="128" height="128" rx="24" fill="#1f6f5c"></rect>
+              <path
+                d="M40 34h26c19 0 32 12 32 30s-13 30-32 30H40V34Zm20 18v42h6c9 0 15-8 15-21s-6-21-15-21h-6Z"
+                fill="#ffffff"></path>
+            </svg>
+          </span>
           <span>Draftline</span>
         </a>
         <div class="nav-links">
@@ -43,7 +50,8 @@ const safetyDiagram = `flowchart LR
           <a href="/docs/">Docs</a>
           <a href="https://github.com/sethjuarez/draftline">GitHub</a>
           <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch color theme">
-            <span class="theme-toggle-icon" aria-hidden="true"></span>
+            <svg class="theme-toggle-icon theme-toggle-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path></svg>
+            <svg class="theme-toggle-icon theme-toggle-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
             <span class="theme-toggle-label">Theme</span>
           </button>
         </div>
@@ -64,8 +72,8 @@ const safetyDiagram = `flowchart LR
             <a class="button secondary" href="https://github.com/sethjuarez/draftline">View source</a>
           </div>
         </div>
-        <Mermaid title="The Draftline safety loop" diagram={safetyDiagram} />
       </div>
+      <Mermaid title="The Draftline safety loop" diagram={safetyDiagram} />
     </section>
 
     <section class="section stats" aria-label="Scenario coverage">
