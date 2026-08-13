@@ -279,6 +279,20 @@ h3 {
   margin: 0;
 }
 
+/* Blend Mermaid edge-label knockout boxes into the page background so the
+   "Yes/No/folders" labels read as floating captions, not gray chips. The box
+   stays opaque (to mask the connector line behind the text) but is painted in
+   the canvas color so it disappears. Mermaid injects these with #id
+   specificity, so !important is required. */
+.mermaid-card .mermaid :is(.edgeLabel, .edgeLabel p, .edgeLabel span) {
+  background: var(--surface-canvas) !important;
+  background-color: var(--surface-canvas) !important;
+}
+.mermaid-card .mermaid :is(.edgeLabel rect, .labelBkg) {
+  fill: var(--surface-canvas) !important;
+  opacity: 1 !important;
+}
+
 .lede {
   max-width: 720px;
   margin: var(--space-4) 0 0;
@@ -314,12 +328,12 @@ h3 {
 
 .button.primary {
   border-color: transparent;
-  background: linear-gradient(135deg, var(--brand-primary), var(--brand-secondary) 52%, var(--color-teal-500));
-  color: var(--text-primary);
+  background: var(--color-teal-700);
+  color: #ffffff;
 }
 
-:root[data-theme="light"] .button.primary {
-  color: #ffffff;
+.button.primary:hover {
+  background: color-mix(in srgb, var(--color-teal-700), white 12%);
 }
 
 .button.secondary {
