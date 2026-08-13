@@ -26,9 +26,6 @@
   --surface-page: var(--color-ink-900);
   --surface-card: rgba(17, 24, 39, 0.82);
   --surface-card-strong: rgba(30, 41, 59, 0.94);
-  /* Opaque equivalent of --surface-card composited over --surface-canvas,
-     used to knock out Mermaid edge-label boxes so they vanish into the card. */
-  --mermaid-label-bg: #0e1524;
 
   --text-primary: var(--color-white);
   --text-secondary: var(--color-slate-300);
@@ -79,7 +76,6 @@
   --surface-page: #eef2ff;
   --surface-card: rgba(255, 255, 255, 0.86);
   --surface-card-strong: rgba(238, 242, 255, 0.96);
-  --mermaid-label-bg: #fefeff;
   --text-primary: #0f172a;
   --text-secondary: #334155;
   --text-muted: #64748b;
@@ -297,25 +293,6 @@ h3 {
   margin: 0;
 }
 
-/* Blend Mermaid edge-label knockout boxes into the card surface so the
-   "Yes/No/folders" labels read as floating captions, not gray chips. The box
-   stays opaque (to mask the connector line behind the text) and is painted in
-   --mermaid-label-bg, the opaque equivalent of the card surface the diagram
-   sits on. Mermaid injects these with #id specificity, so !important is
-   required. */
-.mermaid-card .mermaid :is(.edgeLabel, .edgeLabel p, .edgeLabel span) {
-  background: var(--mermaid-label-bg) !important;
-  background-color: var(--mermaid-label-bg) !important;
-  color: var(--text-secondary) !important;
-}
-.mermaid-card .mermaid .edgeLabel :is(text, tspan) {
-  fill: var(--text-secondary) !important;
-}
-.mermaid-card .mermaid :is(.edgeLabel rect, .labelBkg) {
-  fill: var(--mermaid-label-bg) !important;
-  opacity: 1 !important;
-}
-
 .lede {
   max-width: 720px;
   margin: var(--space-4) 0 0;
@@ -370,15 +347,10 @@ h3 {
 
 .mermaid-card {
   margin: 0;
-  overflow: hidden;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--surface-card);
 }
 
 .mermaid-card figcaption {
-  border-bottom: 1px solid var(--border-subtle);
-  padding: 12px 16px;
+  padding: 0 0 0.5rem;
   color: var(--text-secondary);
   font-size: 0.9rem;
   font-weight: 800;
@@ -386,23 +358,14 @@ h3 {
 
 /*
  * Block container (not grid/place-items:center): lets Mermaid's own sizing work.
- * The rendered <svg> carries width="100%" plus an inline max-width equal to its
- * natural width, so in a block box that percentage resolves against the card's
- * definite width and the diagram fills it. A grid + place-items:center container
- * instead shrink-wrapped the item to the SVG's intrinsic 300px default, collapsing
- * every diagram to a tiny strip.
+ * The diagram surface/border/radius come from the shared .mermaid panel in
+ * mermaid.css; here we only set flow + centering.
  */
 .mermaid-card .mermaid {
   display: block;
   margin: 0;
-  padding: var(--space-3);
   text-align: center;
   overflow-x: auto;
-}
-
-.mermaid-card .mermaid svg {
-  height: auto !important;
-  margin-inline: auto;
 }
 
 .section {
@@ -517,7 +480,7 @@ h3 {
 }
 
 .scenario-card .mermaid-card .mermaid {
-  padding: var(--space-2) 0 0;
+  padding: 1rem;
 }
 
 .flow-table {

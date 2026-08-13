@@ -1,5 +1,6 @@
 ---
 import "../styles/global.css";
+import "../styles/mermaid.css";
 
 interface Props {
   title: string;
@@ -20,7 +21,7 @@ const { title, description } = Astro.props;
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://draftline.dev" />
     <meta name="twitter:card" content="summary_large_image" />
-    <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/diagram-lightbox.css" />
     <title>{title}</title>
     <script is:inline>

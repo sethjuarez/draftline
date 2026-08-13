@@ -22,8 +22,16 @@ export default defineConfig({
       logo: {
         src: "./src/assets/draftline-mark.svg",
       },
-      customCss: ["./src/styles/starlight.css"],
+      customCss: ["./src/styles/starlight.css", "./src/styles/mermaid.css"],
       head: [
+        {
+          tag: "link",
+          attrs: {
+            rel: "icon",
+            href: "/favicon.svg",
+            type: "image/svg+xml",
+          },
+        },
         {
           tag: "link",
           attrs: {
