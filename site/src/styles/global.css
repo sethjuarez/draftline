@@ -326,20 +326,25 @@ h3 {
   font-weight: 800;
 }
 
+/*
+ * Block container (not grid/place-items:center): lets Mermaid's own sizing work.
+ * The rendered <svg> carries width="100%" plus an inline max-width equal to its
+ * natural width, so in a block box that percentage resolves against the card's
+ * definite width and the diagram fills it. A grid + place-items:center container
+ * instead shrink-wrapped the item to the SVG's intrinsic 300px default, collapsing
+ * every diagram to a tiny strip.
+ */
 .mermaid-card .mermaid {
-  display: grid;
-  min-height: 260px;
-  place-items: center;
+  display: block;
   margin: 0;
   padding: var(--space-4);
+  text-align: center;
   overflow-x: auto;
 }
 
 .mermaid-card .mermaid svg {
-  width: 100%;
-  min-width: min(36rem, 100%);
-  max-width: none;
-  height: auto;
+  height: auto !important;
+  margin-inline: auto;
 }
 
 .section {

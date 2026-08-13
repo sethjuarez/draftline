@@ -76,10 +76,23 @@ header.header {
   backdrop-filter: blur(12px);
 }
 
-/* Match the landing page's brand wordmark weight/tracking. */
+/* Match the landing page's brand wordmark: neutral text, not the cyan accent. */
 .site-title {
+  color: var(--sl-color-text);
   font-weight: 800;
   letter-spacing: -0.03em;
+}
+
+/*
+ * Active sidebar link: Starlight's default fills it with the accent color, which
+ * with our light cyan accent left near-white text on a light fill (unreadable).
+ * Use a subtle accent tint with accent-colored text — readable in both themes and
+ * more editorial than a loud solid fill.
+ */
+.sidebar a[aria-current="page"] {
+  background-color: color-mix(in srgb, var(--sl-color-text-accent), transparent 84%);
+  color: var(--sl-color-text-accent);
+  font-weight: 700;
 }
 
 /* Unify keyboard focus with the landing page (global.css). */
@@ -101,6 +114,12 @@ button:focus-visible {
 
 .sl-markdown-content th {
   background: color-mix(in srgb, var(--sl-color-accent-low), transparent 35%);
+}
+
+/* Give table cells breathing room — the default markdown tables read cramped. */
+.sl-markdown-content th,
+.sl-markdown-content td {
+  padding: 0.6rem 1rem;
 }
 
 .sl-markdown-content .mermaid {
