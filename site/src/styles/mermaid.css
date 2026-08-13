@@ -1,0 +1,189 @@
+/*
+ * Shared Mermaid theming for the whole site (landing + Starlight docs) and the
+ * click-to-zoom lightbox.
+ *
+ * astro-mermaid renders every diagram with Mermaid's built-in `dark`/`default`
+ * palette (purple nodes, gray lines) and ignores custom themeVariables, so we
+ * repaint the rendered SVG here with brand-teal tokens. The lightbox clones the
+ * on-page <svg> (which carries Mermaid's own <style>), so the color rules also
+ * target .diagram-lightbox__frame to keep the zoomed view on-brand. Because the
+ * tokens are keyed to [data-theme], diagrams follow the light/dark toggle
+ * automatically. Mermaid injects styles with #id specificity, so !important is
+ * required.
+ *
+ * Imported by BaseLayout.astro (landing) and via Starlight customCss (docs).
+ */
+
+:root,
+:root[data-theme="dark"] {
+  --dl-dgm-surface: #0b1524;
+  --dl-dgm-node-bg: #0f2a24;
+  --dl-dgm-node-border: #2dd4bf;
+  --dl-dgm-text: #e2e8f0;
+  --dl-dgm-line: #6ba392;
+  --dl-dgm-cluster-bg: rgba(45, 212, 191, 0.06);
+  --dl-dgm-cluster-border: rgba(45, 212, 191, 0.3);
+}
+
+:root[data-theme="light"] {
+  --dl-dgm-surface: #f4f8f7;
+  --dl-dgm-node-bg: #e8f6f1;
+  --dl-dgm-node-border: #1f6f5c;
+  --dl-dgm-text: #0f172a;
+  --dl-dgm-line: #4b8f7e;
+  --dl-dgm-cluster-bg: rgba(31, 111, 92, 0.06);
+  --dl-dgm-cluster-border: rgba(31, 111, 92, 0.26);
+}
+
+/*
+ * Diagram panel. Every rendered diagram sits on its own --dl-dgm-surface panel so
+ * the edge-label knockout boxes (painted the same token) always vanish into the
+ * backdrop, and diagrams read consistently across landing + docs. Context
+ * stylesheets add outer margins / captions; this owns the surface itself.
+ */
+.mermaid {
+  background-color: var(--dl-dgm-surface);
+  border: 1px solid var(--dl-dgm-cluster-border);
+  border-radius: 1rem;
+  padding: 1.25rem;
+}
+
+/*
+ * Make diagrams FIT. The rendered <svg> carries a viewBox, so we drop Mermaid's
+ * width="100%" (which makes tall top-down flowcharts fill the width and balloon
+ * vertically) and instead cap the height. The browser then scales the whole
+ * diagram down proportionally to fit, keeping every node visible. The lightbox
+ * is there for anyone who wants to zoom in on detail.
+ */
+.mermaid svg {
+  width: auto !important;
+  height: auto !important;
+  max-width: 100% !important;
+  max-height: min(70vh, 30rem);
+  margin-inline: auto;
+}
+
+/* Node fills + borders */
+:is(.mermaid, .diagram-lightbox__frame) .node rect,
+:is(.mermaid, .diagram-lightbox__frame) .node circle,
+:is(.mermaid, .diagram-lightbox__frame) .node ellipse,
+:is(.mermaid, .diagram-lightbox__frame) .node polygon,
+:is(.mermaid, .diagram-lightbox__frame) .node path {
+  fill: var(--dl-dgm-node-bg) !important;
+  stroke: var(--dl-dgm-node-border) !important;
+}
+
+/* Node / general label text (Mermaid renders these as HTML spans and/or SVG text) */
+:is(.mermaid, .diagram-lightbox__frame) .nodeLabel,
+:is(.mermaid, .diagram-lightbox__frame) .node .label,
+:is(.mermaid, .diagram-lightbox__frame) .label,
+:is(.mermaid, .diagram-lightbox__frame) .cluster-label .nodeLabel,
+:is(.mermaid, .diagram-lightbox__frame) span p {
+  color: var(--dl-dgm-text) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .node .label text,
+:is(.mermaid, .diagram-lightbox__frame) .node text,
+:is(.mermaid, .diagram-lightbox__frame) .label text,
+:is(.mermaid, .diagram-lightbox__frame) text.nodeLabel,
+:is(.mermaid, .diagram-lightbox__frame) .nodeLabel tspan {
+  fill: var(--dl-dgm-text) !important;
+}
+
+/* Connectors + arrowheads */
+:is(.mermaid, .diagram-lightbox__frame) .flowchart-link,
+:is(.mermaid, .diagram-lightbox__frame) .edgePath .path,
+:is(.mermaid, .diagram-lightbox__frame) path.flowchart-link {
+  stroke: var(--dl-dgm-line) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .marker,
+:is(.mermaid, .diagram-lightbox__frame) .arrowMarkerPath,
+:is(.mermaid, .diagram-lightbox__frame) marker path {
+  fill: var(--dl-dgm-line) !important;
+  stroke: var(--dl-dgm-line) !important;
+}
+
+/*
+ * Edge labels ("Yes/No/New folder"): paint the knockout box in the diagram
+ * surface so it masks the connector line behind the text yet reads as a floating
+ * caption rather than a gray chip. The diagram surface is --dl-dgm-surface (the
+ * card background set in global.css / starlight.css / the lightbox), so the two
+ * always match.
+ */
+:is(.mermaid, .diagram-lightbox__frame) .edgeLabel,
+:is(.mermaid, .diagram-lightbox__frame) .edgeLabel p,
+:is(.mermaid, .diagram-lightbox__frame) .edgeLabel span {
+  background: var(--dl-dgm-surface) !important;
+  background-color: var(--dl-dgm-surface) !important;
+  color: var(--dl-dgm-text) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .edgeLabel :is(text, tspan) {
+  fill: var(--dl-dgm-text) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .edgeLabel rect,
+:is(.mermaid, .diagram-lightbox__frame) .labelBkg {
+  fill: var(--dl-dgm-surface) !important;
+  background-color: var(--dl-dgm-surface) !important;
+  opacity: 1 !important;
+}
+
+/* Subgraph / cluster frames */
+:is(.mermaid, .diagram-lightbox__frame) .cluster rect {
+  fill: var(--dl-dgm-cluster-bg) !important;
+  stroke: var(--dl-dgm-cluster-border) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .cluster span,
+:is(.mermaid, .diagram-lightbox__frame) .cluster text {
+  fill: var(--dl-dgm-text) !important;
+  color: var(--dl-dgm-text) !important;
+}
+
+/*
+ * Sequence diagrams use a different class vocabulary than flowcharts, so repaint
+ * them explicitly: participant boxes as teal nodes, lifelines/messages in the
+ * connector color, notes as a soft cluster panel, and alt/loop frames in the
+ * cluster border color. Keeps the one sequence diagram on-brand with the rest.
+ */
+:is(.mermaid, .diagram-lightbox__frame) rect.actor,
+:is(.mermaid, .diagram-lightbox__frame) .actor-top,
+:is(.mermaid, .diagram-lightbox__frame) .actor-bottom,
+:is(.mermaid, .diagram-lightbox__frame) .actor > rect {
+  fill: var(--dl-dgm-node-bg) !important;
+  stroke: var(--dl-dgm-node-border) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) text.actor,
+:is(.mermaid, .diagram-lightbox__frame) text.actor > tspan,
+:is(.mermaid, .diagram-lightbox__frame) .actor-box {
+  fill: var(--dl-dgm-text) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .actor-line {
+  stroke: var(--dl-dgm-line) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .messageLine0,
+:is(.mermaid, .diagram-lightbox__frame) .messageLine1 {
+  stroke: var(--dl-dgm-line) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .messageText {
+  fill: var(--dl-dgm-text) !important;
+  stroke: none !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .note {
+  fill: var(--dl-dgm-cluster-bg) !important;
+  stroke: var(--dl-dgm-node-border) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .noteText,
+:is(.mermaid, .diagram-lightbox__frame) .noteText > tspan {
+  fill: var(--dl-dgm-text) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .loopLine {
+  stroke: var(--dl-dgm-cluster-border) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .labelBox {
+  fill: var(--dl-dgm-cluster-bg) !important;
+  stroke: var(--dl-dgm-cluster-border) !important;
+}
+:is(.mermaid, .diagram-lightbox__frame) .labelText,
+:is(.mermaid, .diagram-lightbox__frame) .labelText > tspan,
+:is(.mermaid, .diagram-lightbox__frame) .loopText,
+:is(.mermaid, .diagram-lightbox__frame) .loopText > tspan {
+  fill: var(--dl-dgm-text) !important;
+}

@@ -3,20 +3,23 @@
 }
 
 .mermaid[data-diagram-lightbox="ready"]:focus-visible {
-  outline: 3px solid #67e8f9;
+  outline: 3px solid var(--dl-dgm-node-border, #2dd4bf);
   outline-offset: 4px;
 }
 
 .diagram-lightbox {
+  display: flex;
+  flex-direction: column;
   width: min(96vw, 1440px);
   max-width: 96vw;
   height: min(92vh, 960px);
   max-height: 92vh;
-  border: 1px solid rgba(148, 163, 184, 0.28);
+  overflow: hidden;
+  border: 1px solid var(--dl-dgm-cluster-border, rgba(148, 163, 184, 0.28));
   border-radius: 1.25rem;
   padding: 0;
-  background: #f8fafc;
-  color: #0f172a;
+  background: var(--dl-dgm-surface, #f8fafc);
+  color: var(--dl-dgm-text, #0f172a);
   box-shadow: 0 32px 120px rgba(2, 6, 23, 0.45);
 }
 
@@ -27,39 +30,46 @@
 
 .diagram-lightbox__bar {
   display: flex;
+  flex: none;
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  border-bottom: 1px solid rgba(15, 23, 42, 0.12);
+  border-bottom: 1px solid var(--dl-dgm-cluster-border, rgba(15, 23, 42, 0.12));
   padding: 0.85rem 1rem;
 }
 
 .diagram-lightbox__title {
   margin: 0;
-  color: #334155;
+  color: var(--dl-dgm-text, #334155);
   font-size: 0.9rem;
   font-weight: 800;
 }
 
 .diagram-lightbox__close {
   min-height: 2.5rem;
-  border: 1px solid rgba(15, 23, 42, 0.16);
+  border: 1px solid var(--dl-dgm-cluster-border, rgba(15, 23, 42, 0.16));
   border-radius: 999px;
   padding: 0 0.9rem;
-  background: #ffffff;
-  color: #0f172a;
+  background: transparent;
+  color: inherit;
   cursor: pointer;
   font: inherit;
   font-weight: 800;
 }
 
 .diagram-lightbox__close:focus-visible {
-  outline: 3px solid #0891b2;
+  outline: 3px solid var(--dl-dgm-node-border, #0891b2);
   outline-offset: 3px;
 }
 
+/*
+ * Flex child that fills the remaining dialog height. min-height:0 lets it shrink
+ * inside the flex column so the centered frame never overflows the dialog (which
+ * previously produced stray scrollbars from a hardcoded height calc).
+ */
 .diagram-lightbox__content {
-  height: calc(100% - 4.25rem);
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
   padding: 1.25rem;
 }
@@ -72,11 +82,15 @@
   overflow: hidden;
 }
 
+/*
+ * Fit the cloned diagram inside the frame preserving its aspect ratio, so it is
+ * centered on both axes with no scrollbars regardless of the diagram's shape.
+ */
 .diagram-lightbox__frame svg {
-  width: 100% !important;
-  max-width: 100%;
-  height: 100% !important;
-  max-height: 100%;
+  width: auto !important;
+  height: auto !important;
+  max-width: 100% !important;
+  max-height: 100% !important;
 }
 
 .diagram-lightbox__frame pre {

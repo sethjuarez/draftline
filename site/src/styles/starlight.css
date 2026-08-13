@@ -107,34 +107,17 @@ button:focus-visible {
   padding: 0.6rem 1rem;
 }
 
+/*
+ * Keep docs diagrams inline with the reading column (no full-bleed band): the
+ * shared diagram panel (surface/border/radius/padding) comes from mermaid.css;
+ * here we only handle flow spacing + centering. mermaid.css caps the <svg>
+ * height so tall flowcharts scale down to fit instead of ballooning.
+ */
 .sl-markdown-content .mermaid {
   display: block;
-  position: relative;
-  left: 50%;
-  width: min(88vw, 74rem);
-  max-width: calc(100vw - 2rem);
   margin-block: 1.5rem;
-  transform: translateX(-50%);
   text-align: center;
   overflow-x: auto;
-  border: 1px solid var(--sl-color-hairline-light);
-  border-radius: 1.25rem;
-  padding: 1.5rem;
-  background: color-mix(in srgb, var(--sl-color-bg), var(--sl-color-accent-low) 12%);
-  box-shadow: 0 20px 70px rgba(15, 23, 42, 0.12);
-}
-
-/*
- * Let Mermaid's own sizing work: the rendered <svg> already carries width="100%"
- * plus an inline max-width equal to its natural width. In a block container that
- * percentage resolves against the card's definite width, so wide diagrams fill the
- * card while narrow ones stay at their natural size (centered). The previous grid /
- * place-items:center container made the grid item shrink to the SVG's intrinsic
- * 300px default, collapsing every diagram. See starlight.css history.
- */
-.sl-markdown-content .mermaid svg {
-  height: auto !important;
-  margin-inline: auto;
 }
 
 .sl-markdown-content blockquote {
