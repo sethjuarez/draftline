@@ -42,9 +42,9 @@
  * stylesheets add outer margins / captions; this owns the surface itself.
  */
 .mermaid {
-  background-color: var(--dl-dgm-surface);
-  border: 1px solid var(--dl-dgm-cluster-border);
-  border-radius: 1rem;
+  background-color: var(--dl-dgm-surface) !important;
+  border: 1px solid var(--dl-dgm-cluster-border) !important;
+  border-radius: 1rem !important;
   padding: 1.25rem;
 }
 

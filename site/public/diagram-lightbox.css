@@ -8,12 +8,11 @@
 }
 
 .diagram-lightbox {
-  display: flex;
-  flex-direction: column;
   width: min(96vw, 1440px);
   max-width: 96vw;
   height: min(92vh, 960px);
   max-height: 92vh;
+  margin: auto;
   overflow: hidden;
   border: 1px solid var(--dl-dgm-cluster-border, rgba(148, 163, 184, 0.28));
   border-radius: 1.25rem;
@@ -21,6 +20,18 @@
   background: var(--dl-dgm-surface, #f8fafc);
   color: var(--dl-dgm-text, #0f172a);
   box-shadow: 0 32px 120px rgba(2, 6, 23, 0.45);
+}
+
+/*
+ * Only lay the dialog out as a flex column when it is actually open. Setting
+ * display on the base .diagram-lightbox would override the UA
+ * `dialog:not([open]) { display: none }` rule, leaving the (empty) dialog
+ * permanently visible and un-closable. Scoping display to [open] keeps the
+ * native show/hide + top-layer centering working.
+ */
+.diagram-lightbox[open] {
+  display: flex;
+  flex-direction: column;
 }
 
 .diagram-lightbox::backdrop {
