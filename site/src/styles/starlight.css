@@ -3,16 +3,17 @@
   --sl-content-width: 58rem;
   --sl-text-5xl: clamp(2.4rem, 1.6rem + 3vw, 4rem);
   --sl-color-accent-low: #e0e7ff;
-  --sl-color-accent: #4f46e5;
+  --sl-color-accent: #6366f1;
   --sl-color-accent-high: #312e81;
 }
 
 :root[data-theme="dark"] {
   --sl-color-bg: #020617;
-  --sl-color-bg-nav: rgba(2, 6, 23, 0.82);
-  --sl-color-bg-sidebar: rgba(2, 6, 23, 0.9);
+  --sl-color-bg-nav: rgba(2, 6, 23, 0.72);
+  --sl-color-bg-sidebar: rgba(2, 6, 23, 0.55);
   --sl-color-bg-inline-code: #111827;
   --sl-color-hairline-light: rgba(203, 213, 225, 0.16);
+  --sl-color-hairline-shade: rgba(203, 213, 225, 0.1);
   --sl-color-text: #f8fafc;
   --sl-color-text-accent: #67e8f9;
   --sl-color-gray-1: #f8fafc;
@@ -22,24 +23,76 @@
   --sl-color-gray-5: #475569;
   --sl-color-gray-6: #1e293b;
   --sl-color-black: #020617;
+
+  /* Shared background tokens mirrored from global.css (landing page). */
+  --dl-canvas: #020617;
+  --dl-page: #0f172a;
+  --dl-glow-primary: rgba(99, 102, 241, 0.28);
+  --dl-glow-accent: rgba(6, 182, 212, 0.18);
 }
 
 :root[data-theme="light"] {
   --sl-color-bg: #f8fafc;
-  --sl-color-bg-nav: rgba(248, 250, 252, 0.88);
-  --sl-color-bg-sidebar: rgba(248, 250, 252, 0.92);
+  --sl-color-bg-nav: rgba(248, 250, 252, 0.72);
+  --sl-color-bg-sidebar: rgba(248, 250, 252, 0.6);
   --sl-color-bg-inline-code: #eef2ff;
   --sl-color-text-accent: #0369a1;
   --sl-color-accent-low: #dbeafe;
-  --sl-color-accent: #4f46e5;
+  --sl-color-accent: #6366f1;
   --sl-color-accent-high: #1e1b4b;
+  --sl-color-hairline-light: rgba(15, 23, 42, 0.14);
+  --sl-color-hairline-shade: rgba(15, 23, 42, 0.08);
+  --sl-color-text: #0f172a;
+  --sl-color-gray-1: #0f172a;
+  --sl-color-gray-2: #334155;
+  --sl-color-gray-3: #475569;
+  --sl-color-gray-4: #64748b;
+  --sl-color-gray-5: #94a3b8;
+  --sl-color-gray-6: #e2e8f0;
+  --sl-color-black: #ffffff;
+
+  /* Shared background tokens mirrored from global.css (landing page). */
+  --dl-canvas: #f8fafc;
+  --dl-page: #eef2ff;
+  --dl-glow-primary: rgba(99, 102, 241, 0.18);
+  --dl-glow-accent: rgba(6, 182, 212, 0.16);
 }
 
-.hero {
-  border-bottom: 1px solid var(--sl-color-hairline-light);
+/*
+ * Match the landing page's layered background so the docs feel like the same site.
+ * global.css paints this exact gradient on <body>; Starlight's nav/sidebar surfaces
+ * use low-alpha backgrounds so the glow shows through.
+ */
+body {
   background:
-    radial-gradient(circle at 18% 10%, rgba(99, 102, 241, 0.18), transparent 30rem),
-    radial-gradient(circle at 82% 18%, rgba(6, 182, 212, 0.14), transparent 28rem);
+    radial-gradient(circle at 16% 10%, var(--dl-glow-primary), transparent 28rem),
+    radial-gradient(circle at 84% 18%, var(--dl-glow-accent), transparent 26rem),
+    linear-gradient(180deg, var(--dl-canvas) 0%, var(--dl-page) 46%, var(--dl-canvas) 100%);
+}
+
+/* Soften the header rule so the shared gradient reads through the chrome. */
+.sl-nav,
+header.header {
+  backdrop-filter: blur(12px);
+}
+
+/* Match the landing page's brand wordmark weight/tracking. */
+.site-title {
+  font-weight: 800;
+  letter-spacing: -0.03em;
+}
+
+/* Unify keyboard focus with the landing page (global.css). */
+:root {
+  --sl-color-focus: var(--sl-color-text-accent);
+}
+
+.sl-markdown-content a:focus-visible,
+.sidebar a:focus-visible,
+a.site-title:focus-visible,
+button:focus-visible {
+  outline: 3px solid var(--sl-color-text-accent);
+  outline-offset: 4px;
 }
 
 .sl-markdown-content h2 {
@@ -51,28 +104,33 @@
 }
 
 .sl-markdown-content .mermaid {
-  display: grid;
+  display: block;
   position: relative;
   left: 50%;
   width: min(88vw, 74rem);
   max-width: calc(100vw - 2rem);
-  min-height: 18rem;
   margin-block: 1.5rem;
   transform: translateX(-50%);
-  place-items: center;
+  text-align: center;
   overflow-x: auto;
   border: 1px solid var(--sl-color-hairline-light);
   border-radius: 1.25rem;
-  padding: 1.25rem;
+  padding: 1.5rem;
   background: color-mix(in srgb, var(--sl-color-bg), var(--sl-color-accent-low) 12%);
   box-shadow: 0 20px 70px rgba(15, 23, 42, 0.12);
 }
 
+/*
+ * Let Mermaid's own sizing work: the rendered <svg> already carries width="100%"
+ * plus an inline max-width equal to its natural width. In a block container that
+ * percentage resolves against the card's definite width, so wide diagrams fill the
+ * card while narrow ones stay at their natural size (centered). The previous grid /
+ * place-items:center container made the grid item shrink to the SVG's intrinsic
+ * 300px default, collapsing every diagram. See starlight.css history.
+ */
 .sl-markdown-content .mermaid svg {
-  width: 100% !important;
-  min-width: min(48rem, 100%);
-  max-width: none;
   height: auto !important;
+  margin-inline: auto;
 }
 
 .sl-markdown-content blockquote {
