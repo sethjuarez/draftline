@@ -26,8 +26,6 @@
   --surface-page: var(--color-ink-900);
   --surface-card: rgba(17, 24, 39, 0.82);
   --surface-card-strong: rgba(30, 41, 59, 0.94);
-  --surface-glow-primary: rgba(99, 102, 241, 0.28);
-  --surface-glow-accent: rgba(45, 212, 191, 0.16);
 
   --text-primary: var(--color-white);
   --text-secondary: var(--color-slate-300);
@@ -78,8 +76,6 @@
   --surface-page: #eef2ff;
   --surface-card: rgba(255, 255, 255, 0.86);
   --surface-card-strong: rgba(238, 242, 255, 0.96);
-  --surface-glow-primary: rgba(99, 102, 241, 0.18);
-  --surface-glow-accent: rgba(20, 184, 166, 0.14);
   --text-primary: #0f172a;
   --text-secondary: #334155;
   --text-muted: #64748b;
@@ -103,10 +99,7 @@ html {
 
 body {
   margin: 0;
-  background:
-    radial-gradient(circle at 16% 10%, var(--surface-glow-primary), transparent 28rem),
-    radial-gradient(circle at 84% 18%, var(--surface-glow-accent), transparent 26rem),
-    linear-gradient(180deg, var(--surface-canvas) 0%, var(--surface-page) 46%, var(--surface-canvas) 100%);
+  background: var(--surface-canvas);
   color: var(--text-primary);
 }
 

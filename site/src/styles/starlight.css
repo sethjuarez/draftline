@@ -23,12 +23,6 @@
   --sl-color-gray-5: #475569;
   --sl-color-gray-6: #1e293b;
   --sl-color-black: #020617;
-
-  /* Shared background tokens mirrored from global.css (landing page). */
-  --dl-canvas: #020617;
-  --dl-page: #0f172a;
-  --dl-glow-primary: rgba(99, 102, 241, 0.28);
-  --dl-glow-accent: rgba(45, 212, 191, 0.16);
 }
 
 :root[data-theme="light"] {
@@ -50,24 +44,15 @@
   --sl-color-gray-5: #94a3b8;
   --sl-color-gray-6: #e2e8f0;
   --sl-color-black: #ffffff;
-
-  /* Shared background tokens mirrored from global.css (landing page). */
-  --dl-canvas: #f8fafc;
-  --dl-page: #eef2ff;
-  --dl-glow-primary: rgba(99, 102, 241, 0.18);
-  --dl-glow-accent: rgba(20, 184, 166, 0.14);
 }
 
 /*
- * Match the landing page's layered background so the docs feel like the same site.
- * global.css paints this exact gradient on <body>; Starlight's nav/sidebar surfaces
- * use low-alpha backgrounds so the glow shows through.
+ * Flat, solid page background on both surfaces (no gradient/glow) — matches the
+ * landing page and reads cleaner. Starlight's nav/sidebar low-alpha surfaces sit
+ * over this solid canvas.
  */
 body {
-  background:
-    radial-gradient(circle at 16% 10%, var(--dl-glow-primary), transparent 28rem),
-    radial-gradient(circle at 84% 18%, var(--dl-glow-accent), transparent 26rem),
-    linear-gradient(180deg, var(--dl-canvas) 0%, var(--dl-page) 46%, var(--dl-canvas) 100%);
+  background: var(--sl-color-bg);
 }
 
 /* Soften the header rule so the shared gradient reads through the chrome. */
