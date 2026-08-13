@@ -11,6 +11,11 @@
   --color-violet-500: #a855f7;
   --color-cyan-500: #06b6d4;
   --color-cyan-300: #67e8f9;
+  /* Brand teal, derived from the logo mark (#1f6f5c). teal-500 is the gradient
+     terminus; teal-300 is the on-dark accent (links/focus/wayfinding). */
+  --color-teal-700: #1f6f5c;
+  --color-teal-500: #14b8a6;
+  --color-teal-300: #54d4b6;
   --color-amber-500: #f97316;
   --color-amber-300: #fdba74;
   --color-emerald-500: #10b981;
@@ -22,7 +27,7 @@
   --surface-card: rgba(17, 24, 39, 0.82);
   --surface-card-strong: rgba(30, 41, 59, 0.94);
   --surface-glow-primary: rgba(99, 102, 241, 0.28);
-  --surface-glow-accent: rgba(6, 182, 212, 0.18);
+  --surface-glow-accent: rgba(45, 212, 191, 0.16);
 
   --text-primary: var(--color-white);
   --text-secondary: var(--color-slate-300);
@@ -31,13 +36,13 @@
 
   --brand-primary: var(--color-indigo-500);
   --brand-secondary: var(--color-violet-500);
-  --brand-accent: var(--color-cyan-300);
+  --brand-accent: var(--color-teal-300);
   --status-covered: var(--color-emerald-300);
   --status-partial: var(--color-amber-300);
   --status-planned: var(--color-rose-300);
 
   --border-subtle: rgba(203, 213, 225, 0.18);
-  --border-focus: var(--color-cyan-300);
+  --border-focus: var(--color-teal-300);
   --shadow-elevated: 0 24px 80px rgba(0, 0, 0, 0.4);
 
   --font-family-sans:
@@ -74,17 +79,17 @@
   --surface-card: rgba(255, 255, 255, 0.86);
   --surface-card-strong: rgba(238, 242, 255, 0.96);
   --surface-glow-primary: rgba(99, 102, 241, 0.18);
-  --surface-glow-accent: rgba(6, 182, 212, 0.16);
+  --surface-glow-accent: rgba(20, 184, 166, 0.14);
   --text-primary: #0f172a;
   --text-secondary: #334155;
   --text-muted: #64748b;
   --text-inverse: #f8fafc;
-  --brand-accent: #0369a1;
+  --brand-accent: #0f766e;
   --status-covered: #047857;
   --status-partial: #c2410c;
   --status-planned: #be123c;
   --border-subtle: rgba(15, 23, 42, 0.14);
-  --border-focus: #0891b2;
+  --border-focus: #0f766e;
   --shadow-elevated: 0 24px 80px rgba(15, 23, 42, 0.13);
 }
 
@@ -202,7 +207,7 @@ main {
   width: 0.75rem;
   height: 0.75rem;
   border-radius: 999px;
-  background: linear-gradient(135deg, var(--brand-primary), var(--brand-secondary), var(--color-cyan-500));
+  background: linear-gradient(135deg, var(--brand-primary), var(--brand-secondary), var(--color-teal-500));
 }
 
 .hero-grid,
@@ -292,7 +297,7 @@ h3 {
 
 .button.primary {
   border-color: transparent;
-  background: linear-gradient(135deg, var(--brand-primary), var(--brand-secondary) 52%, var(--color-cyan-500));
+  background: linear-gradient(135deg, var(--brand-primary), var(--brand-secondary) 52%, var(--color-teal-500));
   color: var(--text-primary);
 }
 
