@@ -26,6 +26,9 @@
   --surface-page: var(--color-ink-900);
   --surface-card: rgba(17, 24, 39, 0.82);
   --surface-card-strong: rgba(30, 41, 59, 0.94);
+  /* Opaque equivalent of --surface-card composited over --surface-canvas,
+     used to knock out Mermaid edge-label boxes so they vanish into the card. */
+  --mermaid-label-bg: #0e1524;
 
   --text-primary: var(--color-white);
   --text-secondary: var(--color-slate-300);
@@ -76,6 +79,7 @@
   --surface-page: #eef2ff;
   --surface-card: rgba(255, 255, 255, 0.86);
   --surface-card-strong: rgba(238, 242, 255, 0.96);
+  --mermaid-label-bg: #fefeff;
   --text-primary: #0f172a;
   --text-secondary: #334155;
   --text-muted: #64748b;
@@ -197,10 +201,24 @@ main {
 }
 
 .theme-toggle-icon {
-  width: 0.75rem;
-  height: 0.75rem;
-  border-radius: 999px;
-  background: linear-gradient(135deg, var(--brand-primary), var(--brand-secondary), var(--color-teal-500));
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+}
+
+/* Show the icon for the theme the button switches TO, matching the label
+   ("Light mode" pairs with a sun in dark; "Dark mode" pairs with a moon). */
+.theme-toggle-sun,
+.theme-toggle-moon {
+  display: none;
+}
+
+:root:not([data-theme="light"]) .theme-toggle-sun {
+  display: block;
+}
+
+:root[data-theme="light"] .theme-toggle-moon {
+  display: block;
 }
 
 .hero-grid,
@@ -279,17 +297,22 @@ h3 {
   margin: 0;
 }
 
-/* Blend Mermaid edge-label knockout boxes into the page background so the
+/* Blend Mermaid edge-label knockout boxes into the card surface so the
    "Yes/No/folders" labels read as floating captions, not gray chips. The box
-   stays opaque (to mask the connector line behind the text) but is painted in
-   the canvas color so it disappears. Mermaid injects these with #id
-   specificity, so !important is required. */
+   stays opaque (to mask the connector line behind the text) and is painted in
+   --mermaid-label-bg, the opaque equivalent of the card surface the diagram
+   sits on. Mermaid injects these with #id specificity, so !important is
+   required. */
 .mermaid-card .mermaid :is(.edgeLabel, .edgeLabel p, .edgeLabel span) {
-  background: var(--surface-canvas) !important;
-  background-color: var(--surface-canvas) !important;
+  background: var(--mermaid-label-bg) !important;
+  background-color: var(--mermaid-label-bg) !important;
+  color: var(--text-secondary) !important;
+}
+.mermaid-card .mermaid .edgeLabel :is(text, tspan) {
+  fill: var(--text-secondary) !important;
 }
 .mermaid-card .mermaid :is(.edgeLabel rect, .labelBkg) {
-  fill: var(--surface-canvas) !important;
+  fill: var(--mermaid-label-bg) !important;
   opacity: 1 !important;
 }
 
