@@ -1,0 +1,54 @@
+name: PR Title
+
+# PRs are squash-merged, so the PR title becomes the Conventional Commit
+# subject on `main`. release-please derives all versioning/publishing from
+# that history, so this is a required (hard) gate — a non-conforming title
+# fails the check and blocks merge.
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+
+permissions:
+  pull-requests: read
+
+jobs:
+  conventional-title:
+    name: Conventional Commit title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Keep in sync with .github/copilot-instructions.md and CONTRIBUTING.md.
+          types: |
+            feat
+            fix
+            docs
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            style
+            revert
+          # Scopes are optional, but when present must be one of these.
+          scopes: |
+            merge
+            workspace
+            client
+            react
+            site
+            ci
+          requireScope: false
+          # Enforce lowercase subject start (Conventional Commits style).
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" starts with an uppercase character.
+            Conventional Commit subjects must start lowercase, e.g.
+            "fix(client): guard against empty version id".

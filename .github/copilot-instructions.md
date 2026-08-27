@@ -37,6 +37,10 @@ Commit** — it becomes the commit on `main`.
 | `ci` | CI/workflow changes | none |
 | `chore` | maintenance that doesn't touch `src`/published code | none |
 | `style` | formatting only, no code meaning change | none |
+| `revert` | reverts a previous commit | none |
+
+The PR title is validated in CI by the **PR Title** workflow
+(`.github/workflows/pr-title-lint.yml`); a non-conforming title fails the check and blocks merge.
 
 ### Breaking changes
 
