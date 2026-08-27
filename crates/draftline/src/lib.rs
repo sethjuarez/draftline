@@ -86,6 +86,10 @@ pub mod workspace;
 
 pub use content_policy::ContentPolicy;
 pub use error::{DraftlineError, Result};
+pub use merge::{
+    MarkdownResolver, MergeConflict, MergeInput, MergeOutcome, PlainTextResolver, ResolutionKind,
+    ResolverRegistry, SemanticMergeResolver,
+};
 pub use profile::{AttributionOperation, ContributorProfile, ContributorProvider};
 pub use recovery::{RecoveryOperation, RecoveryState};
 pub use remote::{

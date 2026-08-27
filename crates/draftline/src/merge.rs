@@ -60,6 +60,10 @@ pub enum ResolutionKind {
 }
 
 /// Trait implemented by content-aware merge resolvers.
+///
+/// Workspace merges invoke resolvers only when the base, local, and remote
+/// file contents are all valid UTF-8. Binary content is reported as a conflict
+/// before resolver selection.
 pub trait SemanticMergeResolver: Send + Sync {
     fn matches(&self, path: &Path) -> bool;
 
@@ -77,17 +81,37 @@ impl ResolverRegistry {
         Self::default()
     }
 
+    /// Creates a registry containing the Markdown resolver followed by the
+    /// catch-all plain-text resolver.
     pub fn with_default_resolvers() -> Self {
         Self::new()
             .register(MarkdownResolver)
             .register(PlainTextResolver)
     }
 
+    /// Appends a resolver after every resolver already in the registry.
+    ///
+    /// Because [`PlainTextResolver`] matches every path, a resolver appended to
+    /// [`ResolverRegistry::with_default_resolvers`] cannot be selected. Use
+    /// [`ResolverRegistry::register_first`] when adding a preferred resolver to
+    /// the default registry.
     pub fn register<R>(mut self, resolver: R) -> Self
     where
         R: SemanticMergeResolver + 'static,
     {
         self.resolvers.push(Box::new(resolver));
+        self
+    }
+
+    /// Registers a resolver ahead of every resolver already in the registry.
+    ///
+    /// Use this when a content-specific resolver must take precedence over
+    /// broad built-in resolvers such as [`PlainTextResolver`].
+    pub fn register_first<R>(mut self, resolver: R) -> Self
+    where
+        R: SemanticMergeResolver + 'static,
+    {
+        self.resolvers.insert(0, Box::new(resolver));
         self
     }
 

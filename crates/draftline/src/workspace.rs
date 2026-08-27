@@ -24,6 +24,7 @@ pub struct Workspace {
     root: PathBuf,
     repo: Repository,
     content_policy: ContentPolicy,
+    resolver_registry: ResolverRegistry,
 }
 
 /// A named version of the workspace.
@@ -1934,6 +1935,7 @@ impl Workspace {
             root,
             repo,
             content_policy,
+            resolver_registry: ResolverRegistry::with_default_resolvers(),
         }
         .initialize())
     }
@@ -1955,6 +1957,7 @@ impl Workspace {
             root,
             repo,
             content_policy,
+            resolver_registry: ResolverRegistry::with_default_resolvers(),
         }
         .initialize())
     }
@@ -2017,8 +2020,64 @@ impl Workspace {
             root,
             repo,
             content_policy,
+            resolver_registry: ResolverRegistry::with_default_resolvers(),
         }
         .initialize())
+    }
+
+    /// Adds a semantic merge resolver ahead of Draftline's built-in resolvers.
+    ///
+    /// The first matching resolver wins, so resolvers added with this method
+    /// take precedence over the built-in Markdown and plain-text behavior.
+    /// Each subsequent call also places the new resolver ahead of resolvers
+    /// added by earlier calls.
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    ///
+    /// use draftline::{
+    ///     MergeInput, MergeOutcome, SemanticMergeResolver, Workspace,
+    /// };
+    ///
+    /// struct SketchResolver;
+    ///
+    /// impl SemanticMergeResolver for SketchResolver {
+    ///     fn matches(&self, path: &Path) -> bool {
+    ///         matches!(
+    ///             path.extension().and_then(|extension| extension.to_str()),
+    ///             Some("sk" | "sb")
+    ///         )
+    ///     }
+    ///
+    ///     fn merge(&self, input: MergeInput<'_>) -> MergeOutcome {
+    ///         // Perform the host application's content-aware three-way merge.
+    ///         MergeOutcome::clean(input.ours)
+    ///     }
+    /// }
+    ///
+    /// let workspace = Workspace::open("my-content")?
+    ///     .with_merge_resolver(SketchResolver);
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
+    pub fn with_merge_resolver<R>(mut self, resolver: R) -> Self
+    where
+        R: crate::merge::SemanticMergeResolver + 'static,
+    {
+        self.resolver_registry =
+            std::mem::take(&mut self.resolver_registry).register_first(resolver);
+        self
+    }
+
+    /// Replaces the complete semantic merge resolver registry.
+    ///
+    /// Use [`ResolverRegistry::with_default_resolvers`] together with
+    /// [`ResolverRegistry::register_first`] to retain Draftline's built-ins
+    /// while giving custom resolvers precedence. A registry created with
+    /// [`ResolverRegistry::new`] still falls back to plain-text merging when no
+    /// registered resolver matches.
+    pub fn with_resolver_registry(mut self, resolver_registry: ResolverRegistry) -> Self {
+        self.resolver_registry = resolver_registry;
+        self
     }
 
     /// Returns the root content folder for this workspace.
@@ -9878,7 +9937,6 @@ impl Workspace {
         self.collect_tracked_tree_paths(local_tree, Path::new(""), &mut paths)?;
         self.collect_tracked_tree_paths(remote_tree, Path::new(""), &mut paths)?;
 
-        let registry = ResolverRegistry::with_default_resolvers();
         let mut files = Vec::new();
         let mut conflicts = Vec::new();
 
@@ -9886,13 +9944,14 @@ impl Workspace {
             let base = self.tree_blob_bytes(base_tree, &path)?;
             let ours = self.tree_blob_bytes(local_tree, &path)?;
             let theirs = self.tree_blob_bytes(remote_tree, &path)?;
-            let merged = match merge_blob_contents(&registry, &path, base, ours, theirs) {
-                Ok(content) => content,
-                Err(conflict) => {
-                    conflicts.push(*conflict);
-                    continue;
-                }
-            };
+            let merged =
+                match merge_blob_contents(&self.resolver_registry, &path, base, ours, theirs) {
+                    Ok(content) => content,
+                    Err(conflict) => {
+                        conflicts.push(*conflict);
+                        continue;
+                    }
+                };
 
             if merged != self.tree_blob_bytes(local_tree, &path)? {
                 files.push(MergeFileChange {
@@ -11785,7 +11844,51 @@ impl Drop for OperationLock {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
     use super::*;
+    use crate::merge::{MergeOutcome, SemanticMergeResolver};
+
+    struct CleanSketchResolver {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SemanticMergeResolver for CleanSketchResolver {
+        fn matches(&self, path: &Path) -> bool {
+            path.extension().and_then(|extension| extension.to_str()) == Some("sk")
+        }
+
+        fn merge(&self, _input: MergeInput<'_>) -> MergeOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            MergeOutcome::clean("semantic merge")
+        }
+    }
+
+    struct ConflictingSketchResolver {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SemanticMergeResolver for ConflictingSketchResolver {
+        fn matches(&self, path: &Path) -> bool {
+            path.extension().and_then(|extension| extension.to_str()) == Some("sk")
+        }
+
+        fn merge(&self, input: MergeInput<'_>) -> MergeOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            MergeOutcome::conflicted(MergeConflict {
+                path: input.path.to_path_buf(),
+                field_path: Some("rows".to_string()),
+                label: "Sketch rows changed in both versions".to_string(),
+                base: Some(input.base.to_string()),
+                ours: Some(input.ours.to_string()),
+                theirs: Some(input.theirs.to_string()),
+                resolution: crate::merge::ResolutionKind::Edit,
+            })
+        }
+    }
 
     fn write_file(root: &Path, relative: &str, content: &[u8]) {
         let path = root.join(relative);
@@ -11827,6 +11930,41 @@ mod tests {
         let mut options = RepositoryInitOptions::new();
         options.bare(true).initial_head(&initial_head);
         Repository::init_opts(root, &options).unwrap()
+    }
+
+    fn diverged_sketch_workspace() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Workspace,
+    ) {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+
+        let author_dir = tempfile::tempdir().unwrap();
+        let author = Workspace::init(author_dir.path()).unwrap();
+        configure_identity(&author, "Seth", "seth@example.com");
+        author
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(author.root(), "plan.sk", b"base");
+        author.save_version("Base").unwrap();
+        author.publish_changes("origin").unwrap();
+
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), peer_dir.path()).unwrap();
+        configure_identity(&peer, "Maria", "maria@example.com");
+
+        write_file(author.root(), "plan.sk", b"remote");
+        author.save_version("Remote").unwrap();
+        author.publish_changes("origin").unwrap();
+
+        write_file(peer.root(), "plan.sk", b"local");
+        peer.save_version("Local").unwrap();
+        peer.fetch_remote("origin").unwrap();
+
+        (remote, author_dir, peer_dir, peer)
     }
 
     #[test]
@@ -14557,6 +14695,71 @@ mod tests {
             .unwrap();
         assert_eq!(commit.parent_count(), 2);
         assert!(second_workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn custom_resolver_precedes_plain_text_in_preflight_and_clean_merge() {
+        let (_remote, _author_dir, _peer_dir, peer) = diverged_sketch_workspace();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let peer = peer.with_merge_resolver(CleanSketchResolver {
+            calls: Arc::clone(&calls),
+        });
+
+        let report = peer.preflight_merge_incoming("origin").unwrap();
+
+        assert!(report.can_merge_cleanly);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        calls.store(0, Ordering::SeqCst);
+        let mut options = RemoteOptions::new();
+        peer.merge_incoming(report.token.unwrap(), "Semantic sketch merge", &mut options)
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read_to_string(peer.root().join("plan.sk")).unwrap(),
+            "semantic merge"
+        );
+    }
+
+    #[test]
+    fn replacement_registry_is_used_when_merging_with_resolutions() {
+        let (_remote, _author_dir, _peer_dir, peer) = diverged_sketch_workspace();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry =
+            ResolverRegistry::with_default_resolvers().register_first(ConflictingSketchResolver {
+                calls: Arc::clone(&calls),
+            });
+        let peer = peer.with_resolver_registry(registry);
+
+        let report = peer.preflight_merge_incoming("origin").unwrap();
+        let token = report.token.unwrap();
+        let conflict = report.conflicts.first().unwrap();
+        assert_eq!(conflict.field_path.as_deref(), Some("rows"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        calls.store(0, Ordering::SeqCst);
+        let mut options = RemoteOptions::new();
+        peer.merge_incoming_with_resolutions(
+            token,
+            "Resolved semantic sketch merge",
+            [MergeConflictResolution {
+                path: conflict.path.clone(),
+                field_path: conflict.field_path.clone(),
+                choice: MergeResolutionChoice::UseContent {
+                    content: "resolved sketch".to_string(),
+                },
+            }],
+            &mut options,
+        )
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read_to_string(peer.root().join("plan.sk")).unwrap(),
+            "resolved sketch"
+        );
     }
 
     #[test]
