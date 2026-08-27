@@ -125,7 +125,8 @@ fn main() -> Result<(), draftline::DraftlineError> {
 
 Releases are automated with [release-please](https://github.com/googleapis/release-please-action).
 Versioning and publishing are driven entirely by commit history, so **all commits to `main`
-must follow [Conventional Commits](https://www.conventionalcommits.org/)**:
+(and all squash-merged PR titles) MUST follow [Conventional Commits](https://www.conventionalcommits.org/)**
+— this is mandatory, see [CONTRIBUTING.md](CONTRIBUTING.md):
 
 - `fix:` &rarr; patch release
 - `feat:` &rarr; minor release
