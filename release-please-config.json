@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "separate-pull-requests": false,
+  "include-component-in-tag": true,
+  "packages": {
+    "crates/draftline": {
+      "release-type": "rust",
+      "component": "draftline",
+      "changelog-path": "CHANGELOG.md"
+    },
+    "packages/client": {
+      "release-type": "node",
+      "component": "client",
+      "changelog-path": "CHANGELOG.md"
+    },
+    "packages/react": {
+      "release-type": "node",
+      "component": "react",
+      "changelog-path": "CHANGELOG.md"
+    },
+    "site": {
+      "release-type": "node",
+      "component": "site",
+      "changelog-path": "CHANGELOG.md"
+    }
+  }
+}
