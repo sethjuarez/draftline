@@ -120,3 +120,44 @@ fn main() -> Result<(), draftline::DraftlineError> {
     Ok(())
 }
 ```
+
+## Releases
+
+Releases are automated with [release-please](https://github.com/googleapis/release-please-action).
+Versioning and publishing are driven entirely by commit history, so **all commits to `main`
+must follow [Conventional Commits](https://www.conventionalcommits.org/)**:
+
+- `fix:` &rarr; patch release
+- `feat:` &rarr; minor release
+- `feat!:` / `fix!:` / `BREAKING CHANGE:` footer &rarr; breaking release
+
+### Managed packages
+
+release-please tracks four independently versioned packages, each with its own
+`CHANGELOG.md` and a component-prefixed tag:
+
+| Package | Path | Type | Tag prefix | Published to |
+| --- | --- | --- | --- | --- |
+| `draftline` | `crates/draftline` | rust | `draftline-v*` | crates.io |
+| `@draftline/client` | `packages/client` | node | `client-v*` | npm + GitHub Packages (`@sethjuarez/draftline-client`) |
+| `@draftline/react` | `packages/react` | node | `react-v*` | npm + GitHub Packages (`@sethjuarez/draftline-react`) |
+| `@draftline/site` | `site` | node | `site-v*` | GitHub Pages (continuous, no registry) |
+
+The `@draftline/workbench` Tauri app and its `workbench/src-tauri` crate are intentionally
+not managed by release-please.
+
+### Flow
+
+1. Commits land on `main` using Conventional Commit messages.
+2. release-please opens/updates a single aggregated release PR that bumps versions and
+   changelogs for the affected packages.
+3. Merging that PR creates the component-prefixed tags and GitHub releases.
+4. The `release-please` workflow then automatically publishes each package that was actually
+   released: the crate via `cargo publish`, the npm packages to npmjs and GitHub Packages.
+   The site is not registry-published — GitHub Pages already deploys on every push to `main`.
+
+The manual `publish-crate` and `publish npm packages` workflows remain available via
+`workflow_dispatch` as a fallback (type `publish` to confirm). Both paths keep the same
+safety checks: they refuse to publish from a non-`main` ref and skip any version already
+present on crates.io / npm.
+

@@ -7,6 +7,11 @@ on:
         description: "Type publish to publish the current draftline version to crates.io"
         required: true
         type: string
+  workflow_call:
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        description: "crates.io registry token used to publish the draftline crate"
+        required: true
 
 permissions:
   contents: read
@@ -29,6 +34,7 @@ jobs:
           fi
 
       - name: Confirm publish intent
+        if: github.event_name == 'workflow_dispatch'
         run: |
           if [ "${{ inputs.confirm_publish }}" != "publish" ]; then
             echo "Refusing to publish without confirm_publish=publish"

@@ -1,0 +1,58 @@
+name: release-please
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Create release PR / releases
+    runs-on: ubuntu-latest
+    outputs:
+      paths_released: ${{ steps.release.outputs.paths_released }}
+      crate_release_created: ${{ steps.release.outputs['crates/draftline--release_created'] }}
+      crate_tag_name: ${{ steps.release.outputs['crates/draftline--tag_name'] }}
+      crate_version: ${{ steps.release.outputs['crates/draftline--version'] }}
+      client_release_created: ${{ steps.release.outputs['packages/client--release_created'] }}
+      client_tag_name: ${{ steps.release.outputs['packages/client--tag_name'] }}
+      react_release_created: ${{ steps.release.outputs['packages/react--release_created'] }}
+      react_tag_name: ${{ steps.release.outputs['packages/react--tag_name'] }}
+      site_release_created: ${{ steps.release.outputs['site--release_created'] }}
+      site_tag_name: ${{ steps.release.outputs['site--tag_name'] }}
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish-crate:
+    name: Publish crate
+    needs: release-please
+    if: needs.release-please.outputs.crate_release_created == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-crate.yml
+    secrets: inherit
+
+  publish-npm:
+    name: Publish npm packages
+    needs: release-please
+    if: needs.release-please.outputs.client_release_created == 'true' || needs.release-please.outputs.react_release_created == 'true'
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/npm-publish.yml
+    with:
+      publish_client: ${{ needs.release-please.outputs.client_release_created == 'true' }}
+      publish_react: ${{ needs.release-please.outputs.react_release_created == 'true' }}
+    secrets: inherit
