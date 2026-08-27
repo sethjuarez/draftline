@@ -9,7 +9,9 @@ changelogs, tags, and registry publishes are all derived from commit history. As
 MUST be a valid [Conventional Commit](https://www.conventionalcommits.org/).**
 
 Non-conforming messages are rejected in review because they produce an incorrect release or are
-dropped from the changelog.
+dropped from the changelog. This is enforced automatically: the **PR Title** GitHub Actions
+check validates every pull request title against the Conventional Commits spec and **must pass
+before a PR can be merged**.
 
 ### Format
 
@@ -17,7 +19,7 @@ dropped from the changelog.
 <type>[optional (scope)][optional !]: <description>
 ```
 
-**Types:** `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `style`.
+**Types:** `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `style`, `revert`.
 
 - `feat:` → minor release, `fix:` → patch release.
 - Breaking changes: add `!` (e.g. `feat(merge)!: ...`) and/or a `BREAKING CHANGE:` footer.
