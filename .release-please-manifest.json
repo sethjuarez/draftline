@@ -1,6 +1,6 @@
 {
-  "crates/draftline": "0.2.17",
-  "packages/client": "0.1.14",
-  "packages/react": "0.1.14",
+  "crates/draftline": "0.3.0",
+  "packages/client": "0.1.15",
+  "packages/react": "0.1.15",
   "site": "0.1.0"
 }

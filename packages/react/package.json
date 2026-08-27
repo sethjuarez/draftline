@@ -1,6 +1,6 @@
 {
   "name": "@draftline/react",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "React hooks and primitives for Draftline-enabled Tauri applications.",
   "license": "MIT",
   "type": "module",
