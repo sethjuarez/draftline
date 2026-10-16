@@ -6710,6 +6710,25 @@ impl Workspace {
         token: SquashVersionsToken,
         label: impl AsRef<str>,
     ) -> Result<Version> {
+        self.squash_versions_with_token_and_optional_profile(token, label, None)
+    }
+
+    /// Squashes preflighted versions into a single new version using host-supplied attribution.
+    pub fn squash_versions_with_token_and_profile(
+        &self,
+        token: SquashVersionsToken,
+        label: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<Version> {
+        self.squash_versions_with_token_and_optional_profile(token, label, Some(profile))
+    }
+
+    fn squash_versions_with_token_and_optional_profile(
+        &self,
+        token: SquashVersionsToken,
+        label: impl AsRef<str>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "squash_versions")?;
         let variation = self.current_variation_unchecked()?;
@@ -6730,14 +6749,14 @@ impl Workspace {
         let squash_parent_oid = Oid::from_str(&token.squash_parent_oid)?;
         let squash_parent = self.repo.find_commit(squash_parent_oid)?;
         let tree = head_commit.tree()?;
-        let signature = self.workspace_signature()?;
+        let (author, committer) = self.workspace_signatures(profile)?;
 
         // Create the squash commit without touching any ref yet — git2 would
         // reject Some("HEAD") here because squash_parent is not the current tip.
         let oid = self.repo.commit(
             None,
-            &signature,
-            &signature,
+            &author,
+            &committer,
             label.as_ref(),
             &tree,
             &[&squash_parent],
@@ -6772,6 +6791,26 @@ impl Workspace {
     }
 
     pub fn squash_versions(&self, count: usize, label: impl AsRef<str>) -> Result<Version> {
+        self.squash_versions_with_optional_profile(count, label, None)
+    }
+
+    /// Squashes the last `count` versions into a single new version using host-supplied
+    /// attribution.
+    pub fn squash_versions_with_profile(
+        &self,
+        count: usize,
+        label: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<Version> {
+        self.squash_versions_with_optional_profile(count, label, Some(profile))
+    }
+
+    fn squash_versions_with_optional_profile(
+        &self,
+        count: usize,
+        label: impl AsRef<str>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Version> {
         let preflight = self.preflight_squash_versions(count)?;
         let Some(token) = preflight.token else {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
@@ -6782,7 +6821,7 @@ impl Workspace {
                 None,
             ))));
         };
-        self.squash_versions_with_token(token, label)
+        self.squash_versions_with_token_and_optional_profile(token, label, profile)
     }
 
     /// Prepares a durable local timeline cleanup plan without moving visible refs.
@@ -18415,5 +18454,67 @@ mod tests {
             .unwrap();
 
         assert_git_config_attribution(&restored.version);
+    }
+
+    fn squash_fixture(workspace: &Workspace) {
+        for (index, content) in ["one", "two", "three"].into_iter().enumerate() {
+            write_file(workspace.root(), "post.md", content.as_bytes());
+            workspace.save_version(format!("v{}", index + 1)).unwrap();
+        }
+    }
+
+    #[test]
+    fn squash_versions_with_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        squash_fixture(&workspace);
+
+        let squashed = workspace
+            .squash_versions_with_profile(2, "Squashed", &attribution_profile())
+            .unwrap();
+
+        assert_eq!(squashed.label, "Squashed");
+        assert_profile_attribution(&squashed);
+    }
+
+    #[test]
+    fn squash_versions_with_token_and_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        squash_fixture(&workspace);
+        let token = workspace
+            .preflight_squash_versions(2)
+            .unwrap()
+            .token
+            .unwrap();
+
+        let squashed = workspace
+            .squash_versions_with_token_and_profile(token, "Squashed", &attribution_profile())
+            .unwrap();
+
+        assert_profile_attribution(&squashed);
+    }
+
+    #[test]
+    fn squash_versions_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        squash_fixture(&workspace);
+
+        let squashed = workspace.squash_versions(2, "Squashed").unwrap();
+
+        assert_git_config_attribution(&squashed);
+    }
+
+    #[test]
+    fn squash_with_invalid_profile_fails_without_pending_recovery() {
+        let (_temp, workspace) = attribution_workspace();
+        squash_fixture(&workspace);
+        let head = workspace.repo.head().unwrap().target().unwrap();
+
+        let err = workspace
+            .squash_versions_with_profile(2, "Bad", &invalid_profile())
+            .unwrap_err();
+
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+        workspace.ensure_no_pending_recovery().unwrap();
+        assert_eq!(workspace.repo.head().unwrap().target().unwrap(), head);
     }
 }
