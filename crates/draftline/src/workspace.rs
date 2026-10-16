@@ -3553,10 +3553,27 @@ impl Workspace {
 
     /// Shelves all current tracked content changes without switching variations.
     pub fn shelve_changes(&self, name: impl AsRef<str>) -> Result<Shelf> {
+        self.shelve_changes_with_optional_profile(name, None)
+    }
+
+    /// Shelves all current tracked content changes using host-supplied attribution.
+    pub fn shelve_changes_with_profile(
+        &self,
+        name: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<Shelf> {
+        self.shelve_changes_with_optional_profile(name, Some(profile))
+    }
+
+    fn shelve_changes_with_optional_profile(
+        &self,
+        name: impl AsRef<str>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Shelf> {
         self.ensure_no_pending_recovery()?;
         let safe_name = validate_variation_name(name.as_ref())?;
         let _lock = OperationLock::acquire(&self.lock_path(), "shelve_changes")?;
-        self.shelve_changes_unchecked(&safe_name)?;
+        self.shelve_changes_unchecked(&safe_name, profile)?;
         self.shelf_by_id(&safe_name)
     }
 
@@ -3586,6 +3603,33 @@ impl Workspace {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        self.shelve_files_with_optional_profile(name, paths, None)
+    }
+
+    /// Shelves only selected tracked content changes using host-supplied attribution.
+    pub fn shelve_files_with_profile<I, P>(
+        &self,
+        name: impl AsRef<str>,
+        paths: I,
+        profile: &ContributorProfile,
+    ) -> Result<Shelf>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.shelve_files_with_optional_profile(name, paths, Some(profile))
+    }
+
+    fn shelve_files_with_optional_profile<I, P>(
+        &self,
+        name: impl AsRef<str>,
+        paths: I,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Shelf>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         self.ensure_no_pending_recovery()?;
         let safe_name = validate_variation_name(name.as_ref())?;
         let changed_files = self.selected_changed_files(paths)?;
@@ -3611,12 +3655,12 @@ impl Workspace {
 
         let tree_id = self.write_selected_changes_tree(&changed_files)?;
         let tree = self.repo.find_tree(tree_id)?;
-        let signature = self.workspace_signature()?;
+        let (author, committer) = self.workspace_signatures(profile)?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             None,
-            &signature,
-            &signature,
+            &author,
+            &committer,
             &format!("Shelved changes: {safe_name}"),
             &tree,
             &[&parent],
@@ -4433,6 +4477,25 @@ impl Workspace {
         variation: &VariationId,
         policy: SwitchPolicy,
     ) -> Result<Variation> {
+        self.switch_variation_with_optional_profile(variation, policy, None)
+    }
+
+    /// Switches to a variation, attributing any `SaveFirst` or `Shelve` commit to a host profile.
+    pub fn switch_variation_with_profile(
+        &self,
+        variation: &VariationId,
+        policy: SwitchPolicy,
+        profile: &ContributorProfile,
+    ) -> Result<Variation> {
+        self.switch_variation_with_optional_profile(variation, policy, Some(profile))
+    }
+
+    fn switch_variation_with_optional_profile(
+        &self,
+        variation: &VariationId,
+        policy: SwitchPolicy,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "switch_variation")?;
         let mut report = self.preflight_switch_variation_unchecked(variation)?;
@@ -4446,10 +4509,10 @@ impl Workspace {
                 return Err(DraftlineError::PreflightFailed(Box::new(report)));
             }
             SwitchPolicy::SaveFirst { label } if !report.can_proceed => {
-                self.save_version_unchecked(label, None)?;
+                self.save_version_unchecked(label, profile)?;
             }
             SwitchPolicy::Shelve { name } if !report.can_proceed => {
-                self.shelve_changes_unchecked(name)?;
+                self.shelve_changes_unchecked(name, profile)?;
             }
             SwitchPolicy::Discard => {
                 return Err(DraftlineError::UnsupportedSwitchPolicy(
@@ -9695,7 +9758,11 @@ impl Workspace {
         Ok(None)
     }
 
-    fn shelve_changes_unchecked(&self, name: &str) -> Result<()> {
+    fn shelve_changes_unchecked(
+        &self,
+        name: &str,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<()> {
         let safe_name = validate_variation_name(name)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
@@ -9724,12 +9791,12 @@ impl Workspace {
 
         let tree_id = index.write_tree()?;
         let tree = self.repo.find_tree(tree_id)?;
-        let signature = self.workspace_signature()?;
+        let (author, committer) = self.workspace_signatures(profile)?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             None,
-            &signature,
-            &signature,
+            &author,
+            &committer,
             &format!("Shelved changes: {safe_name}"),
             &tree,
             &[&parent],
@@ -18000,5 +18067,157 @@ mod tests {
             err,
             DraftlineError::NotEnoughVersionsToSquash { .. }
         ));
+    }
+
+    // ── contributor profile attribution ─────────────────────────────────────
+
+    fn attribution_profile() -> ContributorProfile {
+        ContributorProfile::new(
+            Contributor {
+                name: "Profile Author".to_string(),
+                email: Some("author@profile.invalid".to_string()),
+            },
+            Contributor {
+                name: "Profile Saver".to_string(),
+                email: Some("saver@profile.invalid".to_string()),
+            },
+        )
+    }
+
+    fn assert_profile_attribution(version: &Version) {
+        assert_eq!(version.author.name, "Profile Author");
+        assert_eq!(
+            version.author.email.as_deref(),
+            Some("author@profile.invalid")
+        );
+        assert_eq!(version.saved_by.name, "Profile Saver");
+        assert_eq!(
+            version.saved_by.email.as_deref(),
+            Some("saver@profile.invalid")
+        );
+    }
+
+    fn assert_git_config_attribution(version: &Version) {
+        assert_eq!(version.author.name, "Seth");
+        assert_eq!(version.author.email.as_deref(), Some("seth@example.com"));
+        assert_eq!(version.saved_by.name, "Seth");
+        assert_eq!(version.saved_by.email.as_deref(), Some("seth@example.com"));
+    }
+
+    fn attribution_workspace() -> (tempfile::TempDir, Workspace) {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        (temp, workspace)
+    }
+
+    #[test]
+    fn shelve_changes_with_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+
+        let shelf = workspace
+            .shelve_changes_with_profile("profile-shelf", &attribution_profile())
+            .unwrap();
+
+        assert_profile_attribution(&shelf.version);
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "base"
+        );
+    }
+
+    #[test]
+    fn shelve_changes_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+
+        let shelf = workspace.shelve_changes("plain-shelf").unwrap();
+
+        assert_git_config_attribution(&shelf.version);
+    }
+
+    #[test]
+    fn shelve_files_with_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "one.md", b"one");
+        write_file(workspace.root(), "two.md", b"two");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "one.md", b"one shelved");
+        write_file(workspace.root(), "two.md", b"two remains");
+
+        let shelf = workspace
+            .shelve_files_with_profile("profile-shelf", ["one.md"], &attribution_profile())
+            .unwrap();
+
+        assert_profile_attribution(&shelf.version);
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("two.md")).unwrap(),
+            "two remains"
+        );
+    }
+
+    #[test]
+    fn shelve_files_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "one.md", b"one");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "one.md", b"one shelved");
+
+        let shelf = workspace.shelve_files("plain-shelf", ["one.md"]).unwrap();
+
+        assert_git_config_attribution(&shelf.version);
+    }
+
+    #[test]
+    fn switch_variation_with_profile_attributes_shelve_and_save_first() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        let main = VariationId::from(workspace.current_variation().unwrap());
+        workspace.create_variation("alt").unwrap();
+
+        write_file(workspace.root(), "post.md", b"shelve me");
+        workspace
+            .switch_variation_with_profile(
+                &VariationId::from("alt"),
+                SwitchPolicy::Shelve {
+                    name: "switch-shelf".to_string(),
+                },
+                &attribution_profile(),
+            )
+            .unwrap();
+        let shelf = workspace
+            .list_shelves()
+            .unwrap()
+            .into_iter()
+            .find(|shelf| shelf.id == "switch-shelf")
+            .unwrap();
+        assert_profile_attribution(&shelf.version);
+
+        write_file(workspace.root(), "post.md", b"save me");
+        workspace
+            .switch_variation_with_profile(
+                &main,
+                SwitchPolicy::SaveFirst {
+                    label: "Saved before switch".to_string(),
+                },
+                &attribution_profile(),
+            )
+            .unwrap();
+        let alt_tip = workspace
+            .repo
+            .find_branch("alt", BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let saved = version_from_commit(&alt_tip);
+        assert_eq!(saved.label, "Saved before switch");
+        assert_profile_attribution(&saved);
     }
 }

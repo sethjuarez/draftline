@@ -2387,7 +2387,11 @@ pub fn selected_shelve_with_context(
         return Err(DraftlineError::PreflightFailed(Box::new(preflight)));
     }
 
-    let shelf = workspace.shelve_files(request.name, request.paths)?;
+    let shelf = if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.shelve_files_with_profile(request.name, request.paths, profile)?
+    } else {
+        workspace.shelve_files(request.name, request.paths)?
+    };
     context.emit(&workspace, DraftlineEventKind::DirtyChanged, None);
     Ok(SelectedShelveResult {
         preflight,

@@ -22,10 +22,10 @@ use draftline::tauri_contract::{
     publish_history_cleanup, rename_variation, resolve_rewritten_version,
     restore_version_as_new_save, restore_version_as_new_save_to_variation, save,
     search_workspace_graph, selected_discard, selected_save, selected_save_with_context,
-    selected_shelve, switch_variation, undo_history_cleanup, verify_workspace,
-    whole_file_use_content_resolutions, ApplyHistoryCleanupRequest, CloneWorkspaceRequest,
-    ConflictContentSource, CreateVariationFromVersionRequest, CurrentFileRequest,
-    DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
+    selected_shelve, selected_shelve_with_context, switch_variation, undo_history_cleanup,
+    verify_workspace, whole_file_use_content_resolutions, ApplyHistoryCleanupRequest,
+    CloneWorkspaceRequest, ConflictContentSource, CreateVariationFromVersionRequest,
+    CurrentFileRequest, DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
     GuardedCreateVariationFromVersionRequest, HistoryCleanupRemoteImpactRequest,
     HistoryCompactionCandidatesCommandRequest, ListSupportRefsRequest, MergeIncomingRequest,
     MergeIncomingWithResolutionsRequest, PreflightCreateVariationFromVersionRequest,
@@ -1369,6 +1369,70 @@ fn tauri_contract_context_applies_policy_profile_and_events() {
     assert_eq!(events[0].kind, DraftlineEventKind::HistoryChanged);
     assert_eq!(events[0].sequence, 1);
     assert!(events[0].changed_paths.is_empty());
+}
+
+fn attribution_profile() -> ContributorProfile {
+    ContributorProfile::new(
+        Contributor {
+            name: "Context Author".to_string(),
+            email: Some("author@context.invalid".to_string()),
+        },
+        Contributor {
+            name: "Context Saver".to_string(),
+            email: Some("saver@context.invalid".to_string()),
+        },
+    )
+}
+
+fn assert_context_attribution(version: &draftline::Version) {
+    assert_eq!(version.author.name, "Context Author");
+    assert_eq!(
+        version.author.email.as_deref(),
+        Some("author@context.invalid")
+    );
+    assert_eq!(version.saved_by.name, "Context Saver");
+    assert_eq!(
+        version.saved_by.email.as_deref(),
+        Some("saver@context.invalid")
+    );
+}
+
+#[test]
+fn tauri_contract_selected_shelve_with_context_records_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "one.md", b"one");
+    write_file(workspace.root(), "two.md", b"two");
+    workspace.save_version("Base").unwrap();
+    write_file(workspace.root(), "one.md", b"one shelved");
+    write_file(workspace.root(), "two.md", b"two remains");
+
+    let mut context =
+        DraftlineCommandContext::new().with_contributor_profile(attribution_profile());
+    let shelved = selected_shelve_with_context(
+        &mut context,
+        SelectedShelveRequest {
+            workspace_path: temp.path().to_path_buf(),
+            paths: vec![PathBuf::from("one.md")],
+            name: "context-shelf".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_context_attribution(&shelved.shelf.version);
+    assert_eq!(read_file(workspace.root(), "one.md"), "one");
+    assert_eq!(read_file(workspace.root(), "two.md"), "two remains");
+
+    write_file(workspace.root(), "one.md", b"one again");
+    let plain = selected_shelve(SelectedShelveRequest {
+        workspace_path: temp.path().to_path_buf(),
+        paths: vec![PathBuf::from("one.md")],
+        name: "plain-shelf".to_string(),
+    })
+    .unwrap();
+    assert_eq!(plain.shelf.version.author.name, "Dogfood Bot");
+    assert_eq!(plain.shelf.version.saved_by.name, "Dogfood Bot");
 }
 
 #[test]
