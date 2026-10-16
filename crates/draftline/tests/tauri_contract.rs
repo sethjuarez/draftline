@@ -2,25 +2,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use draftline::tauri_contract::{
-    adopt_remote_variation, adopt_workspace, apply_history_cleanup, apply_incoming, apply_shelf,
-    audit_content_policy, clone_workspace, create_variation_from_version,
-    create_variation_from_version_guarded, diff_version_to_workspace, diff_versions,
-    diff_workspace_file, fetch_remote, get_changes, get_full_history, get_history,
-    get_history_compaction_candidates, get_workspace_graph, get_workspace_graph_agent_summary,
-    get_workspace_graph_around_version, get_workspace_graph_common_ancestor,
-    get_workspace_graph_compare_summary, get_workspace_graph_for_variation,
-    get_workspace_graph_neighborhood, get_workspace_graph_node, get_workspace_graph_overview,
-    get_workspace_graph_path, get_workspace_graph_refs, get_workspace_graph_summary,
-    inspect_workspace, into_tauri_result, list_remote_variations, list_remotes, list_shelves,
-    list_support_refs, list_variations, merge_conflict_view_model, merge_incoming,
-    merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context, open_workspace,
-    preflight_apply_incoming, preflight_apply_shelf, preflight_create_variation_from_version,
-    preflight_history_cleanup_remote_impact, preflight_merge_incoming,
-    preflight_publish_history_cleanup, preflight_rename_variation, preflight_switch_variation,
-    preflight_undo_history_cleanup, preview_history_cleanup, preview_shelf, preview_version,
-    preview_version_file, preview_workspace_file, publish_current_variation,
-    publish_history_cleanup, rename_variation, resolve_rewritten_version,
-    restore_version_as_new_save, restore_version_as_new_save_to_variation,
+    adopt_remote_variation, adopt_workspace, apply_history_cleanup,
+    apply_history_cleanup_with_context, apply_incoming, apply_shelf, audit_content_policy,
+    clone_workspace, create_variation_from_version, create_variation_from_version_guarded,
+    diff_version_to_workspace, diff_versions, diff_workspace_file, fetch_remote, get_changes,
+    get_full_history, get_history, get_history_compaction_candidates, get_workspace_graph,
+    get_workspace_graph_agent_summary, get_workspace_graph_around_version,
+    get_workspace_graph_common_ancestor, get_workspace_graph_compare_summary,
+    get_workspace_graph_for_variation, get_workspace_graph_neighborhood, get_workspace_graph_node,
+    get_workspace_graph_overview, get_workspace_graph_path, get_workspace_graph_refs,
+    get_workspace_graph_summary, inspect_workspace, into_tauri_result, list_remote_variations,
+    list_remotes, list_shelves, list_support_refs, list_variations, merge_conflict_view_model,
+    merge_incoming, merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
+    open_workspace, preflight_apply_incoming, preflight_apply_shelf,
+    preflight_create_variation_from_version, preflight_history_cleanup_remote_impact,
+    preflight_merge_incoming, preflight_publish_history_cleanup, preflight_rename_variation,
+    preflight_switch_variation, preflight_undo_history_cleanup, preview_history_cleanup,
+    preview_history_cleanup_with_context, preview_shelf, preview_version, preview_version_file,
+    preview_workspace_file, publish_current_variation, publish_history_cleanup, rename_variation,
+    resolve_rewritten_version, restore_version_as_new_save,
+    restore_version_as_new_save_to_variation,
     restore_version_as_new_save_to_variation_with_context,
     restore_version_as_new_save_with_context, save, search_workspace_graph, selected_discard,
     selected_save, selected_save_with_context, selected_shelve, selected_shelve_with_context,
@@ -1483,6 +1484,108 @@ fn tauri_contract_restore_with_context_records_profile() {
     .unwrap();
     assert_eq!(plain.version.author.name, "Dogfood Bot");
     assert_eq!(plain.version.saved_by.name, "Dogfood Bot");
+}
+
+fn cleanup_workspace_with_noise() -> (tempfile::TempDir, HistoryCleanupRequest) {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"v1");
+    workspace.save_version("v1").unwrap();
+    write_file(workspace.root(), "post.md", b"v2");
+    let v2 = workspace.save_version("noisy v2").unwrap();
+    write_file(workspace.root(), "post.md", b"v3");
+    let v3 = workspace.save_version("noisy v3").unwrap();
+    let cleanup = HistoryCleanupRequest {
+        target_variation: None,
+        base: CleanupBase::Auto,
+        mode: CleanupMode::CompactMilestones {
+            milestones: vec![MilestoneSpec {
+                title: "Clean milestone".to_string(),
+                description: None,
+                include_range: CommitRange {
+                    start: v2.id().clone(),
+                    end: v3.id().clone(),
+                },
+            }],
+            preserve_named_branches: true,
+            preserve_merge_boundaries: true,
+        },
+        safety: CleanupSafety::default_user_facing(),
+        remote_policy: RemoteRewritePolicy::LocalOnly,
+    };
+    (temp, cleanup)
+}
+
+fn commit_attribution(root: &Path, id: &str) -> (Contributor, Contributor) {
+    let repo = git2::Repository::open(root).unwrap();
+    let commit = repo.find_commit(git2::Oid::from_str(id).unwrap()).unwrap();
+    let contributor = |signature: git2::Signature<'_>| Contributor {
+        name: signature.name().unwrap().to_string(),
+        email: signature.email().map(ToString::to_string),
+    };
+    (
+        contributor(commit.author()),
+        contributor(commit.committer()),
+    )
+}
+
+fn assert_context_commit_attribution(root: &Path, id: &str) {
+    let (author, saved_by) = commit_attribution(root, id);
+    assert_eq!(author.name, "Context Author");
+    assert_eq!(author.email.as_deref(), Some("author@context.invalid"));
+    assert_eq!(saved_by.name, "Context Saver");
+    assert_eq!(saved_by.email.as_deref(), Some("saver@context.invalid"));
+}
+
+#[test]
+fn tauri_contract_history_cleanup_with_context_records_profile() {
+    let (temp, cleanup) = cleanup_workspace_with_noise();
+    let mut context =
+        DraftlineCommandContext::new().with_contributor_profile(attribution_profile());
+    let preview = preview_history_cleanup_with_context(
+        &context,
+        PreviewHistoryCleanupRequest {
+            workspace_path: temp.path().to_path_buf(),
+            cleanup,
+        },
+    )
+    .unwrap();
+    assert_context_commit_attribution(temp.path(), preview.new_head.as_str());
+    let result = apply_history_cleanup_with_context(
+        &mut context,
+        ApplyHistoryCleanupRequest {
+            workspace_path: temp.path().to_path_buf(),
+            plan_id: preview.plan_id.to_string(),
+            confirmation: RewriteConfirmation::UserConfirmed,
+        },
+    )
+    .unwrap();
+    assert_eq!(result.new_head, preview.new_head);
+
+    let (temp, cleanup) = cleanup_workspace_with_noise();
+    let preview = preview_history_cleanup(PreviewHistoryCleanupRequest {
+        workspace_path: temp.path().to_path_buf(),
+        cleanup,
+    })
+    .unwrap();
+    assert_eq!(
+        commit_attribution(temp.path(), preview.new_head.as_str())
+            .0
+            .name,
+        "Dogfood Bot"
+    );
+    let result = apply_history_cleanup_with_context(
+        &mut context,
+        ApplyHistoryCleanupRequest {
+            workspace_path: temp.path().to_path_buf(),
+            plan_id: preview.plan_id.to_string(),
+            confirmation: RewriteConfirmation::UserConfirmed,
+        },
+    )
+    .unwrap();
+    assert_ne!(result.new_head, preview.new_head);
+    assert_context_commit_attribution(temp.path(), result.new_head.as_str());
 }
 
 #[test]

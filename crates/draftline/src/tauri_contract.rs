@@ -1196,7 +1196,15 @@ pub fn preview_history_cleanup_with_context(
 ) -> Result<HistoryCleanupPreview> {
     let workspace = context.open_workspace(&request.workspace_path)?;
     let mut options = context.remote_options();
-    workspace.preview_history_cleanup_with_options(request.cleanup, &mut options)
+    if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.preview_history_cleanup_with_options_and_profile(
+            request.cleanup,
+            &mut options,
+            profile,
+        )
+    } else {
+        workspace.preview_history_cleanup_with_options(request.cleanup, &mut options)
+    }
 }
 
 /// Applies a durable history cleanup plan.
@@ -1213,7 +1221,11 @@ pub fn apply_history_cleanup_with_context(
 ) -> Result<TimelineCleanupResult> {
     let workspace = context.open_workspace(&request.workspace_path)?;
     let plan_id = CleanupPlanId::from_string(request.plan_id)?;
-    let result = workspace.apply_history_cleanup(plan_id, request.confirmation)?;
+    let result = if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.apply_history_cleanup_with_profile(plan_id, request.confirmation, profile)?
+    } else {
+        workspace.apply_history_cleanup(plan_id, request.confirmation)?
+    };
     context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
     Ok(result)
 }

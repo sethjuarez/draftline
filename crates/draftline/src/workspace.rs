@@ -1878,6 +1878,7 @@ struct CompactCleanupPlanInput<'a> {
     milestones: &'a [MilestoneSpec],
     preserve_named_branches: bool,
     preserve_merge_boundaries: bool,
+    profile: Option<&'a ContributorProfile>,
 }
 
 /// Diff between two versions or between a version and the current workspace.
@@ -6833,11 +6834,42 @@ impl Workspace {
         self.preview_history_cleanup_with_options(request, &mut options)
     }
 
+    /// Prepares a durable local cleanup plan whose milestone commits use host-supplied
+    /// attribution. Replayed descendants keep their original author and committer.
+    pub fn preview_history_cleanup_with_profile(
+        &self,
+        request: HistoryCleanupRequest,
+        profile: &ContributorProfile,
+    ) -> Result<HistoryCleanupPreview> {
+        let mut options = RemoteOptions::new();
+        self.preview_history_cleanup_with_optional_profile(request, &mut options, Some(profile))
+    }
+
     /// Prepares a durable timeline cleanup plan with explicit remote options.
     pub fn preview_history_cleanup_with_options(
         &self,
         request: HistoryCleanupRequest,
         options: &mut RemoteOptions<'_>,
+    ) -> Result<HistoryCleanupPreview> {
+        self.preview_history_cleanup_with_optional_profile(request, options, None)
+    }
+
+    /// Prepares a durable timeline cleanup plan with explicit remote options and
+    /// host-supplied attribution for milestone commits.
+    pub fn preview_history_cleanup_with_options_and_profile(
+        &self,
+        request: HistoryCleanupRequest,
+        options: &mut RemoteOptions<'_>,
+        profile: &ContributorProfile,
+    ) -> Result<HistoryCleanupPreview> {
+        self.preview_history_cleanup_with_optional_profile(request, options, Some(profile))
+    }
+
+    fn preview_history_cleanup_with_optional_profile(
+        &self,
+        request: HistoryCleanupRequest,
+        options: &mut RemoteOptions<'_>,
+        profile: Option<&ContributorProfile>,
     ) -> Result<HistoryCleanupPreview> {
         self.ensure_no_pending_recovery()?;
         let target_variation = match request.target_variation.clone() {
@@ -6894,6 +6926,7 @@ impl Workspace {
             milestones,
             preserve_named_branches,
             preserve_merge_boundaries,
+            profile,
         })?;
         let remote_impact_remote =
             if let RemoteRewritePolicy::PushWithLease { remote, branch } = &request.remote_policy {
@@ -6977,11 +7010,37 @@ impl Workspace {
     pub fn apply_history_cleanup(
         &self,
         plan_id: CleanupPlanId,
+        confirmation: RewriteConfirmation,
+    ) -> Result<TimelineCleanupResult> {
+        self.apply_history_cleanup_with_optional_profile(plan_id, confirmation, None)
+    }
+
+    /// Applies a durable cleanup preview so its milestone commits record host-supplied
+    /// attribution.
+    ///
+    /// When the preview's milestone commits already carry this profile, the preview is
+    /// applied as-is. Otherwise the milestones are re-created with the profile before any
+    /// visible ref moves; the re-created plan must match the preview's rewrite map and
+    /// ref updates, or the apply fails and asks for a new preview. Replayed descendants
+    /// keep their original author and committer.
+    pub fn apply_history_cleanup_with_profile(
+        &self,
+        plan_id: CleanupPlanId,
+        confirmation: RewriteConfirmation,
+        profile: &ContributorProfile,
+    ) -> Result<TimelineCleanupResult> {
+        self.apply_history_cleanup_with_optional_profile(plan_id, confirmation, Some(profile))
+    }
+
+    fn apply_history_cleanup_with_optional_profile(
+        &self,
+        plan_id: CleanupPlanId,
         _confirmation: RewriteConfirmation,
+        profile: Option<&ContributorProfile>,
     ) -> Result<TimelineCleanupResult> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "history_cleanup")?;
-        let stored = self.read_history_cleanup_plan(&plan_id)?;
+        let mut stored = self.read_history_cleanup_plan(&plan_id)?;
         self.ensure_no_pending_history_cleanup(
             "history_cleanup",
             Some(stored.preview.target_variation.as_str()),
@@ -6999,7 +7058,8 @@ impl Workspace {
             }
         }
 
-        let variation = stored.preview.target_variation.as_str();
+        let variation = stored.preview.target_variation.as_str().to_owned();
+        let variation = variation.as_str();
         let branch_ref = format!("refs/heads/{variation}");
         let old_head_oid = oid_from_version(&stored.preview.old_head)?;
         let new_head_oid = oid_from_version(&stored.preview.new_head)?;
@@ -7017,14 +7077,30 @@ impl Workspace {
             }
         }
 
-        let actual_preview = self
-            .repo
-            .refname_to_id(stored.preview.preview_ref.as_str())?;
-        if actual_preview != new_head_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{}@{new_head_oid}", stored.preview.preview_ref.as_str()),
-                actual: format!("{}@{actual_preview}", stored.preview.preview_ref.as_str()),
-            });
+        let remint_profile = match profile {
+            Some(profile)
+                if !self.history_cleanup_milestones_match_profile(&stored.preview, profile)? =>
+            {
+                Some(profile)
+            }
+            _ => None,
+        };
+        // A re-mint regenerates the preview from the verified refs and overwrites the
+        // preview ref, so the preview-ref check is skipped. This keeps a retry safe if
+        // a previous re-mint was interrupted between the ref move and the plan write.
+        if let Some(profile) = remint_profile {
+            stored.preview = self.reattribute_history_cleanup_preview(&stored, profile)?;
+            self.write_history_cleanup_plan(&stored)?;
+        } else {
+            let actual_preview = self
+                .repo
+                .refname_to_id(stored.preview.preview_ref.as_str())?;
+            if actual_preview != new_head_oid {
+                return Err(DraftlineError::LocalStateChanged {
+                    expected: format!("{}@{new_head_oid}", stored.preview.preview_ref.as_str()),
+                    actual: format!("{}@{actual_preview}", stored.preview.preview_ref.as_str()),
+                });
+            }
         }
 
         let mut backup_refs = Vec::new();
@@ -8856,6 +8932,100 @@ impl Workspace {
             .map_err(|_| DraftlineError::VersionNotFound(version.to_string()))
     }
 
+    fn history_cleanup_milestones_match_profile(
+        &self,
+        preview: &HistoryCleanupPreview,
+        profile: &ContributorProfile,
+    ) -> Result<bool> {
+        let (author, committer) = self.workspace_signatures(Some(profile))?;
+        for operation in &preview.operations {
+            let commit = self
+                .repo
+                .find_commit(oid_from_version(&operation.new_version)?)?;
+            let commit_author = commit.author();
+            let commit_committer = commit.committer();
+            if commit_author.name_bytes() != author.name_bytes()
+                || commit_author.email_bytes() != author.email_bytes()
+                || commit_committer.name_bytes() != committer.name_bytes()
+                || commit_committer.email_bytes() != committer.email_bytes()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Re-creates a stored cleanup preview's milestone commits with `profile` and returns the
+    /// updated preview. The caller must already have verified the stored plan against the
+    /// live refs; any structural drift from the stored preview is rejected.
+    fn reattribute_history_cleanup_preview(
+        &self,
+        stored: &HistoryCleanupStoredPlan,
+        profile: &ContributorProfile,
+    ) -> Result<HistoryCleanupPreview> {
+        let preview = &stored.preview;
+        let CleanupMode::CompactMilestones {
+            milestones,
+            preserve_named_branches,
+            preserve_merge_boundaries,
+        } = &stored.request.mode;
+        let planned = self.plan_compact_milestones(CompactCleanupPlanInput {
+            target_variation: &preview.target_variation,
+            old_head_oid: oid_from_version(&preview.old_head)?,
+            base: &stored.request.base,
+            milestones,
+            preserve_named_branches: *preserve_named_branches,
+            preserve_merge_boundaries: *preserve_merge_boundaries,
+            profile: Some(profile),
+        })?;
+
+        let same_commit_map =
+            planned.commit_map.len() == preview.commit_map.len()
+                && planned.commit_map.iter().zip(&preview.commit_map).all(
+                    |(planned, previewed)| {
+                        planned.old == previewed.old
+                            && std::mem::discriminant(&planned.disposition)
+                                == std::mem::discriminant(&previewed.disposition)
+                    },
+                );
+        let same_ref_updates = planned.planned_ref_updates.len()
+            == preview.planned_ref_updates.len()
+            && planned
+                .planned_ref_updates
+                .iter()
+                .zip(&preview.planned_ref_updates)
+                .all(|(planned, previewed)| {
+                    planned.name == previewed.name && planned.old == previewed.old
+                });
+        if !same_commit_map || !same_ref_updates {
+            return Err(DraftlineError::InvalidHistoryCleanup(
+                "history cleanup plan no longer matches the workspace; preview the cleanup again"
+                    .to_string(),
+            ));
+        }
+
+        let new_head = VersionId::from(planned.new_head_oid);
+        self.repo.reference(
+            preview.preview_ref.as_str(),
+            planned.new_head_oid,
+            true,
+            "reattribute history cleanup preview",
+        )?;
+
+        let mut updated = preview.clone();
+        updated.new_head = new_head.clone();
+        updated.graph_diff.new_head = new_head.clone();
+        updated.affected_refs = planned.affected_refs;
+        updated.planned_ref_updates = planned.planned_ref_updates;
+        updated.operations = planned.operations;
+        updated.commit_map = planned.commit_map;
+        updated.snapshot_map = planned.snapshot_map;
+        if let Some(impact) = updated.remote_impact.as_mut() {
+            impact.replacement_head = Some(new_head);
+        }
+        Ok(updated)
+    }
+
     fn plan_compact_milestones(
         &self,
         input: CompactCleanupPlanInput<'_>,
@@ -8867,6 +9037,7 @@ impl Workspace {
             milestones,
             preserve_named_branches: _preserve_named_branches,
             preserve_merge_boundaries,
+            profile,
         } = input;
 
         if milestones.is_empty() {
@@ -8902,7 +9073,7 @@ impl Workspace {
         let mut oid_rewrites = HashMap::new();
         let mut previous_new_oid = base_parent_oid;
         let mut previous_old_end = base_parent_oid;
-        let signature = self.workspace_signature()?;
+        let (author, committer) = self.workspace_signatures(profile)?;
 
         for milestone in milestones {
             let title = milestone.title.trim();
@@ -8947,8 +9118,8 @@ impl Workspace {
             let message = cleanup_commit_message(title, milestone.description.as_deref());
             let new_oid = self.repo.commit(
                 None,
-                &signature,
-                &signature,
+                &author,
+                &committer,
                 &message,
                 &tree,
                 parents.as_slice(),
@@ -9389,10 +9560,10 @@ impl Workspace {
 
     fn write_history_cleanup_plan(&self, plan: &HistoryCleanupStoredPlan) -> Result<()> {
         fs::create_dir_all(self.history_cleanup_plans_dir())?;
-        fs::write(
-            self.history_cleanup_plan_path(&plan.preview.plan_id),
-            serde_json::to_vec_pretty(plan)?,
-        )?;
+        let path = self.history_cleanup_plan_path(&plan.preview.plan_id);
+        let temp = path.with_extension("json.tmp");
+        fs::write(&temp, serde_json::to_vec_pretty(plan)?)?;
+        fs::rename(&temp, &path)?;
         Ok(())
     }
 
@@ -10303,9 +10474,7 @@ impl Workspace {
             ));
         }
 
-        let signature = self.workspace_signature()?;
-        let contributor = contributor_from_signature(&signature);
-        let signature = signature_from_contributor(&contributor)?;
+        let signature = self.workspace_signature()?.to_owned();
         Ok((signature.clone(), signature))
     }
 
@@ -18516,5 +18685,279 @@ mod tests {
         assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
         workspace.ensure_no_pending_recovery().unwrap();
         assert_eq!(workspace.repo.head().unwrap().target().unwrap(), head);
+    }
+
+    fn descendant_profile() -> ContributorProfile {
+        ContributorProfile::new(
+            Contributor {
+                name: "Descendant Author".to_string(),
+                email: Some("descendant@profile.invalid".to_string()),
+            },
+            Contributor {
+                name: "Descendant Saver".to_string(),
+                email: Some("descendant-saver@profile.invalid".to_string()),
+            },
+        )
+    }
+
+    /// v1 → v2 → v3 → v4, where v4 is a descendant saved under a distinct identity.
+    fn cleanup_fixture(workspace: &Workspace) -> (Version, Version, Version) {
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("noisy autosave").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("another noisy autosave").unwrap();
+        write_file(workspace.root(), "post.md", b"v4");
+        let v4 = workspace
+            .save_version_with_profile("descendant", &descendant_profile())
+            .unwrap();
+        (v2, v3, v4)
+    }
+
+    fn cleanup_versions(
+        workspace: &Workspace,
+        result: &TimelineCleanupResult,
+    ) -> (Version, Version) {
+        let milestone = result
+            .commit_map
+            .iter()
+            .find_map(|entry| match &entry.disposition {
+                RewriteDisposition::SquashedInto { new_id } => Some(new_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let descendant = result
+            .commit_map
+            .iter()
+            .find_map(|entry| match &entry.disposition {
+                RewriteDisposition::Preserved { new_id } => Some(new_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let load = |id: &VersionId| {
+            version_from_commit(
+                &workspace
+                    .repo
+                    .find_commit(oid_from_version(id).unwrap())
+                    .unwrap(),
+            )
+        };
+        (load(&milestone), load(&descendant))
+    }
+
+    fn assert_descendant_attribution(version: &Version) {
+        assert_eq!(version.label, "descendant");
+        assert_eq!(version.author.name, "Descendant Author");
+        assert_eq!(version.saved_by.name, "Descendant Saver");
+    }
+
+    #[test]
+    fn history_cleanup_with_profile_attributes_milestones_and_keeps_descendants() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, _v4) = cleanup_fixture(&workspace);
+
+        let preview = workspace
+            .preview_history_cleanup_with_profile(
+                compact_cleanup_request(&v2, &v3),
+                &attribution_profile(),
+            )
+            .unwrap();
+        let result = workspace
+            .apply_history_cleanup_with_profile(
+                preview.plan_id.clone(),
+                RewriteConfirmation::UserConfirmed,
+                &attribution_profile(),
+            )
+            .unwrap();
+
+        assert_eq!(result.new_head, preview.new_head);
+        let (milestone, descendant) = cleanup_versions(&workspace, &result);
+        assert_profile_attribution(&milestone);
+        assert_descendant_attribution(&descendant);
+    }
+
+    #[test]
+    fn history_cleanup_apply_with_profile_reattributes_unprofiled_preview() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, v4) = cleanup_fixture(&workspace);
+
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        let previewed = version_from_commit(
+            &workspace
+                .repo
+                .find_commit(oid_from_version(&preview.operations[0].new_version).unwrap())
+                .unwrap(),
+        );
+        assert_git_config_attribution(&previewed);
+
+        let result = workspace
+            .apply_history_cleanup_with_profile(
+                preview.plan_id.clone(),
+                RewriteConfirmation::UserConfirmed,
+                &attribution_profile(),
+            )
+            .unwrap();
+
+        assert_ne!(result.new_head, preview.new_head);
+        assert_eq!(result.old_head, v4.id().clone());
+        let (milestone, descendant) = cleanup_versions(&workspace, &result);
+        assert_profile_attribution(&milestone);
+        assert_descendant_attribution(&descendant);
+        let head = workspace
+            .repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(head.to_string(), result.new_head.as_str());
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id(preview.preview_ref.as_str())
+                .unwrap(),
+            head
+        );
+        let stored = workspace
+            .read_history_cleanup_plan(&preview.plan_id)
+            .unwrap();
+        assert_eq!(stored.preview.new_head, result.new_head);
+        assert_eq!(stored.preview.commit_map, result.commit_map);
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "v4"
+        );
+
+        let resolution = workspace
+            .resolve_rewritten_version(StaleVersionResolutionRequest {
+                version: v2.id().clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            resolution.disposition,
+            StaleVersionDisposition::SquashedInto { ref version } if version == milestone.id()
+        ));
+
+        let undo = workspace
+            .preflight_undo_history_cleanup(result.plan_id.clone())
+            .unwrap();
+        assert!(undo.can_undo);
+        let undone = workspace.undo_history_cleanup(undo.token).unwrap();
+        assert_eq!(undone.new_head, v4.id().clone());
+    }
+
+    #[test]
+    fn history_cleanup_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, _v4) = cleanup_fixture(&workspace);
+
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        let result = workspace
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+
+        assert_eq!(result.new_head, preview.new_head);
+        let (milestone, descendant) = cleanup_versions(&workspace, &result);
+        assert_git_config_attribution(&milestone);
+        assert_descendant_attribution(&descendant);
+    }
+
+    #[test]
+    fn history_cleanup_with_invalid_profile_fails_without_moving_refs() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, v4) = cleanup_fixture(&workspace);
+
+        let err = workspace
+            .preview_history_cleanup_with_profile(
+                compact_cleanup_request(&v2, &v3),
+                &invalid_profile(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        let err = workspace
+            .apply_history_cleanup_with_profile(
+                preview.plan_id.clone(),
+                RewriteConfirmation::UserConfirmed,
+                &invalid_profile(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+        workspace.ensure_no_pending_recovery().unwrap();
+        let head = workspace.repo.head().unwrap().target().unwrap();
+        assert_eq!(head.to_string(), v4.id().as_str());
+    }
+
+    #[test]
+    fn history_cleanup_apply_with_profile_recovers_interrupted_remint() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, _v4) = cleanup_fixture(&workspace);
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        let stored = workspace
+            .read_history_cleanup_plan(&preview.plan_id)
+            .unwrap();
+        // Simulate a crash after the preview ref moved but before the plan was rewritten.
+        workspace
+            .reattribute_history_cleanup_preview(&stored, &attribution_profile())
+            .unwrap();
+
+        let result = workspace
+            .apply_history_cleanup_with_profile(
+                preview.plan_id.clone(),
+                RewriteConfirmation::UserConfirmed,
+                &attribution_profile(),
+            )
+            .unwrap();
+        let (milestone, descendant) = cleanup_versions(&workspace, &result);
+        assert_profile_attribution(&milestone);
+        assert_descendant_attribution(&descendant);
+    }
+
+    #[test]
+    fn history_cleanup_apply_with_profile_rejects_plan_drift_before_moving_refs() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, v4) = cleanup_fixture(&workspace);
+
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        workspace
+            .create_variation_from(v4.id(), "late-branch")
+            .unwrap();
+
+        let err = workspace
+            .apply_history_cleanup_with_profile(
+                preview.plan_id.clone(),
+                RewriteConfirmation::UserConfirmed,
+                &attribution_profile(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DraftlineError::InvalidHistoryCleanup(ref message)
+                if message.contains("no longer matches the workspace")
+        ));
+        workspace.ensure_no_pending_recovery().unwrap();
+        let head = workspace.repo.head().unwrap().target().unwrap();
+        assert_eq!(head.to_string(), v4.id().as_str());
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id(preview.preview_ref.as_str())
+                .unwrap()
+                .to_string(),
+            preview.new_head.as_str()
+        );
     }
 }
