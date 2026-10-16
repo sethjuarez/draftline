@@ -20,16 +20,18 @@ use draftline::tauri_contract::{
     preflight_undo_history_cleanup, preview_history_cleanup, preview_shelf, preview_version,
     preview_version_file, preview_workspace_file, publish_current_variation,
     publish_history_cleanup, rename_variation, resolve_rewritten_version,
-    restore_version_as_new_save, restore_version_as_new_save_to_variation, save,
-    search_workspace_graph, selected_discard, selected_save, selected_save_with_context,
-    selected_shelve, selected_shelve_with_context, switch_variation, undo_history_cleanup,
-    verify_workspace, whole_file_use_content_resolutions, ApplyHistoryCleanupRequest,
-    CloneWorkspaceRequest, ConflictContentSource, CreateVariationFromVersionRequest,
-    CurrentFileRequest, DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
-    GuardedCreateVariationFromVersionRequest, HistoryCleanupRemoteImpactRequest,
-    HistoryCompactionCandidatesCommandRequest, ListSupportRefsRequest, MergeIncomingRequest,
-    MergeIncomingWithResolutionsRequest, PreflightCreateVariationFromVersionRequest,
-    PreviewHistoryCleanupRequest, PreviewVersionFileRequest, PublishCurrentVariationRequest,
+    restore_version_as_new_save, restore_version_as_new_save_to_variation,
+    restore_version_as_new_save_to_variation_with_context,
+    restore_version_as_new_save_with_context, save, search_workspace_graph, selected_discard,
+    selected_save, selected_save_with_context, selected_shelve, selected_shelve_with_context,
+    switch_variation, undo_history_cleanup, verify_workspace, whole_file_use_content_resolutions,
+    ApplyHistoryCleanupRequest, CloneWorkspaceRequest, ConflictContentSource,
+    CreateVariationFromVersionRequest, CurrentFileRequest, DiffVersionsRequest,
+    DraftlineCommandContext, DraftlineEventKind, GuardedCreateVariationFromVersionRequest,
+    HistoryCleanupRemoteImpactRequest, HistoryCompactionCandidatesCommandRequest,
+    ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
+    PreflightCreateVariationFromVersionRequest, PreviewHistoryCleanupRequest,
+    PreviewVersionFileRequest, PublishCurrentVariationRequest,
     PublishHistoryCleanupPreflightRequest, PublishHistoryCleanupRequest, RemoteRequest,
     RemoteVariationRequest, RenameVariationRequest, ResolveRewrittenVersionRequest,
     RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
@@ -1433,6 +1435,54 @@ fn tauri_contract_selected_shelve_with_context_records_profile() {
     .unwrap();
     assert_eq!(plain.shelf.version.author.name, "Dogfood Bot");
     assert_eq!(plain.shelf.version.saved_by.name, "Dogfood Bot");
+}
+
+#[test]
+fn tauri_contract_restore_with_context_records_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"base");
+    let base = workspace.save_version("Base").unwrap();
+    write_file(workspace.root(), "post.md", b"edited");
+    workspace.save_version("Edited").unwrap();
+
+    let mut context =
+        DraftlineCommandContext::new().with_contributor_profile(attribution_profile());
+    let restored = restore_version_as_new_save_with_context(
+        &mut context,
+        RestoreVersionRequest {
+            workspace_path: temp.path().to_path_buf(),
+            version_id: base.id().as_str().to_string(),
+            label: "Restore base".to_string(),
+        },
+    )
+    .unwrap();
+    assert_context_attribution(&restored.version);
+
+    let targeted = restore_version_as_new_save_to_variation_with_context(
+        &mut context,
+        TargetedRestoreVersionRequest {
+            workspace_path: temp.path().to_path_buf(),
+            version_id: base.id().as_str().to_string(),
+            label: "Restore to branch".to_string(),
+            target: RestoreVersionTarget::New {
+                name: "restored".to_string(),
+                metadata: Default::default(),
+            },
+        },
+    )
+    .unwrap();
+    assert_context_attribution(&targeted.version);
+
+    let plain = restore_version_as_new_save(RestoreVersionRequest {
+        workspace_path: temp.path().to_path_buf(),
+        version_id: base.id().as_str().to_string(),
+        label: "Plain restore".to_string(),
+    })
+    .unwrap();
+    assert_eq!(plain.version.author.name, "Dogfood Bot");
+    assert_eq!(plain.version.saved_by.name, "Dogfood Bot");
 }
 
 #[test]

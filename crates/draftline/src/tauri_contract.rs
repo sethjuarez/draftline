@@ -1884,7 +1884,11 @@ pub fn restore_version_as_new_save_with_context(
 ) -> Result<RestoreVersionResult> {
     let version_id = parse_version_id(request.version_id)?;
     let workspace = context.open_workspace(&request.workspace_path)?;
-    let version = workspace.restore_version_as_new_save(&version_id, request.label)?;
+    let version = if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.restore_version_as_new_save_with_profile(&version_id, request.label, profile)?
+    } else {
+        workspace.restore_version_as_new_save(&version_id, request.label)?
+    };
     context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
     Ok(RestoreVersionResult {
         version,
@@ -1919,11 +1923,20 @@ pub fn restore_version_as_new_save_to_variation_with_context(
 ) -> Result<TargetedRestoreVersionCommandResult> {
     let version_id = parse_version_id(request.version_id)?;
     let workspace = context.open_workspace(&request.workspace_path)?;
-    let result = workspace.restore_version_as_new_save_to_variation(
-        &version_id,
-        request.label,
-        request.target,
-    )?;
+    let result = if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.restore_version_as_new_save_to_variation_with_profile(
+            &version_id,
+            request.label,
+            request.target,
+            profile,
+        )?
+    } else {
+        workspace.restore_version_as_new_save_to_variation(
+            &version_id,
+            request.label,
+            request.target,
+        )?
+    };
     context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
     Ok(TargetedRestoreVersionCommandResult {
         version: result.version,

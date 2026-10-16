@@ -3644,6 +3644,7 @@ impl Workspace {
         }
 
         let _lock = OperationLock::acquire(&self.lock_path(), "shelve_files")?;
+        let (author, committer) = self.workspace_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -3655,7 +3656,6 @@ impl Workspace {
 
         let tree_id = self.write_selected_changes_tree(&changed_files)?;
         let tree = self.repo.find_tree(tree_id)?;
-        let (author, committer) = self.workspace_signatures(profile)?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             None,
@@ -4776,6 +4776,25 @@ impl Workspace {
         version: &VersionId,
         label: impl AsRef<str>,
     ) -> Result<Version> {
+        self.restore_version_as_new_save_with_optional_profile(version, label, None)
+    }
+
+    /// Creates a new version from an earlier version using host-supplied attribution.
+    pub fn restore_version_as_new_save_with_profile(
+        &self,
+        version: &VersionId,
+        label: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<Version> {
+        self.restore_version_as_new_save_with_optional_profile(version, label, Some(profile))
+    }
+
+    fn restore_version_as_new_save_with_optional_profile(
+        &self,
+        version: &VersionId,
+        label: impl AsRef<str>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "restore_version_as_new_save")?;
         let report = preflight_report(
@@ -4792,6 +4811,7 @@ impl Workspace {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
 
+        let (author, committer) = self.workspace_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -4803,12 +4823,11 @@ impl Workspace {
 
         let commit = self.find_version_commit(version)?;
         let tree = commit.tree()?;
-        let signature = self.workspace_signature()?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             Some("HEAD"),
-            &signature,
-            &signature,
+            &author,
+            &committer,
             label.as_ref(),
             &tree,
             &[&parent],
@@ -4840,6 +4859,35 @@ impl Workspace {
         label: impl AsRef<str>,
         target: RestoreVersionTarget,
     ) -> Result<TargetedRestoreVersionResult> {
+        self.restore_version_as_new_save_to_variation_with_optional_profile(
+            version, label, target, None,
+        )
+    }
+
+    /// Restores a saved version as a new save on a selected target variation using
+    /// host-supplied attribution.
+    pub fn restore_version_as_new_save_to_variation_with_profile(
+        &self,
+        version: &VersionId,
+        label: impl AsRef<str>,
+        target: RestoreVersionTarget,
+        profile: &ContributorProfile,
+    ) -> Result<TargetedRestoreVersionResult> {
+        self.restore_version_as_new_save_to_variation_with_optional_profile(
+            version,
+            label,
+            target,
+            Some(profile),
+        )
+    }
+
+    fn restore_version_as_new_save_to_variation_with_optional_profile(
+        &self,
+        version: &VersionId,
+        label: impl AsRef<str>,
+        target: RestoreVersionTarget,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<TargetedRestoreVersionResult> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(
             &self.lock_path(),
@@ -4863,6 +4911,7 @@ impl Workspace {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
 
+        let (author, committer) = self.workspace_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -4873,12 +4922,11 @@ impl Workspace {
         })?;
 
         let parent = self.repo.find_commit(parent_oid)?;
-        let signature = self.workspace_signature()?;
         let target_ref = format!("refs/heads/{target_name}");
         let oid = self.repo.commit(
             Some(&target_ref),
-            &signature,
-            &signature,
+            &author,
+            &committer,
             label.as_ref(),
             &source_tree,
             &[&parent],
@@ -9764,6 +9812,7 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<()> {
         let safe_name = validate_variation_name(name)?;
+        let (author, committer) = self.workspace_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -9791,7 +9840,6 @@ impl Workspace {
 
         let tree_id = index.write_tree()?;
         let tree = self.repo.find_tree(tree_id)?;
-        let (author, committer) = self.workspace_signatures(profile)?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             None,
@@ -18219,5 +18267,153 @@ mod tests {
         let saved = version_from_commit(&alt_tip);
         assert_eq!(saved.label, "Saved before switch");
         assert_profile_attribution(&saved);
+    }
+
+    fn invalid_profile() -> ContributorProfile {
+        ContributorProfile::new(
+            Contributor {
+                name: "   ".to_string(),
+                email: None,
+            },
+            Contributor {
+                name: "Profile Saver".to_string(),
+                email: None,
+            },
+        )
+    }
+
+    #[test]
+    fn shelve_with_invalid_profile_fails_without_pending_recovery() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"dirty");
+
+        let err = workspace
+            .shelve_files_with_profile("bad-shelf", ["post.md"], &invalid_profile())
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+        let err = workspace
+            .shelve_changes_with_profile("bad-shelf", &invalid_profile())
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+
+        workspace.ensure_no_pending_recovery().unwrap();
+        assert!(workspace.list_shelves().unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "dirty"
+        );
+    }
+
+    fn restore_fixture(workspace: &Workspace) -> Version {
+        write_file(workspace.root(), "post.md", b"first");
+        let first = workspace.save_version("First").unwrap();
+        write_file(workspace.root(), "post.md", b"second");
+        workspace.save_version("Second").unwrap();
+        first
+    }
+
+    #[test]
+    fn restore_version_as_new_save_with_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        let first = restore_fixture(&workspace);
+
+        let restored = workspace
+            .restore_version_as_new_save_with_profile(
+                first.id(),
+                "Restore first",
+                &attribution_profile(),
+            )
+            .unwrap();
+
+        assert_eq!(restored.label, "Restore first");
+        assert_profile_attribution(&restored);
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "first"
+        );
+    }
+
+    #[test]
+    fn restore_version_as_new_save_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        let first = restore_fixture(&workspace);
+
+        let restored = workspace
+            .restore_version_as_new_save(first.id(), "Restore first")
+            .unwrap();
+
+        assert_git_config_attribution(&restored);
+    }
+
+    #[test]
+    fn restore_with_invalid_profile_fails_without_pending_recovery() {
+        let (_temp, workspace) = attribution_workspace();
+        let first = restore_fixture(&workspace);
+        let head = workspace.repo.head().unwrap().target().unwrap();
+
+        let err = workspace
+            .restore_version_as_new_save_with_profile(first.id(), "Bad", &invalid_profile())
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+        let err = workspace
+            .restore_version_as_new_save_to_variation_with_profile(
+                first.id(),
+                "Bad",
+                RestoreVersionTarget::Current,
+                &invalid_profile(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+
+        workspace.ensure_no_pending_recovery().unwrap();
+        assert_eq!(workspace.repo.head().unwrap().target().unwrap(), head);
+    }
+
+    #[test]
+    fn restore_version_to_variation_with_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        let first = restore_fixture(&workspace);
+
+        let current = workspace
+            .restore_version_as_new_save_to_variation_with_profile(
+                first.id(),
+                "Restore on current",
+                RestoreVersionTarget::Current,
+                &attribution_profile(),
+            )
+            .unwrap();
+        assert_profile_attribution(&current.version);
+
+        let created = workspace
+            .restore_version_as_new_save_to_variation_with_profile(
+                first.id(),
+                "Restore on new",
+                RestoreVersionTarget::New {
+                    name: "restored".to_string(),
+                    metadata: VariationMetadata::default(),
+                },
+                &attribution_profile(),
+            )
+            .unwrap();
+        assert_eq!(created.target_variation.id().as_str(), "restored");
+        assert_profile_attribution(&created.version);
+    }
+
+    #[test]
+    fn restore_version_to_variation_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        let first = restore_fixture(&workspace);
+
+        let restored = workspace
+            .restore_version_as_new_save_to_variation(
+                first.id(),
+                "Restore on current",
+                RestoreVersionTarget::Current,
+            )
+            .unwrap();
+
+        assert_git_config_attribution(&restored.version);
     }
 }
