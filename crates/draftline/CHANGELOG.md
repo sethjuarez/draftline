@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.4.0...draftline-v0.5.0) (2026-10-17)
+
+
+### Features
+
+* **merge:** add additive milestone merge publishing ([7c292a0](https://github.com/sethjuarez/draftline/commit/7c292a07dc4ca610b8b29036c4bd98ee998e6d85))
+
 ## [0.4.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.3.0...draftline-v0.4.0) (2026-10-17)
 
 
