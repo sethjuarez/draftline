@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.3.0...draftline-v0.4.0) (2026-10-17)
+
+
+### Features
+
+* **workspace:** honor contributor profiles in every commit-creating operation ([#45](https://github.com/sethjuarez/draftline/issues/45)) ([e41294b](https://github.com/sethjuarez/draftline/commit/e41294b401ee454f14e2332cc11d46b628f137d8))
+
 ## [0.3.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.2.17...draftline-v0.3.0) (2026-08-27)
 
 
