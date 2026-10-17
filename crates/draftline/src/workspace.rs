@@ -3645,7 +3645,7 @@ impl Workspace {
         }
 
         let _lock = OperationLock::acquire(&self.lock_path(), "shelve_files")?;
-        let (author, committer) = self.workspace_signatures(profile)?;
+        let (author, committer) = self.rewrite_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -4812,7 +4812,7 @@ impl Workspace {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
 
-        let (author, committer) = self.workspace_signatures(profile)?;
+        let (author, committer) = self.rewrite_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -4912,7 +4912,7 @@ impl Workspace {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
 
-        let (author, committer) = self.workspace_signatures(profile)?;
+        let (author, committer) = self.rewrite_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -6750,7 +6750,7 @@ impl Workspace {
         let squash_parent_oid = Oid::from_str(&token.squash_parent_oid)?;
         let squash_parent = self.repo.find_commit(squash_parent_oid)?;
         let tree = head_commit.tree()?;
-        let (author, committer) = self.workspace_signatures(profile)?;
+        let (author, committer) = self.rewrite_signatures(profile)?;
 
         // Create the squash commit without touching any ref yet — git2 would
         // reject Some("HEAD") here because squash_parent is not the current tip.
@@ -9073,7 +9073,7 @@ impl Workspace {
         let mut oid_rewrites = HashMap::new();
         let mut previous_new_oid = base_parent_oid;
         let mut previous_old_end = base_parent_oid;
-        let (author, committer) = self.workspace_signatures(profile)?;
+        let (author, committer) = self.rewrite_signatures(profile)?;
 
         for milestone in milestones {
             let title = milestone.title.trim();
@@ -10022,7 +10022,7 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<()> {
         let safe_name = validate_variation_name(name)?;
-        let (author, committer) = self.workspace_signatures(profile)?;
+        let (author, committer) = self.rewrite_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -10474,6 +10474,21 @@ impl Workspace {
             ));
         }
 
+        let signature = self.workspace_signature()?;
+        let contributor = contributor_from_signature(&signature);
+        let signature = signature_from_contributor(&contributor)?;
+        Ok((signature.clone(), signature))
+    }
+
+    /// Like [`Self::workspace_signatures`], but without a profile it returns the exact
+    /// Git config signature that these operations used before they became profile-aware.
+    fn rewrite_signatures(
+        &self,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<(Signature<'static>, Signature<'static>)> {
+        if profile.is_some() {
+            return self.workspace_signatures(profile);
+        }
         let signature = self.workspace_signature()?.to_owned();
         Ok((signature.clone(), signature))
     }
@@ -18365,6 +18380,37 @@ mod tests {
         let workspace = Workspace::init(temp.path()).unwrap();
         configure_identity(&workspace, "Seth", "seth@example.com");
         (temp, workspace)
+    }
+
+    #[test]
+    fn no_profile_operations_keep_their_pre_profile_git_config_signatures() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let mut config = fs::read(workspace.repo.path().join("config")).unwrap();
+        config.extend_from_slice(b"[user]\n\tname = Jos\xe9\n\temail = jose@example.com\n");
+        fs::write(workspace.repo.path().join("config"), config).unwrap();
+        let names = |version: &Version| {
+            let commit = workspace
+                .repo
+                .find_commit(oid_from_version(version.id()).unwrap())
+                .unwrap();
+            let author = commit.author().name_bytes().to_vec();
+            let committer = commit.committer().name_bytes().to_vec();
+            (author, committer)
+        };
+
+        write_file(workspace.root(), "post.md", b"base");
+        let saved = workspace.save_version("Base").unwrap();
+        // Save has always normalized the config identity through `Contributor`.
+        assert_eq!(names(&saved), (b"Unknown".to_vec(), b"Unknown".to_vec()));
+
+        write_file(workspace.root(), "post.md", b"shelved");
+        let shelf = workspace.shelve_changes("wip").unwrap();
+        // Shelve, restore, squash and cleanup have always used the raw config signature.
+        assert_eq!(
+            names(&shelf.version),
+            (b"Jos\xe9".to_vec(), b"Jos\xe9".to_vec())
+        );
     }
 
     #[test]
