@@ -1,5 +1,5 @@
 {
-  "crates/draftline": "0.3.0",
+  "crates/draftline": "0.4.0",
   "packages/client": "0.1.15",
   "packages/react": "0.1.15",
   "site": "0.1.0"
