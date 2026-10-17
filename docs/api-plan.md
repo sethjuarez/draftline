@@ -261,10 +261,14 @@ Support refs should be:
 | `Workspace::preflight_publish_history_cleanup(plan_id, remote)` | Captures expected remote OID, replacement OID, and support-ref publish token for a local cleanup that is ready to share. Implemented. |
 | `Workspace::publish_history_cleanup(token, confirmation)` | Publishes cleanup support refs first, then moves the visible remote branch with expected-OID lease protection. Implemented. |
 | `Workspace::fetch_remote(remote)` / `Workspace::apply_incoming(remote)` | Fetch support refs with visible refs and apply recognized incoming compaction rewrites, including safe first-parent replay of local-only snapshots. Implemented. |
+| `Workspace::preflight_milestone_merge(remote)` | Validate a clean local-ahead current variation can be wrapped as an additive milestone merge without rewriting save history. Implemented for Flow 10a. |
+| `Workspace::create_milestone_merge(token, label)` | Create a normal two-parent milestone commit whose first parent is the shared remote tip and second parent is the local save-chain tip, then leave publication to normal guarded publish. Implemented for Flow 10a. |
 
 Shared visible refs should never be deleted or replaced unless the recovery support ref is durably published to the shared remote.
 
 Timeline cleanup remains local-first for the rewrite itself: hosts preview and apply locally before sharing. Shared publication is explicit through `preflight_publish_history_cleanup` / `publish_history_cleanup`, which publishes support refs before the lease-guarded visible branch move. Incoming shared compaction is handled through normal fetch/sync/apply paths once support refs are fetched; dirty work blocks and ambiguous merge-shaped local history stays in merge flow.
+
+Milestone merge is the non-rewrite alternative for sharing a clean main line. It preserves every original save commit and creates one named merge commit that can be published with normal fast-forward/lease semantics; it is not part of cleanup publish and must not require force-push or remote replacement.
 
 ## Phase 7: purge/redaction
 

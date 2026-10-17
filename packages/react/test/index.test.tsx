@@ -12,8 +12,10 @@ import {
   ChangedFilesList,
   ContentPolicyDiagnosticsPanel,
   createDraftlineHistoryGraph,
+  createDraftlineWorkspaceGraphModel,
   createDraftlineVariationListModel,
   DraftlineHistoryGraph,
+  DraftlineWorkspaceGraph,
   DraftlineProvider,
   DraftlineVariationSelect,
   RawInspectorPanel,
@@ -23,6 +25,14 @@ import {
   useDraftlineWorkspace,
 } from '../src/index';
 import { useState } from 'react';
+
+class ResizeObserverMock {
+  disconnect() {}
+  observe() {}
+  unobserve() {}
+}
+
+globalThis.ResizeObserver = ResizeObserverMock as typeof ResizeObserver;
 
 afterEach(() => cleanup());
 
@@ -434,6 +444,66 @@ describe('@draftline/react', () => {
     expect(selected).toHaveBeenCalledTimes(1);
   });
 
+  it('creates first-parent and expanded WorkspaceGraph models for milestone merges', () => {
+    const expanded = createDraftlineWorkspaceGraphModel(milestoneWorkspaceGraph, {
+      view: 'expanded',
+    });
+    const firstParent = createDraftlineWorkspaceGraphModel(milestoneWorkspaceGraph, {
+      view: 'first-parent',
+    });
+
+    expect(expanded.nodes.map((node) => node.id).sort()).toEqual([
+      'node-a',
+      'node-b',
+      'node-c',
+      'node-m',
+    ]);
+    expect(expanded.edges.map((edge) => [edge.source, edge.target, edge.data?.parentIndex])).toEqual([
+      ['node-a', 'node-b', 0],
+      ['node-b', 'node-c', 0],
+      ['node-a', 'node-m', 0],
+      ['node-c', 'node-m', 1],
+    ]);
+    expect(firstParent.nodes.map((node) => node.id).sort()).toEqual(['node-a', 'node-m']);
+    expect(firstParent.edges.map((edge) => [edge.source, edge.target, edge.data?.parentIndex])).toEqual([
+      ['node-a', 'node-m', 0],
+    ]);
+    expect(firstParent.hiddenNodeCount).toBe(2);
+    expect(firstParent.nodes.find((node) => node.id === 'node-m')?.data).toEqual(
+      expect.objectContaining({
+        hiddenParentCount: 1,
+        isFirstParentProjection: true,
+        label: 'Milestone',
+        refs: ['main'],
+      }),
+    );
+  });
+
+  it('renders WorkspaceGraph nodes with host-owned content and selection', () => {
+    const model = createDraftlineWorkspaceGraphModel(milestoneWorkspaceGraph, {
+      view: 'first-parent',
+    });
+    const selected = vi.fn();
+
+    render(
+      <DraftlineWorkspaceGraph
+        model={model}
+        onSelectNode={selected}
+        renderNode={(node) => <span>commit:{node.data.label}</span>}
+      />,
+    );
+
+    const milestoneButton = screen.getByText('commit:Milestone').closest('button');
+    expect(milestoneButton).not.toBeNull();
+    fireEvent.click(milestoneButton as HTMLButtonElement);
+
+    expect(screen.getByText('commit:Shared base')).toBeTruthy();
+    expect(selected).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'node-m' }),
+      expect.objectContaining({ model }),
+    );
+  });
+
   it('creates a headless variation list model', () => {
     const model = createDraftlineVariationListModel({
       activeVariationId: 'main',
@@ -743,6 +813,58 @@ function errorMessage(error: unknown) {
   return '';
 }
 
+function workspaceGraphNode({
+  id,
+  isCurrent = false,
+  isMerge = false,
+  label,
+  parentIds,
+  row,
+  versionId,
+}: {
+  id: string;
+  isCurrent?: boolean;
+  isMerge?: boolean;
+  label: string;
+  parentIds: string[];
+  row: number;
+  versionId: string;
+}) {
+  return {
+    action_hints: [],
+    available_actions: [],
+    boundary: {
+      hidden_child_count: 0,
+      hidden_parent_count: 0,
+      missing_child_ids: [],
+      missing_parent_ids: [],
+    },
+    child_count: 0,
+    child_ids: [],
+    id,
+    is_branch_point: id === 'node-a',
+    is_current: isCurrent,
+    is_head: isCurrent,
+    is_merge: isMerge,
+    is_tip: isCurrent,
+    kind: 'normal' as const,
+    layout: { display_label: label, lane: isMerge ? 0 : 1, row },
+    parent_ids: parentIds,
+    parent_version_ids: parentIds.map((parentId) => `${parentId.slice(-1).repeat(40)}`),
+    reachable_from_local_variation: true,
+    reachable_from_remote_variation: false,
+    reachable_from_support_ref: false,
+    topo_index: row,
+    variation_tips: isCurrent ? ['main'] : [],
+    version: {
+      ...version,
+      id: versionId,
+      label,
+      time_seconds: row,
+    },
+  };
+}
+
 const version = {
   author: { name: 'Author', email: null },
   id: 'abc123',
@@ -782,6 +904,71 @@ const preflightReport = {
   unresolved_conflicts: [],
   untracked_assets: [],
   will_write_files: true,
+};
+
+const milestoneWorkspaceGraph = {
+  current_variation: 'main',
+  current_version: 'mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm',
+  dirty: { files: [], is_dirty: false },
+  has_more: false,
+  next_cursor: null,
+  nodes: [
+    workspaceGraphNode({
+      id: 'node-a',
+      label: 'Shared base',
+      parentIds: [],
+      row: 0,
+      versionId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    }),
+    workspaceGraphNode({
+      id: 'node-b',
+      label: 'Rough save',
+      parentIds: ['node-a'],
+      row: 1,
+      versionId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    }),
+    workspaceGraphNode({
+      id: 'node-c',
+      label: 'Polished save',
+      parentIds: ['node-b'],
+      row: 2,
+      versionId: 'cccccccccccccccccccccccccccccccccccccccc',
+    }),
+    workspaceGraphNode({
+      id: 'node-m',
+      isCurrent: true,
+      isMerge: true,
+      label: 'Milestone',
+      parentIds: ['node-a', 'node-c'],
+      row: 3,
+      versionId: 'mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm',
+    }),
+  ],
+  recovery: null,
+  refs: [
+    {
+      action_hints: [],
+      available_actions: [],
+      display_label: 'main',
+      group: null,
+      id: 'refs/heads/main',
+      is_current: true,
+      is_user_facing: true,
+      kind: 'local_variation' as const,
+      metadata: null,
+      name: 'main',
+      remote: null,
+      scope: 'local' as const,
+      support_ref_kind: null,
+      target: 'node-m',
+      target_version: 'mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm',
+      variation: 'main',
+    },
+  ],
+  snapshot_id: 'snapshot',
+  state_may_be_inconsistent: false,
+  was_pruned: false,
+  workspace_id: { root: 'C:/repo/' },
 };
 
 const fixtureDiagnostics: WorkspaceDiagnostics = {

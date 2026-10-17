@@ -7,7 +7,8 @@ use draftline::tauri_contract::{
     GuardedCreateVariationFromVersionRequest, GuardedCreateVariationFromVersionResult,
     HistoryCompactionCandidatesCommandRequest, ListSupportRefsRequest,
     MergeIncomingCommandResult, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
-    PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
+    MilestoneMergeCommandResult, MilestoneMergeRequest, PreflightCreateVariationFromVersionRequest,
+    PreviewVersionFileRequest,
     PublishCurrentVariationRequest, PublishCurrentVariationResult,
     RecoveryRequest, RemoteRequest, RemoteVariationRequest, RestoreVersionRequest,
     RestoreVersionResult, SaveRequest, SaveResult, SelectedDiscardRequest, SelectedDiscardResult,
@@ -21,12 +22,13 @@ use draftline::tauri_contract::{
 };
 use draftline::{
     ApplyIncomingReport, ChangeSet, ContentPolicyAudit, CurrentFileDiff, CurrentFilePreview,
-    HistoryCompactionCandidates, HistoryEntry, MergeIncomingReport, PreflightReport, PreviewFile,
-    RecoveryRepairResult, RemoteEndpoint, RemoteVariation, RemoteVariationDiagnostics, Shelf,
-    ShelfApplyReport, SupportRef, VariationCreatePreflight, VariationSummary, VersionDiff,
-    VersionPreview, WorkspaceGraph, WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor,
-    WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail, WorkspaceGraphPath, WorkspaceGraphRefs,
-    WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceVerification,
+    HistoryCompactionCandidates, HistoryEntry, MergeIncomingReport, MilestoneMergeReport,
+    PreflightReport, PreviewFile, RecoveryRepairResult, RemoteEndpoint, RemoteVariation,
+    RemoteVariationDiagnostics, Shelf, ShelfApplyReport, SupportRef, VariationCreatePreflight,
+    VariationSummary, VersionDiff, VersionPreview, WorkspaceGraph, WorkspaceGraphAgentSummary,
+    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail,
+    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
+    WorkspaceVerification,
 };
 use std::sync::{Mutex, MutexGuard};
 use tauri::{Emitter, Manager};
@@ -636,6 +638,30 @@ fn apply_incoming(
 }
 
 #[tauri::command]
+fn preflight_milestone_merge(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: RemoteRequest,
+) -> TauriCommandResult<MilestoneMergeReport> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::preflight_milestone_merge_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn create_milestone_merge(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: MilestoneMergeRequest,
+) -> TauriCommandResult<MilestoneMergeCommandResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::create_milestone_merge_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
 fn preflight_merge_incoming(
     state: tauri::State<'_, DraftlineContextState>,
     request: RemoteRequest,
@@ -754,6 +780,8 @@ fn main() {
             fetch_remote,
             preflight_apply_incoming,
             apply_incoming,
+            preflight_milestone_merge,
+            create_milestone_merge,
             preflight_merge_incoming,
             merge_incoming,
             merge_incoming_with_resolutions

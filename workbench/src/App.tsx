@@ -1,17 +1,20 @@
 import {
   ChangedFilesList,
   DraftlineProvider,
+  DraftlineWorkspaceGraph,
   OperationsPanel,
   RawInspectorPanel,
   VariationList,
   VersionLane,
   WorkspaceStatusRail,
   WorkspaceSummaryPanel,
+  createDraftlineWorkspaceGraphModel,
   useDraftlineWorkspace,
   type DraftlineClient,
+  type DraftlineWorkspaceGraphView,
 } from '@draftline/react';
 import { type WorkspaceGraph } from '@draftline/client';
-import { type FormEvent, useState } from 'react';
+import { type FormEvent, useMemo, useState } from 'react';
 
 export function App({ client }: { client?: DraftlineClient }) {
   const [workspacePath, setWorkspacePath] = useState('');
@@ -107,8 +110,13 @@ function WorkspaceGraphPanel({
   const [graph, setGraph] = useState<WorkspaceGraph | null>(null);
   const [includeRemotes, setIncludeRemotes] = useState(false);
   const [includeSupportRefs, setIncludeSupportRefs] = useState(false);
+  const [view, setView] = useState<DraftlineWorkspaceGraphView>('first-parent');
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const graphModel = useMemo(
+    () => (graph ? createDraftlineWorkspaceGraphModel(graph, { view }) : null),
+    [graph, view],
+  );
 
   async function loadGraph() {
     if (!client || !workspacePath) {
@@ -142,6 +150,16 @@ function WorkspaceGraphPanel({
       </div>
       <div className="graph-options">
         <label>
+          <span>View</span>
+          <select
+            onChange={(event) => setView(event.target.value as DraftlineWorkspaceGraphView)}
+            value={view}
+          >
+            <option value="first-parent">First-parent milestones</option>
+            <option value="expanded">Expanded DAG</option>
+          </select>
+        </label>
+        <label>
           <input
             checked={includeRemotes}
             onChange={(event) => setIncludeRemotes(event.target.checked)}
@@ -159,7 +177,7 @@ function WorkspaceGraphPanel({
         </label>
       </div>
       {error ? <p className="error-text">{error}</p> : null}
-      {graph ? (
+      {graph && graphModel ? (
         <div className="stack" data-testid="workspace-graph-summary">
           <dl className="metric-grid">
             <div>
@@ -174,7 +192,14 @@ function WorkspaceGraphPanel({
               <dt>Current</dt>
               <dd>{graph.current_variation ?? 'none'}</dd>
             </div>
+            <div>
+              <dt>Hidden</dt>
+              <dd>{graphModel.hiddenNodeCount}</dd>
+            </div>
           </dl>
+          <div className="workspace-graph-preview" data-testid="workspace-graph-preview">
+            <DraftlineWorkspaceGraph model={graphModel} />
+          </div>
           <ul className="item-list graph-list">
             {graph.nodes.slice(0, 8).map((node) => (
               <li key={node.id}>

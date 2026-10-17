@@ -83,7 +83,7 @@ flowchart TD
 | Safety behavior | Compaction must preserve final workspace file content. Visible refs move only after backup refs exist and the preview/target refs still match. Dirty work blocks by default so unsaved content is not overwritten by checkout. |
 | Edge cases | Candidate selection must account for selected node role, descendant replay, merge boundaries, named variation refs inside the compacted range, stale preview refs, and target ref movement between preview and apply. A selected version must be on the target variation's first-parent chain; otherwise `history_compaction_candidates` returns a structured cleanup blocker instead of treating the graph node as compaction-eligible. |
 | Tests | `scenario_local_milestone_compaction_preview_apply_resolve_and_undo`, `history_cleanup_compacts_milestones_maps_old_versions_and_undoes`, `history_cleanup_compacts_middle_range_and_replays_descendants`, `history_compaction_candidates_reports_viable_partner_nodes`, and related stale-ref/blocker tests. |
-| Gap | Multi-range and richer semantic conflict handling remain future expansion; current support targets linear milestone compaction. |
+| Gap | Multi-range and richer semantic conflict handling remain future expansion; current support targets linear milestone compaction. When the product goal is a readable shared main line rather than local history cleanup, use Flow 10a's additive milestone merge instead of rewriting saves. |
 
 ## Flow 13b: remove or rewrite shared work
 

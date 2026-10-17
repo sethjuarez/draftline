@@ -2,6 +2,7 @@ import { StrictMode } from 'react';
 import { initAuditaur } from '@auditaur/api';
 import { createDraftlineClient, setDraftlineInvoke } from '@draftline/client';
 import { createRoot } from 'react-dom/client';
+import '@xyflow/react/dist/style.css';
 
 import { App } from './App';
 import './styles.css';

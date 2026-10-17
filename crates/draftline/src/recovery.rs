@@ -18,6 +18,7 @@ pub enum RecoveryOperation {
     ShelveChanges,
     ApplyIncoming,
     MergeIncoming,
+    MilestoneMerge,
     DiscardChanges,
     DiscardFile,
     DeleteVariation,

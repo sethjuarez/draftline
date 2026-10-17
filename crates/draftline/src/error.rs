@@ -118,7 +118,7 @@ pub enum DraftlineError {
     #[error("invalid contributor identity: {0}")]
     InvalidContributorIdentity(String),
 
-    #[error("remote operation timed out after {timeout_ms}ms while running {operation}")]
+    #[error("remote operation timed out{suffix} while running {operation}", suffix = timeout_suffix(*timeout_ms))]
     RemoteOperationTimedOut { operation: String, timeout_ms: u64 },
 
     #[error("invalid merge resolution: {0}")]
@@ -129,4 +129,12 @@ pub enum DraftlineError {
 
     #[error("history cleanup request is blocked")]
     HistoryCleanupBlocked(Box<HistoryCleanupBlockReport>),
+}
+
+fn timeout_suffix(timeout_ms: u64) -> String {
+    if timeout_ms == 0 {
+        String::new()
+    } else {
+        format!(" after {timeout_ms}ms")
+    }
 }

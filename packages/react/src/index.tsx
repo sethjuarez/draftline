@@ -8,8 +8,21 @@ import {
   type Variation,
   type TauriCommandError,
   type Version,
+  type WorkspaceGraph,
+  type WorkspaceGraphNode,
   type WorkspaceDiagnostics,
 } from '@draftline/client';
+import dagre from '@dagrejs/dagre';
+import {
+  Background,
+  Controls,
+  MarkerType,
+  Position,
+  ReactFlow,
+  type Edge as ReactFlowEdge,
+  type Node as ReactFlowNode,
+  type NodeProps,
+} from '@xyflow/react';
 import {
   createContext,
   useCallback,
@@ -142,6 +155,66 @@ export interface DraftlineHistoryGraphProps {
   orientation?: DraftlineGraphOrientation;
   renderBadge?: (node: DraftlineGraphNode, context: DraftlineGraphNodeContext) => ReactNode;
   renderNode?: (node: DraftlineGraphNode, context: DraftlineGraphNodeContext) => ReactNode;
+  style?: CSSProperties;
+}
+
+export type DraftlineWorkspaceGraphView = 'expanded' | 'first-parent';
+export type DraftlineWorkspaceGraphDirection = 'TB' | 'BT' | 'LR' | 'RL';
+
+export interface DraftlineWorkspaceGraphModelOptions {
+  direction?: DraftlineWorkspaceGraphDirection;
+  nodeHeight?: number;
+  nodeWidth?: number;
+  rootVersionId?: string | null;
+  view?: DraftlineWorkspaceGraphView;
+}
+
+export interface DraftlineWorkspaceGraphNodeData {
+  [key: string]: unknown;
+  graphNode: WorkspaceGraphNode;
+  hiddenParentCount: number;
+  isFirstParentProjection: boolean;
+  label: string;
+  refs: string[];
+}
+
+export interface DraftlineWorkspaceGraphEdgeData {
+  [key: string]: unknown;
+  isFirstParent: boolean;
+  parentIndex: number;
+}
+
+export type DraftlineWorkspaceGraphNode = ReactFlowNode<
+  DraftlineWorkspaceGraphNodeData,
+  'draftlineCommit'
+>;
+
+export type DraftlineWorkspaceGraphEdge = ReactFlowEdge<DraftlineWorkspaceGraphEdgeData>;
+
+export interface DraftlineWorkspaceGraphModel {
+  edges: DraftlineWorkspaceGraphEdge[];
+  graph: WorkspaceGraph;
+  hiddenNodeCount: number;
+  nodes: DraftlineWorkspaceGraphNode[];
+  view: DraftlineWorkspaceGraphView;
+}
+
+export interface DraftlineWorkspaceGraphRenderContext {
+  model: DraftlineWorkspaceGraphModel;
+}
+
+export interface DraftlineWorkspaceGraphProps {
+  className?: string;
+  fitView?: boolean;
+  model: DraftlineWorkspaceGraphModel;
+  onSelectNode?: (
+    node: DraftlineWorkspaceGraphNode,
+    context: DraftlineWorkspaceGraphRenderContext,
+  ) => Promise<void> | void;
+  renderNode?: (
+    node: DraftlineWorkspaceGraphNode,
+    context: DraftlineWorkspaceGraphRenderContext,
+  ) => ReactNode;
   style?: CSSProperties;
 }
 
@@ -894,6 +967,106 @@ export function createDraftlineHistoryGraph({
   };
 }
 
+export function createDraftlineWorkspaceGraphModel(
+  graph: WorkspaceGraph,
+  {
+    direction = 'TB',
+    nodeHeight = 72,
+    nodeWidth = 220,
+    rootVersionId,
+    view = 'expanded',
+  }: DraftlineWorkspaceGraphModelOptions = {},
+): DraftlineWorkspaceGraphModel {
+  const nodesById = new Map(graph.nodes.map((node) => [node.id, node]));
+  const nodesByVersion = new Map(graph.nodes.map((node) => [node.version.id, node]));
+  const rootNode =
+    (rootVersionId ? nodesByVersion.get(rootVersionId) : undefined) ??
+    (graph.current_version ? nodesByVersion.get(graph.current_version) : undefined) ??
+    graph.nodes.find((node) => node.is_current) ??
+    graph.nodes.find((node) => node.is_head) ??
+    graph.nodes[0];
+  const visibleIds =
+    view === 'first-parent' && rootNode
+      ? collectFirstParentChain(rootNode, nodesById)
+      : new Set(graph.nodes.map((node) => node.id));
+  const refsByTarget = new Map<string, string[]>();
+  for (const ref of graph.refs) {
+    refsByTarget.set(ref.target, [...(refsByTarget.get(ref.target) ?? []), ref.display_label]);
+  }
+
+  const layoutGraph = new dagre.graphlib.Graph();
+  layoutGraph.setDefaultEdgeLabel(() => ({}));
+  layoutGraph.setGraph({
+    marginx: 24,
+    marginy: 24,
+    nodesep: 44,
+    rankdir: direction,
+    ranksep: 72,
+  });
+
+  const visibleGraphNodes = graph.nodes
+    .filter((node) => visibleIds.has(node.id))
+    .sort((left, right) => left.topo_index - right.topo_index);
+  for (const node of visibleGraphNodes) {
+    layoutGraph.setNode(node.id, { height: nodeHeight, width: nodeWidth });
+  }
+
+  const edges: DraftlineWorkspaceGraphEdge[] = [];
+  for (const node of visibleGraphNodes) {
+    node.parent_ids.forEach((parentId, parentIndex) => {
+      if (!visibleIds.has(parentId)) {
+        return;
+      }
+      if (view === 'first-parent' && parentIndex > 0) {
+        return;
+      }
+      const edge: DraftlineWorkspaceGraphEdge = {
+        id: `${parentId}->${node.id}:${parentIndex}`,
+        data: { isFirstParent: parentIndex === 0, parentIndex },
+        markerEnd: { type: MarkerType.ArrowClosed },
+        source: parentId,
+        style: parentIndex === 0 ? undefined : { strokeDasharray: '6 4' },
+        target: node.id,
+        type: 'smoothstep',
+      };
+      edges.push(edge);
+      layoutGraph.setEdge(parentId, node.id);
+    });
+  }
+
+  dagre.layout(layoutGraph);
+
+  const nodes: DraftlineWorkspaceGraphNode[] = visibleGraphNodes.map((node) => {
+    const layout = layoutGraph.node(node.id) as { x?: number; y?: number } | undefined;
+    const hiddenParentCount = node.parent_ids.filter((parentId) => !visibleIds.has(parentId)).length;
+    return {
+      data: {
+        graphNode: node,
+        hiddenParentCount,
+        isFirstParentProjection: view === 'first-parent',
+        label: node.layout.display_label || node.version.label || node.version.id.slice(0, 7),
+        refs: refsByTarget.get(node.id) ?? [],
+      },
+      id: node.id,
+      position: {
+        x: (layout?.x ?? node.layout.lane * (nodeWidth + 44)) - nodeWidth / 2,
+        y: (layout?.y ?? node.layout.row * (nodeHeight + 72)) - nodeHeight / 2,
+      },
+      sourcePosition: direction === 'LR' ? Position.Right : Position.Bottom,
+      targetPosition: direction === 'LR' ? Position.Left : Position.Top,
+      type: 'draftlineCommit',
+    };
+  });
+
+  return {
+    edges,
+    graph,
+    hiddenNodeCount: graph.nodes.length - nodes.length,
+    nodes,
+    view,
+  };
+}
+
 export function createDraftlineVariationListModel({
   activeVariationId,
   getLabel = defaultVariationLabel,
@@ -942,6 +1115,51 @@ export function DraftlineHistoryGraph({
         />
       ))}
     </ol>
+  );
+}
+
+export function DraftlineWorkspaceGraph({
+  className,
+  fitView = true,
+  model,
+  onSelectNode,
+  renderNode,
+  style,
+}: DraftlineWorkspaceGraphProps) {
+  const context = useMemo<DraftlineWorkspaceGraphRenderContext>(() => ({ model }), [model]);
+  const nodeTypes = useMemo(
+    () => ({
+      draftlineCommit: (props: NodeProps<DraftlineWorkspaceGraphNode>) => (
+        <DraftlineWorkspaceGraphNodeView
+          context={context}
+          node={props}
+          onSelectNode={onSelectNode}
+          renderNode={renderNode}
+        />
+      ),
+    }),
+    [context, onSelectNode, renderNode],
+  );
+
+  return (
+    <div
+      className={['draftline-workspace-graph', className].filter(Boolean).join(' ')}
+      data-view={model.view}
+      style={style}
+    >
+      <ReactFlow
+        edges={model.edges}
+        fitView={fitView}
+        nodes={model.nodes}
+        nodeTypes={nodeTypes}
+        nodesDraggable={false}
+        nodesFocusable={Boolean(onSelectNode)}
+        proOptions={{ hideAttribution: true }}
+      >
+        <Background />
+        <Controls showInteractive={false} />
+      </ReactFlow>
+    </div>
   );
 }
 
@@ -1022,6 +1240,52 @@ function DraftlineHistoryGraphRow({
         {node.kind === 'remoteTip' ? <StatusPill tone="neutral">{node.remote}</StatusPill> : null}
       </span>
     </li>
+  );
+}
+
+function DraftlineWorkspaceGraphNodeView({
+  context,
+  node,
+  onSelectNode,
+  renderNode,
+}: {
+  context: DraftlineWorkspaceGraphRenderContext;
+  node: NodeProps<DraftlineWorkspaceGraphNode>;
+  onSelectNode?: (
+    node: DraftlineWorkspaceGraphNode,
+    context: DraftlineWorkspaceGraphRenderContext,
+  ) => Promise<void> | void;
+  renderNode?: (
+    node: DraftlineWorkspaceGraphNode,
+    context: DraftlineWorkspaceGraphRenderContext,
+  ) => ReactNode;
+}) {
+  const graphNode = context.model.nodes.find((candidate) => candidate.id === node.id);
+  if (!graphNode) {
+    return null;
+  }
+  const content = renderNode ? (
+    renderNode(graphNode, context)
+  ) : (
+    <DefaultWorkspaceGraphNode node={graphNode} />
+  );
+  const onClick = () => {
+    const result = onSelectNode?.(graphNode, context);
+    if (result) {
+      void Promise.resolve(result).catch((error) => {
+        setTimeout(() => {
+          throw error;
+        }, 0);
+      });
+    }
+  };
+
+  return onSelectNode ? (
+    <button className="workspace-graph-node" onClick={onClick} type="button">
+      {content}
+    </button>
+  ) : (
+    <div className="workspace-graph-node">{content}</div>
   );
 }
 
@@ -1173,6 +1437,20 @@ function RailItem({
   );
 }
 
+function collectFirstParentChain(
+  rootNode: WorkspaceGraphNode,
+  nodesById: Map<string, WorkspaceGraphNode>,
+) {
+  const keep = new Set<string>();
+  let current: WorkspaceGraphNode | undefined = rootNode;
+  while (current && !keep.has(current.id)) {
+    keep.add(current.id);
+    const firstParentId: string | undefined = current.parent_ids[0];
+    current = firstParentId ? nodesById.get(firstParentId) : undefined;
+  }
+  return keep;
+}
+
 function DefaultGraphNode({ node }: { node: DraftlineGraphNode }) {
   if (node.kind === 'dirty') {
     return (
@@ -1200,6 +1478,25 @@ function DefaultGraphNode({ node }: { node: DraftlineGraphNode }) {
         {node.version ? new Date(node.version.time_seconds * 1000).toLocaleString() : 'unsaved'}
       </small>
     </span>
+  );
+}
+
+function DefaultWorkspaceGraphNode({ node }: { node: DraftlineWorkspaceGraphNode }) {
+  const graphNode = node.data.graphNode;
+  return (
+    <div className="workspace-graph-node-card" data-merge={graphNode.is_merge || undefined}>
+      <strong>{node.data.label}</strong>
+      <small>{graphNode.version.id.slice(0, 7)}</small>
+      {node.data.refs.length > 0 ? (
+        <span className="workspace-graph-node-refs">{node.data.refs.join(', ')}</span>
+      ) : null}
+      {node.data.hiddenParentCount > 0 ? (
+        <span className="workspace-graph-node-hidden">
+          +{node.data.hiddenParentCount} collapsed parent
+          {node.data.hiddenParentCount === 1 ? '' : 's'}
+        </span>
+      ) : null}
+    </div>
   );
 }
 

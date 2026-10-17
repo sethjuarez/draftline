@@ -4,22 +4,23 @@ use std::path::{Path, PathBuf};
 use draftline::tauri_contract::{
     adopt_remote_variation, adopt_workspace, apply_history_cleanup,
     apply_history_cleanup_with_context, apply_incoming, apply_shelf, audit_content_policy,
-    clone_workspace, create_variation_from_version, create_variation_from_version_guarded,
-    diff_version_to_workspace, diff_versions, diff_workspace_file, fetch_remote, get_changes,
-    get_full_history, get_history, get_history_compaction_candidates, get_workspace_graph,
-    get_workspace_graph_agent_summary, get_workspace_graph_around_version,
-    get_workspace_graph_common_ancestor, get_workspace_graph_compare_summary,
-    get_workspace_graph_for_variation, get_workspace_graph_neighborhood, get_workspace_graph_node,
-    get_workspace_graph_overview, get_workspace_graph_path, get_workspace_graph_refs,
-    get_workspace_graph_summary, inspect_workspace, into_tauri_result, list_remote_variations,
-    list_remotes, list_shelves, list_support_refs, list_variations, merge_conflict_view_model,
-    merge_incoming, merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
-    open_workspace, preflight_apply_incoming, preflight_apply_shelf,
-    preflight_create_variation_from_version, preflight_history_cleanup_remote_impact,
-    preflight_merge_incoming, preflight_publish_history_cleanup, preflight_rename_variation,
-    preflight_switch_variation, preflight_undo_history_cleanup, preview_history_cleanup,
-    preview_history_cleanup_with_context, preview_shelf, preview_version, preview_version_file,
-    preview_workspace_file, publish_current_variation, publish_history_cleanup, rename_variation,
+    clone_workspace, create_milestone_merge, create_variation_from_version,
+    create_variation_from_version_guarded, diff_version_to_workspace, diff_versions,
+    diff_workspace_file, fetch_remote, get_changes, get_full_history, get_history,
+    get_history_compaction_candidates, get_workspace_graph, get_workspace_graph_agent_summary,
+    get_workspace_graph_around_version, get_workspace_graph_common_ancestor,
+    get_workspace_graph_compare_summary, get_workspace_graph_for_variation,
+    get_workspace_graph_neighborhood, get_workspace_graph_node, get_workspace_graph_overview,
+    get_workspace_graph_path, get_workspace_graph_refs, get_workspace_graph_summary,
+    inspect_workspace, into_tauri_result, list_remote_variations, list_remotes, list_shelves,
+    list_support_refs, list_variations, merge_conflict_view_model, merge_incoming,
+    merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context, open_workspace,
+    preflight_apply_incoming, preflight_apply_shelf, preflight_create_variation_from_version,
+    preflight_history_cleanup_remote_impact, preflight_merge_incoming, preflight_milestone_merge,
+    preflight_publish_history_cleanup, preflight_rename_variation, preflight_switch_variation,
+    preflight_undo_history_cleanup, preview_history_cleanup, preview_history_cleanup_with_context,
+    preview_shelf, preview_version, preview_version_file, preview_workspace_file,
+    publish_current_variation, publish_history_cleanup, rename_variation,
     resolve_rewritten_version, restore_version_as_new_save,
     restore_version_as_new_save_to_variation,
     restore_version_as_new_save_to_variation_with_context,
@@ -31,8 +32,8 @@ use draftline::tauri_contract::{
     DraftlineCommandContext, DraftlineEventKind, GuardedCreateVariationFromVersionRequest,
     HistoryCleanupRemoteImpactRequest, HistoryCompactionCandidatesCommandRequest,
     ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
-    PreflightCreateVariationFromVersionRequest, PreviewHistoryCleanupRequest,
-    PreviewVersionFileRequest, PublishCurrentVariationRequest,
+    MilestoneMergeRequest, PreflightCreateVariationFromVersionRequest,
+    PreviewHistoryCleanupRequest, PreviewVersionFileRequest, PublishCurrentVariationRequest,
     PublishHistoryCleanupPreflightRequest, PublishHistoryCleanupRequest, RemoteRequest,
     RemoteVariationRequest, RenameVariationRequest, ResolveRewrittenVersionRequest,
     RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
@@ -48,7 +49,7 @@ use draftline::{
     MergeConflictResolution, MergeResolutionChoice, MilestoneSpec, OperationLockState,
     RemoteRewritePolicy, RestoreVersionTarget, RewriteConfirmation, StaleVersionDisposition,
     SupportRefScope, SwitchPolicy, SyncState, VariationId, Workspace,
-    WorkspaceGraphOverviewOptions,
+    WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
 };
 use serde_json::Value;
 
@@ -750,6 +751,118 @@ fn tauri_contract_smokes_publish_current_variation() {
         .target()
         .unwrap();
     assert_eq!(remote_oid, local_oid);
+}
+
+#[test]
+fn tauri_contract_smokes_milestone_merge_commands() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    init_bare_remote(remote_dir.path());
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"published base");
+    let base = workspace.save_version("Published base").unwrap();
+    workspace
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    workspace.publish_changes("origin").unwrap();
+
+    write_file(workspace.root(), "post.md", b"published base\nfirst local save");
+    let first_local = workspace.save_version("First local save").unwrap();
+    write_file(
+        workspace.root(),
+        "post.md",
+        b"published base\nfirst local save\nsecond local save",
+    );
+    let second_local = workspace.save_version("Second local save").unwrap();
+
+    let request = RemoteRequest {
+        workspace_path: temp.path().to_path_buf(),
+        remote: "origin".to_string(),
+    };
+    let preflight = preflight_milestone_merge(request.clone()).unwrap();
+    assert!(preflight.can_create_milestone);
+    assert_eq!(preflight.unpublished_versions, 2);
+    assert_eq!(preflight.first_parent.as_ref(), Some(base.id()));
+    assert_eq!(&preflight.second_parent, second_local.id());
+
+    let result = create_milestone_merge(MilestoneMergeRequest {
+        workspace_path: temp.path().to_path_buf(),
+        remote: "origin".to_string(),
+        label: "Review milestone".to_string(),
+    })
+    .unwrap();
+    assert_eq!(result.preflight.sync_status.state, SyncState::LocalAhead);
+    assert_eq!(result.merge.version.label, "Review milestone");
+    assert_eq!(&result.merge.first_parent, base.id());
+    assert_eq!(&result.merge.second_parent, second_local.id());
+    assert!(result.postconditions.errors.is_empty());
+
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["merge"]["first_parent"], base.id().as_str());
+    assert_eq!(json["merge"]["second_parent"], second_local.id().as_str());
+
+    let graph = get_workspace_graph_for_variation(WorkspaceGraphVariationRequest {
+        workspace_path: temp.path().to_path_buf(),
+        variation_id: "main".to_string(),
+        options: WorkspaceGraphOptions::default(),
+    })
+    .unwrap();
+    let milestone_node = graph
+        .nodes
+        .iter()
+        .find(|node| node.version.id() == result.merge.version.id())
+        .unwrap();
+    assert_eq!(
+        milestone_node
+            .parent_version_ids
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>(),
+        vec![base.id().as_str(), second_local.id().as_str()]
+    );
+
+    let published = publish_current_variation(PublishCurrentVariationRequest {
+        workspace_path: temp.path().to_path_buf(),
+        remote: "origin".to_string(),
+    })
+    .unwrap();
+    assert_eq!(published.publish.published_versions, 3);
+    assert!(published.postconditions.errors.is_empty());
+
+    let remote = git2::Repository::open_bare(remote_dir.path()).unwrap();
+    let remote_tip = remote.refname_to_id("refs/heads/main").unwrap();
+    assert_eq!(remote_tip.to_string(), result.merge.version.id().as_str());
+
+    let mut first_parent_walk = remote.revwalk().unwrap();
+    first_parent_walk.push(remote_tip).unwrap();
+    first_parent_walk.simplify_first_parent().unwrap();
+    let first_parent_ids = first_parent_walk
+        .map(|oid| oid.unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first_parent_ids,
+        vec![result.merge.version.id().as_str(), base.id().as_str()]
+    );
+
+    let mut full_walk = remote.revwalk().unwrap();
+    full_walk.push(remote_tip).unwrap();
+    full_walk.set_sorting(git2::Sort::TOPOLOGICAL).unwrap();
+    let full_ids = full_walk
+        .map(|oid| oid.unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(full_ids.iter().any(|id| id == first_local.id().as_str()));
+    assert!(full_ids.iter().any(|id| id == second_local.id().as_str()));
+
+    let fresh_clone_dir = tempfile::tempdir().unwrap();
+    let fresh_clone = git2::Repository::clone(
+        remote_dir.path().to_string_lossy().as_ref(),
+        fresh_clone_dir.path(),
+    )
+    .unwrap();
+    let fresh_tip = fresh_clone.refname_to_id("refs/heads/main").unwrap();
+    assert_eq!(fresh_tip, remote_tip);
 }
 
 #[test]
