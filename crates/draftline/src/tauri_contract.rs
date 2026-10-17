@@ -1196,7 +1196,15 @@ pub fn preview_history_cleanup_with_context(
 ) -> Result<HistoryCleanupPreview> {
     let workspace = context.open_workspace(&request.workspace_path)?;
     let mut options = context.remote_options();
-    workspace.preview_history_cleanup_with_options(request.cleanup, &mut options)
+    if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.preview_history_cleanup_with_options_and_profile(
+            request.cleanup,
+            &mut options,
+            profile,
+        )
+    } else {
+        workspace.preview_history_cleanup_with_options(request.cleanup, &mut options)
+    }
 }
 
 /// Applies a durable history cleanup plan.
@@ -1213,7 +1221,11 @@ pub fn apply_history_cleanup_with_context(
 ) -> Result<TimelineCleanupResult> {
     let workspace = context.open_workspace(&request.workspace_path)?;
     let plan_id = CleanupPlanId::from_string(request.plan_id)?;
-    let result = workspace.apply_history_cleanup(plan_id, request.confirmation)?;
+    let result = if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.apply_history_cleanup_with_profile(plan_id, request.confirmation, profile)?
+    } else {
+        workspace.apply_history_cleanup(plan_id, request.confirmation)?
+    };
     context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
     Ok(result)
 }
@@ -1884,7 +1896,11 @@ pub fn restore_version_as_new_save_with_context(
 ) -> Result<RestoreVersionResult> {
     let version_id = parse_version_id(request.version_id)?;
     let workspace = context.open_workspace(&request.workspace_path)?;
-    let version = workspace.restore_version_as_new_save(&version_id, request.label)?;
+    let version = if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.restore_version_as_new_save_with_profile(&version_id, request.label, profile)?
+    } else {
+        workspace.restore_version_as_new_save(&version_id, request.label)?
+    };
     context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
     Ok(RestoreVersionResult {
         version,
@@ -1919,11 +1935,20 @@ pub fn restore_version_as_new_save_to_variation_with_context(
 ) -> Result<TargetedRestoreVersionCommandResult> {
     let version_id = parse_version_id(request.version_id)?;
     let workspace = context.open_workspace(&request.workspace_path)?;
-    let result = workspace.restore_version_as_new_save_to_variation(
-        &version_id,
-        request.label,
-        request.target,
-    )?;
+    let result = if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.restore_version_as_new_save_to_variation_with_profile(
+            &version_id,
+            request.label,
+            request.target,
+            profile,
+        )?
+    } else {
+        workspace.restore_version_as_new_save_to_variation(
+            &version_id,
+            request.label,
+            request.target,
+        )?
+    };
     context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
     Ok(TargetedRestoreVersionCommandResult {
         version: result.version,
@@ -2387,7 +2412,11 @@ pub fn selected_shelve_with_context(
         return Err(DraftlineError::PreflightFailed(Box::new(preflight)));
     }
 
-    let shelf = workspace.shelve_files(request.name, request.paths)?;
+    let shelf = if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.shelve_files_with_profile(request.name, request.paths, profile)?
+    } else {
+        workspace.shelve_files(request.name, request.paths)?
+    };
     context.emit(&workspace, DraftlineEventKind::DirtyChanged, None);
     Ok(SelectedShelveResult {
         preflight,

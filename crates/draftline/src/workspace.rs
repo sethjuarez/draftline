@@ -1878,6 +1878,7 @@ struct CompactCleanupPlanInput<'a> {
     milestones: &'a [MilestoneSpec],
     preserve_named_branches: bool,
     preserve_merge_boundaries: bool,
+    profile: Option<&'a ContributorProfile>,
 }
 
 /// Diff between two versions or between a version and the current workspace.
@@ -3553,10 +3554,27 @@ impl Workspace {
 
     /// Shelves all current tracked content changes without switching variations.
     pub fn shelve_changes(&self, name: impl AsRef<str>) -> Result<Shelf> {
+        self.shelve_changes_with_optional_profile(name, None)
+    }
+
+    /// Shelves all current tracked content changes using host-supplied attribution.
+    pub fn shelve_changes_with_profile(
+        &self,
+        name: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<Shelf> {
+        self.shelve_changes_with_optional_profile(name, Some(profile))
+    }
+
+    fn shelve_changes_with_optional_profile(
+        &self,
+        name: impl AsRef<str>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Shelf> {
         self.ensure_no_pending_recovery()?;
         let safe_name = validate_variation_name(name.as_ref())?;
         let _lock = OperationLock::acquire(&self.lock_path(), "shelve_changes")?;
-        self.shelve_changes_unchecked(&safe_name)?;
+        self.shelve_changes_unchecked(&safe_name, profile)?;
         self.shelf_by_id(&safe_name)
     }
 
@@ -3586,6 +3604,33 @@ impl Workspace {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        self.shelve_files_with_optional_profile(name, paths, None)
+    }
+
+    /// Shelves only selected tracked content changes using host-supplied attribution.
+    pub fn shelve_files_with_profile<I, P>(
+        &self,
+        name: impl AsRef<str>,
+        paths: I,
+        profile: &ContributorProfile,
+    ) -> Result<Shelf>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.shelve_files_with_optional_profile(name, paths, Some(profile))
+    }
+
+    fn shelve_files_with_optional_profile<I, P>(
+        &self,
+        name: impl AsRef<str>,
+        paths: I,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Shelf>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
         self.ensure_no_pending_recovery()?;
         let safe_name = validate_variation_name(name.as_ref())?;
         let changed_files = self.selected_changed_files(paths)?;
@@ -3600,6 +3645,7 @@ impl Workspace {
         }
 
         let _lock = OperationLock::acquire(&self.lock_path(), "shelve_files")?;
+        let (author, committer) = self.rewrite_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -3611,12 +3657,11 @@ impl Workspace {
 
         let tree_id = self.write_selected_changes_tree(&changed_files)?;
         let tree = self.repo.find_tree(tree_id)?;
-        let signature = self.workspace_signature()?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             None,
-            &signature,
-            &signature,
+            &author,
+            &committer,
             &format!("Shelved changes: {safe_name}"),
             &tree,
             &[&parent],
@@ -4433,6 +4478,25 @@ impl Workspace {
         variation: &VariationId,
         policy: SwitchPolicy,
     ) -> Result<Variation> {
+        self.switch_variation_with_optional_profile(variation, policy, None)
+    }
+
+    /// Switches to a variation, attributing any `SaveFirst` or `Shelve` commit to a host profile.
+    pub fn switch_variation_with_profile(
+        &self,
+        variation: &VariationId,
+        policy: SwitchPolicy,
+        profile: &ContributorProfile,
+    ) -> Result<Variation> {
+        self.switch_variation_with_optional_profile(variation, policy, Some(profile))
+    }
+
+    fn switch_variation_with_optional_profile(
+        &self,
+        variation: &VariationId,
+        policy: SwitchPolicy,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "switch_variation")?;
         let mut report = self.preflight_switch_variation_unchecked(variation)?;
@@ -4446,10 +4510,10 @@ impl Workspace {
                 return Err(DraftlineError::PreflightFailed(Box::new(report)));
             }
             SwitchPolicy::SaveFirst { label } if !report.can_proceed => {
-                self.save_version_unchecked(label, None)?;
+                self.save_version_unchecked(label, profile)?;
             }
             SwitchPolicy::Shelve { name } if !report.can_proceed => {
-                self.shelve_changes_unchecked(name)?;
+                self.shelve_changes_unchecked(name, profile)?;
             }
             SwitchPolicy::Discard => {
                 return Err(DraftlineError::UnsupportedSwitchPolicy(
@@ -4713,6 +4777,25 @@ impl Workspace {
         version: &VersionId,
         label: impl AsRef<str>,
     ) -> Result<Version> {
+        self.restore_version_as_new_save_with_optional_profile(version, label, None)
+    }
+
+    /// Creates a new version from an earlier version using host-supplied attribution.
+    pub fn restore_version_as_new_save_with_profile(
+        &self,
+        version: &VersionId,
+        label: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<Version> {
+        self.restore_version_as_new_save_with_optional_profile(version, label, Some(profile))
+    }
+
+    fn restore_version_as_new_save_with_optional_profile(
+        &self,
+        version: &VersionId,
+        label: impl AsRef<str>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "restore_version_as_new_save")?;
         let report = preflight_report(
@@ -4729,6 +4812,7 @@ impl Workspace {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
 
+        let (author, committer) = self.rewrite_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -4740,12 +4824,11 @@ impl Workspace {
 
         let commit = self.find_version_commit(version)?;
         let tree = commit.tree()?;
-        let signature = self.workspace_signature()?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             Some("HEAD"),
-            &signature,
-            &signature,
+            &author,
+            &committer,
             label.as_ref(),
             &tree,
             &[&parent],
@@ -4777,6 +4860,35 @@ impl Workspace {
         label: impl AsRef<str>,
         target: RestoreVersionTarget,
     ) -> Result<TargetedRestoreVersionResult> {
+        self.restore_version_as_new_save_to_variation_with_optional_profile(
+            version, label, target, None,
+        )
+    }
+
+    /// Restores a saved version as a new save on a selected target variation using
+    /// host-supplied attribution.
+    pub fn restore_version_as_new_save_to_variation_with_profile(
+        &self,
+        version: &VersionId,
+        label: impl AsRef<str>,
+        target: RestoreVersionTarget,
+        profile: &ContributorProfile,
+    ) -> Result<TargetedRestoreVersionResult> {
+        self.restore_version_as_new_save_to_variation_with_optional_profile(
+            version,
+            label,
+            target,
+            Some(profile),
+        )
+    }
+
+    fn restore_version_as_new_save_to_variation_with_optional_profile(
+        &self,
+        version: &VersionId,
+        label: impl AsRef<str>,
+        target: RestoreVersionTarget,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<TargetedRestoreVersionResult> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(
             &self.lock_path(),
@@ -4800,6 +4912,7 @@ impl Workspace {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
 
+        let (author, committer) = self.rewrite_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -4810,12 +4923,11 @@ impl Workspace {
         })?;
 
         let parent = self.repo.find_commit(parent_oid)?;
-        let signature = self.workspace_signature()?;
         let target_ref = format!("refs/heads/{target_name}");
         let oid = self.repo.commit(
             Some(&target_ref),
-            &signature,
-            &signature,
+            &author,
+            &committer,
             label.as_ref(),
             &source_tree,
             &[&parent],
@@ -6599,6 +6711,25 @@ impl Workspace {
         token: SquashVersionsToken,
         label: impl AsRef<str>,
     ) -> Result<Version> {
+        self.squash_versions_with_token_and_optional_profile(token, label, None)
+    }
+
+    /// Squashes preflighted versions into a single new version using host-supplied attribution.
+    pub fn squash_versions_with_token_and_profile(
+        &self,
+        token: SquashVersionsToken,
+        label: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<Version> {
+        self.squash_versions_with_token_and_optional_profile(token, label, Some(profile))
+    }
+
+    fn squash_versions_with_token_and_optional_profile(
+        &self,
+        token: SquashVersionsToken,
+        label: impl AsRef<str>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "squash_versions")?;
         let variation = self.current_variation_unchecked()?;
@@ -6619,14 +6750,14 @@ impl Workspace {
         let squash_parent_oid = Oid::from_str(&token.squash_parent_oid)?;
         let squash_parent = self.repo.find_commit(squash_parent_oid)?;
         let tree = head_commit.tree()?;
-        let signature = self.workspace_signature()?;
+        let (author, committer) = self.rewrite_signatures(profile)?;
 
         // Create the squash commit without touching any ref yet — git2 would
         // reject Some("HEAD") here because squash_parent is not the current tip.
         let oid = self.repo.commit(
             None,
-            &signature,
-            &signature,
+            &author,
+            &committer,
             label.as_ref(),
             &tree,
             &[&squash_parent],
@@ -6661,6 +6792,26 @@ impl Workspace {
     }
 
     pub fn squash_versions(&self, count: usize, label: impl AsRef<str>) -> Result<Version> {
+        self.squash_versions_with_optional_profile(count, label, None)
+    }
+
+    /// Squashes the last `count` versions into a single new version using host-supplied
+    /// attribution.
+    pub fn squash_versions_with_profile(
+        &self,
+        count: usize,
+        label: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<Version> {
+        self.squash_versions_with_optional_profile(count, label, Some(profile))
+    }
+
+    fn squash_versions_with_optional_profile(
+        &self,
+        count: usize,
+        label: impl AsRef<str>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Version> {
         let preflight = self.preflight_squash_versions(count)?;
         let Some(token) = preflight.token else {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
@@ -6671,7 +6822,7 @@ impl Workspace {
                 None,
             ))));
         };
-        self.squash_versions_with_token(token, label)
+        self.squash_versions_with_token_and_optional_profile(token, label, profile)
     }
 
     /// Prepares a durable local timeline cleanup plan without moving visible refs.
@@ -6683,11 +6834,42 @@ impl Workspace {
         self.preview_history_cleanup_with_options(request, &mut options)
     }
 
+    /// Prepares a durable local cleanup plan whose milestone commits use host-supplied
+    /// attribution. Replayed descendants keep their original author and committer.
+    pub fn preview_history_cleanup_with_profile(
+        &self,
+        request: HistoryCleanupRequest,
+        profile: &ContributorProfile,
+    ) -> Result<HistoryCleanupPreview> {
+        let mut options = RemoteOptions::new();
+        self.preview_history_cleanup_with_optional_profile(request, &mut options, Some(profile))
+    }
+
     /// Prepares a durable timeline cleanup plan with explicit remote options.
     pub fn preview_history_cleanup_with_options(
         &self,
         request: HistoryCleanupRequest,
         options: &mut RemoteOptions<'_>,
+    ) -> Result<HistoryCleanupPreview> {
+        self.preview_history_cleanup_with_optional_profile(request, options, None)
+    }
+
+    /// Prepares a durable timeline cleanup plan with explicit remote options and
+    /// host-supplied attribution for milestone commits.
+    pub fn preview_history_cleanup_with_options_and_profile(
+        &self,
+        request: HistoryCleanupRequest,
+        options: &mut RemoteOptions<'_>,
+        profile: &ContributorProfile,
+    ) -> Result<HistoryCleanupPreview> {
+        self.preview_history_cleanup_with_optional_profile(request, options, Some(profile))
+    }
+
+    fn preview_history_cleanup_with_optional_profile(
+        &self,
+        request: HistoryCleanupRequest,
+        options: &mut RemoteOptions<'_>,
+        profile: Option<&ContributorProfile>,
     ) -> Result<HistoryCleanupPreview> {
         self.ensure_no_pending_recovery()?;
         let target_variation = match request.target_variation.clone() {
@@ -6744,6 +6926,7 @@ impl Workspace {
             milestones,
             preserve_named_branches,
             preserve_merge_boundaries,
+            profile,
         })?;
         let remote_impact_remote =
             if let RemoteRewritePolicy::PushWithLease { remote, branch } = &request.remote_policy {
@@ -6827,11 +7010,37 @@ impl Workspace {
     pub fn apply_history_cleanup(
         &self,
         plan_id: CleanupPlanId,
+        confirmation: RewriteConfirmation,
+    ) -> Result<TimelineCleanupResult> {
+        self.apply_history_cleanup_with_optional_profile(plan_id, confirmation, None)
+    }
+
+    /// Applies a durable cleanup preview so its milestone commits record host-supplied
+    /// attribution.
+    ///
+    /// When the preview's milestone commits already carry this profile, the preview is
+    /// applied as-is. Otherwise the milestones are re-created with the profile before any
+    /// visible ref moves; the re-created plan must match the preview's rewrite map and
+    /// ref updates, or the apply fails and asks for a new preview. Replayed descendants
+    /// keep their original author and committer.
+    pub fn apply_history_cleanup_with_profile(
+        &self,
+        plan_id: CleanupPlanId,
+        confirmation: RewriteConfirmation,
+        profile: &ContributorProfile,
+    ) -> Result<TimelineCleanupResult> {
+        self.apply_history_cleanup_with_optional_profile(plan_id, confirmation, Some(profile))
+    }
+
+    fn apply_history_cleanup_with_optional_profile(
+        &self,
+        plan_id: CleanupPlanId,
         _confirmation: RewriteConfirmation,
+        profile: Option<&ContributorProfile>,
     ) -> Result<TimelineCleanupResult> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "history_cleanup")?;
-        let stored = self.read_history_cleanup_plan(&plan_id)?;
+        let mut stored = self.read_history_cleanup_plan(&plan_id)?;
         self.ensure_no_pending_history_cleanup(
             "history_cleanup",
             Some(stored.preview.target_variation.as_str()),
@@ -6849,7 +7058,8 @@ impl Workspace {
             }
         }
 
-        let variation = stored.preview.target_variation.as_str();
+        let variation = stored.preview.target_variation.as_str().to_owned();
+        let variation = variation.as_str();
         let branch_ref = format!("refs/heads/{variation}");
         let old_head_oid = oid_from_version(&stored.preview.old_head)?;
         let new_head_oid = oid_from_version(&stored.preview.new_head)?;
@@ -6867,14 +7077,30 @@ impl Workspace {
             }
         }
 
-        let actual_preview = self
-            .repo
-            .refname_to_id(stored.preview.preview_ref.as_str())?;
-        if actual_preview != new_head_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{}@{new_head_oid}", stored.preview.preview_ref.as_str()),
-                actual: format!("{}@{actual_preview}", stored.preview.preview_ref.as_str()),
-            });
+        let remint_profile = match profile {
+            Some(profile)
+                if !self.history_cleanup_milestones_match_profile(&stored.preview, profile)? =>
+            {
+                Some(profile)
+            }
+            _ => None,
+        };
+        // A re-mint regenerates the preview from the verified refs and overwrites the
+        // preview ref, so the preview-ref check is skipped. This keeps a retry safe if
+        // a previous re-mint was interrupted between the ref move and the plan write.
+        if let Some(profile) = remint_profile {
+            stored.preview = self.reattribute_history_cleanup_preview(&stored, profile)?;
+            self.write_history_cleanup_plan(&stored)?;
+        } else {
+            let actual_preview = self
+                .repo
+                .refname_to_id(stored.preview.preview_ref.as_str())?;
+            if actual_preview != new_head_oid {
+                return Err(DraftlineError::LocalStateChanged {
+                    expected: format!("{}@{new_head_oid}", stored.preview.preview_ref.as_str()),
+                    actual: format!("{}@{actual_preview}", stored.preview.preview_ref.as_str()),
+                });
+            }
         }
 
         let mut backup_refs = Vec::new();
@@ -8706,6 +8932,100 @@ impl Workspace {
             .map_err(|_| DraftlineError::VersionNotFound(version.to_string()))
     }
 
+    fn history_cleanup_milestones_match_profile(
+        &self,
+        preview: &HistoryCleanupPreview,
+        profile: &ContributorProfile,
+    ) -> Result<bool> {
+        let (author, committer) = self.workspace_signatures(Some(profile))?;
+        for operation in &preview.operations {
+            let commit = self
+                .repo
+                .find_commit(oid_from_version(&operation.new_version)?)?;
+            let commit_author = commit.author();
+            let commit_committer = commit.committer();
+            if commit_author.name_bytes() != author.name_bytes()
+                || commit_author.email_bytes() != author.email_bytes()
+                || commit_committer.name_bytes() != committer.name_bytes()
+                || commit_committer.email_bytes() != committer.email_bytes()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Re-creates a stored cleanup preview's milestone commits with `profile` and returns the
+    /// updated preview. The caller must already have verified the stored plan against the
+    /// live refs; any structural drift from the stored preview is rejected.
+    fn reattribute_history_cleanup_preview(
+        &self,
+        stored: &HistoryCleanupStoredPlan,
+        profile: &ContributorProfile,
+    ) -> Result<HistoryCleanupPreview> {
+        let preview = &stored.preview;
+        let CleanupMode::CompactMilestones {
+            milestones,
+            preserve_named_branches,
+            preserve_merge_boundaries,
+        } = &stored.request.mode;
+        let planned = self.plan_compact_milestones(CompactCleanupPlanInput {
+            target_variation: &preview.target_variation,
+            old_head_oid: oid_from_version(&preview.old_head)?,
+            base: &stored.request.base,
+            milestones,
+            preserve_named_branches: *preserve_named_branches,
+            preserve_merge_boundaries: *preserve_merge_boundaries,
+            profile: Some(profile),
+        })?;
+
+        let same_commit_map =
+            planned.commit_map.len() == preview.commit_map.len()
+                && planned.commit_map.iter().zip(&preview.commit_map).all(
+                    |(planned, previewed)| {
+                        planned.old == previewed.old
+                            && std::mem::discriminant(&planned.disposition)
+                                == std::mem::discriminant(&previewed.disposition)
+                    },
+                );
+        let same_ref_updates = planned.planned_ref_updates.len()
+            == preview.planned_ref_updates.len()
+            && planned
+                .planned_ref_updates
+                .iter()
+                .zip(&preview.planned_ref_updates)
+                .all(|(planned, previewed)| {
+                    planned.name == previewed.name && planned.old == previewed.old
+                });
+        if !same_commit_map || !same_ref_updates {
+            return Err(DraftlineError::InvalidHistoryCleanup(
+                "history cleanup plan no longer matches the workspace; preview the cleanup again"
+                    .to_string(),
+            ));
+        }
+
+        let new_head = VersionId::from(planned.new_head_oid);
+        self.repo.reference(
+            preview.preview_ref.as_str(),
+            planned.new_head_oid,
+            true,
+            "reattribute history cleanup preview",
+        )?;
+
+        let mut updated = preview.clone();
+        updated.new_head = new_head.clone();
+        updated.graph_diff.new_head = new_head.clone();
+        updated.affected_refs = planned.affected_refs;
+        updated.planned_ref_updates = planned.planned_ref_updates;
+        updated.operations = planned.operations;
+        updated.commit_map = planned.commit_map;
+        updated.snapshot_map = planned.snapshot_map;
+        if let Some(impact) = updated.remote_impact.as_mut() {
+            impact.replacement_head = Some(new_head);
+        }
+        Ok(updated)
+    }
+
     fn plan_compact_milestones(
         &self,
         input: CompactCleanupPlanInput<'_>,
@@ -8717,6 +9037,7 @@ impl Workspace {
             milestones,
             preserve_named_branches: _preserve_named_branches,
             preserve_merge_boundaries,
+            profile,
         } = input;
 
         if milestones.is_empty() {
@@ -8752,7 +9073,7 @@ impl Workspace {
         let mut oid_rewrites = HashMap::new();
         let mut previous_new_oid = base_parent_oid;
         let mut previous_old_end = base_parent_oid;
-        let signature = self.workspace_signature()?;
+        let (author, committer) = self.rewrite_signatures(profile)?;
 
         for milestone in milestones {
             let title = milestone.title.trim();
@@ -8797,8 +9118,8 @@ impl Workspace {
             let message = cleanup_commit_message(title, milestone.description.as_deref());
             let new_oid = self.repo.commit(
                 None,
-                &signature,
-                &signature,
+                &author,
+                &committer,
                 &message,
                 &tree,
                 parents.as_slice(),
@@ -9239,10 +9560,10 @@ impl Workspace {
 
     fn write_history_cleanup_plan(&self, plan: &HistoryCleanupStoredPlan) -> Result<()> {
         fs::create_dir_all(self.history_cleanup_plans_dir())?;
-        fs::write(
-            self.history_cleanup_plan_path(&plan.preview.plan_id),
-            serde_json::to_vec_pretty(plan)?,
-        )?;
+        let path = self.history_cleanup_plan_path(&plan.preview.plan_id);
+        let temp = path.with_extension("json.tmp");
+        fs::write(&temp, serde_json::to_vec_pretty(plan)?)?;
+        fs::rename(&temp, &path)?;
         Ok(())
     }
 
@@ -9695,8 +10016,13 @@ impl Workspace {
         Ok(None)
     }
 
-    fn shelve_changes_unchecked(&self, name: &str) -> Result<()> {
+    fn shelve_changes_unchecked(
+        &self,
+        name: &str,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<()> {
         let safe_name = validate_variation_name(name)?;
+        let (author, committer) = self.rewrite_signatures(profile)?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -9724,12 +10050,11 @@ impl Workspace {
 
         let tree_id = index.write_tree()?;
         let tree = self.repo.find_tree(tree_id)?;
-        let signature = self.workspace_signature()?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             None,
-            &signature,
-            &signature,
+            &author,
+            &committer,
             &format!("Shelved changes: {safe_name}"),
             &tree,
             &[&parent],
@@ -10152,6 +10477,19 @@ impl Workspace {
         let signature = self.workspace_signature()?;
         let contributor = contributor_from_signature(&signature);
         let signature = signature_from_contributor(&contributor)?;
+        Ok((signature.clone(), signature))
+    }
+
+    /// Like [`Self::workspace_signatures`], but without a profile it returns the exact
+    /// Git config signature that these operations used before they became profile-aware.
+    fn rewrite_signatures(
+        &self,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<(Signature<'static>, Signature<'static>)> {
+        if profile.is_some() {
+            return self.workspace_signatures(profile);
+        }
+        let signature = self.workspace_signature()?.to_owned();
         Ok((signature.clone(), signature))
     }
 
@@ -18000,5 +18338,672 @@ mod tests {
             err,
             DraftlineError::NotEnoughVersionsToSquash { .. }
         ));
+    }
+
+    // ── contributor profile attribution ─────────────────────────────────────
+
+    fn attribution_profile() -> ContributorProfile {
+        ContributorProfile::new(
+            Contributor {
+                name: "Profile Author".to_string(),
+                email: Some("author@profile.invalid".to_string()),
+            },
+            Contributor {
+                name: "Profile Saver".to_string(),
+                email: Some("saver@profile.invalid".to_string()),
+            },
+        )
+    }
+
+    fn assert_profile_attribution(version: &Version) {
+        assert_eq!(version.author.name, "Profile Author");
+        assert_eq!(
+            version.author.email.as_deref(),
+            Some("author@profile.invalid")
+        );
+        assert_eq!(version.saved_by.name, "Profile Saver");
+        assert_eq!(
+            version.saved_by.email.as_deref(),
+            Some("saver@profile.invalid")
+        );
+    }
+
+    fn assert_git_config_attribution(version: &Version) {
+        assert_eq!(version.author.name, "Seth");
+        assert_eq!(version.author.email.as_deref(), Some("seth@example.com"));
+        assert_eq!(version.saved_by.name, "Seth");
+        assert_eq!(version.saved_by.email.as_deref(), Some("seth@example.com"));
+    }
+
+    fn attribution_workspace() -> (tempfile::TempDir, Workspace) {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        (temp, workspace)
+    }
+
+    #[test]
+    fn no_profile_operations_keep_their_pre_profile_git_config_signatures() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let mut config = fs::read(workspace.repo.path().join("config")).unwrap();
+        config.extend_from_slice(b"[user]\n\tname = Jos\xe9\n\temail = jose@example.com\n");
+        fs::write(workspace.repo.path().join("config"), config).unwrap();
+        let names = |version: &Version| {
+            let commit = workspace
+                .repo
+                .find_commit(oid_from_version(version.id()).unwrap())
+                .unwrap();
+            let author = commit.author().name_bytes().to_vec();
+            let committer = commit.committer().name_bytes().to_vec();
+            (author, committer)
+        };
+
+        write_file(workspace.root(), "post.md", b"base");
+        let saved = workspace.save_version("Base").unwrap();
+        // Save has always normalized the config identity through `Contributor`.
+        assert_eq!(names(&saved), (b"Unknown".to_vec(), b"Unknown".to_vec()));
+
+        write_file(workspace.root(), "post.md", b"shelved");
+        let shelf = workspace.shelve_changes("wip").unwrap();
+        // Shelve, restore, squash and cleanup have always used the raw config signature.
+        assert_eq!(
+            names(&shelf.version),
+            (b"Jos\xe9".to_vec(), b"Jos\xe9".to_vec())
+        );
+    }
+
+    #[test]
+    fn shelve_changes_with_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+
+        let shelf = workspace
+            .shelve_changes_with_profile("profile-shelf", &attribution_profile())
+            .unwrap();
+
+        assert_profile_attribution(&shelf.version);
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "base"
+        );
+    }
+
+    #[test]
+    fn shelve_changes_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+
+        let shelf = workspace.shelve_changes("plain-shelf").unwrap();
+
+        assert_git_config_attribution(&shelf.version);
+    }
+
+    #[test]
+    fn shelve_files_with_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "one.md", b"one");
+        write_file(workspace.root(), "two.md", b"two");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "one.md", b"one shelved");
+        write_file(workspace.root(), "two.md", b"two remains");
+
+        let shelf = workspace
+            .shelve_files_with_profile("profile-shelf", ["one.md"], &attribution_profile())
+            .unwrap();
+
+        assert_profile_attribution(&shelf.version);
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("two.md")).unwrap(),
+            "two remains"
+        );
+    }
+
+    #[test]
+    fn shelve_files_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "one.md", b"one");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "one.md", b"one shelved");
+
+        let shelf = workspace.shelve_files("plain-shelf", ["one.md"]).unwrap();
+
+        assert_git_config_attribution(&shelf.version);
+    }
+
+    #[test]
+    fn switch_variation_with_profile_attributes_shelve_and_save_first() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        let main = VariationId::from(workspace.current_variation().unwrap());
+        workspace.create_variation("alt").unwrap();
+
+        write_file(workspace.root(), "post.md", b"shelve me");
+        workspace
+            .switch_variation_with_profile(
+                &VariationId::from("alt"),
+                SwitchPolicy::Shelve {
+                    name: "switch-shelf".to_string(),
+                },
+                &attribution_profile(),
+            )
+            .unwrap();
+        let shelf = workspace
+            .list_shelves()
+            .unwrap()
+            .into_iter()
+            .find(|shelf| shelf.id == "switch-shelf")
+            .unwrap();
+        assert_profile_attribution(&shelf.version);
+
+        write_file(workspace.root(), "post.md", b"save me");
+        workspace
+            .switch_variation_with_profile(
+                &main,
+                SwitchPolicy::SaveFirst {
+                    label: "Saved before switch".to_string(),
+                },
+                &attribution_profile(),
+            )
+            .unwrap();
+        let alt_tip = workspace
+            .repo
+            .find_branch("alt", BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let saved = version_from_commit(&alt_tip);
+        assert_eq!(saved.label, "Saved before switch");
+        assert_profile_attribution(&saved);
+    }
+
+    fn invalid_profile() -> ContributorProfile {
+        ContributorProfile::new(
+            Contributor {
+                name: "   ".to_string(),
+                email: None,
+            },
+            Contributor {
+                name: "Profile Saver".to_string(),
+                email: None,
+            },
+        )
+    }
+
+    #[test]
+    fn shelve_with_invalid_profile_fails_without_pending_recovery() {
+        let (_temp, workspace) = attribution_workspace();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"dirty");
+
+        let err = workspace
+            .shelve_files_with_profile("bad-shelf", ["post.md"], &invalid_profile())
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+        let err = workspace
+            .shelve_changes_with_profile("bad-shelf", &invalid_profile())
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+
+        workspace.ensure_no_pending_recovery().unwrap();
+        assert!(workspace.list_shelves().unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "dirty"
+        );
+    }
+
+    fn restore_fixture(workspace: &Workspace) -> Version {
+        write_file(workspace.root(), "post.md", b"first");
+        let first = workspace.save_version("First").unwrap();
+        write_file(workspace.root(), "post.md", b"second");
+        workspace.save_version("Second").unwrap();
+        first
+    }
+
+    #[test]
+    fn restore_version_as_new_save_with_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        let first = restore_fixture(&workspace);
+
+        let restored = workspace
+            .restore_version_as_new_save_with_profile(
+                first.id(),
+                "Restore first",
+                &attribution_profile(),
+            )
+            .unwrap();
+
+        assert_eq!(restored.label, "Restore first");
+        assert_profile_attribution(&restored);
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "first"
+        );
+    }
+
+    #[test]
+    fn restore_version_as_new_save_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        let first = restore_fixture(&workspace);
+
+        let restored = workspace
+            .restore_version_as_new_save(first.id(), "Restore first")
+            .unwrap();
+
+        assert_git_config_attribution(&restored);
+    }
+
+    #[test]
+    fn restore_with_invalid_profile_fails_without_pending_recovery() {
+        let (_temp, workspace) = attribution_workspace();
+        let first = restore_fixture(&workspace);
+        let head = workspace.repo.head().unwrap().target().unwrap();
+
+        let err = workspace
+            .restore_version_as_new_save_with_profile(first.id(), "Bad", &invalid_profile())
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+        let err = workspace
+            .restore_version_as_new_save_to_variation_with_profile(
+                first.id(),
+                "Bad",
+                RestoreVersionTarget::Current,
+                &invalid_profile(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+
+        workspace.ensure_no_pending_recovery().unwrap();
+        assert_eq!(workspace.repo.head().unwrap().target().unwrap(), head);
+    }
+
+    #[test]
+    fn restore_version_to_variation_with_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        let first = restore_fixture(&workspace);
+
+        let current = workspace
+            .restore_version_as_new_save_to_variation_with_profile(
+                first.id(),
+                "Restore on current",
+                RestoreVersionTarget::Current,
+                &attribution_profile(),
+            )
+            .unwrap();
+        assert_profile_attribution(&current.version);
+
+        let created = workspace
+            .restore_version_as_new_save_to_variation_with_profile(
+                first.id(),
+                "Restore on new",
+                RestoreVersionTarget::New {
+                    name: "restored".to_string(),
+                    metadata: VariationMetadata::default(),
+                },
+                &attribution_profile(),
+            )
+            .unwrap();
+        assert_eq!(created.target_variation.id().as_str(), "restored");
+        assert_profile_attribution(&created.version);
+    }
+
+    #[test]
+    fn restore_version_to_variation_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        let first = restore_fixture(&workspace);
+
+        let restored = workspace
+            .restore_version_as_new_save_to_variation(
+                first.id(),
+                "Restore on current",
+                RestoreVersionTarget::Current,
+            )
+            .unwrap();
+
+        assert_git_config_attribution(&restored.version);
+    }
+
+    fn squash_fixture(workspace: &Workspace) {
+        for (index, content) in ["one", "two", "three"].into_iter().enumerate() {
+            write_file(workspace.root(), "post.md", content.as_bytes());
+            workspace.save_version(format!("v{}", index + 1)).unwrap();
+        }
+    }
+
+    #[test]
+    fn squash_versions_with_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        squash_fixture(&workspace);
+
+        let squashed = workspace
+            .squash_versions_with_profile(2, "Squashed", &attribution_profile())
+            .unwrap();
+
+        assert_eq!(squashed.label, "Squashed");
+        assert_profile_attribution(&squashed);
+    }
+
+    #[test]
+    fn squash_versions_with_token_and_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        squash_fixture(&workspace);
+        let token = workspace
+            .preflight_squash_versions(2)
+            .unwrap()
+            .token
+            .unwrap();
+
+        let squashed = workspace
+            .squash_versions_with_token_and_profile(token, "Squashed", &attribution_profile())
+            .unwrap();
+
+        assert_profile_attribution(&squashed);
+    }
+
+    #[test]
+    fn squash_versions_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        squash_fixture(&workspace);
+
+        let squashed = workspace.squash_versions(2, "Squashed").unwrap();
+
+        assert_git_config_attribution(&squashed);
+    }
+
+    #[test]
+    fn squash_with_invalid_profile_fails_without_pending_recovery() {
+        let (_temp, workspace) = attribution_workspace();
+        squash_fixture(&workspace);
+        let head = workspace.repo.head().unwrap().target().unwrap();
+
+        let err = workspace
+            .squash_versions_with_profile(2, "Bad", &invalid_profile())
+            .unwrap_err();
+
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+        workspace.ensure_no_pending_recovery().unwrap();
+        assert_eq!(workspace.repo.head().unwrap().target().unwrap(), head);
+    }
+
+    fn descendant_profile() -> ContributorProfile {
+        ContributorProfile::new(
+            Contributor {
+                name: "Descendant Author".to_string(),
+                email: Some("descendant@profile.invalid".to_string()),
+            },
+            Contributor {
+                name: "Descendant Saver".to_string(),
+                email: Some("descendant-saver@profile.invalid".to_string()),
+            },
+        )
+    }
+
+    /// v1 → v2 → v3 → v4, where v4 is a descendant saved under a distinct identity.
+    fn cleanup_fixture(workspace: &Workspace) -> (Version, Version, Version) {
+        write_file(workspace.root(), "post.md", b"v1");
+        workspace.save_version("v1").unwrap();
+        write_file(workspace.root(), "post.md", b"v2");
+        let v2 = workspace.save_version("noisy autosave").unwrap();
+        write_file(workspace.root(), "post.md", b"v3");
+        let v3 = workspace.save_version("another noisy autosave").unwrap();
+        write_file(workspace.root(), "post.md", b"v4");
+        let v4 = workspace
+            .save_version_with_profile("descendant", &descendant_profile())
+            .unwrap();
+        (v2, v3, v4)
+    }
+
+    fn cleanup_versions(
+        workspace: &Workspace,
+        result: &TimelineCleanupResult,
+    ) -> (Version, Version) {
+        let milestone = result
+            .commit_map
+            .iter()
+            .find_map(|entry| match &entry.disposition {
+                RewriteDisposition::SquashedInto { new_id } => Some(new_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let descendant = result
+            .commit_map
+            .iter()
+            .find_map(|entry| match &entry.disposition {
+                RewriteDisposition::Preserved { new_id } => Some(new_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let load = |id: &VersionId| {
+            version_from_commit(
+                &workspace
+                    .repo
+                    .find_commit(oid_from_version(id).unwrap())
+                    .unwrap(),
+            )
+        };
+        (load(&milestone), load(&descendant))
+    }
+
+    fn assert_descendant_attribution(version: &Version) {
+        assert_eq!(version.label, "descendant");
+        assert_eq!(version.author.name, "Descendant Author");
+        assert_eq!(version.saved_by.name, "Descendant Saver");
+    }
+
+    #[test]
+    fn history_cleanup_with_profile_attributes_milestones_and_keeps_descendants() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, _v4) = cleanup_fixture(&workspace);
+
+        let preview = workspace
+            .preview_history_cleanup_with_profile(
+                compact_cleanup_request(&v2, &v3),
+                &attribution_profile(),
+            )
+            .unwrap();
+        let result = workspace
+            .apply_history_cleanup_with_profile(
+                preview.plan_id.clone(),
+                RewriteConfirmation::UserConfirmed,
+                &attribution_profile(),
+            )
+            .unwrap();
+
+        assert_eq!(result.new_head, preview.new_head);
+        let (milestone, descendant) = cleanup_versions(&workspace, &result);
+        assert_profile_attribution(&milestone);
+        assert_descendant_attribution(&descendant);
+    }
+
+    #[test]
+    fn history_cleanup_apply_with_profile_reattributes_unprofiled_preview() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, v4) = cleanup_fixture(&workspace);
+
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        let previewed = version_from_commit(
+            &workspace
+                .repo
+                .find_commit(oid_from_version(&preview.operations[0].new_version).unwrap())
+                .unwrap(),
+        );
+        assert_git_config_attribution(&previewed);
+
+        let result = workspace
+            .apply_history_cleanup_with_profile(
+                preview.plan_id.clone(),
+                RewriteConfirmation::UserConfirmed,
+                &attribution_profile(),
+            )
+            .unwrap();
+
+        assert_ne!(result.new_head, preview.new_head);
+        assert_eq!(result.old_head, v4.id().clone());
+        let (milestone, descendant) = cleanup_versions(&workspace, &result);
+        assert_profile_attribution(&milestone);
+        assert_descendant_attribution(&descendant);
+        let head = workspace
+            .repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(head.to_string(), result.new_head.as_str());
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id(preview.preview_ref.as_str())
+                .unwrap(),
+            head
+        );
+        let stored = workspace
+            .read_history_cleanup_plan(&preview.plan_id)
+            .unwrap();
+        assert_eq!(stored.preview.new_head, result.new_head);
+        assert_eq!(stored.preview.commit_map, result.commit_map);
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "v4"
+        );
+
+        let resolution = workspace
+            .resolve_rewritten_version(StaleVersionResolutionRequest {
+                version: v2.id().clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            resolution.disposition,
+            StaleVersionDisposition::SquashedInto { ref version } if version == milestone.id()
+        ));
+
+        let undo = workspace
+            .preflight_undo_history_cleanup(result.plan_id.clone())
+            .unwrap();
+        assert!(undo.can_undo);
+        let undone = workspace.undo_history_cleanup(undo.token).unwrap();
+        assert_eq!(undone.new_head, v4.id().clone());
+    }
+
+    #[test]
+    fn history_cleanup_without_profile_keeps_git_config_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, _v4) = cleanup_fixture(&workspace);
+
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        let result = workspace
+            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
+            .unwrap();
+
+        assert_eq!(result.new_head, preview.new_head);
+        let (milestone, descendant) = cleanup_versions(&workspace, &result);
+        assert_git_config_attribution(&milestone);
+        assert_descendant_attribution(&descendant);
+    }
+
+    #[test]
+    fn history_cleanup_with_invalid_profile_fails_without_moving_refs() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, v4) = cleanup_fixture(&workspace);
+
+        let err = workspace
+            .preview_history_cleanup_with_profile(
+                compact_cleanup_request(&v2, &v3),
+                &invalid_profile(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        let err = workspace
+            .apply_history_cleanup_with_profile(
+                preview.plan_id.clone(),
+                RewriteConfirmation::UserConfirmed,
+                &invalid_profile(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
+        workspace.ensure_no_pending_recovery().unwrap();
+        let head = workspace.repo.head().unwrap().target().unwrap();
+        assert_eq!(head.to_string(), v4.id().as_str());
+    }
+
+    #[test]
+    fn history_cleanup_apply_with_profile_recovers_interrupted_remint() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, _v4) = cleanup_fixture(&workspace);
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        let stored = workspace
+            .read_history_cleanup_plan(&preview.plan_id)
+            .unwrap();
+        // Simulate a crash after the preview ref moved but before the plan was rewritten.
+        workspace
+            .reattribute_history_cleanup_preview(&stored, &attribution_profile())
+            .unwrap();
+
+        let result = workspace
+            .apply_history_cleanup_with_profile(
+                preview.plan_id.clone(),
+                RewriteConfirmation::UserConfirmed,
+                &attribution_profile(),
+            )
+            .unwrap();
+        let (milestone, descendant) = cleanup_versions(&workspace, &result);
+        assert_profile_attribution(&milestone);
+        assert_descendant_attribution(&descendant);
+    }
+
+    #[test]
+    fn history_cleanup_apply_with_profile_rejects_plan_drift_before_moving_refs() {
+        let (_temp, workspace) = attribution_workspace();
+        let (v2, v3, v4) = cleanup_fixture(&workspace);
+
+        let preview = workspace
+            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
+            .unwrap();
+        workspace
+            .create_variation_from(v4.id(), "late-branch")
+            .unwrap();
+
+        let err = workspace
+            .apply_history_cleanup_with_profile(
+                preview.plan_id.clone(),
+                RewriteConfirmation::UserConfirmed,
+                &attribution_profile(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DraftlineError::InvalidHistoryCleanup(ref message)
+                if message.contains("no longer matches the workspace")
+        ));
+        workspace.ensure_no_pending_recovery().unwrap();
+        let head = workspace.repo.head().unwrap().target().unwrap();
+        assert_eq!(head.to_string(), v4.id().as_str());
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id(preview.preview_ref.as_str())
+                .unwrap()
+                .to_string(),
+            preview.new_head.as_str()
+        );
     }
 }
