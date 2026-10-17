@@ -131,6 +131,8 @@ export interface DraftlineClient {
   fetchRemote(request: RemoteRequest): Promise<FetchRemoteResult>;
   preflightApplyIncoming(request: RemoteRequest): Promise<ApplyIncomingReport>;
   applyIncoming(request: RemoteRequest): Promise<ApplyIncomingCommandResult>;
+  preflightMilestoneMerge(request: RemoteRequest): Promise<MilestoneMergeReport>;
+  createMilestoneMerge(request: MilestoneMergeRequest): Promise<MilestoneMergeCommandResult>;
   preflightMergeIncoming(request: RemoteRequest): Promise<MergeIncomingReport>;
   mergeIncoming(request: MergeIncomingRequest): Promise<MergeIncomingCommandResult>;
   mergeIncomingWithResolutions(
@@ -291,6 +293,8 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     fetchRemote: (request) => run('fetch_remote', { request }),
     preflightApplyIncoming: (request) => run('preflight_apply_incoming', { request }),
     applyIncoming: (request) => run('apply_incoming', { request }),
+    preflightMilestoneMerge: (request) => run('preflight_milestone_merge', { request }),
+    createMilestoneMerge: (request) => run('create_milestone_merge', { request }),
     preflightMergeIncoming: (request) => run('preflight_merge_incoming', { request }),
     mergeIncoming: (request) => run('merge_incoming', { request }),
     mergeIncomingWithResolutions: (request) =>
@@ -1394,6 +1398,38 @@ export interface ApplyIncomingCommandResult {
   postconditions: CommandPostconditions;
 }
 
+export interface MilestoneMergeToken {
+  remote: string;
+  variation: string;
+  local_oid: string;
+  remote_oid: string;
+  merge_base_oid: string;
+}
+
+export interface MilestoneMergeReport {
+  sync_status: SyncStatus;
+  dirty_files: ChangedFile[];
+  token?: MilestoneMergeToken | null;
+  can_create_milestone: boolean;
+  unpublished_versions: number;
+  first_parent?: string | null;
+  second_parent: string;
+  changed_workspace: boolean;
+}
+
+export interface MilestoneMergeResult {
+  version: Version;
+  first_parent: string;
+  second_parent: string;
+  preserved_versions: number;
+}
+
+export interface MilestoneMergeCommandResult {
+  preflight: MilestoneMergeReport;
+  merge: MilestoneMergeResult;
+  postconditions: CommandPostconditions;
+}
+
 export interface MergeConflict {
   path: string;
   field_path?: string | null;
@@ -1599,6 +1635,10 @@ export interface MergeIncomingRequest extends RemoteRequest {
   label: string;
 }
 
+export interface MilestoneMergeRequest extends RemoteRequest {
+  label: string;
+}
+
 export interface MergeIncomingWithResolutionsRequest extends MergeIncomingRequest {
   token: MergeIncomingToken;
   resolutions: MergeConflictResolution[];
@@ -1729,6 +1769,8 @@ export interface DraftlineHostFacade {
   publishCurrentVariation(remote?: string): Promise<PublishCurrentVariationResult>;
   preflightApplyIncoming(remote?: string): Promise<ApplyIncomingReport>;
   applyIncoming(remote?: string): Promise<ApplyIncomingCommandResult>;
+  preflightMilestoneMerge(remote?: string): Promise<MilestoneMergeReport>;
+  createMilestoneMerge(label: string, remote?: string): Promise<MilestoneMergeCommandResult>;
   preflightMergeIncoming(remote?: string): Promise<MergeIncomingReport>;
   mergeIncoming(label: string, remote?: string): Promise<MergeIncomingCommandResult>;
   mergeIncomingWithResolutions(
@@ -1909,6 +1951,9 @@ export function createDraftlineHostFacade({
     publishCurrentVariation: (remote) => client.publishCurrentVariation(remoteRequest(remote)),
     preflightApplyIncoming: (remote) => client.preflightApplyIncoming(remoteRequest(remote)),
     applyIncoming: (remote) => client.applyIncoming(remoteRequest(remote)),
+    preflightMilestoneMerge: (remote) => client.preflightMilestoneMerge(remoteRequest(remote)),
+    createMilestoneMerge: (label, remote) =>
+      client.createMilestoneMerge({ ...remoteRequest(remote), label }),
     preflightMergeIncoming: (remote) => client.preflightMergeIncoming(remoteRequest(remote)),
     mergeIncoming: (label, remote) => client.mergeIncoming({ ...remoteRequest(remote), label }),
     mergeIncomingWithResolutions: (label, token, resolutions, remote) =>
@@ -2287,6 +2332,18 @@ export async function applyIncoming(
   request: RemoteRequest,
 ): Promise<ApplyIncomingCommandResult> {
   return createDraftlineClient().applyIncoming(request);
+}
+
+export async function preflightMilestoneMerge(
+  request: RemoteRequest,
+): Promise<MilestoneMergeReport> {
+  return createDraftlineClient().preflightMilestoneMerge(request);
+}
+
+export async function createMilestoneMerge(
+  request: MilestoneMergeRequest,
+): Promise<MilestoneMergeCommandResult> {
+  return createDraftlineClient().createMilestoneMerge(request);
 }
 
 export async function preflightMergeIncoming(request: RemoteRequest): Promise<MergeIncomingReport> {

@@ -609,6 +609,30 @@ mod tests {
     }
 
     #[test]
+    fn timeout_error_without_explicit_deadline_omits_zero_milliseconds() {
+        let options = RemoteOptions::new();
+        let error = options
+            .map_git_result::<()>(
+                "fetch_remote",
+                Err(git2::Error::new(
+                    git2::ErrorCode::Timeout,
+                    git2::ErrorClass::Net,
+                    "socket timed out",
+                )),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DraftlineError::RemoteOperationTimedOut { timeout_ms: 0, .. }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "remote operation timed out while running fetch_remote"
+        );
+    }
+
+    #[test]
     fn push_expectations_reject_create_only_when_remote_ref_exists() {
         let remote_dir = tempfile::tempdir().unwrap();
         Repository::init_bare(remote_dir.path()).unwrap();

@@ -6,7 +6,7 @@ use draftline::{
     DiagnosticCode, DraftlineError, HistoryCleanupRequest, HistoryCompactionCandidatesRequest,
     MilestoneSpec, RemoteOptions, RemoteRewritePolicy, RestoreVersionTarget, RewriteConfirmation,
     StaleVersionDisposition, StaleVersionResolutionRequest, SupportRefScope, SwitchPolicy,
-    SyncState, VariationId, VariationMetadata, Version, Workspace,
+    SyncState, VariationId, VariationMetadata, Version, Workspace, WorkspaceGraphOptions,
 };
 
 fn write_file(root: &Path, relative: &str, content: &str) {
@@ -78,7 +78,7 @@ fn scenario_flow_documentation_matrix_is_executable() {
 
     assert_eq!(
         rows.len(),
-        39,
+        40,
         "every documented Flow row must be in the matrix"
     );
     for row in rows {
@@ -443,6 +443,245 @@ fn scenario_flow_10_11_12_collaboration_fast_forward_and_clean_merge() {
         author.sync_status("origin").unwrap().state,
         SyncState::LocalAhead
     );
+}
+
+#[test]
+fn scenario_flow_10a_milestone_merge_preserves_save_chain_and_publishes_forward() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    init_bare_remote(remote_dir.path());
+
+    let author_dir = tempfile::tempdir().unwrap();
+    let author = Workspace::init(author_dir.path()).unwrap();
+    configure_identity(author.root(), "Scenario Author");
+    write_file(author.root(), "story.md", "shared base");
+    let base = author.save_version("Shared base").unwrap();
+    author
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    author.publish_changes("origin").unwrap();
+
+    write_file(author.root(), "story.md", "shared base\nfirst local save");
+    let first_save = author.save_version("First local save").unwrap();
+    write_file(
+        author.root(),
+        "story.md",
+        "shared base\nfirst local save\nsecond local save",
+    );
+    let second_save = author.save_version("Second local save").unwrap();
+
+    author.fetch_remote("origin").unwrap();
+    let preflight = author.preflight_milestone_merge("origin").unwrap();
+    assert!(preflight.can_create_milestone);
+    assert_eq!(preflight.unpublished_versions, 2);
+    assert_eq!(preflight.first_parent.as_ref(), Some(base.id()));
+    assert_eq!(&preflight.second_parent, second_save.id());
+
+    let milestone = author
+        .create_milestone_merge(
+            preflight.token.unwrap(),
+            "Milestone: local direction",
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    assert_eq!(milestone.version.label, "Milestone: local direction");
+    assert_eq!(&milestone.first_parent, base.id());
+    assert_eq!(&milestone.second_parent, second_save.id());
+    assert_eq!(milestone.preserved_versions, 2);
+    assert_eq!(
+        read_file(author.root(), "story.md"),
+        "shared base\nfirst local save\nsecond local save"
+    );
+
+    let repo = git2::Repository::open(author.root()).unwrap();
+    let milestone_commit = repo
+        .find_commit(git2::Oid::from_str(milestone.version.id().as_str()).unwrap())
+        .unwrap();
+    assert_eq!(milestone_commit.parent_count(), 2);
+    assert_eq!(
+        milestone_commit.parent_id(0).unwrap().to_string(),
+        base.id().as_str()
+    );
+    assert_eq!(
+        milestone_commit.parent_id(1).unwrap().to_string(),
+        second_save.id().as_str()
+    );
+    assert!(repo
+        .graph_descendant_of(
+            git2::Oid::from_str(milestone.version.id().as_str()).unwrap(),
+            git2::Oid::from_str(first_save.id().as_str()).unwrap(),
+        )
+        .unwrap());
+
+    let graph = author
+        .workspace_graph_for_variation(&VariationId::from("main"), WorkspaceGraphOptions::default())
+        .unwrap();
+    let milestone_node = graph
+        .nodes
+        .iter()
+        .find(|node| node.version.id() == milestone.version.id())
+        .unwrap();
+    assert_eq!(
+        milestone_node
+            .parent_version_ids
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>(),
+        vec![base.id().as_str(), second_save.id().as_str()]
+    );
+    let first_save_node = graph
+        .nodes
+        .iter()
+        .find(|node| node.version.id() == first_save.id())
+        .unwrap();
+    assert_eq!(
+        first_save_node
+            .parent_version_ids
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>(),
+        vec![base.id().as_str()]
+    );
+    let second_save_node = graph
+        .nodes
+        .iter()
+        .find(|node| node.version.id() == second_save.id())
+        .unwrap();
+    assert_eq!(
+        second_save_node
+            .parent_version_ids
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>(),
+        vec![first_save.id().as_str()]
+    );
+
+    let published = author.publish_changes("origin").unwrap();
+    assert_eq!(published.published_versions, 3);
+
+    let remote_repo = git2::Repository::open_bare(remote_dir.path()).unwrap();
+    let remote_tip = remote_repo.refname_to_id("refs/heads/main").unwrap();
+    assert_eq!(remote_tip.to_string(), milestone.version.id().as_str());
+    assert!(remote_repo
+        .graph_descendant_of(remote_tip, git2::Oid::from_str(base.id().as_str()).unwrap(),)
+        .unwrap());
+    assert!(remote_repo
+        .graph_descendant_of(
+            remote_tip,
+            git2::Oid::from_str(first_save.id().as_str()).unwrap(),
+        )
+        .unwrap());
+    assert!(remote_repo
+        .graph_descendant_of(
+            remote_tip,
+            git2::Oid::from_str(second_save.id().as_str()).unwrap(),
+        )
+        .unwrap());
+
+    let mut first_parent_walk = remote_repo.revwalk().unwrap();
+    first_parent_walk.push(remote_tip).unwrap();
+    first_parent_walk.simplify_first_parent().unwrap();
+    let first_parent_ids = first_parent_walk
+        .map(|oid| oid.unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first_parent_ids,
+        vec![milestone.version.id().as_str(), base.id().as_str()]
+    );
+
+    let mut full_walk = remote_repo.revwalk().unwrap();
+    full_walk.push(remote_tip).unwrap();
+    full_walk.set_sorting(git2::Sort::TOPOLOGICAL).unwrap();
+    let full_ids = full_walk
+        .map(|oid| oid.unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(full_ids.iter().any(|id| id == first_save.id().as_str()));
+    assert!(full_ids.iter().any(|id| id == second_save.id().as_str()));
+
+    let fresh_clone_dir = tempfile::tempdir().unwrap();
+    let fresh_clone = git2::Repository::clone(
+        remote_dir.path().to_string_lossy().as_ref(),
+        fresh_clone_dir.path(),
+    )
+    .unwrap();
+    let fresh_tip = fresh_clone.refname_to_id("refs/heads/main").unwrap();
+    assert_eq!(fresh_tip, remote_tip);
+}
+
+#[test]
+fn milestone_merge_blocks_dirty_stale_and_remote_changed_states() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    init_bare_remote(remote_dir.path());
+
+    let author_dir = tempfile::tempdir().unwrap();
+    let author = Workspace::init(author_dir.path()).unwrap();
+    configure_identity(author.root(), "Scenario Author");
+    write_file(author.root(), "story.md", "shared base");
+    author.save_version("Shared base").unwrap();
+    author
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    author.publish_changes("origin").unwrap();
+
+    write_file(author.root(), "story.md", "shared base\nlocal save");
+    author.save_version("Local save").unwrap();
+    author.fetch_remote("origin").unwrap();
+    let token = author
+        .preflight_milestone_merge("origin")
+        .unwrap()
+        .token
+        .unwrap();
+
+    write_file(author.root(), "notes.md", "unsaved work");
+    let dirty_preflight = author.preflight_milestone_merge("origin").unwrap();
+    assert!(!dirty_preflight.can_create_milestone);
+    assert!(dirty_preflight.token.is_none());
+    assert!(matches!(
+        author.create_milestone_merge(
+            token.clone(),
+            "Blocked dirty milestone",
+            &mut RemoteOptions::new()
+        ),
+        Err(DraftlineError::PreflightFailed(_))
+    ));
+    fs::remove_file(author.root().join("notes.md")).unwrap();
+
+    write_file(
+        author.root(),
+        "story.md",
+        "shared base\nlocal save\nnew local save",
+    );
+    author.save_version("New local save").unwrap();
+    assert!(matches!(
+        author.create_milestone_merge(
+            token.clone(),
+            "Blocked stale milestone",
+            &mut RemoteOptions::new()
+        ),
+        Err(DraftlineError::LocalStateChanged { .. })
+    ));
+
+    let fresh_token = author
+        .preflight_milestone_merge("origin")
+        .unwrap()
+        .token
+        .unwrap();
+    let teammate_dir = tempfile::tempdir().unwrap();
+    let teammate =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), teammate_dir.path())
+            .unwrap();
+    configure_identity(teammate.root(), "Scenario Teammate");
+    write_file(teammate.root(), "teammate.md", "remote changed");
+    teammate.save_version("Remote changed").unwrap();
+    teammate.publish_changes("origin").unwrap();
+
+    assert!(matches!(
+        author.create_milestone_merge(
+            fresh_token,
+            "Blocked remote-changed milestone",
+            &mut RemoteOptions::new()
+        ),
+        Err(DraftlineError::SyncNeedsMerge(_))
+    ));
 }
 
 #[test]

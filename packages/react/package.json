@@ -30,7 +30,9 @@
     "test": "vitest run --environment jsdom"
   },
   "dependencies": {
-    "@draftline/client": "0.1.14"
+    "@dagrejs/dagre": "^3.1.1",
+    "@draftline/client": "0.1.15",
+    "@xyflow/react": "^12.12.0"
   },
   "peerDependencies": {
     "react": "^19.0.0"

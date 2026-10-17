@@ -1115,6 +1115,31 @@ pub struct MergeIncomingToken {
     pub merge_base_oid: String,
 }
 
+/// Read-only preflight report for wrapping local saves in a shared milestone merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MilestoneMergeReport {
+    pub sync_status: SyncStatus,
+    pub dirty_files: Vec<ChangedFile>,
+    pub token: Option<MilestoneMergeToken>,
+    pub can_create_milestone: bool,
+    pub unpublished_versions: usize,
+    pub first_parent: Option<VersionId>,
+    pub second_parent: VersionId,
+    pub changed_workspace: bool,
+}
+
+/// Opaque token tying milestone merge execution to a local-ahead shared state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MilestoneMergeToken {
+    pub remote: String,
+    pub variation: String,
+    pub local_oid: String,
+    pub remote_oid: String,
+    pub merge_base_oid: String,
+}
+
 /// Explicit user choice for resolving one merge conflict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -1166,6 +1191,16 @@ impl MergeConflictResolution {
 pub struct MergeIncomingResult {
     pub version: Version,
     pub merged_files: Vec<PathBuf>,
+}
+
+/// Result of creating a milestone merge around local saves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct MilestoneMergeResult {
+    pub version: Version,
+    pub first_parent: VersionId,
+    pub second_parent: VersionId,
+    pub preserved_versions: usize,
 }
 
 struct IncomingMergeInput<'repo> {
@@ -2551,9 +2586,9 @@ impl Workspace {
             RecoveryOperation::DeleteRemoteVariation => {
                 self.repair_delete_remote_variation_recovery(state, options)
             }
-            RecoveryOperation::RestoreVersionAsNewSave | RecoveryOperation::MergeIncoming => {
-                Ok(self.recovery_unavailable(state))
-            }
+            RecoveryOperation::RestoreVersionAsNewSave
+            | RecoveryOperation::MergeIncoming
+            | RecoveryOperation::MilestoneMerge => Ok(self.recovery_unavailable(state)),
         }
     }
 
@@ -2641,7 +2676,8 @@ impl Workspace {
             | RecoveryOperation::DiscardFile
             | RecoveryOperation::DeleteRemoteVariation
             | RecoveryOperation::ExpireSupportRefs
-            | RecoveryOperation::MergeIncoming => Ok(self.recovery_unavailable(state)),
+            | RecoveryOperation::MergeIncoming
+            | RecoveryOperation::MilestoneMerge => Ok(self.recovery_unavailable(state)),
         }
     }
 
@@ -6198,6 +6234,168 @@ impl Workspace {
             file_hazards,
             is_fast_forward,
             can_proceed,
+        })
+    }
+
+    /// Preflights creating an additive milestone merge for local saves.
+    pub fn preflight_milestone_merge(
+        &self,
+        remote: impl AsRef<str>,
+    ) -> Result<MilestoneMergeReport> {
+        self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("preflight_milestone_merge")?;
+        let sync_status = self.sync_status(remote)?;
+        let dirty_files = self.changed_files_unchecked()?;
+        let local_oid = self.repo.head()?.peel_to_commit()?.id();
+        let mut token = None;
+        let mut first_parent = None;
+        let unpublished_versions = sync_status.ahead;
+
+        if matches!(sync_status.state, SyncState::LocalAhead) {
+            let remote_ref = format!(
+                "refs/remotes/{}/{}",
+                sync_status.remote, sync_status.variation
+            );
+            let remote_oid = self.repo.refname_to_id(&remote_ref)?;
+            let merge_base_oid = self.repo.merge_base(local_oid, remote_oid)?;
+            first_parent = Some(VersionId::from(remote_oid));
+            if merge_base_oid == remote_oid && dirty_files.is_empty() {
+                token = Some(MilestoneMergeToken {
+                    remote: sync_status.remote.clone(),
+                    variation: sync_status.variation.clone(),
+                    local_oid: local_oid.to_string(),
+                    remote_oid: remote_oid.to_string(),
+                    merge_base_oid: merge_base_oid.to_string(),
+                });
+            }
+        }
+
+        Ok(MilestoneMergeReport {
+            sync_status,
+            dirty_files,
+            token: token.clone(),
+            can_create_milestone: token.is_some(),
+            unpublished_versions,
+            first_parent,
+            second_parent: VersionId::from(local_oid),
+            changed_workspace: false,
+        })
+    }
+
+    /// Creates a two-parent milestone merge whose first parent is the shared tip
+    /// and second parent is the preserved local save chain.
+    pub fn create_milestone_merge(
+        &self,
+        token: MilestoneMergeToken,
+        label: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<MilestoneMergeResult> {
+        self.create_milestone_merge_with_optional_profile(token, label, options, None)
+    }
+
+    /// Creates an additive milestone merge using host-supplied attribution.
+    pub fn create_milestone_merge_with_profile(
+        &self,
+        token: MilestoneMergeToken,
+        label: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+        profile: &ContributorProfile,
+    ) -> Result<MilestoneMergeResult> {
+        self.create_milestone_merge_with_optional_profile(token, label, options, Some(profile))
+    }
+
+    fn create_milestone_merge_with_optional_profile(
+        &self,
+        token: MilestoneMergeToken,
+        label: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<MilestoneMergeResult> {
+        self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation("create_milestone_merge")?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "create_milestone_merge")?;
+        let dirty_files = self.changed_files_unchecked()?;
+        if !dirty_files.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "create_milestone_merge",
+                true,
+                dirty_files,
+                Vec::new(),
+                None,
+            ))));
+        }
+
+        let variation = self.current_variation_unchecked()?;
+        let local_commit = self.repo.head()?.peel_to_commit()?;
+        if variation != token.variation || local_commit.id().to_string() != token.local_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{}", token.variation, token.local_oid),
+                actual: format!("{variation}@{}", local_commit.id()),
+            });
+        }
+
+        self.fetch_remote_unchecked(&token.remote, options)?;
+        let status = self.sync_status(&token.remote)?;
+        if status.state != SyncState::LocalAhead {
+            return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
+        }
+        let actual_remote_oid = remote_tracking_oid(&self.repo, &token.remote, &token.variation);
+        if actual_remote_oid.as_deref() != Some(token.remote_oid.as_str()) {
+            return Err(DraftlineError::RemoteRace {
+                remote: token.remote,
+                variation: token.variation,
+                expected: Some(token.remote_oid),
+                actual: actual_remote_oid,
+            });
+        }
+
+        let remote_oid = Oid::from_str(&token.remote_oid)?;
+        let merge_base_oid = self.repo.merge_base(local_commit.id(), remote_oid)?;
+        if merge_base_oid.to_string() != token.merge_base_oid || merge_base_oid != remote_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: token.merge_base_oid,
+                actual: merge_base_oid.to_string(),
+            });
+        }
+
+        let remote_commit = self.repo.find_commit(remote_oid)?;
+        let tree = local_commit.tree()?;
+        let (author, committer) = self.workspace_signatures(profile)?;
+        let operation_id = new_operation_id();
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::MilestoneMerge,
+            original_variation: Some(variation),
+            target: Some(token.remote_oid.clone()),
+            completed: false,
+        })?;
+
+        let oid = self.repo.commit(
+            None,
+            &author,
+            &committer,
+            label.as_ref(),
+            &tree,
+            &[&remote_commit, &local_commit],
+        )?;
+        let branch_ref = format!("refs/heads/{}", token.variation);
+        self.repo
+            .reference(&branch_ref, oid, true, "create_milestone_merge")?;
+        self.repo.set_head(&branch_ref)?;
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::MilestoneMerge,
+            original_variation: None,
+            target: Some(oid.to_string()),
+            completed: true,
+        })?;
+
+        Ok(MilestoneMergeResult {
+            version: version_from_commit(&self.repo.find_commit(oid)?),
+            first_parent: VersionId::from(remote_oid),
+            second_parent: VersionId::from(local_commit.id()),
+            preserved_versions: status.ahead,
         })
     }
 

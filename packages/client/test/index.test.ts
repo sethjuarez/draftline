@@ -25,6 +25,12 @@ describe('createDraftlineClient', () => {
     await client.inspectWorkspace('C:\\repo');
     await client.fetchRemote({ workspace_path: 'C:\\repo', remote: 'origin' });
     await client.applyIncoming({ workspace_path: 'C:\\repo', remote: 'origin' });
+    await client.preflightMilestoneMerge({ workspace_path: 'C:\\repo', remote: 'origin' });
+    await client.createMilestoneMerge({
+      workspace_path: 'C:\\repo',
+      remote: 'origin',
+      label: 'Review milestone',
+    });
     await client.mergeIncoming({
       workspace_path: 'C:\\repo',
       remote: 'origin',
@@ -85,10 +91,20 @@ describe('createDraftlineClient', () => {
     expect(invoke).toHaveBeenNthCalledWith(3, 'apply_incoming', {
       request: { workspace_path: 'C:\\repo', remote: 'origin' },
     });
-    expect(invoke).toHaveBeenNthCalledWith(4, 'merge_incoming', {
+    expect(invoke).toHaveBeenNthCalledWith(4, 'preflight_milestone_merge', {
+      request: { workspace_path: 'C:\\repo', remote: 'origin' },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(5, 'create_milestone_merge', {
+      request: {
+        workspace_path: 'C:\\repo',
+        remote: 'origin',
+        label: 'Review milestone',
+      },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(6, 'merge_incoming', {
       request: { workspace_path: 'C:\\repo', remote: 'origin', label: 'Merge incoming' },
     });
-    expect(invoke).toHaveBeenNthCalledWith(5, 'merge_incoming_with_resolutions', {
+    expect(invoke).toHaveBeenNthCalledWith(7, 'merge_incoming_with_resolutions', {
       request: {
         workspace_path: 'C:\\repo',
         remote: 'origin',
@@ -109,29 +125,29 @@ describe('createDraftlineClient', () => {
         ],
       },
     });
-    expect(invoke).toHaveBeenNthCalledWith(6, 'selected_save', {
+    expect(invoke).toHaveBeenNthCalledWith(8, 'selected_save', {
       request: { workspace_path: 'C:\\repo', paths: ['post.md'], label: 'Save post' },
     });
-    expect(invoke).toHaveBeenNthCalledWith(7, 'selected_shelve', {
+    expect(invoke).toHaveBeenNthCalledWith(9, 'selected_shelve', {
       request: { workspace_path: 'C:\\repo', paths: ['post.md'], name: 'post-shelf' },
     });
-    expect(invoke).toHaveBeenNthCalledWith(8, 'selected_discard', {
+    expect(invoke).toHaveBeenNthCalledWith(10, 'selected_discard', {
       request: { workspace_path: 'C:\\repo', paths: ['post.md'] },
     });
-    expect(invoke).toHaveBeenNthCalledWith(9, 'publish_current_variation', {
+    expect(invoke).toHaveBeenNthCalledWith(11, 'publish_current_variation', {
       request: { workspace_path: 'C:\\repo', remote: 'origin' },
     });
-    expect(invoke).toHaveBeenNthCalledWith(10, 'list_support_refs', {
+    expect(invoke).toHaveBeenNthCalledWith(12, 'list_support_refs', {
       request: { workspace_path: 'C:\\repo', scope: 'local' },
     });
-    expect(invoke).toHaveBeenNthCalledWith(11, 'preflight_rename_variation', {
+    expect(invoke).toHaveBeenNthCalledWith(13, 'preflight_rename_variation', {
       request: {
         workspace_path: 'C:\\repo',
         source_variation_id: 'master',
         target_variation_id: 'main',
       },
     });
-    expect(invoke).toHaveBeenNthCalledWith(12, 'rename_variation', {
+    expect(invoke).toHaveBeenNthCalledWith(14, 'rename_variation', {
       request: {
         workspace_path: 'C:\\repo',
         source_variation_id: 'master',

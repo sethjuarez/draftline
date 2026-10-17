@@ -16,12 +16,13 @@ use crate::{
     HistoryCleanupRemoteImpact, HistoryCleanupRequest, HistoryCleanupUndoPreflight,
     HistoryCleanupUndoToken, HistoryCompactionCandidates, HistoryCompactionCandidatesRequest,
     HistoryEntry, MergeConflictResolution, MergeIncomingReport, MergeIncomingResult,
-    MergeIncomingToken, MergeResolutionChoice, OperationLockInspection, PendingHistoryCleanup,
-    PreflightReport, PreviewFile, PublishPreflight, PublishResult, RecoveryRepairResult,
-    RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions,
-    RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result, RewriteConfirmation,
-    Shelf, ShelfApplyReport, StaleVersionResolution, StaleVersionResolutionRequest, SupportRef,
-    SupportRefScope, SwitchPolicy, SyncState, SyncStatus, TimelineCleanupResult, Variation,
+    MergeIncomingToken, MergeResolutionChoice, MilestoneMergeReport, MilestoneMergeResult,
+    OperationLockInspection, PendingHistoryCleanup, PreflightReport, PreviewFile, PublishPreflight,
+    PublishResult, RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest,
+    RemoteEndpoint, RemoteOptions, RemoteVariation, RemoteVariationDiagnostics,
+    RestoreVersionTarget, Result, RewriteConfirmation, Shelf, ShelfApplyReport,
+    StaleVersionResolution, StaleVersionResolutionRequest, SupportRef, SupportRefScope,
+    SwitchPolicy, SyncState, SyncStatus, TimelineCleanupResult, Variation,
     VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
     VariationRenamePreflight, VariationRenameToken, VariationSummary, Version, VersionDiff,
     VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
@@ -714,6 +715,14 @@ pub struct MergeIncomingRequest {
     pub label: String,
 }
 
+/// Request for wrapping local-ahead saves in a named milestone merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MilestoneMergeRequest {
+    pub workspace_path: PathBuf,
+    pub remote: String,
+    pub label: String,
+}
+
 /// Request for writing an incoming merge after explicit conflict resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeIncomingWithResolutionsRequest {
@@ -729,6 +738,14 @@ pub struct MergeIncomingWithResolutionsRequest {
 pub struct MergeIncomingCommandResult {
     pub preflight: MergeIncomingReport,
     pub merge: MergeIncomingResult,
+    pub postconditions: CommandPostconditions,
+}
+
+/// Milestone merge result with the preflight and postcondition state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MilestoneMergeCommandResult {
+    pub preflight: MilestoneMergeReport,
+    pub merge: MilestoneMergeResult,
     pub postconditions: CommandPostconditions,
 }
 
@@ -2745,6 +2762,96 @@ pub fn preflight_merge_incoming_with_context(
     let mut options = context.remote_options();
     workspace.fetch_remote_with_options(&request.remote, &mut options)?;
     workspace.preflight_merge_incoming(&request.remote)
+}
+
+/// Preflights wrapping local-ahead saves as a shared milestone merge.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn preflight_milestone_merge(request: RemoteRequest) -> Result<MilestoneMergeReport> {
+    preflight_milestone_merge_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Preflights milestone merge using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn preflight_milestone_merge_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: RemoteRequest,
+) -> Result<MilestoneMergeReport> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let mut options = context.remote_options();
+    workspace.fetch_remote_with_options(&request.remote, &mut options)?;
+    workspace.preflight_milestone_merge(&request.remote)
+}
+
+/// Creates an additive milestone merge through Draftline's tokenized path.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn create_milestone_merge(
+    request: MilestoneMergeRequest,
+) -> Result<MilestoneMergeCommandResult> {
+    create_milestone_merge_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Creates an additive milestone merge using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn create_milestone_merge_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: MilestoneMergeRequest,
+) -> Result<MilestoneMergeCommandResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let contributor_profile = context.contributor_profile.clone();
+    let (preflight, merge) = {
+        let mut options = context.remote_options();
+        workspace.fetch_remote_with_options(&request.remote, &mut options)?;
+        let preflight = workspace.preflight_milestone_merge(&request.remote)?;
+        let Some(token) = preflight.token.clone() else {
+            return Err(DraftlineError::PreflightFailed(Box::new(PreflightReport {
+                operation: "create_milestone_merge".to_string(),
+                will_write_files: false,
+                dirty_files: preflight.dirty_files.clone(),
+                file_hazards: Vec::new(),
+                untracked_assets: Vec::new(),
+                unresolved_conflicts: Vec::new(),
+                large_files: Vec::new(),
+                binary_files: Vec::new(),
+                variation_divergence: Some(format!(
+                    "milestone merge requires local-ahead state, found {:?}",
+                    preflight.sync_status.state
+                )),
+                can_proceed: false,
+            })));
+        };
+        let merge = match contributor_profile.as_ref() {
+            Some(profile) => workspace.create_milestone_merge_with_profile(
+                token,
+                request.label,
+                &mut options,
+                profile,
+            )?,
+            None => workspace.create_milestone_merge(token, request.label, &mut options)?,
+        };
+        (preflight, merge)
+    };
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(MilestoneMergeCommandResult {
+        preflight,
+        merge,
+        postconditions: collect_postconditions(&workspace, true),
+    })
 }
 
 /// Writes a clean incoming merge through Draftline's tokenized merge path.
