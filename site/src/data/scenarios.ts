@@ -145,6 +145,28 @@ export const scenarioGroups: ScenarioGroup[] = [
     H -- Yes --> I[publish hidden support refs]
     H -- No --> J[local recovery point]`,
   },
+  {
+    title: "Hybrid projects",
+    eyebrow: "Share a repository with developers",
+    summary:
+      "Edit a project folder inside a code repository while developers use plain Git, and share by pull request.",
+    source: "docs/scenario-flows/hybrid-projects.md",
+    docsPath: "/docs/scenarios/hybrid-projects/",
+    primitives: [
+      "init_with_policy",
+      "with_variation_namespace",
+      "send",
+      "preflight_merge_base",
+    ],
+    diagram: `flowchart LR
+    A[Open project folder] --> B[Edit and save]
+    B --> C[Send]
+    C --> D[Pull request]
+    D --> E[Merged on GitHub]
+    E --> F[Get updates]
+    F --> B
+    G[Developer commits] -.-> B`,
+  },
 ];
 
 export const flowMatrix: Flow[] = [
@@ -406,6 +428,55 @@ export const flowMatrix: Flow[] = [
     group: "Recovery and cleanup",
     status: "Partially covered",
     outcome: "Clear stale metadata locks only when the workspace proves it is safe.",
+  },
+  {
+    id: "15",
+    title: "Open a project inside a code repository",
+    group: "Hybrid projects",
+    status: "Covered",
+    outcome: "Join the enclosing repository and scope everything to the project folder.",
+  },
+  {
+    id: "15a",
+    title: "Save and go back next to a developer",
+    group: "Hybrid projects",
+    status: "Covered",
+    outcome: "Save, restore, and shelve only the project folder; leave the developer's index alone.",
+  },
+  {
+    id: "15b",
+    title: "Developers commit with plain Git",
+    group: "Hybrid projects",
+    status: "Covered",
+    outcome: "Show developer commits that touch the project as versions; hide code-only ones.",
+  },
+  {
+    id: "15c",
+    title: "Send work for review",
+    group: "Hybrid projects",
+    status: "Covered",
+    outcome: "Push a namespaced branch without force and open or reuse a pull request.",
+  },
+  {
+    id: "15d",
+    title: "Get updates",
+    group: "Hybrid projects",
+    status: "Covered for clean merges in the project folder",
+    outcome: "Merge teammates' work or the latest base; hand code conflicts to a developer.",
+  },
+  {
+    id: "15e",
+    title: "Work in a separate copy",
+    group: "Hybrid projects",
+    status: "Covered in Rust",
+    outcome: "Create, list, and remove draftline-* worktrees without touching other tools' worktrees.",
+  },
+  {
+    id: "15f",
+    title: "An operation was interrupted in another project",
+    group: "Hybrid projects",
+    status: "Covered",
+    outcome: "Block every project in the checkout, but let only the owning project finish recovery.",
   },
 ];
 

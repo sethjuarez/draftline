@@ -14,6 +14,7 @@ See the [Draftline API plan](api-plan.md) for the roadmap from these scenarios t
 | [Content policy](scenario-flows/content-policy.md) | Business-content boundaries, policy changes, and Git ignore/attributes hazards. |
 | [Authoring and versions](scenario-flows/authoring.md) | Current state, saves, discard, variations, switching, preview, and restore. |
 | [Collaboration](scenario-flows/collaboration.md) | Publish, apply incoming, remote variation lifecycle, remote destination changes, and merge. |
+| [Hybrid projects](scenario-flows/hybrid-projects.md) | A project folder inside a code repository, shared with developers who use plain Git. |
 | [Recovery and cleanup](scenario-flows/recovery-cleanup.md) | Shelves, variation delete, support refs, purge/redaction, binary assets, interruption, out-of-band mutation, and stale locks. |
 | [Coverage and roadmap](coverage.md) | Executive coverage, primitive coverage, and follow-up priority gaps. |
 | [Product language](product-language.md) | Mapping between product actions and Git-backed implementation. |
@@ -74,6 +75,13 @@ Every documented flow must either name executable coverage or explain why the re
 | Flow 14: recover from interruption or unusual state | Partially covered | `delete_remote_variation_retries_after_support_ref_was_already_published`, `repair_remote_delete_recovers_after_visible_ref_was_deleted`, `clear_stale_lock_removes_only_stale_metadata_lock` | Recovery repair is operation-specific; broader repair/rollback metadata is still expanding. |
 | Flow 14a: out-of-band Git mutation | Partially covered | `tauri_contract_keeps_frontend_json_shape_stable`, `clear_stale_lock_removes_only_stale_metadata_lock` | Deeper repair for detached HEAD, raw branch changes, conflict indexes, and non-Draftline rewrites remains future work. |
 | Flow 14b: stale or abandoned operation lock | Partially covered | `clear_stale_lock_removes_only_stale_metadata_lock` | Integrated lock-plus-recovery repair remains future work. |
+| Flow 15: open a project inside a code repository | Covered | `init_in_project_folder_joins_enclosing_repo_without_nesting`, `changes_outside_project_folder_are_invisible`, `variation_namespace_hides_developer_branches` | Host UX for choosing the project folder is host work. |
+| Flow 15a: save and go back next to a developer | Covered | `save_leaves_developer_staged_changes_staged_and_uncommitted`, `restore_rolls_back_only_project_content`, `shelve_and_apply_leave_code_alone` | None known. |
+| Flow 15b: developers commit with plain Git | Covered | `scoped_versions_skip_developer_commits_outside_the_project`, `scoped_history_follows_the_side_that_brought_project_changes_through_a_merge` | Attribution copy for developer commits is host work. |
+| Flow 15c: send work for review | Covered | `send_from_the_default_branch_moves_work_to_a_new_branch_and_opens_a_pull_request`, `send_retries_safely_after_the_host_fails_and_avoids_taken_branch_names` | The host supplies the pull request provider and auth. |
+| Flow 15d: get updates | Covered for clean merges in the project folder | `incoming_merge_keeps_teammate_code_and_the_developer_index`, `incoming_merge_leaves_code_conflicts_to_a_developer`, `bringing_in_the_latest_base_merges_everything_into_the_variation` | Conflicts outside the project folder are handed to a developer. |
+| Flow 15e: work in a separate copy | Covered in Rust | `owned_worktree_starts_from_the_latest_base_and_leaves_this_checkout_alone`, `a_failed_owned_worktree_leaves_nothing_behind` | Not yet exposed to Tauri or TypeScript. |
+| Flow 15f: an operation was interrupted in another project | Covered | `only_the_project_that_was_interrupted_can_finish_its_recovery` | None known. |
 
 ## Business safety principles
 

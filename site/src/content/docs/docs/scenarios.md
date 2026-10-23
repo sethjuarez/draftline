@@ -22,6 +22,7 @@ scenario.
 | [Content policy](/docs/scenarios/content-policy/) | Business-content boundaries, policy changes, and Git ignore/attributes hazards. |
 | [Authoring and versions](/docs/scenarios/authoring/) | Current state, saves, discard, variations, switching, preview, and restore. |
 | [Collaboration](/docs/scenarios/collaboration/) | Publish, apply incoming, remote variation lifecycle, remote destination changes, and merge. |
+| [Hybrid projects](/docs/scenarios/hybrid-projects/) | A project folder inside a code repository, shared with developers who use plain Git. |
 | [Recovery and cleanup](/docs/scenarios/recovery-cleanup/) | Shelves, variation delete, support refs, purge/redaction, binary assets, interruption, out-of-band mutation, and stale locks. |
 
 ## Coverage legend

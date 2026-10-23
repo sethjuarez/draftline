@@ -45,7 +45,7 @@ fn scenario_flow_documentation_matrix_is_executable() {
 
     assert_eq!(
         rows.len(),
-        37,
+        44,
         "every documented Flow row must be in the matrix"
     );
     for row in rows {
