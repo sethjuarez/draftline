@@ -41,6 +41,7 @@ pub struct DraftlineCommandContext<'callbacks> {
     credential_provider: Option<Mutex<Box<CredentialProvider<'callbacks>>>>,
     event_sink: Option<Box<EventSink<'callbacks>>>,
     next_event_sequence: u64,
+    variation_namespace: Option<String>,
 }
 
 impl fmt::Debug for DraftlineCommandContext<'_> {
@@ -55,6 +56,7 @@ impl fmt::Debug for DraftlineCommandContext<'_> {
             )
             .field("has_event_sink", &self.event_sink.is_some())
             .field("next_event_sequence", &self.next_event_sequence)
+            .field("variation_namespace", &self.variation_namespace)
             .finish()
     }
 }
@@ -67,6 +69,7 @@ impl<'callbacks> Default for DraftlineCommandContext<'callbacks> {
             credential_provider: None,
             event_sink: None,
             next_event_sequence: 1,
+            variation_namespace: None,
         }
     }
 }
@@ -101,8 +104,21 @@ impl<'callbacks> DraftlineCommandContext<'callbacks> {
         self
     }
 
+    /// Applies [`Workspace::with_variation_namespace`] to every workspace the
+    /// commands open, so hybrid projects hide developers' branches.
+    pub fn with_variation_namespace(mut self, namespace: impl Into<String>) -> Result<Self> {
+        let namespace = namespace.into();
+        crate::workspace::validate_variation_namespace(&namespace)?;
+        self.variation_namespace = Some(namespace);
+        Ok(self)
+    }
+
     fn open_workspace(&self, path: impl AsRef<std::path::Path>) -> Result<Workspace> {
-        Workspace::open_with_policy(path, self.content_policy.clone())
+        let workspace = Workspace::open_with_policy(path, self.content_policy.clone())?;
+        match &self.variation_namespace {
+            Some(namespace) => workspace.with_variation_namespace(namespace.clone()),
+            None => Ok(workspace),
+        }
     }
 
     fn remote_options(&self) -> RemoteOptions<'_> {

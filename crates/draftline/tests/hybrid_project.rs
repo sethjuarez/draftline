@@ -928,6 +928,43 @@ fn unscoped_versions_still_list_every_commit() {
 }
 
 #[test]
+fn command_context_applies_the_variation_namespace_on_every_open() {
+    use draftline::tauri_contract::{
+        list_variations_with_context, DraftlineCommandContext, WorkspaceRequest,
+    };
+    let (temp, repo) = code_repo();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/login", &head, false).unwrap();
+    repo.branch("cutready/pitch", &head, false).unwrap();
+    scoped(&temp);
+
+    assert!(DraftlineCommandContext::new()
+        .with_variation_namespace("cutready")
+        .is_err());
+    let names = |context: &DraftlineCommandContext<'_>| {
+        let mut names = list_variations_with_context(
+            context,
+            WorkspaceRequest {
+                workspace_path: temp.path().join("cutready"),
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|summary| summary.variation.name)
+        .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let context = DraftlineCommandContext::new()
+        .with_content_policy(cutready_policy())
+        .with_variation_namespace("cutready/")
+        .unwrap();
+    assert_eq!(names(&context), ["cutready/pitch", "main"]);
+    let plain = DraftlineCommandContext::new().with_content_policy(cutready_policy());
+    assert_eq!(names(&plain).len(), 3);
+}
+
+#[test]
 fn variation_namespace_hides_developer_branches() {
     let (temp, repo) = code_repo();
     let head = repo.head().unwrap().peel_to_commit().unwrap();

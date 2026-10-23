@@ -1551,13 +1551,7 @@ impl Workspace {
     /// business user's view; without it every local branch is a variation.
     pub fn with_variation_namespace(mut self, namespace: impl Into<String>) -> Result<Self> {
         let namespace = namespace.into();
-        let probe = format!("{namespace}x");
-        if !namespace.ends_with('/')
-            || !git2::Reference::is_valid_name(&format!("refs/heads/{probe}"))
-        {
-            return Err(DraftlineError::InvalidVariationName(namespace));
-        }
-        validate_variation_name(&probe)?;
+        validate_variation_namespace(&namespace)?;
         self.variation_namespace = Some(namespace);
         Ok(self)
     }
@@ -8627,6 +8621,16 @@ impl Workspace {
 
 fn default_initial_variation_name() -> String {
     "main".to_string()
+}
+
+pub(crate) fn validate_variation_namespace(namespace: &str) -> Result<()> {
+    let probe = format!("{namespace}x");
+    if !namespace.ends_with('/') || !git2::Reference::is_valid_name(&format!("refs/heads/{probe}"))
+    {
+        return Err(DraftlineError::InvalidVariationName(namespace.to_string()));
+    }
+    validate_variation_name(&probe)?;
+    Ok(())
 }
 
 fn validate_variation_name(name: &str) -> Result<String> {
