@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +25,7 @@ pub struct Workspace {
     repo: Repository,
     content_policy: ContentPolicy,
     resolver_registry: ResolverRegistry,
+    variation_namespace: Option<String>,
 }
 
 /// A named version of the workspace.
@@ -1991,6 +1992,7 @@ impl Workspace {
             repo,
             content_policy,
             resolver_registry: ResolverRegistry::with_default_resolvers(),
+            variation_namespace: None,
         }
         .initialize())
     }
@@ -2134,6 +2136,29 @@ impl Workspace {
     /// Returns the absolute project folder.
     pub fn project_root(&self) -> PathBuf {
         self.root.join(self.scope())
+    }
+
+    /// Lists only branches under `namespace` (e.g. `"cutready/"`) as
+    /// variations, plus the default branch and whatever branch is currently
+    /// checked out. Use this
+    /// inside a shared code repository so developers' branches stay out of the
+    /// business user's view; without it every local branch is a variation.
+    pub fn with_variation_namespace(mut self, namespace: impl Into<String>) -> Result<Self> {
+        let namespace = namespace.into();
+        let probe = format!("{namespace}x");
+        if !namespace.ends_with('/')
+            || !git2::Reference::is_valid_name(&format!("refs/heads/{probe}"))
+        {
+            return Err(DraftlineError::InvalidVariationName(namespace));
+        }
+        validate_variation_name(&probe)?;
+        self.variation_namespace = Some(namespace);
+        Ok(self)
+    }
+
+    /// The branch namespace set by [`Workspace::with_variation_namespace`].
+    pub fn variation_namespace(&self) -> Option<&str> {
+        self.variation_namespace.as_deref()
     }
 
     /// Returns the current content policy.
@@ -2811,19 +2836,13 @@ impl Workspace {
     }
 
     /// Lists versions reachable from the current variation, newest first.
+    ///
+    /// In a project folder inside a larger repository, only commits that change
+    /// the folder are versions (like `git log -- <folder>`); developers' other
+    /// commits are skipped.
     pub fn versions(&self) -> Result<Vec<Version>> {
         self.ensure_no_pending_recovery()?;
-        let mut walk = self.repo.revwalk()?;
-        if walk.push_head().is_err() {
-            return Ok(Vec::new());
-        }
-
-        walk.map(|oid| {
-            let oid = oid?;
-            let commit = self.repo.find_commit(oid)?;
-            Ok(version_from_commit(&commit))
-        })
-        .collect()
+        self.versions_unchecked()
     }
 
     /// Returns true when the workspace has unsaved content changes.
@@ -3466,25 +3485,7 @@ impl Workspace {
     /// Lists local variations.
     pub fn variations(&self) -> Result<Vec<Variation>> {
         self.ensure_no_pending_recovery()?;
-        let current = self.current_variation().ok();
-        let mut paths = Vec::new();
-
-        for branch in self.repo.branches(Some(BranchType::Local))? {
-            let (branch, _) = branch?;
-            let Some(name) = branch.name()? else {
-                continue;
-            };
-
-            let metadata = self.read_variation_metadata(name)?;
-            paths.push(variation_from_name(
-                name.to_string(),
-                current.as_ref(),
-                metadata,
-            ));
-        }
-
-        paths.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(paths)
+        self.variations_unchecked()
     }
 
     /// Lists visible variations discovered on a remote-tracking namespace.
@@ -5237,12 +5238,18 @@ impl Workspace {
             return Ok(Vec::new());
         }
 
-        walk.map(|oid| {
-            let oid = oid?;
-            let commit = self.repo.find_commit(oid)?;
-            history_entry_from_commit(&commit, &tips, head_oid)
-        })
-        .collect()
+        let mut history = self.scoped_history(&tips);
+        let mut entries = Vec::new();
+        for oid in walk {
+            let commit = self.repo.find_commit(oid?)?;
+            if history.shows(&commit)? {
+                let parents = history.parents(&commit)?;
+                entries.push(history_entry_from_commit(
+                    &commit, &parents, &tips, head_oid,
+                )?);
+            }
+        }
+        Ok(entries)
     }
 
     /// Returns the combined version history across **all** local variations.
@@ -5275,19 +5282,22 @@ impl Workspace {
         let mut walk = self.repo.revwalk()?;
         walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
 
-        for branch in self.repo.branches(Some(BranchType::Local))? {
-            let (branch, _) = branch?;
-            if let Ok(tip) = branch.get().peel_to_commit() {
-                walk.push(tip.id())?;
-            }
+        for (_, tip) in self.listed_variation_tip_oids()? {
+            walk.push(tip)?;
         }
 
-        walk.map(|oid| {
-            let oid = oid?;
-            let commit = self.repo.find_commit(oid)?;
-            history_entry_from_commit(&commit, &tips, head_oid)
-        })
-        .collect()
+        let mut history = self.scoped_history(&tips);
+        let mut entries = Vec::new();
+        for oid in walk {
+            let commit = self.repo.find_commit(oid?)?;
+            if history.shows(&commit)? {
+                let parents = history.parents(&commit)?;
+                entries.push(history_entry_from_commit(
+                    &commit, &parents, &tips, head_oid,
+                )?);
+            }
+        }
+        Ok(entries)
     }
 
     /// Returns viable second endpoints for compacting history around one version.
@@ -5486,9 +5496,9 @@ impl Workspace {
             files: dirty_files,
         };
         let local_tips = if state_may_be_inconsistent {
-            self.local_variation_tip_oids().unwrap_or_default()
+            self.listed_variation_tip_oids().unwrap_or_default()
         } else {
-            self.local_variation_tip_oids()?
+            self.listed_variation_tip_oids()?
         };
         let remote_variations = if options.include_remotes && state_may_be_inconsistent {
             self.graph_remote_variations(options.remote.as_deref())
@@ -5565,17 +5575,25 @@ impl Workspace {
         let walk_result = (|| -> Result<()> {
             let mut walk = self.repo.revwalk()?;
             walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+            let mut history = ScopedHistory::new(
+                &self.repo,
+                self.scope(),
+                push_oids.iter().copied().chain(head_oid),
+            );
             for oid in push_oids {
                 walk.push(oid)?;
             }
             for oid in walk {
                 let oid = oid?;
+                let commit = self.repo.find_commit(oid)?;
+                if !history.shows(&commit)? {
+                    continue;
+                }
                 if total >= start && total < end {
-                    let commit = self.repo.find_commit(oid)?;
+                    let parents = history.parents(&commit)?;
                     nodes.push(workspace_graph_node_from_commit(
                         &commit,
-                        &tips,
-                        head_oid,
+                        history_entry_from_commit(&commit, &parents, &tips, head_oid)?,
                         &local_reachable,
                         &remote_reachable,
                         &support_reachable,
@@ -5668,9 +5686,9 @@ impl Workspace {
             files: dirty_files,
         };
         let local_tips = if state_may_be_inconsistent {
-            self.local_variation_tip_oids().unwrap_or_default()
+            self.listed_variation_tip_oids().unwrap_or_default()
         } else {
-            self.local_variation_tip_oids()?
+            self.listed_variation_tip_oids()?
         };
         let remote_variations = if options.include_remotes && state_may_be_inconsistent {
             self.graph_remote_variations(options.remote.as_deref())
@@ -6093,9 +6111,10 @@ impl Workspace {
         if !by_id.contains_key(&to_id) {
             return Err(DraftlineError::VersionNotFound(to.to_string()));
         }
-        let ancestor = self
-            .workspace_graph_common_ancestor(from, to)?
-            .common_ancestor;
+        // Use the graph's own (possibly scope-simplified) parents so the
+        // ancestor is always a node the caller can see.
+        let ancestor = workspace_graph_nearest_common_ancestor(&by_id, &from_id, &to_id)
+            .and_then(|id| version_by_id.get(&id).cloned());
         let node_ids = if let Some(ancestor) = ancestor.as_ref() {
             let ancestor_id = workspace_graph_node_id_from_version(ancestor)?;
             let mut left = workspace_graph_path_to_ancestor(&by_id, &from_id, &ancestor_id)
@@ -6133,10 +6152,23 @@ impl Workspace {
             .map_err(|_| DraftlineError::VersionNotFound(left.to_string()))?;
         let right_oid = Oid::from_str(right.as_str())
             .map_err(|_| DraftlineError::VersionNotFound(right.to_string()))?;
-        let common_ancestor = match self.repo.merge_base(left_oid, right_oid) {
-            Ok(oid) => Some(VersionId::from(oid)),
+        let merge_base = match self.repo.merge_base(left_oid, right_oid) {
+            Ok(oid) => Some(oid),
             Err(error) if error.code() == git2::ErrorCode::NotFound => None,
             Err(error) => return Err(error.into()),
+        };
+        // In a scoped workspace the merge base may be a hidden developer-only
+        // commit; report the nearest version the graph actually shows.
+        let common_ancestor = match merge_base {
+            Some(oid) => {
+                let mut tips = self.variation_tips_map()?;
+                tips.entry(left_oid).or_default();
+                tips.entry(right_oid).or_default();
+                self.scoped_history(&tips)
+                    .nearest_shown(oid)?
+                    .map(VersionId::from)
+            }
+            None => None,
         };
         Ok(WorkspaceGraphCommonAncestor {
             left_version: left.clone(),
@@ -6236,6 +6268,9 @@ impl Workspace {
             let Some(name) = branch.name()? else {
                 continue;
             };
+            if !self.lists_variation(name, current.as_deref()) {
+                continue;
+            }
             let metadata = self.read_variation_metadata(name)?;
             let variation = variation_from_name(name.to_string(), current.as_ref(), metadata);
 
@@ -6244,7 +6279,13 @@ impl Workspace {
                     let head_version = Some(version_from_commit(&tip));
                     let mut walk = self.repo.revwalk()?;
                     walk.push(tip.id())?;
-                    let count = walk.count();
+                    let mut history = ScopedHistory::new(&self.repo, self.scope(), [tip.id()]);
+                    let mut count = 0;
+                    for oid in walk {
+                        if history.shows(&self.repo.find_commit(oid?)?)? {
+                            count += 1;
+                        }
+                    }
                     (head_version, count)
                 }
                 Err(_) => (None, 0),
@@ -10877,12 +10918,59 @@ impl Workspace {
         if walk.push_head().is_err() {
             return Ok(Vec::new());
         }
-        walk.map(|oid| {
-            let oid = oid?;
-            let commit = self.repo.find_commit(oid)?;
-            Ok(version_from_commit(&commit))
-        })
-        .collect()
+        let mut history = ScopedHistory::new(&self.repo, self.scope(), []);
+        let mut versions = Vec::new();
+        for oid in walk {
+            let commit = self.repo.find_commit(oid?)?;
+            if history.shows(&commit)? {
+                versions.push(version_from_commit(&commit));
+            }
+        }
+        Ok(versions)
+    }
+
+    /// Path-limited history pinned to HEAD and every listed tip so labels stay
+    /// anchored even when a tip is a developer-only commit.
+    fn scoped_history(&self, tips: &HashMap<Oid, Vec<VariationId>>) -> ScopedHistory<'_> {
+        let head = self.repo.head().ok().and_then(|head| head.target());
+        ScopedHistory::new(&self.repo, self.scope(), tips.keys().copied().chain(head))
+    }
+
+    fn lists_variation(&self, name: &str, current: Option<&str>) -> bool {
+        match self.variation_namespace.as_deref() {
+            Some(namespace) => {
+                name.starts_with(namespace)
+                    || Some(name) == current
+                    || self.default_branch().as_deref() == Some(name)
+            }
+            None => true,
+        }
+    }
+
+    /// The branch new work starts from: `origin/HEAD`'s target, else a local
+    /// `main` or `master`.
+    fn default_branch(&self) -> Option<String> {
+        if let Ok(reference) = self.repo.find_reference("refs/remotes/origin/HEAD") {
+            if let Some(name) = reference
+                .symbolic_target()
+                .and_then(|target| target.strip_prefix("refs/remotes/origin/"))
+            {
+                return Some(name.to_string());
+            }
+        }
+        ["main", "master"]
+            .into_iter()
+            .find(|name| self.repo.find_branch(name, BranchType::Local).is_ok())
+            .map(str::to_string)
+    }
+
+    fn listed_variation_tip_oids(&self) -> Result<Vec<(VariationId, Oid)>> {
+        let current = self.current_variation_unchecked().ok();
+        Ok(self
+            .local_variation_tip_oids()?
+            .into_iter()
+            .filter(|(variation, _)| self.lists_variation(variation.as_str(), current.as_deref()))
+            .collect())
     }
 
     fn variations_unchecked(&self) -> Result<Vec<Variation>> {
@@ -10893,6 +10981,9 @@ impl Workspace {
             let Some(name) = branch.name()? else {
                 continue;
             };
+            if !self.lists_variation(name, current.as_deref()) {
+                continue;
+            }
             let metadata = self.read_variation_metadata(name)?;
             paths.push(variation_from_name(
                 name.to_string(),
@@ -10935,6 +11026,7 @@ impl Workspace {
     fn remote_variations_unchecked(&self, remote: impl AsRef<str>) -> Result<Vec<RemoteVariation>> {
         let remote = remote.as_ref().to_string();
         let prefix = format!("refs/remotes/{remote}/");
+        let current = self.current_variation_unchecked().ok();
         let mut variations = Vec::new();
 
         for reference in self.repo.references_glob(&format!("{prefix}*"))? {
@@ -10953,6 +11045,7 @@ impl Workspace {
                 || name.ends_with("/HEAD")
                 || name == "draftline"
                 || name.starts_with("draftline/")
+                || !self.lists_variation(name, current.as_deref())
             {
                 continue;
             }
@@ -11122,16 +11215,8 @@ impl Workspace {
 
     fn variation_tips_map(&self) -> Result<HashMap<Oid, Vec<VariationId>>> {
         let mut map: HashMap<Oid, Vec<VariationId>> = HashMap::new();
-        for branch in self.repo.branches(Some(BranchType::Local))? {
-            let (branch, _) = branch?;
-            let Some(name) = branch.name()? else {
-                continue;
-            };
-            if let Ok(tip) = branch.get().peel_to_commit() {
-                map.entry(tip.id())
-                    .or_default()
-                    .push(VariationId::from(name));
-            }
+        for (variation, tip) in self.listed_variation_tip_oids()? {
+            map.entry(tip).or_default().push(variation);
         }
         Ok(map)
     }
@@ -11461,6 +11546,109 @@ fn signature_from_contributor(contributor: &Contributor) -> Result<Signature<'st
     Ok(Signature::now(name, email)?)
 }
 
+/// Path-limited history like `git log --parents -- <scope>`: in a scoped
+/// workspace only commits that change the project folder are shown (plus
+/// pinned ref tips), and parents are rewritten to the nearest shown ancestor,
+/// following the parent whose project folder is unchanged through merges.
+/// Unscoped workspaces show every commit with its real parents.
+struct ScopedHistory<'r> {
+    repo: &'r Repository,
+    scope: Option<PathBuf>,
+    pinned: HashSet<Oid>,
+    scope_trees: HashMap<Oid, Option<Oid>>,
+    nearest: HashMap<Oid, Option<Oid>>,
+}
+
+impl<'r> ScopedHistory<'r> {
+    fn new(repo: &'r Repository, scope: &Path, pinned: impl IntoIterator<Item = Oid>) -> Self {
+        Self {
+            repo,
+            scope: (!scope.as_os_str().is_empty()).then(|| scope.to_path_buf()),
+            pinned: pinned.into_iter().collect(),
+            scope_trees: HashMap::new(),
+            nearest: HashMap::new(),
+        }
+    }
+
+    fn scope_tree(&mut self, scope: &Path, oid: Oid) -> Result<Option<Oid>> {
+        if let Some(cached) = self.scope_trees.get(&oid) {
+            return Ok(*cached);
+        }
+        let tree = self.repo.find_commit(oid)?.tree()?;
+        let id = match tree.get_path(scope) {
+            Ok(entry) => Some(entry.id()),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        self.scope_trees.insert(oid, id);
+        Ok(id)
+    }
+
+    /// The first parent whose project folder is identical to `commit`'s.
+    fn unchanged_parent(&mut self, scope: &Path, commit: &Commit<'_>) -> Result<Option<Oid>> {
+        let own = self.scope_tree(scope, commit.id())?;
+        for parent in commit.parent_ids() {
+            if self.scope_tree(scope, parent)? == own {
+                return Ok(Some(parent));
+            }
+        }
+        Ok(None)
+    }
+
+    fn shows(&mut self, commit: &Commit<'_>) -> Result<bool> {
+        let Some(scope) = self.scope.clone() else {
+            return Ok(true);
+        };
+        if self.pinned.contains(&commit.id()) {
+            return Ok(true);
+        }
+        if commit.parent_count() == 0 {
+            return Ok(self.scope_tree(&scope, commit.id())?.is_some());
+        }
+        Ok(self.unchanged_parent(&scope, commit)?.is_none())
+    }
+
+    /// The nearest shown commit at or below `oid`, iteratively so long runs of
+    /// developer-only commits cannot overflow the stack.
+    fn nearest_shown(&mut self, oid: Oid) -> Result<Option<Oid>> {
+        let Some(scope) = self.scope.clone() else {
+            return Ok(Some(oid));
+        };
+        let mut hidden = Vec::new();
+        let mut current = Some(oid);
+        let found = loop {
+            let Some(oid) = current else {
+                break None;
+            };
+            if let Some(cached) = self.nearest.get(&oid) {
+                break *cached;
+            }
+            let commit = self.repo.find_commit(oid)?;
+            if self.shows(&commit)? {
+                break Some(oid);
+            }
+            hidden.push(oid);
+            current = self.unchanged_parent(&scope, &commit)?;
+        };
+        for oid in hidden {
+            self.nearest.insert(oid, found);
+        }
+        Ok(found)
+    }
+
+    fn parents(&mut self, commit: &Commit<'_>) -> Result<Vec<Oid>> {
+        let mut parents = Vec::new();
+        for parent in commit.parent_ids() {
+            if let Some(shown) = self.nearest_shown(parent)? {
+                if !parents.contains(&shown) {
+                    parents.push(shown);
+                }
+            }
+        }
+        Ok(parents)
+    }
+}
+
 fn version_from_commit(commit: &Commit<'_>) -> Version {
     Version {
         id: VersionId::from(commit.id()),
@@ -11538,6 +11726,7 @@ fn history_cleanup_needs_pending_resolution(impact: &HistoryCleanupRemoteImpact)
 
 fn history_entry_from_commit(
     commit: &Commit<'_>,
+    parents: &[Oid],
     tips: &HashMap<Oid, Vec<VariationId>>,
     head_oid: Option<Oid>,
 ) -> Result<HistoryEntry> {
@@ -11546,9 +11735,7 @@ fn history_entry_from_commit(
     let mut variation_tips = tips.get(&oid).cloned().unwrap_or_default();
     variation_tips.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     let is_head = head_oid == Some(oid);
-    let parent_ids = (0..commit.parent_count())
-        .map(|i| commit.parent_id(i).map(VersionId::from))
-        .collect::<std::result::Result<Vec<_>, git2::Error>>()?;
+    let parent_ids = parents.iter().copied().map(VersionId::from).collect();
     Ok(HistoryEntry {
         version,
         variation_tips,
@@ -11557,17 +11744,40 @@ fn history_entry_from_commit(
     })
 }
 
+/// The common ancestor of `left` and `right` nearest to `right`, walking the
+/// graph's parent links breadth-first.
+fn workspace_graph_nearest_common_ancestor(
+    parents: &HashMap<WorkspaceGraphNodeId, Vec<WorkspaceGraphNodeId>>,
+    left: &WorkspaceGraphNodeId,
+    right: &WorkspaceGraphNodeId,
+) -> Option<WorkspaceGraphNodeId> {
+    let ancestors = |start: &WorkspaceGraphNodeId| {
+        let mut seen = HashSet::new();
+        let mut order = Vec::new();
+        let mut queue = VecDeque::from([start.clone()]);
+        while let Some(id) = queue.pop_front() {
+            if seen.insert(id.clone()) {
+                queue.extend(parents.get(&id).into_iter().flatten().cloned());
+                order.push(id);
+            }
+        }
+        order
+    };
+    let left_ancestors = ancestors(left).into_iter().collect::<HashSet<_>>();
+    ancestors(right)
+        .into_iter()
+        .find(|id| left_ancestors.contains(id))
+}
+
 fn workspace_graph_node_from_commit(
     commit: &Commit<'_>,
-    tips: &HashMap<Oid, Vec<VariationId>>,
-    head_oid: Option<Oid>,
+    history_entry: HistoryEntry,
     local_reachable: &BTreeSet<Oid>,
     remote_reachable: &BTreeSet<Oid>,
     support_reachable: &BTreeSet<Oid>,
     topo_index: usize,
 ) -> Result<WorkspaceGraphNode> {
     let oid = commit.id();
-    let history_entry = history_entry_from_commit(commit, tips, head_oid)?;
     let reachable_from_local_variation = local_reachable.contains(&oid);
     let reachable_from_remote_variation = remote_reachable.contains(&oid);
     let reachable_from_support_ref = support_reachable.contains(&oid);

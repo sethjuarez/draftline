@@ -736,3 +736,311 @@ fn shelving_a_rename_out_of_the_project_keeps_the_developer_target() {
     assert!(status(&repo, "notes/intro.sk").contains(git2::Status::INDEX_NEW));
     assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one\n");
 }
+
+fn labels(versions: &[draftline::Version]) -> Vec<String> {
+    versions
+        .iter()
+        .map(|version| version.label.clone())
+        .collect()
+}
+
+fn scoped(temp: &tempfile::TempDir) -> Workspace {
+    Workspace::init_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap()
+}
+
+#[test]
+fn scoped_versions_skip_developer_commits_outside_the_project() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp);
+
+    write_file(temp.path(), "src/main.rs", "fn main() { run() }\n");
+    commit_all(&repo, "Dev: wire up run");
+    write_file(temp.path(), "cutready/intro.sk", "scene one, by dev\n");
+    write_file(temp.path(), "src/lib.rs", "pub fn run() {}\n");
+    commit_all(&repo, "Dev: tweak intro and code");
+    write_file(temp.path(), "cutready/intro.sk", "scene one, by BU\n");
+    workspace.save_version("BU revise").unwrap();
+
+    assert_eq!(
+        labels(&workspace.versions().unwrap()),
+        ["BU revise", "Dev: tweak intro and code", "Initial app"]
+    );
+    let dev = &workspace.versions().unwrap()[1];
+    assert_eq!(dev.author.name, "Dev");
+}
+
+#[test]
+fn scoped_history_rewrites_parents_across_hidden_commits_and_pins_head() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp);
+    let initial = repo.head().unwrap().target().unwrap();
+
+    write_file(temp.path(), "src/main.rs", "fn main() { a() }\n");
+    commit_all(&repo, "Dev: a");
+    write_file(temp.path(), "cutready/intro.sk", "scene one, revised\n");
+    workspace.save_version("BU revise").unwrap();
+    let save = repo.head().unwrap().target().unwrap();
+    write_file(temp.path(), "src/main.rs", "fn main() { b() }\n");
+    let dev_tip = commit_all(&repo, "Dev: b");
+
+    assert_eq!(
+        labels(&workspace.versions().unwrap()),
+        ["BU revise", "Initial app"]
+    );
+
+    let history = workspace.history().unwrap();
+    let ids = history
+        .iter()
+        .map(|entry| entry.version.id().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        [dev_tip.to_string(), save.to_string(), initial.to_string()]
+    );
+    assert!(
+        history[0].is_head,
+        "HEAD stays visible even when it is code-only"
+    );
+    let parents = |index: usize| {
+        history[index]
+            .parent_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(parents(0), [save.to_string()]);
+    assert_eq!(parents(1), [initial.to_string()], "skips the hidden Dev: a");
+    assert!(parents(2).is_empty());
+
+    let graph = workspace
+        .workspace_graph(draftline::WorkspaceGraphOptions::default())
+        .unwrap();
+    assert_eq!(graph.nodes.len(), 3);
+    let save_node = graph
+        .nodes
+        .iter()
+        .find(|node| node.version.id().to_string() == save.to_string())
+        .unwrap();
+    assert_eq!(
+        save_node
+            .parent_version_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        [initial.to_string()]
+    );
+}
+
+#[test]
+fn scoped_history_follows_the_side_that_brought_project_changes_through_a_merge() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp);
+    let initial = repo.head().unwrap().peel_to_commit().unwrap();
+    let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+
+    write_file(temp.path(), "src/main.rs", "fn main() { code() }\n");
+    let code = repo.find_commit(commit_all(&repo, "Dev: code")).unwrap();
+
+    let mut feature_tree = repo.treebuilder(Some(&initial.tree().unwrap())).unwrap();
+    let mut project = repo
+        .treebuilder(Some(
+            &repo
+                .find_tree(
+                    initial
+                        .tree()
+                        .unwrap()
+                        .get_path(Path::new("cutready"))
+                        .unwrap()
+                        .id(),
+                )
+                .unwrap(),
+        ))
+        .unwrap();
+    let blob = repo.blob(b"scene one, on a branch\n").unwrap();
+    project.insert("intro.sk", blob, 0o100644).unwrap();
+    feature_tree
+        .insert("cutready", project.write().unwrap(), 0o040000)
+        .unwrap();
+    let feature_tree = repo.find_tree(feature_tree.write().unwrap()).unwrap();
+    let feature = repo
+        .find_commit(
+            repo.commit(
+                None,
+                &signature,
+                &signature,
+                "Branch: intro",
+                &feature_tree,
+                &[&initial],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let mut merged = repo.merge_commits(&code, &feature, None).unwrap();
+    assert!(!merged.has_conflicts());
+    let merged_tree = repo
+        .find_tree(merged.write_tree_to(&repo).unwrap())
+        .unwrap();
+    let merge = repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Merge branch",
+            &merged_tree,
+            &[&code, &feature],
+        )
+        .unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    assert_eq!(
+        labels(&workspace.versions().unwrap()),
+        ["Branch: intro", "Initial app"],
+        "the merge only carries the branch's project change"
+    );
+
+    let history = workspace.history().unwrap();
+    let head = &history[0];
+    assert_eq!(head.version.id().to_string(), merge.to_string());
+    assert_eq!(
+        head.parent_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        [initial.id().to_string(), feature.id().to_string()],
+        "the code-only first parent collapses to the last project version"
+    );
+}
+
+#[test]
+fn unscoped_versions_still_list_every_commit() {
+    let (temp, repo) = code_repo();
+    let workspace = Workspace::init_with_policy(temp.path(), cutready_policy()).unwrap();
+    write_file(temp.path(), "src/main.rs", "fn main() { a() }\n");
+    commit_all(&repo, "Dev: a");
+
+    assert_eq!(
+        labels(&workspace.versions().unwrap()),
+        ["Dev: a", "Initial app"]
+    );
+    assert_eq!(workspace.history().unwrap().len(), 2);
+}
+
+#[test]
+fn variation_namespace_hides_developer_branches() {
+    let (temp, repo) = code_repo();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/login", &head, false).unwrap();
+    repo.branch("cutready/pitch", &head, false).unwrap();
+    let (_bare, _other_dir, _other) = with_remote(&repo);
+    repo.find_remote("origin")
+        .unwrap()
+        .push(
+            &[
+                "refs/heads/feature/login:refs/heads/feature/login",
+                "refs/heads/cutready/pitch:refs/heads/cutready/pitch",
+            ],
+            None,
+        )
+        .unwrap();
+
+    assert!(scoped(&temp).with_variation_namespace("cutready").is_err());
+    assert!(scoped(&temp).with_variation_namespace("").is_err());
+    assert!(scoped(&temp)
+        .with_variation_namespace("cutready//")
+        .is_err());
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    assert_eq!(workspace.variation_namespace(), Some("cutready/"));
+
+    let mut names = workspace
+        .variations()
+        .unwrap()
+        .into_iter()
+        .map(|variation| variation.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(
+        names,
+        ["cutready/pitch", "main"],
+        "current branch always listed"
+    );
+
+    workspace.fetch_all_variations("origin").unwrap();
+    let mut remote = workspace
+        .remote_variations("origin")
+        .unwrap()
+        .into_iter()
+        .map(|variation| variation.name)
+        .collect::<Vec<_>>();
+    remote.sort();
+    assert_eq!(remote, ["cutready/pitch", "main"]);
+
+    let graph = workspace
+        .workspace_graph(draftline::WorkspaceGraphOptions::default())
+        .unwrap();
+    let tips = graph
+        .nodes
+        .iter()
+        .flat_map(|node| {
+            node.variation_tips
+                .iter()
+                .map(|tip| tip.as_str().to_string())
+        })
+        .collect::<Vec<_>>();
+    assert!(!tips.iter().any(|tip| tip == "feature/login"), "{tips:?}");
+    assert!(tips.iter().any(|tip| tip == "cutready/pitch"), "{tips:?}");
+
+    let unfiltered = scoped(&temp);
+    assert_eq!(unfiltered.variations().unwrap().len(), 3);
+}
+
+#[test]
+fn scoped_graph_ancestor_and_counts_skip_hidden_developer_commits() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let initial = repo.head().unwrap().target().unwrap();
+    write_file(temp.path(), "src/main.rs", "fn main() { fork() }\n");
+    let fork = repo
+        .find_commit(commit_all(&repo, "Dev: fork point"))
+        .unwrap();
+    repo.branch("cutready/pitch", &fork, false).unwrap();
+
+    write_file(temp.path(), "cutready/intro.sk", "main take\n");
+    let left = workspace.save_version("Main take").unwrap();
+    workspace
+        .switch_variation(
+            &draftline::VariationId::from("cutready/pitch"),
+            draftline::SwitchPolicy::AbortIfDirty,
+        )
+        .unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "pitch take\n");
+    let right = workspace.save_version("Pitch take").unwrap();
+
+    let ancestor = workspace
+        .workspace_graph_common_ancestor(left.id(), right.id())
+        .unwrap()
+        .common_ancestor
+        .unwrap();
+    assert_eq!(ancestor.to_string(), initial.to_string());
+    let path = workspace
+        .workspace_graph_path(
+            left.id(),
+            right.id(),
+            draftline::WorkspaceGraphOptions::default(),
+        )
+        .unwrap();
+    assert!(path.found);
+    assert_eq!(path.version_ids.len(), 3);
+
+    let counts = workspace
+        .variation_summaries()
+        .unwrap()
+        .into_iter()
+        .map(|summary| (summary.variation.name, summary.reachable_version_count))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        counts,
+        [("cutready/pitch".to_string(), 2), ("main".to_string(), 2)]
+    );
+}
