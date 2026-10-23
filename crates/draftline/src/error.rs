@@ -9,7 +9,7 @@ pub type Result<T> = std::result::Result<T, DraftlineError>;
 #[derive(Debug, thiserror::Error)]
 pub enum DraftlineError {
     #[error("git operation failed: {0}")]
-    Git(#[from] git2::Error),
+    Git(git2::Error),
 
     #[error("I/O operation failed: {0}")]
     Io(#[from] std::io::Error),
@@ -70,11 +70,12 @@ pub enum DraftlineError {
     #[error("workspace is locked by another Draftline operation")]
     WorkspaceLocked,
 
-    /// Another Git process holds the repository's index, as `git` does while
-    /// it stages, commits, or checks out. Retry once it finishes; if no Git
-    /// process is running, the named lock file was left by a crash.
-    #[error("Git is busy in this repository ({0} exists); try again when it finishes")]
-    GitIndexLocked(PathBuf),
+    /// Another Git process holds one of the repository's lock files (its
+    /// `index.lock` or a ref's `.lock`), as `git` does while it stages,
+    /// commits, or checks out. Retry once it finishes; if no Git process is
+    /// running, the lock file was left by a crash.
+    #[error("Git is busy in this repository (a .lock file exists); try again when it finishes")]
+    GitIndexLocked,
 
     #[error("unsupported switch policy: {0}")]
     UnsupportedSwitchPolicy(&'static str),
@@ -144,6 +145,18 @@ pub enum DraftlineError {
 
     #[error("worktree has unsaved or untracked files: {0:?}")]
     OwnedWorktreeHasChanges(Vec<std::path::PathBuf>),
+}
+
+impl From<git2::Error> for DraftlineError {
+    /// libgit2 reports a lock file held by Git (index or ref) as `Locked`;
+    /// every operation surfaces it as the same retryable error.
+    fn from(error: git2::Error) -> Self {
+        if error.code() == git2::ErrorCode::Locked {
+            DraftlineError::GitIndexLocked
+        } else {
+            DraftlineError::Git(error)
+        }
+    }
 }
 
 fn timeout_suffix(timeout_ms: u64) -> String {

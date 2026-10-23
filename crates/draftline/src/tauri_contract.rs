@@ -2738,7 +2738,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::VersionNotLocallyReachable(_) => "version_not_locally_reachable",
         DraftlineError::NoCurrentVariation => "no_current_variation",
         DraftlineError::WorkspaceLocked => "workspace_locked",
-        DraftlineError::GitIndexLocked(_) => "git_index_locked",
+        DraftlineError::GitIndexLocked => "git_index_locked",
         DraftlineError::UnsupportedSwitchPolicy(_) => "unsupported_switch_policy",
         DraftlineError::InvalidContentPolicyPath(_) => "invalid_content_policy_path",
         DraftlineError::InvalidContentPolicyExtension(_) => "invalid_content_policy_extension",

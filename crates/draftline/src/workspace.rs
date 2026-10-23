@@ -2136,11 +2136,24 @@ impl Workspace {
                 }
                 self.complete_recovery(state, changed_workspace)
             }
-            RecoveryOperation::ShelveChanges
-            | RecoveryOperation::ApplyIncoming
-            | RecoveryOperation::RestoreVersionAsNewSave
-            | RecoveryOperation::DiscardChanges
-            | RecoveryOperation::DiscardFile
+            RecoveryOperation::DiscardChanges | RecoveryOperation::DiscardFile => {
+                // A discard only removes edits; stopping keeps whatever is on disk.
+                self.complete_recovery(state, false)
+            }
+            RecoveryOperation::ShelveChanges => {
+                let changed_workspace = self.rollback_shelve_recovery(&state)?;
+                self.complete_recovery(state, changed_workspace)
+            }
+            RecoveryOperation::RestoreVersionAsNewSave => {
+                let Some(target) = state.target.as_deref() else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                match self.rollback_restore_recovery(target)? {
+                    Some(changed_workspace) => self.complete_recovery(state, changed_workspace),
+                    None => Ok(self.recovery_unavailable(state)),
+                }
+            }
+            RecoveryOperation::ApplyIncoming
             | RecoveryOperation::DeleteRemoteVariation
             | RecoveryOperation::ExpireSupportRefs
             | RecoveryOperation::MergeIncoming
@@ -2148,6 +2161,134 @@ impl Workspace {
             | RecoveryOperation::SquashVersions
             | RecoveryOperation::HistoryCleanup => Ok(self.recovery_unavailable(state)),
         }
+    }
+
+    /// Undoes an interrupted shelve. The shelf is deleted only while every
+    /// path it captured is still unchanged on disk; once the discard step has
+    /// touched a file, the shelf is the only copy of the edit and is kept.
+    fn rollback_shelve_recovery(&self, state: &RecoveryState) -> Result<bool> {
+        let Some(name) = state.target.as_deref() else {
+            return Ok(false);
+        };
+        let Ok((id, shelf)) = self.find_shelf_commit(name) else {
+            return Ok(false);
+        };
+        let parent_tree = match shelf.parent(0) {
+            Ok(parent) => Some(parent.tree()?),
+            Err(_) => None,
+        };
+        let shelf_tree = shelf.tree()?;
+        let captured = self.paths_changed_between(parent_tree.as_ref(), &shelf_tree)?;
+        if self.workdir_matches(&shelf_tree, &captured)?.len() == captured.len() {
+            self.repo
+                .find_reference(&format!("refs/draftline/shelves/{id}"))?
+                .delete()?;
+        }
+        Ok(false)
+    }
+
+    /// Undoes an interrupted restore: files still at the restored version go
+    /// back to `HEAD`; files edited since the failure are left alone. `None`
+    /// when the restore save already landed, which only a new restore undoes.
+    fn rollback_restore_recovery(&self, version: &str) -> Result<Option<bool>> {
+        let head = self.repo.head()?.peel_to_commit()?;
+        let head_tree = head.tree()?;
+        // Targeted restores record "VERSION -> VARIATION" and build on another
+        // variation's tip; only plain restores can be undone here.
+        let Ok(version) = VersionId::from_canonical_string(version) else {
+            return Ok(None);
+        };
+        let source = self.find_version_commit(&version)?.tree()?;
+        let restored = self
+            .repo
+            .find_tree(self.compose_scoped_tree(&head_tree, &source)?)?;
+        if restored.id() == head_tree.id() {
+            return Ok(None);
+        }
+        let restored_paths = self.paths_changed_between(Some(&head_tree), &restored)?;
+        let paths = self.workdir_matches(&restored, &restored_paths)?;
+        if paths.is_empty() {
+            return Ok(Some(false));
+        }
+
+        self.while_git_busy(|| self.write_index_from_tree(&head_tree, &paths, &[]))?;
+        let (in_head, added): (Vec<_>, Vec<_>) = paths
+            .iter()
+            .cloned()
+            .partition(|path| head_tree.get_path(path).is_ok());
+        for path in &added {
+            remove_workspace_path_if_exists(&self.root.join(path))?;
+        }
+        if !in_head.is_empty() {
+            // The index was written above, so the checkout cannot hit Git's lock.
+            let mut checkout = CheckoutBuilder::new();
+            checkout
+                .force()
+                .update_index(false)
+                .disable_pathspec_match(true);
+            for path in &in_head {
+                checkout.path(path.to_string_lossy().replace('\\', "/"));
+            }
+            let refused = RefCell::default();
+            self.checkout_refusing_filters(checkout, &refused, &head_tree, |checkout| {
+                self.repo.checkout_head(Some(checkout))
+            })?;
+        }
+        Ok(Some(true))
+    }
+
+    /// Paths whose blobs differ between two trees.
+    fn paths_changed_between(
+        &self,
+        old: Option<&Tree<'_>>,
+        new: &Tree<'_>,
+    ) -> Result<Vec<PathBuf>> {
+        let diff = self.repo.diff_tree_to_tree(old, Some(new), None)?;
+        let mut paths = BTreeSet::new();
+        for delta in diff.deltas() {
+            for file in [delta.old_file(), delta.new_file()] {
+                if let Some(path) = file.path() {
+                    paths.insert(path.to_path_buf());
+                }
+            }
+        }
+        Ok(paths.into_iter().collect())
+    }
+
+    /// The subset of `paths` whose working files (after Git filters) are
+    /// exactly as in `tree`, including paths absent from both.
+    fn workdir_matches(&self, tree: &Tree<'_>, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut options = git2::DiffOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .disable_pathspec_match(true);
+        for path in paths {
+            options.pathspec(path.to_string_lossy().replace('\\', "/"));
+        }
+        // A scratch index of `tree` has no stat cache, so every file is hashed
+        // through Git's filters instead of trusting the real index's timestamps.
+        let mut expected = git2::Index::new()?;
+        expected.read_tree(tree)?;
+        let diff = self
+            .repo
+            .diff_index_to_workdir(Some(&expected), Some(&mut options))?;
+        let mut differing = BTreeSet::new();
+        for delta in diff.deltas() {
+            for file in [delta.old_file(), delta.new_file()] {
+                if let Some(path) = file.path() {
+                    differing.insert(path.to_path_buf());
+                }
+            }
+        }
+        Ok(paths
+            .iter()
+            .filter(|path| !differing.contains(*path))
+            .cloned()
+            .collect())
     }
 
     /// Acknowledges an incomplete recovery record and allows normal operations again.
@@ -2205,8 +2346,14 @@ impl Workspace {
         label: impl AsRef<str>,
         profile: Option<&ContributorProfile>,
     ) -> Result<Version> {
-        let changed_files = self.changed_files_unchecked()?;
-        self.commit_content_changes(&changed_files, "save_version", label.as_ref(), profile)
+        self.while_head_moves_forward(|retrying| {
+            let changed_files = self.changed_files_unchecked()?;
+            if retrying && changed_files.is_empty() {
+                return Ok(None);
+            }
+            self.commit_content_changes(&changed_files, "save_version", label.as_ref(), profile)
+                .map(Some)
+        })
     }
 
     /// Preflights saving only selected workspace-relative tracked content files.
@@ -2259,14 +2406,75 @@ impl Workspace {
     {
         let _lock = self.acquire_for_index("save_files")?;
         self.ensure_no_pending_recovery()?;
-        let changed_files = self.selected_changed_files(paths)?;
-        if changed_files.is_empty() {
-            return Err(DraftlineError::PreflightFailed(Box::new(
-                selected_files_preflight_report("save_files", false, changed_files),
-            )));
-        }
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        self.while_head_moves_forward(|retrying| {
+            let changed_files = self.selected_changed_files(&paths)?;
+            if retrying && changed_files.is_empty() {
+                return Ok(None);
+            }
+            if changed_files.is_empty() {
+                return Err(DraftlineError::PreflightFailed(Box::new(
+                    selected_files_preflight_report("save_files", false, changed_files),
+                )));
+            }
+            self.commit_content_changes(&changed_files, "save_files", label.as_ref(), profile)
+                .map(Some)
+        })
+    }
 
-        self.commit_content_changes(&changed_files, "save_files", label.as_ref(), profile)
+    /// Reruns a save whose branch a developer committed onto meanwhile, as
+    /// pressing Save again would. A switched, reset, or rewound branch still
+    /// refuses, since the save would then land somewhere the user didn't pick.
+    /// A rerun with nothing left to save (`Ok(None)`, say because the
+    /// developer's commit took the same edits) keeps the original refusal.
+    fn while_head_moves_forward<T>(
+        &self,
+        mut save: impl FnMut(bool) -> Result<Option<T>>,
+    ) -> Result<T> {
+        let deadline = std::time::Instant::now() + GIT_BUSY_WAIT;
+        let mut refusal = None;
+        loop {
+            let before = self.head_position();
+            match save(refusal.is_some()) {
+                Ok(Some(saved)) => return Ok(saved),
+                Ok(None) => {
+                    return Err(refusal.expect("only a rerun reports nothing left to save"));
+                }
+                Err(error @ DraftlineError::LocalStateChanged { .. })
+                    if std::time::Instant::now() < deadline && self.head_moved_forward(&before) =>
+                {
+                    refusal.get_or_insert(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn head_position(&self) -> (Option<String>, Option<Oid>) {
+        let name = self
+            .repo
+            .find_reference("HEAD")
+            .ok()
+            .and_then(|head| head.symbolic_target().map(str::to_string));
+        let tip = self.repo.head().ok().and_then(|head| head.target());
+        (name, tip)
+    }
+
+    fn head_moved_forward(&self, before: &(Option<String>, Option<Oid>)) -> bool {
+        let now = self.head_position();
+        if now.0 != before.0 {
+            return false;
+        }
+        match (before.1, now.1) {
+            (Some(old), Some(new)) => {
+                new != old && self.repo.graph_descendant_of(new, old).unwrap_or(false)
+            }
+            (None, Some(_)) => true,
+            _ => false,
+        }
     }
 
     /// Lists versions reachable from the current variation, newest first.
@@ -7535,26 +7743,38 @@ impl Workspace {
     /// refuses up front while another Git process holds that index.
     fn acquire_for_index(&self, operation: &str) -> Result<OperationLock> {
         let lock = OperationLock::acquire(&self.lock_path(), operation)?;
-        self.ensure_git_index_unlocked()?;
+        self.while_git_busy(|| self.ensure_git_index_unlocked())?;
         Ok(lock)
     }
 
-    fn ensure_git_index_unlocked(&self) -> Result<()> {
-        let lock = self.repo.path().join("index.lock");
-        if lock.exists() {
-            return Err(DraftlineError::GitIndexLocked(lock));
+    /// Git holds `index.lock` only while it stages, commits, or checks out, so
+    /// a step that finds it taken is retried briefly before reporting
+    /// [`DraftlineError::GitIndexLocked`]. Every wrapped step is idempotent.
+    fn while_git_busy<T>(&self, mut step: impl FnMut() -> Result<T>) -> Result<T> {
+        let deadline = std::time::Instant::now() + GIT_BUSY_WAIT;
+        loop {
+            match step() {
+                Err(DraftlineError::GitIndexLocked) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(DraftlineError::GitIndexLocked) => {
+                    // A failed write leaves libgit2's shared index ahead of disk.
+                    if let Ok(mut index) = self.repo.index() {
+                        let _ = index.read(true);
+                    }
+                    return Err(DraftlineError::GitIndexLocked);
+                }
+                result => return result,
+            }
         }
-        Ok(())
     }
 
-    /// Git took its index lock after [`Self::ensure_git_index_unlocked`]
-    /// passed; report it the same way so callers see one retryable error.
-    fn index_busy(&self, error: git2::Error) -> DraftlineError {
-        if error.code() == git2::ErrorCode::Locked && error.class() == git2::ErrorClass::Index {
-            DraftlineError::GitIndexLocked(self.repo.path().join("index.lock"))
-        } else {
-            error.into()
+    fn ensure_git_index_unlocked(&self) -> Result<()> {
+        if self.repo.path().join("index.lock").exists() {
+            return Err(DraftlineError::GitIndexLocked);
         }
+        test_hooks::fire("after_index_precheck", self.repo.path());
+        Ok(())
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -7737,12 +7957,13 @@ impl Workspace {
             .head()
             .ok()
             .and_then(|head| head.peel_to_commit().ok());
+        test_hooks::fire("after_parent_read", self.repo.path());
         let (tree_id, affected_paths) =
             self.content_changes_tree(parent.as_ref(), changed_files, operation)?;
         let tree = self.repo.find_tree(tree_id)?;
         let (author, committer) = self.workspace_signatures(profile)?;
         let parents = parent.iter().collect::<Vec<_>>();
-        self.ensure_git_index_unlocked()?;
+        self.while_git_busy(|| self.ensure_git_index_unlocked())?;
         // Like `git commit`: the index is updated before the branch moves, so a
         // busy index fails the save cleanly instead of leaving a commit the
         // index would silently revert on the developer's next commit.
@@ -7750,8 +7971,10 @@ impl Workspace {
             .repo
             .commit(None, &author, &committer, label, &tree, &parents)?;
         let commit = self.repo.find_commit(oid)?;
-        let previous = self.stage_from(&commit, &affected_paths)?;
-        if let Err(error) = self.advance_head(&commit, parent.as_ref(), &committer) {
+        let previous = self.while_git_busy(|| self.stage_from(&commit, &affected_paths))?;
+        if let Err(error) =
+            self.while_git_busy(|| self.advance_head(&commit, parent.as_ref(), &committer))
+        {
             self.restore_index_entries(&affected_paths, previous)?;
             return Err(error);
         }
@@ -7776,14 +7999,11 @@ impl Workspace {
             .filter(|entry| wanted.contains(&entry.path))
             .collect();
         drop(index);
-        self.repo
-            .reset_default(Some(commit.as_object()), paths.iter().map(PathBuf::as_path))
-            .map_err(|error| self.index_busy(error))?;
+        self.write_index_from_tree(&commit.tree()?, paths, &[])?;
         Ok(previous)
     }
 
-    /// Puts back the entries [`Self::stage_from`] replaced. Git holds its index
-    /// lock only briefly, so a busy index is retried for up to a second.
+    /// Puts back the entries [`Self::stage_from`] replaced.
     fn restore_index_entries(
         &self,
         paths: &[PathBuf],
@@ -7792,19 +8012,7 @@ impl Workspace {
         if paths.is_empty() {
             return Ok(());
         }
-        let mut attempts = 0;
-        loop {
-            match self.write_index_entries(paths, &entries) {
-                Err(DraftlineError::Git(error))
-                    if error.code() == git2::ErrorCode::Locked && attempts < 20 =>
-                {
-                    attempts += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(DraftlineError::Git(error)) => return Err(self.index_busy(error)),
-                result => return result,
-            }
-        }
+        self.while_git_busy(|| self.write_index_entries(paths, &entries))
     }
 
     fn write_index_entries(&self, paths: &[PathBuf], entries: &[git2::IndexEntry]) -> Result<()> {
@@ -7820,8 +8028,7 @@ impl Workspace {
         for entry in entries {
             index.add(entry)?;
         }
-        index.write()?;
-        Ok(())
+        write_index_or_reload(&mut index)
     }
 
     /// Moves HEAD's branch (or a detached HEAD) to `commit` only if it still
@@ -7992,12 +8199,75 @@ impl Workspace {
     /// `git checkout` does: files with local edits are never overwritten.
     /// Must run before HEAD or its branch moves, since HEAD is the baseline.
     fn checkout_tree_safely(&self, target: &Tree<'_>) -> Result<()> {
+        let baseline = self.repo.head().and_then(|head| head.peel_to_tree()).ok();
+        let position = self.head_position();
         let mut checkout = CheckoutBuilder::new();
         checkout.safe().overwrite_ignored(false);
         let refused = RefCell::default();
-        self.checkout_refusing_filters(checkout, &refused, target, |checkout| {
+        let result = self.checkout_refusing_filters(checkout, &refused, target, |checkout| {
             self.repo.checkout_tree(target.as_object(), Some(checkout))
+        });
+        if !matches!(result, Err(DraftlineError::GitIndexLocked)) {
+            return result;
+        }
+        // libgit2 writes the index last, so every file is already at `target`.
+        // Rerunning a safe checkout would see files it just added as untracked
+        // and refuse; writing the moved paths' index entries from `target`
+        // finishes the job instead. If HEAD (its branch or tip) or any of those files changed while
+        // Git held the index, the lock error stands and recovery takes over.
+        let paths = self.paths_changed_between(baseline.as_ref(), target)?;
+        self.while_git_busy(|| {
+            if self.head_position() != position
+                || self.workdir_matches(target, &paths)?.len() != paths.len()
+            {
+                return Err(DraftlineError::GitIndexLocked);
+            }
+            self.write_index_from_tree(target, &paths, &[])
         })
+    }
+
+    /// Sets the index entries for `paths` to `tree`'s (removing those `tree`
+    /// lacks) and drops `remove`, in a single index write. Entries carry no
+    /// stat data, so Git rehashes those files on the next status.
+    fn write_index_from_tree(
+        &self,
+        tree: &Tree<'_>,
+        paths: &[PathBuf],
+        remove: &[PathBuf],
+    ) -> Result<()> {
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        for path in paths.iter().chain(remove) {
+            if let Err(error) = index.remove_path(path) {
+                if error.code() != git2::ErrorCode::NotFound {
+                    return Err(error.into());
+                }
+            }
+        }
+        for path in paths {
+            let entry = match tree.get_path(path) {
+                Ok(entry) if entry.kind() != Some(ObjectType::Tree) => entry,
+                Ok(_) => continue,
+                Err(error) if error.code() == git2::ErrorCode::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let key = path.to_string_lossy().replace('\\', "/").into_bytes();
+            index.add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: entry.filemode() as u32,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: entry.id(),
+                flags: key.len().min(0xfff) as u16,
+                flags_extended: 0,
+                path: key,
+            })?;
+        }
+        write_index_or_reload(&mut index)
     }
 
     /// Safe checkout for an operation with a pending recovery record. A refused
@@ -8031,9 +8301,52 @@ impl Workspace {
             checkout.disable_pathspec_match(true).path(pathspec);
         }
         let refused = RefCell::default();
-        self.checkout_refusing_filters(checkout, &refused, target, |checkout| {
+        let result = self.checkout_refusing_filters(checkout, &refused, target, |checkout| {
             self.repo.checkout_tree(target.as_object(), Some(checkout))
+        });
+        if !matches!(result, Err(DraftlineError::GitIndexLocked)) {
+            return result;
+        }
+        // libgit2 writes the index last, so the folder's files are already at
+        // `target`. Forcing them again could overwrite an edit made while Git
+        // held the index; finishing only the index leaves such an edit visible
+        // as a change instead.
+        self.while_git_busy(|| {
+            let paths = self.scope_index_paths(target)?;
+            self.write_index_from_tree(target, &paths, &[])
         })
+    }
+
+    /// Every path in the project folder that `target` or the index has.
+    fn scope_index_paths(&self, target: &Tree<'_>) -> Result<Vec<PathBuf>> {
+        let scope = scope_pathspec(self.scope());
+        let in_scope = |path: &str| {
+            scope.as_deref().is_none_or(|scope| {
+                path == scope
+                    || path
+                        .strip_prefix(scope)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        };
+        let mut paths = BTreeSet::new();
+        target.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            if entry.kind() != Some(ObjectType::Tree) {
+                let path = format!("{dir}{}", String::from_utf8_lossy(entry.name_bytes()));
+                if in_scope(&path) {
+                    paths.insert(path);
+                }
+            }
+            git2::TreeWalkResult::Ok
+        })?;
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        for entry in index.iter() {
+            let path = String::from_utf8_lossy(&entry.path).into_owned();
+            if in_scope(&path) {
+                paths.insert(path);
+            }
+        }
+        Ok(paths.into_iter().map(PathBuf::from).collect())
     }
 
     /// `base` with its project folder replaced by `source`'s project folder.
@@ -8145,22 +8458,13 @@ impl Workspace {
 
     fn discard_changed_files(&self, changed_files: &[ChangedFile]) -> Result<()> {
         self.ensure_discard_unfiltered(changed_files, "discard")?;
-        let mut index = self.repo.index()?;
-        let mut checkout = CheckoutBuilder::new();
-        checkout.force();
+        let mut paths_to_unstage = Vec::new();
         let mut paths_to_reset = Vec::new();
         let mut paths_to_remove_after_checkout = Vec::new();
 
         for changed in changed_files {
             match changed.kind {
-                ChangeKind::Added => {
-                    if let Err(error) = index.remove_path(&changed.path) {
-                        if error.code() != git2::ErrorCode::NotFound {
-                            return Err(error.into());
-                        }
-                    }
-                    remove_workspace_path_if_exists(&self.root.join(&changed.path))?;
-                }
+                ChangeKind::Added => paths_to_unstage.push(changed.path.clone()),
                 ChangeKind::Renamed => {
                     let target = match self.staged_rename_target_for_path(&changed.path)? {
                         Some(target) if self.content_policy.tracks(&target)? => Some(target),
@@ -8168,35 +8472,41 @@ impl Workspace {
                     };
                     // A target outside the content policy belongs to the developer.
                     if let Some(target) = target {
-                        checkout.path(&target);
                         paths_to_reset.push(target.clone());
                         paths_to_remove_after_checkout.push(target);
                     }
-                    checkout.path(&changed.path);
                     paths_to_reset.push(changed.path.clone());
                 }
                 ChangeKind::Modified
                 | ChangeKind::Deleted
                 | ChangeKind::Conflicted
-                | ChangeKind::TypeChanged => {
-                    checkout.path(&changed.path);
-                    paths_to_reset.push(changed.path.clone());
-                }
+                | ChangeKind::TypeChanged => paths_to_reset.push(changed.path.clone()),
             }
         }
 
-        index.write().map_err(|error| self.index_busy(error))?;
-        drop(index);
+        // The whole index change is one write made before any file is touched,
+        // and the file steps never write the index, so a busy index leaves the
+        // workspace exactly as it was.
+        let head_tree = self.repo.head()?.peel_to_tree()?;
+        if !paths_to_unstage.is_empty() || !paths_to_reset.is_empty() {
+            self.while_git_busy(|| {
+                self.write_index_from_tree(&head_tree, &paths_to_reset, &paths_to_unstage)
+            })?;
+        }
+        for path in &paths_to_unstage {
+            remove_workspace_path_if_exists(&self.root.join(path))?;
+        }
 
         if !paths_to_reset.is_empty() {
-            let head = self.repo.head()?.peel(ObjectType::Commit)?;
-            self.repo
-                .reset_default(Some(&head), paths_to_reset.iter().map(PathBuf::as_path))
-                .map_err(|error| self.index_busy(error))?;
-            let head_tree = head.peel_to_tree()?;
+            let mut checkout = CheckoutBuilder::new();
+            checkout.force().update_index(false);
+            for path in &paths_to_reset {
+                checkout.path(path);
+            }
             let refused = RefCell::default();
             self.checkout_refusing_filters(checkout, &refused, &head_tree, |checkout| {
-                self.repo.checkout_head(Some(checkout))
+                self.repo
+                    .checkout_tree(head_tree.as_object(), Some(checkout))
             })?;
         }
 
@@ -9202,6 +9512,16 @@ fn file_is_binary(path: &Path) -> Result<bool> {
     };
 
     Ok(bytes.contains(&0) || std::str::from_utf8(&bytes).is_err())
+}
+
+/// libgit2 shares one in-memory index per repository, so a failed write
+/// would leave later reads seeing changes that never reached disk.
+fn write_index_or_reload(index: &mut git2::Index) -> Result<()> {
+    if let Err(error) = index.write() {
+        let _ = index.read(true);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn remove_workspace_path_if_exists(path: &Path) -> Result<()> {
@@ -10519,6 +10839,44 @@ impl Drop for OperationLock {
     }
 }
 
+/// Lets unit tests run Git between two steps of an operation, to force
+/// interleavings that real timing only hits by chance.
+/// How long an operation waits for another Git process to release the index.
+const GIT_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(test)]
+mod test_hooks {
+    use std::{cell::RefCell, path::Path};
+
+    type Hook = Box<dyn FnMut(&Path)>;
+
+    thread_local! {
+        static HOOKS: RefCell<Vec<(&'static str, Hook)>> = RefCell::new(Vec::new());
+    }
+
+    /// Runs `hook` once, the next time `point` is reached on this thread.
+    pub fn once(point: &'static str, hook: impl FnMut(&Path) + 'static) {
+        HOOKS.with(|hooks| hooks.borrow_mut().push((point, Box::new(hook))));
+    }
+
+    pub fn fire(point: &str, git_dir: &Path) {
+        let hook = HOOKS.with(|hooks| {
+            let mut hooks = hooks.borrow_mut();
+            let index = hooks.iter().position(|(name, _)| *name == point)?;
+            Some(hooks.remove(index).1)
+        });
+        if let Some(mut hook) = hook {
+            hook(git_dir);
+        }
+    }
+}
+
+#[cfg(not(test))]
+mod test_hooks {
+    #[inline(always)]
+    pub fn fire(_point: &str, _git_dir: &std::path::Path) {}
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -10642,6 +11000,657 @@ mod tests {
         peer.fetch_remote("origin").unwrap();
 
         (remote, author_dir, peer_dir, peer)
+    }
+
+    /// Git grabs `index.lock` right after Draftline's precheck passed.
+    fn lock_index_after_precheck() {
+        test_hooks::once("after_index_precheck", |git_dir| {
+            fs::write(git_dir.join("index.lock"), b"").unwrap();
+        });
+    }
+
+    /// After a late lock is released, the operation has either not happened
+    /// or can be rolled back, and nothing outside it changed.
+    fn settle_after_late_lock(workspace: &Workspace) {
+        fs::remove_file(workspace.repo.path().join("index.lock")).unwrap();
+        if let Some(state) = workspace.recovery_state().unwrap() {
+            workspace.rollback_recovery(&state.operation_id).unwrap();
+        }
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    fn content(workspace: &Workspace, path: &str) -> String {
+        fs::read_to_string(workspace.root().join(path)).unwrap()
+    }
+
+    fn head_summary(workspace: &Workspace) -> String {
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        head.summary().unwrap().to_string()
+    }
+
+    fn assert_clean(workspace: &Workspace) {
+        let statuses = workspace.repo.statuses(None).unwrap();
+        let dirty = statuses
+            .iter()
+            .filter(|entry| entry.status() != git2::Status::IGNORED)
+            .map(|entry| entry.path().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(dirty.is_empty(), "unexpected changes: {dirty:?}");
+    }
+
+    fn two_saves() -> (tempfile::TempDir, Workspace, Version) {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        let first = workspace.save_version("First").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        workspace.save_version("Second").unwrap();
+        (temp, workspace, first)
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_save_keeps_the_edit_unsaved() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_after_precheck();
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        settle_after_late_lock(&workspace);
+        assert_eq!(head_summary(&workspace), "Second");
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+        workspace.save_version("Third").unwrap();
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_restore_is_retryable() {
+        let (_temp, workspace, first) = two_saves();
+        lock_index_after_precheck();
+
+        let error = workspace
+            .restore_version_as_new_save(first.id(), "Restore first")
+            .unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        settle_after_late_lock(&workspace);
+        assert_eq!(head_summary(&workspace), "Second");
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert_clean(&workspace);
+        workspace
+            .restore_version_as_new_save(first.id(), "Restore first")
+            .unwrap();
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_switch_is_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        workspace.save_version("Second").unwrap();
+        lock_index_after_precheck();
+
+        let error = workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        settle_after_late_lock(&workspace);
+        assert_eq!(head_summary(&workspace), "Second");
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert_clean(&workspace);
+        workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_discard_keeps_the_edit() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_after_precheck();
+
+        let error = workspace.discard_changes().unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        settle_after_late_lock(&workspace);
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+        workspace.discard_changes().unwrap();
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_shelve_keeps_the_edit() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_after_precheck();
+
+        let error = workspace.shelve_changes("later").unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        settle_after_late_lock(&workspace);
+        assert_eq!(head_summary(&workspace), "Second");
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+        assert!(workspace.list_shelves().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_shelve_rollback_keeps_the_shelf_once_an_edit_was_discarded() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_after_precheck();
+        workspace.shelve_changes("later").unwrap_err();
+        // As if the discard step had reverted the file before failing.
+        write_file(workspace.root(), "plan.sk", b"v2");
+
+        settle_after_late_lock(&workspace);
+
+        let shelves = workspace.list_shelves().unwrap();
+        assert_eq!(shelves.len(), 1);
+        workspace.apply_shelf(&shelves[0].id).unwrap();
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+    }
+
+    #[test]
+    fn a_restore_rollback_keeps_files_edited_after_the_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        write_file(workspace.root(), "notes.md", b"v1");
+        let first = workspace.save_version("First").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        write_file(workspace.root(), "notes.md", b"v2");
+        fs::remove_file(workspace.root().join("plan.sk")).unwrap();
+        write_file(workspace.root(), "added.md", b"v2");
+        workspace.save_version("Second").unwrap();
+        lock_index_after_precheck();
+        workspace
+            .restore_version_as_new_save(first.id(), "Restore first")
+            .unwrap_err();
+        assert_eq!(content(&workspace, "notes.md"), "v1");
+        write_file(workspace.root(), "notes.md", b"mine");
+
+        settle_after_late_lock(&workspace);
+
+        assert_eq!(head_summary(&workspace), "Second");
+        assert_eq!(content(&workspace, "notes.md"), "mine");
+        assert!(!workspace.root().join("plan.sk").exists());
+        assert_eq!(content(&workspace, "added.md"), "v2");
+        let changed = workspace.changed_files().unwrap();
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0].path, Path::new("notes.md"));
+    }
+
+    /// Git grabs `index.lock` after the precheck and lets go shortly after.
+    fn lock_index_briefly_after_precheck() {
+        test_hooks::once("after_index_precheck", |git_dir| {
+            let lock = git_dir.join("index.lock");
+            fs::write(&lock, b"").unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                fs::remove_file(lock).unwrap();
+            });
+        });
+    }
+
+    #[test]
+    fn a_save_waits_out_a_brief_index_lock() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_briefly_after_precheck();
+
+        workspace.save_version("Third").unwrap();
+
+        assert_eq!(head_summary(&workspace), "Third");
+        assert!(workspace
+            .recovery_state()
+            .unwrap()
+            .is_none_or(|state| state.completed));
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_restore_waits_out_a_brief_index_lock() {
+        let (_temp, workspace, first) = two_saves();
+        lock_index_briefly_after_precheck();
+
+        workspace
+            .restore_version_as_new_save(first.id(), "Restore first")
+            .unwrap();
+
+        assert_eq!(head_summary(&workspace), "Restore first");
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_waits_out_a_brief_index_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        let main = workspace.current_variation().unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        fs::remove_file(workspace.root().join("plan.sk")).unwrap();
+        write_file(workspace.root(), "other.sk", b"alt");
+        workspace.save_version("Alternate").unwrap();
+        lock_index_briefly_after_precheck();
+
+        let main_id = VariationId::from(main);
+        workspace
+            .switch_variation(&main_id, SwitchPolicy::AbortIfDirty)
+            .unwrap();
+
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
+        assert!(!workspace.root().join("other.sk").exists());
+        assert!(workspace
+            .recovery_state()
+            .unwrap()
+            .is_none_or(|state| state.completed));
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_mixed_discard_changes_nothing() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        write_file(workspace.root(), "new.sk", b"new");
+        let mut index = workspace.repo.index().unwrap();
+        index.add_path(Path::new("new.sk")).unwrap();
+        index.write().unwrap();
+        lock_index_after_precheck();
+
+        let error = workspace.discard_changes().unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+        assert_eq!(content(&workspace, "new.sk"), "new");
+        settle_after_late_lock(&workspace);
+        assert_eq!(content(&workspace, "new.sk"), "new");
+        let status = workspace.repo.status_file(Path::new("new.sk")).unwrap();
+        assert!(status.contains(git2::Status::INDEX_NEW), "{status:?}");
+    }
+
+    #[test]
+    fn a_switch_never_stages_a_file_edited_while_it_waits_for_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        workspace.save_version("Second").unwrap();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_index_precheck", move |git_dir| {
+            let lock = git_dir.join("index.lock");
+            fs::write(&lock, b"").unwrap();
+            let plan = root.join("plan.sk");
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                fs::write(plan, b"theirs").unwrap();
+                fs::remove_file(lock).unwrap();
+            });
+        });
+
+        let error = workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        assert_eq!(content(&workspace, "plan.sk"), "theirs");
+        assert!(workspace.recovery_state().unwrap().is_some());
+        let entry = workspace
+            .repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("plan.sk"), 0)
+            .unwrap();
+        let head = workspace.repo.head().unwrap().peel_to_tree().unwrap();
+        assert_eq!(entry.id, head.get_path(Path::new("plan.sk")).unwrap().id());
+    }
+
+    /// Git holds the branch's ref lock while it moves the branch.
+    fn lock_branch_after_precheck(workspace: &Workspace, release_after_ms: Option<u64>) {
+        let branch = workspace.repo.head().unwrap().name().unwrap().to_string();
+        test_hooks::once("after_index_precheck", move |git_dir| {
+            let lock = git_dir.join(format!("{branch}.lock"));
+            fs::write(&lock, b"").unwrap();
+            if let Some(ms) = release_after_ms {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    fs::remove_file(lock).unwrap();
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn a_save_waits_out_a_brief_branch_ref_lock() {
+        let (_temp, workspace, _first) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"third");
+        lock_branch_after_precheck(&workspace, Some(300));
+
+        workspace.save_version("Third").unwrap();
+
+        assert_eq!(head_summary(&workspace), "Third");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_lingering_branch_ref_lock_fails_the_save_cleanly() {
+        let (_temp, workspace, _first) = two_saves();
+        let before = workspace.repo.head().unwrap().target().unwrap();
+        write_file(workspace.root(), "plan.sk", b"third");
+        lock_branch_after_precheck(&workspace, None);
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        assert_eq!(workspace.repo.head().unwrap().target().unwrap(), before);
+        let status = workspace.repo.status_file(Path::new("plan.sk")).unwrap();
+        assert_eq!(status, git2::Status::WT_MODIFIED);
+        let branch = workspace.repo.head().unwrap().name().unwrap().to_string();
+        fs::remove_file(workspace.repo.path().join(format!("{branch}.lock"))).unwrap();
+        workspace.save_version("Third").unwrap();
+        assert_eq!(head_summary(&workspace), "Third");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_stops_when_a_developer_commits_while_it_waits_for_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        workspace.save_version("Second").unwrap();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_index_precheck", move |git_dir| {
+            let lock = git_dir.join("index.lock");
+            fs::write(&lock, b"").unwrap();
+            let root = root.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let repo = Repository::open(&root).unwrap();
+                let head = repo.head().unwrap().peel_to_commit().unwrap();
+                let blob = repo.blob(b"fn main() {}").unwrap();
+                let mut builder = repo.treebuilder(Some(&head.tree().unwrap())).unwrap();
+                builder.insert("code.rs", blob, 0o100644).unwrap();
+                let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+                let signature = git2::Signature::now("Dev", "dev@example.com").unwrap();
+                repo.commit(Some("HEAD"), &signature, &signature, "dev", &tree, &[&head])
+                    .unwrap();
+                fs::remove_file(lock).unwrap();
+            });
+        });
+
+        let error = workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        assert!(workspace.recovery_state().unwrap().is_some());
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message(), Some("dev"));
+    }
+
+    #[test]
+    fn rollback_of_a_targeted_restore_stays_unavailable() {
+        let (_temp, workspace, first) = two_saves();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::RestoreVersionAsNewSave,
+                original_variation: Some("main".to_string()),
+                target: Some(format!("{} -> other", first.id().as_str())),
+                completed: false,
+            })
+            .unwrap();
+
+        let rollback = workspace.rollback_recovery("interrupted").unwrap();
+
+        assert!(!rollback.completed);
+        assert_eq!(head_summary(&workspace), "Second");
+    }
+
+    #[test]
+    fn a_discard_waits_out_a_brief_index_lock() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_briefly_after_precheck();
+
+        workspace.discard_changes().unwrap();
+
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_developer_commit_that_lands_mid_save_is_never_reverted() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_parent_read", move |_| {
+            let repo = Repository::open(&root).unwrap();
+            fs::write(root.join("code.rs"), b"dev").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("code.rs")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let signature = repo.signature().unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "dev",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        });
+
+        workspace.save_version("Third").unwrap();
+
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary(), Some("Third"));
+        assert_eq!(head.parent(0).unwrap().summary(), Some("dev"));
+        let tree = head.tree().unwrap();
+        assert!(tree.get_name("code.rs").is_some(), "keeps the dev commit");
+        let plan = workspace
+            .repo
+            .find_blob(tree.get_name("plan.sk").unwrap().id());
+        assert_eq!(plan.unwrap().content(), b"edit");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_save_refuses_when_a_developer_rewinds_the_branch_mid_save() {
+        let (_temp, workspace, first) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let root = workspace.root().to_path_buf();
+        let first = first.id().as_str().to_string();
+        test_hooks::once("after_parent_read", move |_| {
+            let repo = Repository::open(&root).unwrap();
+            let target = Oid::from_str(&first).unwrap();
+            repo.head()
+                .unwrap()
+                .set_target(target, "reset: moving to First")
+                .unwrap();
+        });
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(head_summary(&workspace), "First");
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+    }
+
+    #[test]
+    fn a_save_refuses_when_a_developer_switches_branch_mid_save() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_parent_read", move |_| {
+            let repo = Repository::open(&root).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let signature = repo.signature().unwrap();
+            let tree = parent.tree().unwrap();
+            let oid = repo
+                .commit(None, &signature, &signature, "dev", &tree, &[&parent])
+                .unwrap();
+            repo.branch("feature", &repo.find_commit(oid).unwrap(), false)
+                .unwrap();
+            repo.set_head("refs/heads/feature").unwrap();
+        });
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(head_summary(&workspace), "dev");
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+    }
+
+    #[test]
+    fn a_save_whose_edit_a_developer_already_committed_refuses_instead_of_saving_nothing() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_parent_read", move |_| {
+            let repo = Repository::open(&root).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("plan.sk")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let signature = repo.signature().unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "dev",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        });
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(head_summary(&workspace), "dev");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_stops_when_a_developer_switches_to_an_identical_branch_while_it_waits() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        workspace.save_version("Second").unwrap();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_index_precheck", move |git_dir| {
+            let lock = git_dir.join("index.lock");
+            fs::write(&lock, b"").unwrap();
+            let root = root.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let repo = Repository::open(&root).unwrap();
+                let head = repo.head().unwrap().peel_to_commit().unwrap();
+                repo.branch("twin", &head, false).unwrap();
+                repo.set_head("refs/heads/twin").unwrap();
+                fs::remove_file(lock).unwrap();
+            });
+        });
+
+        let error = workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        assert!(workspace.recovery_state().unwrap().is_some());
+        let head = workspace.repo.head().unwrap();
+        assert_eq!(head.name(), Some("refs/heads/twin"));
+    }
+
+    #[test]
+    fn a_switch_rollback_keeps_an_edit_made_while_it_waits_for_git() {
+        let (_temp, workspace, first) = two_saves();
+        let original = workspace.current_variation_unchecked().unwrap();
+        let commit = workspace
+            .repo
+            .find_commit(first.id().as_str().parse().unwrap());
+        workspace
+            .repo
+            .branch("alt", &commit.unwrap(), false)
+            .unwrap();
+        workspace.repo.set_head("refs/heads/alt").unwrap();
+        let mut checkout = CheckoutBuilder::new();
+        workspace
+            .repo
+            .checkout_head(Some(checkout.force()))
+            .unwrap();
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::SwitchVariation,
+                original_variation: Some(original.clone()),
+                target: Some("alt".to_string()),
+                completed: false,
+            })
+            .unwrap();
+        let plan = workspace.root().join("plan.sk");
+        test_hooks::once("after_index_precheck", move |git_dir| {
+            let lock = git_dir.join("index.lock");
+            fs::write(&lock, b"").unwrap();
+            let plan = plan.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                fs::write(plan, b"theirs").unwrap();
+                fs::remove_file(lock).unwrap();
+            });
+        });
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "plan.sk"), "theirs");
+        let status = workspace.repo.status_file(Path::new("plan.sk")).unwrap();
+        assert_eq!(status, git2::Status::WT_MODIFIED);
+        assert!(workspace.recovery_state().unwrap().is_none());
     }
 
     #[test]
@@ -12471,7 +13480,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_restore_recovery_reports_unavailable_without_original_oid() {
+    fn rollback_restore_recovery_leaves_later_saves_and_edits_alone() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
         write_file(workspace.root(), "post.md", b"base");
@@ -12490,16 +13499,37 @@ mod tests {
 
         let rollback = workspace.rollback_recovery("interrupted").unwrap();
 
-        assert!(!rollback.completed);
+        assert!(rollback.completed);
         assert!(!rollback.changed_workspace);
-        assert_eq!(
-            rollback.safe_next_actions,
-            vec![SafeNextAction::RepairRecovery]
-        );
         assert_eq!(
             workspace.repo.head().unwrap().target().unwrap().to_string(),
             advanced.id().as_str()
         );
+        assert_eq!(content(&workspace, "post.md"), "restored");
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn rollback_restore_recovery_is_unavailable_once_the_restore_save_landed() {
+        let (_temp, workspace, first) = two_saves();
+        workspace
+            .restore_version_as_new_save(first.id(), "Restore first")
+            .unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::RestoreVersionAsNewSave,
+                original_variation: None,
+                target: Some(first.id().as_str().to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        let rollback = workspace.rollback_recovery("interrupted").unwrap();
+
+        assert!(!rollback.completed);
+        assert_eq!(head_summary(&workspace), "Restore first");
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
     }
 
     #[test]

@@ -749,7 +749,7 @@ fn head_id(repo: &git2::Repository) -> git2::Oid {
 }
 
 fn is_git_index_locked(error: &DraftlineError) -> bool {
-    matches!(error, DraftlineError::GitIndexLocked(_))
+    matches!(error, DraftlineError::GitIndexLocked)
 }
 
 /// A business-user edit plus a developer's staged code, ready to save.
