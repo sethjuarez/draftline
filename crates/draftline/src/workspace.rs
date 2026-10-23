@@ -11,6 +11,7 @@ use git2::{
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::merge::{MergeConflict, MergeInput, ResolverRegistry};
+use crate::pull_request::{PullRequestProvider, PullRequestRequest, SendRequest, SendResult};
 use crate::recovery::RecoveryOperation;
 use crate::remote::{ensure_supported_remote_url, PushRefExpectation};
 use crate::{
@@ -8966,6 +8967,218 @@ impl Workspace {
         })
     }
 
+    /// Shares saved work the way the Copilot app does: push the current branch
+    /// (never forced) and open a pull request, or reuse the one already open.
+    ///
+    /// On the base branch, Send first moves the work onto a new branch named
+    /// from the variation namespace and title, then hands the local base back
+    /// to its upstream so it never diverges. Retrying after a failure is safe:
+    /// the push becomes a no-op and the open pull request is found.
+    pub fn send(
+        &self,
+        remote: impl AsRef<str>,
+        request: &SendRequest,
+        provider: &mut dyn PullRequestProvider,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<SendResult> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref();
+        let base = match &request.base {
+            Some(base) => validate_variation_name(base)?,
+            None => self
+                .default_branch_on(remote)
+                .ok_or(DraftlineError::SendBaseUnknown)?,
+        };
+        let current = self.current_variation_unchecked()?;
+        if let Some(namespace) = &self.variation_namespace {
+            if current != base && !current.starts_with(namespace.as_str()) {
+                return Err(DraftlineError::SendOutsideNamespace(current));
+            }
+        }
+        self.fetch_remote_variation_ref(remote, &base, options)?;
+        let advertised = self.remote_advertised_branches(remote, options)?;
+
+        let mut created_variation = false;
+        let variation = if current == base {
+            let report = preflight_report(
+                "send",
+                false,
+                self.changed_files_unchecked()?,
+                Vec::new(),
+                None,
+            );
+            if !report.can_proceed {
+                return Err(DraftlineError::PreflightFailed(Box::new(report)));
+            }
+            let taken = |name: &str| {
+                self.repo.find_branch(name, BranchType::Local).is_ok() || advertised.contains(name)
+            };
+            let name = match &request.branch {
+                Some(name) => validate_variation_name(name)?,
+                None => self.unused_send_branch_name(&request.title, taken)?,
+            };
+            if let Some(namespace) = &self.variation_namespace {
+                if !name.starts_with(namespace.as_str()) {
+                    return Err(DraftlineError::SendOutsideNamespace(name));
+                }
+            }
+            if taken(&name) {
+                return Err(DraftlineError::VariationAlreadyExists(name));
+            }
+            let head = self.repo.head()?.peel_to_commit()?;
+            let mut branch = self.repo.branch(&name, &head, false)?;
+            let switched = (|| -> Result<()> {
+                if !request.title.trim().is_empty() {
+                    self.write_variation_metadata(
+                        &name,
+                        &VariationMetadata::default().with_label(request.title.trim()),
+                    )?;
+                }
+                self.repo.set_head(&format!("refs/heads/{name}"))?;
+                Ok(())
+            })();
+            if let Err(error) = switched {
+                let _ = branch.delete();
+                return Err(error);
+            }
+            created_variation = true;
+            name
+        } else {
+            current
+        };
+        self.hand_base_back_to_upstream(&base, remote)?;
+
+        let base_ahead = match (
+            advertised.contains(&variation),
+            self.repo
+                .refname_to_id(&format!("refs/remotes/{remote}/{base}")),
+        ) {
+            (false, Ok(base_oid)) => {
+                let head = self.repo.head()?.peel_to_commit()?.id();
+                Some(self.repo.graph_ahead_behind(head, base_oid)?.0)
+            }
+            _ => None,
+        };
+        let published = self.publish_changes_with_options(remote, options)?;
+        let published_versions = base_ahead.unwrap_or(published.published_versions);
+        if self
+            .repo
+            .find_reference(&format!("refs/remotes/{remote}/{variation}"))
+            .is_ok()
+        {
+            self.repo
+                .find_branch(&variation, BranchType::Local)?
+                .set_upstream(Some(&format!("{remote}/{variation}")))?;
+        }
+
+        let pull_request_request = PullRequestRequest {
+            remote: remote.to_string(),
+            head: variation.clone(),
+            base: base.clone(),
+            title: request.title.clone(),
+            body: request.body.clone(),
+        };
+        let (pull_request, created_pull_request) =
+            match provider.find_open(&pull_request_request)? {
+                Some(open) => (open, false),
+                None => (provider.create(&pull_request_request)?, true),
+            };
+
+        Ok(SendResult {
+            remote: remote.to_string(),
+            variation,
+            base,
+            created_variation,
+            published_versions,
+            pull_request,
+            created_pull_request,
+        })
+    }
+
+    fn unused_send_branch_name(&self, title: &str, taken: impl Fn(&str) -> bool) -> Result<String> {
+        let mut slug = String::new();
+        for character in title.trim().to_lowercase().chars() {
+            if character.is_ascii_alphanumeric() {
+                slug.push(character);
+            } else if !slug.is_empty() && !slug.ends_with('-') {
+                slug.push('-');
+            }
+            if slug.len() >= 48 {
+                break;
+            }
+        }
+        let slug = slug.trim_end_matches('-');
+        let stem = format!(
+            "{}{}",
+            self.variation_namespace.as_deref().unwrap_or_default(),
+            if slug.is_empty() { "send" } else { slug }
+        );
+        let name = (1..)
+            .map(|n| {
+                if n == 1 {
+                    stem.clone()
+                } else {
+                    format!("{stem}-{n}")
+                }
+            })
+            .find(|name| !taken(name))
+            .expect("an unused suffix exists");
+        validate_variation_name(&name)
+    }
+
+    /// Moves the local base to its freshly fetched remote-tracking ref when the
+    /// current branch carries every local base commit, so nothing is lost and
+    /// the base never diverges from upstream. The worktree is untouched. Runs on every send, which also repairs a send
+    /// that failed after switching branches.
+    fn hand_base_back_to_upstream(&self, base: &str, remote: &str) -> Result<()> {
+        let Ok(upstream) = self
+            .repo
+            .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
+        else {
+            return Ok(());
+        };
+        let Ok(mut local) = self.repo.find_branch(base, BranchType::Local) else {
+            return Ok(());
+        };
+        let Some(local_oid) = local.get().target() else {
+            return Ok(());
+        };
+        let head = self.repo.head()?.peel_to_commit()?.id();
+        let carried = head == local_oid || self.repo.graph_descendant_of(head, local_oid)?;
+        if local_oid != upstream && carried {
+            local.get_mut().set_target(
+                upstream,
+                &format!("draftline: send moved local work off {base}"),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn remote_advertised_branches(
+        &self,
+        remote_name: &str,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<HashSet<String>> {
+        let mut remote = self.repo.find_remote(remote_name)?;
+        ensure_remote_transport_supported(&remote)?;
+        let _timeout_guard = options.server_timeout_guard()?;
+        let branches = |heads: &[git2::RemoteHead<'_>]| {
+            heads
+                .iter()
+                .filter_map(|head| head.name().strip_prefix("refs/heads/"))
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        };
+        if options.has_network_callbacks() {
+            let callbacks = options.remote_callbacks("remote_advertised_branches");
+            let connection = remote.connect_auth(Direction::Fetch, Some(callbacks), None)?;
+            Ok(branches(connection.list()?))
+        } else {
+            remote.connect(Direction::Fetch)?;
+            Ok(branches(remote.list()?))
+        }
+    }
+
     /// Publishes local versions for the current variation when doing so will not overwrite remote work.
     pub fn publish_changes(&self, remote: impl AsRef<str>) -> Result<PublishResult> {
         let mut options = RemoteOptions::new();
@@ -10950,10 +11163,15 @@ impl Workspace {
     /// The branch new work starts from: `origin/HEAD`'s target, else a local
     /// `main` or `master`.
     fn default_branch(&self) -> Option<String> {
-        if let Ok(reference) = self.repo.find_reference("refs/remotes/origin/HEAD") {
+        self.default_branch_on("origin")
+    }
+
+    fn default_branch_on(&self, remote: &str) -> Option<String> {
+        let prefix = format!("refs/remotes/{remote}/");
+        if let Ok(reference) = self.repo.find_reference(&format!("{prefix}HEAD")) {
             if let Some(name) = reference
                 .symbolic_target()
-                .and_then(|target| target.strip_prefix("refs/remotes/origin/"))
+                .and_then(|target| target.strip_prefix(prefix.as_str()))
             {
                 return Some(name.to_string());
             }

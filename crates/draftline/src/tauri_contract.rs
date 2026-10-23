@@ -3157,6 +3157,9 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidMergeResolution(_) => "invalid_merge_resolution",
         DraftlineError::InvalidHistoryCleanup(_) => "invalid_history_cleanup",
         DraftlineError::HistoryCleanupBlocked(_) => "history_cleanup_blocked",
+        DraftlineError::SendBaseUnknown => "send_base_unknown",
+        DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
+        DraftlineError::PullRequest(_) => "pull_request_failed",
     }
 }
 

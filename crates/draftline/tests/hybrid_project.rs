@@ -1044,3 +1044,327 @@ fn scoped_graph_ancestor_and_counts_skip_hidden_developer_commits() {
         [("cutready/pitch".to_string(), 2), ("main".to_string(), 2)]
     );
 }
+
+#[derive(Default)]
+struct FakeHost {
+    open: Vec<(draftline::PullRequestRequest, draftline::PullRequest)>,
+    created: usize,
+    fail_next_create: bool,
+}
+
+impl draftline::PullRequestProvider for FakeHost {
+    fn find_open(
+        &mut self,
+        request: &draftline::PullRequestRequest,
+    ) -> draftline::Result<Option<draftline::PullRequest>> {
+        Ok(self
+            .open
+            .iter()
+            .find(|(open, _)| open.head == request.head && open.base == request.base)
+            .map(|(_, pull_request)| pull_request.clone()))
+    }
+
+    fn create(
+        &mut self,
+        request: &draftline::PullRequestRequest,
+    ) -> draftline::Result<draftline::PullRequest> {
+        if std::mem::take(&mut self.fail_next_create) {
+            return Err(DraftlineError::PullRequest("host offline".into()));
+        }
+        self.created += 1;
+        let pull_request = draftline::PullRequest {
+            number: self.created as u64,
+            url: format!("https://example.test/pull/{}", self.created),
+        };
+        self.open.push((request.clone(), pull_request.clone()));
+        Ok(pull_request)
+    }
+}
+
+fn send_request(title: &str) -> draftline::SendRequest {
+    draftline::SendRequest {
+        title: title.into(),
+        ..Default::default()
+    }
+}
+
+fn remote_branch(bare: &Path, name: &str) -> Option<git2::Oid> {
+    git2::Repository::open_bare(bare)
+        .unwrap()
+        .refname_to_id(&format!("refs/heads/{name}"))
+        .ok()
+}
+
+#[test]
+fn send_from_the_default_branch_moves_work_to_a_new_branch_and_opens_a_pull_request() {
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+    repo.find_remote("origin")
+        .unwrap()
+        .fetch(&["main"], None, None)
+        .unwrap();
+    let base = repo.head().unwrap().target().unwrap();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    write_file(temp.path(), "src/main.rs", "fn main() { local() }\n");
+    write_file(temp.path(), "cutready/intro.sk", "scene one, for review\n");
+    let saved = workspace.save_version("Revise intro").unwrap();
+    let mut host = FakeHost::default();
+
+    let result = workspace
+        .send(
+            "origin",
+            &send_request("Revise intro for Q3!"),
+            &mut host,
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+
+    assert_eq!(result.variation, "cutready/revise-intro-for-q3");
+    assert_eq!(result.base, "main");
+    assert!(result.created_variation && result.created_pull_request);
+    assert_eq!(result.published_versions, 1);
+    assert_eq!(host.open[0].0.head, "cutready/revise-intro-for-q3");
+    assert_eq!(host.open[0].0.title, "Revise intro for Q3!");
+    assert_eq!(
+        repo.head().unwrap().shorthand(),
+        Some("cutready/revise-intro-for-q3")
+    );
+    assert_eq!(
+        repo.refname_to_id("refs/heads/main").unwrap(),
+        base,
+        "local main is handed back to its upstream"
+    );
+    assert_eq!(
+        remote_branch(bare.path(), "cutready/revise-intro-for-q3"),
+        Some(saved.id().as_str().parse().unwrap())
+    );
+    assert_eq!(remote_branch(bare.path(), "main"), Some(base));
+    let branch = repo
+        .find_branch("cutready/revise-intro-for-q3", git2::BranchType::Local)
+        .unwrap();
+    assert_eq!(
+        branch.upstream().unwrap().name().unwrap(),
+        Some("origin/cutready/revise-intro-for-q3")
+    );
+    assert!(status(&repo, "src/main.rs").contains(git2::Status::WT_MODIFIED));
+
+    write_file(
+        temp.path(),
+        "cutready/intro.sk",
+        "scene one, after review\n",
+    );
+    let second = workspace.save_version("Address feedback").unwrap();
+    let again = workspace
+        .send(
+            "origin",
+            &send_request("ignored"),
+            &mut host,
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    assert!(!again.created_variation && !again.created_pull_request);
+    assert_eq!(again.pull_request.number, 1);
+    assert_eq!(host.created, 1);
+    assert_eq!(
+        remote_branch(bare.path(), "cutready/revise-intro-for-q3"),
+        Some(second.id().as_str().parse().unwrap())
+    );
+}
+
+#[test]
+fn send_retries_safely_after_the_host_fails_and_avoids_taken_branch_names() {
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, other) = with_remote(&repo);
+    let head = other.head().unwrap().peel_to_commit().unwrap();
+    other.branch("cutready/pitch", &head, false).unwrap();
+    other
+        .find_remote("origin")
+        .unwrap()
+        .push(
+            &["refs/heads/cutready/pitch:refs/heads/cutready/pitch"],
+            None,
+        )
+        .unwrap();
+    assert!(
+        repo.find_reference("refs/remotes/origin/cutready/pitch")
+            .is_err(),
+        "the name is taken only on the live remote"
+    );
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "pitch\n");
+    workspace.save_version("Pitch").unwrap();
+    let mut host = FakeHost {
+        fail_next_create: true,
+        ..Default::default()
+    };
+
+    let error = workspace
+        .send(
+            "origin",
+            &send_request("Pitch"),
+            &mut host,
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, DraftlineError::PullRequest(_)), "{error:?}");
+    assert!(remote_branch(bare.path(), "cutready/pitch-2").is_some());
+
+    let retry = workspace
+        .send(
+            "origin",
+            &send_request("Pitch"),
+            &mut host,
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    assert_eq!(retry.variation, "cutready/pitch-2");
+    assert!(!retry.created_variation && retry.created_pull_request);
+    assert_eq!(retry.published_versions, 0);
+}
+
+#[test]
+fn send_refuses_unsaved_project_changes_before_creating_a_branch() {
+    let (temp, repo) = code_repo();
+    let (_bare, _other_dir, _other) = with_remote(&repo);
+    let workspace = scoped(&temp);
+    write_file(temp.path(), "cutready/intro.sk", "unsaved\n");
+
+    let error = workspace
+        .send(
+            "origin",
+            &send_request("Draft"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, DraftlineError::PreflightFailed(_)),
+        "{error:?}"
+    );
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert!(repo.find_branch("draft", git2::BranchType::Local).is_err());
+}
+
+#[test]
+fn send_needs_a_known_base_branch() {
+    let (temp, repo) = code_repo();
+    let bare = tempfile::tempdir().unwrap();
+    git2::Repository::init_bare(bare.path()).unwrap();
+    repo.remote("origin", bare.path().to_str().unwrap())
+        .unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("trunk", &head, false).unwrap();
+    repo.set_head("refs/heads/trunk").unwrap();
+    repo.find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .delete()
+        .unwrap();
+
+    let error = scoped(&temp)
+        .send(
+            "origin",
+            &send_request("Draft"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, DraftlineError::SendBaseUnknown),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn send_rejects_developer_branches_outside_the_variation_namespace() {
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/login", &head, false).unwrap();
+    repo.set_head("refs/heads/feature/login").unwrap();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+
+    let error = workspace
+        .send(
+            "origin",
+            &send_request("Login"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, DraftlineError::SendOutsideNamespace(ref name) if name == "feature/login"),
+        "{error:?}"
+    );
+    assert!(remote_branch(bare.path(), "feature/login").is_none());
+
+    repo.set_head("refs/heads/main").unwrap();
+    let error = workspace
+        .send(
+            "origin",
+            &draftline::SendRequest {
+                title: "Login".into(),
+                branch: Some("feature/login-2".into()),
+                ..Default::default()
+            },
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::SendOutsideNamespace(_)),
+        "{error:?}"
+    );
+    assert!(repo
+        .find_branch("feature/login-2", git2::BranchType::Local)
+        .is_err());
+}
+
+#[test]
+fn send_hands_a_stale_local_base_back_to_the_fresh_upstream() {
+    let (temp, repo) = code_repo();
+    let (bare, other_dir, other) = with_remote(&repo);
+    write_file(other_dir.path(), "README.md", "# teammate\n");
+    commit_all(&other, "Teammate");
+    push_main(&other);
+    let fresh = remote_branch(bare.path(), "main").unwrap();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "pitch\n");
+    workspace.save_version("Pitch").unwrap();
+
+    let result = workspace
+        .send(
+            "origin",
+            &send_request("Pitch"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+
+    assert_eq!(result.variation, "cutready/pitch");
+    assert_eq!(result.published_versions, 1);
+    assert_eq!(repo.refname_to_id("refs/heads/main").unwrap(), fresh);
+
+    // A send interrupted after switching branches is repaired by the next one.
+    write_file(temp.path(), "cutready/intro.sk", "pitch v2\n");
+    workspace.save_version("Pitch v2").unwrap();
+    let carried = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.reference(
+        "refs/heads/main",
+        carried.id(),
+        true,
+        "simulate interruption",
+    )
+    .unwrap();
+    workspace
+        .send(
+            "origin",
+            &send_request("Pitch"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    assert_eq!(repo.refname_to_id("refs/heads/main").unwrap(), fresh);
+}

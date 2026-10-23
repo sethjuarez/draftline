@@ -79,6 +79,7 @@ pub mod merge;
 pub mod mobile_ffi;
 pub mod path;
 pub mod profile;
+pub mod pull_request;
 pub mod recovery;
 pub mod remote;
 pub mod tauri_contract;
@@ -91,6 +92,9 @@ pub use merge::{
     ResolverRegistry, SemanticMergeResolver,
 };
 pub use profile::{AttributionOperation, ContributorProfile, ContributorProvider};
+pub use pull_request::{
+    PullRequest, PullRequestProvider, PullRequestRequest, SendRequest, SendResult,
+};
 pub use recovery::{RecoveryOperation, RecoveryState};
 pub use remote::{
     Contributor, PublishPreflight, PublishResult, PublishToken, RemoteCredential,

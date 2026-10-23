@@ -129,6 +129,15 @@ pub enum DraftlineError {
 
     #[error("history cleanup request is blocked")]
     HistoryCleanupBlocked(Box<HistoryCleanupBlockReport>),
+
+    #[error("cannot tell which branch to send to; pass a base branch")]
+    SendBaseUnknown,
+
+    #[error("branch `{0}` is not a variation; switch to one or to the base branch to send")]
+    SendOutsideNamespace(String),
+
+    #[error("pull request provider failed: {0}")]
+    PullRequest(String),
 }
 
 fn timeout_suffix(timeout_ms: u64) -> String {
