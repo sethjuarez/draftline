@@ -246,6 +246,10 @@ pub enum FileHazardKind {
     Ignored,
     Untracked,
     PolicyExcluded,
+    /// Needs a Git filter driver (for example Git LFS) that Draftline cannot run.
+    GitFilter,
+    /// Has uncommitted local edits that the operation would overwrite.
+    LocalChanges,
 }
 
 /// Read-only view of a version.
@@ -2515,12 +2519,23 @@ impl Workspace {
                     .map_err(|_| DraftlineError::VersionNotFound(target.to_string()))?;
                 let commit = self.repo.find_commit(oid)?;
                 let branch_ref = format!("refs/heads/{}", validate_variation_name(variation)?);
-                self.repo
-                    .reference(&branch_ref, oid, true, "repair apply_incoming")?;
-                self.repo.checkout_tree(
-                    commit.tree()?.as_object(),
-                    Some(CheckoutBuilder::new().force()),
-                )?;
+                let current = self.repo.refname_to_id(&branch_ref).ok();
+                if current == Some(oid) {
+                    // The ref already moved; only the project files may lag behind.
+                    self.checkout_scope_forced(&commit.tree()?)?;
+                } else if current.is_some_and(|current| {
+                    self.repo.graph_descendant_of(oid, current).unwrap_or(false)
+                }) {
+                    // Interrupted mid-checkout: safe checkout treats files already at
+                    // either side as clean, so rerunning it is idempotent and still
+                    // refuses to clobber local edits.
+                    self.checkout_tree_safely(&commit.tree()?)?;
+                    self.repo
+                        .reference(&branch_ref, oid, true, "repair apply_incoming")?;
+                } else {
+                    // Someone else moved the branch since; don't guess.
+                    return Ok(self.recovery_unavailable(state));
+                }
                 self.repo.set_head(&branch_ref)?;
                 self.complete_recovery(state, true)
             }
@@ -2565,10 +2580,7 @@ impl Workspace {
                     return Ok(self.recovery_unavailable(state));
                 };
                 let (_id, commit) = self.find_shelf_commit(target)?;
-                self.repo.checkout_tree(
-                    commit.tree()?.as_object(),
-                    Some(CheckoutBuilder::new().force()),
-                )?;
+                self.apply_shelf_paths(&commit)?;
                 self.complete_recovery(state, true)
             }
             RecoveryOperation::ExpireSupportRefs => {
@@ -2634,10 +2646,7 @@ impl Workspace {
                     .reference(&branch_ref, oid, true, "rollback recovery")?;
                 if self.current_variation_unchecked().ok().as_deref() == Some(variation) {
                     let commit = self.repo.find_commit(oid)?;
-                    self.repo.checkout_tree(
-                        commit.tree()?.as_object(),
-                        Some(CheckoutBuilder::new().force()),
-                    )?;
+                    self.checkout_scope_forced(&commit.tree()?)?;
                     self.repo.set_head(&branch_ref)?;
                 }
                 let archive_ref = archive_ref("deleted-variations", variation, &state.operation_id);
@@ -2738,47 +2747,8 @@ impl Workspace {
         label: impl AsRef<str>,
         profile: Option<&ContributorProfile>,
     ) -> Result<Version> {
-        let mut index = self.repo.index()?;
-
-        for changed in self.changed_files_unchecked()? {
-            match changed.kind {
-                ChangeKind::Deleted => index.remove_path(&changed.path)?,
-                _ => index.add_path(&changed.path)?,
-            }
-        }
-
-        index.write()?;
-
-        let tree_id = index.write_tree()?;
-        let tree = self.repo.find_tree(tree_id)?;
-        let (author, committer) = self.workspace_signatures(profile)?;
-        let parent = self
-            .repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .and_then(|oid| self.repo.find_commit(oid).ok());
-
-        let oid = match parent.as_ref() {
-            Some(parent) => self.repo.commit(
-                Some("HEAD"),
-                &author,
-                &committer,
-                label.as_ref(),
-                &tree,
-                &[parent],
-            )?,
-            None => self.repo.commit(
-                Some("HEAD"),
-                &author,
-                &committer,
-                label.as_ref(),
-                &tree,
-                &[],
-            )?,
-        };
-
-        Ok(version_from_commit(&self.repo.find_commit(oid)?))
+        let changed_files = self.changed_files_unchecked()?;
+        self.commit_content_changes(&changed_files, "save_version", label.as_ref(), profile)
     }
 
     /// Preflights saving only selected workspace-relative tracked content files.
@@ -2837,36 +2807,7 @@ impl Workspace {
             )));
         }
 
-        let tree_id = self.write_selected_changes_tree(&changed_files)?;
-        let tree = self.repo.find_tree(tree_id)?;
-        let (author, committer) = self.workspace_signatures(profile)?;
-        let parent = self
-            .repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .and_then(|oid| self.repo.find_commit(oid).ok());
-
-        let oid = match parent.as_ref() {
-            Some(parent) => self.repo.commit(
-                Some("HEAD"),
-                &author,
-                &committer,
-                label.as_ref(),
-                &tree,
-                &[parent],
-            )?,
-            None => self.repo.commit(
-                Some("HEAD"),
-                &author,
-                &committer,
-                label.as_ref(),
-                &tree,
-                &[],
-            )?,
-        };
-
-        Ok(version_from_commit(&self.repo.find_commit(oid)?))
+        self.commit_content_changes(&changed_files, "save_files", label.as_ref(), profile)
     }
 
     /// Lists versions reachable from the current variation, newest first.
@@ -2988,19 +2929,69 @@ impl Workspace {
             .recurse_untracked_dirs(true)
             .recurse_ignored_dirs(true);
 
+        // Only paths the target actually changes can be overwritten, so scan
+        // just those instead of walking the whole (possibly huge) repository.
+        let head_tree = self.repo.head().ok().and_then(|head| head.peel_to_tree().ok());
+        let diff = self
+            .repo
+            .diff_tree_to_tree(head_tree.as_ref(), Some(target_tree), None)?;
+        let mut target_paths = BTreeSet::new();
+        for delta in diff.deltas() {
+            for file in [delta.old_file(), delta.new_file()] {
+                if let Some(path) = file.path() {
+                    target_paths.insert(path.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        if target_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        options.disable_pathspec_match(true);
+        for path in &target_paths {
+            options.pathspec(path);
+        }
+
         let statuses = self.repo.statuses(Some(&mut options))?;
+        let local_change = Status::WT_MODIFIED
+            | Status::WT_DELETED
+            | Status::WT_TYPECHANGE
+            | Status::WT_RENAMED
+            | Status::INDEX_MODIFIED
+            | Status::INDEX_DELETED
+            | Status::INDEX_TYPECHANGE
+            | Status::INDEX_RENAMED;
         let mut hazards = Vec::new();
 
         for entry in statuses.iter() {
             let Some(path) = entry.path() else {
                 continue;
             };
+            let path_ref = Path::new(path);
+            let status = entry.status();
 
-            if !tree_contains_path(target_tree, Path::new(path))? {
+            // Uncommitted edits outside the content policy (developer code) are
+            // never overwritten: flag them when the target changes that path.
+            if status.intersects(local_change) && !status.is_wt_new() && !status.is_index_new() {
+                if self.content_policy.tracks(path)? {
+                    continue;
+                }
+                let head_entry = match head_tree.as_ref() {
+                    Some(tree) => optional_tree_entry(tree, path_ref)?,
+                    None => None,
+                };
+                if head_entry != optional_tree_entry(target_tree, path_ref)? {
+                    hazards.push(FileHazard {
+                        path: PathBuf::from(path),
+                        kind: FileHazardKind::LocalChanges,
+                    });
+                }
                 continue;
             }
 
-            let status = entry.status();
+            if !tree_contains_path(target_tree, path_ref)? {
+                continue;
+            }
+
             let kind = if status.contains(Status::IGNORED) {
                 Some(FileHazardKind::Ignored)
             } else if status.is_wt_new() || status.is_index_new() {
@@ -3021,9 +3012,88 @@ impl Workspace {
             }
         }
 
+        // Safe checkout also refuses file/folder obstructions the status scan
+        // cannot see, so flag those up front instead of failing mid-operation.
+        for path in self.obstructed_paths(head_tree.as_ref(), target_tree, &target_paths)? {
+            if hazards.iter().any(|hazard| hazard.path == path)
+                || self.content_policy.tracks(&path)?
+            {
+                continue;
+            }
+            let kind = if self.repo.is_path_ignored(&path)? {
+                FileHazardKind::Ignored
+            } else {
+                FileHazardKind::PolicyExcluded
+            };
+            hazards.push(FileHazard { path, kind });
+        }
+
         hazards.sort_by(|left, right| left.path.cmp(&right.path));
         hazards.dedup_by(|left, right| left.path == right.path);
         Ok(hazards)
+    }
+
+    /// Untracked or ignored paths that block the target's files or folders: a
+    /// file where the target needs a folder, or files inside a folder the
+    /// target turns into a file.
+    fn obstructed_paths(
+        &self,
+        head_tree: Option<&Tree<'_>>,
+        target_tree: &Tree<'_>,
+        target_paths: &BTreeSet<String>,
+    ) -> Result<Vec<PathBuf>> {
+        let Some(workdir) = self.repo.workdir() else {
+            return Ok(Vec::new());
+        };
+        let in_head = |path: &Path| -> Result<bool> {
+            match head_tree {
+                Some(tree) => tree_contains_path(tree, path),
+                None => Ok(false),
+            }
+        };
+        let mut obstructed = BTreeSet::new();
+        for path in target_paths {
+            let path = Path::new(path);
+            if !tree_contains_path(target_tree, path)? {
+                continue;
+            }
+            for ancestor in path.ancestors().skip(1) {
+                if ancestor.as_os_str().is_empty() {
+                    break;
+                }
+                let on_disk = workdir.join(ancestor);
+                if fs::symlink_metadata(&on_disk).is_ok_and(|meta| !meta.is_dir())
+                    && !in_head(ancestor)?
+                {
+                    obstructed.insert(ancestor.to_path_buf());
+                }
+            }
+            let on_disk = workdir.join(path);
+            if fs::symlink_metadata(&on_disk).is_ok_and(|meta| meta.is_dir()) {
+                let mut pending = vec![on_disk];
+                while let Some(dir) = pending.pop() {
+                    for entry in fs::read_dir(&dir)? {
+                        let entry = entry?;
+                        if entry.file_type()?.is_dir() {
+                            pending.push(entry.path());
+                            continue;
+                        }
+                        let relative = entry
+                            .path()
+                            .strip_prefix(workdir)
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|_| entry.path());
+                        if !in_head(&relative)? {
+                            obstructed.insert(relative);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(obstructed
+            .into_iter()
+            .map(|path| PathBuf::from(path.to_string_lossy().replace('\\', "/")))
+            .collect())
     }
 
     /// Returns content changes and an optional textual diff of unsaved workspace changes.
@@ -3705,7 +3775,7 @@ impl Workspace {
             completed: false,
         })?;
 
-        let tree_id = self.write_selected_changes_tree(&changed_files)?;
+        let (tree_id, _) = self.content_changes_tree(&changed_files, "shelve_files")?;
         let tree = self.repo.find_tree(tree_id)?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
@@ -3788,7 +3858,8 @@ impl Workspace {
     pub fn preflight_apply_shelf(&self, id: impl AsRef<str>) -> Result<ShelfApplyReport> {
         self.ensure_no_pending_recovery()?;
         let (safe_name, commit) = self.find_shelf_commit(id.as_ref())?;
-        let tree = commit.tree()?;
+        let (tree_id, _paths) = self.shelf_target_tree(&commit)?;
+        let tree = self.repo.find_tree(tree_id)?;
         let dirty_files = self.changed_files_unchecked()?;
         let file_hazards = self.target_tree_hazards(&tree)?;
         let can_proceed = dirty_files.is_empty() && file_hazards.is_empty();
@@ -3830,9 +3901,7 @@ impl Workspace {
         })?;
 
         let (_id, commit) = self.find_shelf_commit(&safe_name)?;
-        let tree = commit.tree()?;
-        self.repo
-            .checkout_tree(tree.as_object(), Some(CheckoutBuilder::new().force()))?;
+        self.apply_shelf_paths(&commit)?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -4848,14 +4917,17 @@ impl Workspace {
     ) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "restore_version_as_new_save")?;
+        let head_commit = self.repo.head()?.peel_to_commit()?;
+        let restored_tree = {
+            let source = self.find_version_commit(version)?.tree()?;
+            let tree_id = self.compose_scoped_tree(&head_commit.tree()?, &source)?;
+            self.repo.find_tree(tree_id)?
+        };
         let report = preflight_report(
             "restore_version_as_new_save",
             true,
             self.changed_files_unchecked()?,
-            {
-                let commit = self.find_version_commit(version)?;
-                self.target_tree_hazards(&commit.tree()?)?
-            },
+            self.target_tree_hazards(&restored_tree)?,
             None,
         );
         if !report.can_proceed {
@@ -4872,20 +4944,15 @@ impl Workspace {
             completed: false,
         })?;
 
-        let commit = self.find_version_commit(version)?;
-        let tree = commit.tree()?;
-        let parent = self.repo.head()?.peel_to_commit()?;
+        self.checkout_tree_safely(&restored_tree)?;
         let oid = self.repo.commit(
             Some("HEAD"),
             &author,
             &committer,
             label.as_ref(),
-            &tree,
-            &[&parent],
+            &restored_tree,
+            &[&head_commit],
         )?;
-
-        self.repo
-            .checkout_tree(tree.as_object(), Some(CheckoutBuilder::new().force()))?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -4950,12 +5017,17 @@ impl Workspace {
         let current_variation = self.current_variation_unchecked()?;
         let (target_name, target_metadata, parent_oid) =
             self.resolve_restore_version_target(target, &current_variation)?;
+        let parent = self.repo.find_commit(parent_oid)?;
+        let restored_tree = {
+            let tree_id = self.compose_scoped_tree(&parent.tree()?, &source_tree)?;
+            self.repo.find_tree(tree_id)?
+        };
 
         let report = preflight_report(
             "restore_version_as_new_save_to_variation",
             true,
             self.changed_files_unchecked()?,
-            self.target_tree_hazards(&source_tree)?,
+            self.target_tree_hazards(&restored_tree)?,
             Some(format!("{current_variation} -> {target_name}")),
         );
         if !report.can_proceed {
@@ -4972,22 +5044,18 @@ impl Workspace {
             completed: false,
         })?;
 
-        let parent = self.repo.find_commit(parent_oid)?;
+        // Move files before any ref so HEAD is still the checkout baseline.
+        self.checkout_tree_safely(&restored_tree)?;
         let target_ref = format!("refs/heads/{target_name}");
         let oid = self.repo.commit(
             Some(&target_ref),
             &author,
             &committer,
             label.as_ref(),
-            &source_tree,
+            &restored_tree,
             &[&parent],
         )?;
         self.write_variation_metadata(&target_name, &target_metadata)?;
-
-        self.repo.checkout_tree(
-            source_tree.as_object(),
-            Some(CheckoutBuilder::new().force()),
-        )?;
         self.repo.set_head(&target_ref)?;
 
         self.write_recovery_state(&RecoveryState {
@@ -6768,9 +6836,6 @@ impl Workspace {
         }
         let branch_ref = format!("refs/heads/{variation}");
 
-        // Save the original OID so we can roll back if checkout fails.
-        let original_oid = self.repo.refname_to_id(&branch_ref).ok();
-
         let operation_id = new_operation_id();
         let remote_rewrite_application = if let Some(rewrite) = incoming_rewrite.as_ref() {
             Some(self.prepare_incoming_remote_rewrite(&variation, local_oid, rewrite)?)
@@ -6791,24 +6856,15 @@ impl Workspace {
             completed: false,
         })?;
 
-        // Fast-forward or rewrite the local branch ref to the incoming target.
+        // Bring files up to the incoming tree like `git merge --ff-only`: local
+        // edits are never overwritten. This runs before the ref moves so HEAD
+        // is still the checkout baseline.
+        if let Err(checkout_err) = self.checkout_tree_safely(&checkout_commit.tree()?) {
+            let _ = self.acknowledge_recovery();
+            return Err(checkout_err);
+        }
         self.repo
             .reference(&branch_ref, target_oid, true, "apply_incoming")?;
-
-        // Bring the working directory up to the new tree.  Roll back the ref if
-        // checkout fails so the repo is not left with a moved branch and stale tree.
-        if let Err(checkout_err) = self.repo.checkout_tree(
-            checkout_commit.tree()?.as_object(),
-            Some(CheckoutBuilder::new().force()),
-        ) {
-            if let Some(orig) = original_oid {
-                let _ = self
-                    .repo
-                    .reference(&branch_ref, orig, true, "apply_incoming rollback");
-            }
-            let _ = self.acknowledge_recovery();
-            return Err(checkout_err.into());
-        }
 
         self.repo.set_head(&branch_ref)?;
         if let Some(application) = remote_rewrite_application {
@@ -8250,9 +8306,8 @@ impl Workspace {
         let safe_variation = validate_variation_name(variation)?;
         let branch = self.repo.find_branch(&safe_variation, BranchType::Local)?;
         let reference = branch.into_reference();
-        let target = reference.peel(ObjectType::Commit)?;
-        self.repo
-            .checkout_tree(&target, Some(CheckoutBuilder::new().force()))?;
+        let target = reference.peel_to_tree()?;
+        self.checkout_scope_forced(&target)?;
         self.repo
             .set_head(&format!("refs/heads/{safe_variation}"))?;
         Ok(())
@@ -10052,102 +10107,227 @@ impl Workspace {
             .collect())
     }
 
-    fn write_selected_changes_tree(&self, changed_files: &[ChangedFile]) -> Result<Oid> {
-        let all_changed_files = self.changed_files_unchecked()?;
-        let selected_paths: BTreeSet<_> = changed_files
-            .iter()
-            .map(|changed| changed.path.as_path())
-            .collect();
-        let mut rename_targets = HashMap::new();
-        let mut paths_to_reset = BTreeSet::new();
-        let mut paths_to_restore = BTreeSet::new();
-        for changed in &all_changed_files {
-            let mut affected_paths = vec![changed.path.clone()];
-            if changed.kind == ChangeKind::Renamed {
-                if let Some(target) = self.staged_rename_target_for_path(&changed.path)? {
-                    affected_paths.push(target.clone());
-                    rename_targets.insert(changed.path.clone(), target);
-                }
-            }
-            paths_to_reset.extend(affected_paths.iter().cloned());
-            if !selected_paths.contains(changed.path.as_path()) {
-                paths_to_restore.extend(affected_paths);
-            }
-        }
-
-        let original_index_entries = {
-            let index = self.repo.index()?;
-            paths_to_restore
-                .iter()
-                .map(|path| (path.clone(), index.get_path(path, 0)))
-                .collect::<Vec<_>>()
-        };
-
-        if let Ok(head) = self
-            .repo
-            .head()
-            .and_then(|head| head.peel(ObjectType::Commit))
-        {
-            self.repo
-                .reset_default(Some(&head), paths_to_reset.iter().map(PathBuf::as_path))?;
-        }
-
-        let mut index = self.repo.index()?;
-        if self.repo.head().is_err() {
-            for path in &paths_to_reset {
-                if let Err(error) = index.remove_path(path) {
-                    if error.code() != git2::ErrorCode::NotFound {
-                        return Err(error.into());
-                    }
-                }
-            }
-        }
-
+    /// Builds the tree for `changed_files` on top of HEAD in a private
+    /// in-memory index so the developer's staged changes are never consumed.
+    /// Returns the tree and every path whose real index entry should follow it.
+    fn content_changes_tree(
+        &self,
+        changed_files: &[ChangedFile],
+        operation: &str,
+    ) -> Result<(Oid, Vec<PathBuf>)> {
+        // Resolve every path first so filter checks see what will really be added.
+        let mut additions = Vec::new();
+        let mut removals = Vec::new();
         for changed in changed_files {
             match changed.kind {
                 ChangeKind::Renamed => {
-                    let target = rename_targets.get(&changed.path).ok_or_else(|| {
-                        DraftlineError::LocalStateChanged {
+                    let target = self
+                        .staged_rename_target_for_path(&changed.path)?
+                        .ok_or_else(|| DraftlineError::LocalStateChanged {
                             expected: format!(
                                 "staged rename target for {}",
                                 changed.path.display()
                             ),
                             actual: "missing rename target".to_string(),
-                        }
-                    })?;
-                    index.add_path(target)?;
-                    if let Err(error) = index.remove_path(&changed.path) {
-                        if error.code() != git2::ErrorCode::NotFound {
-                            return Err(error.into());
-                        }
+                        })?;
+                    removals.push(changed.path.clone());
+                    // A rename out of the project leaves the target to whoever made it.
+                    if self.content_policy.tracks(&target)? {
+                        additions.push(target);
                     }
                 }
-                ChangeKind::Deleted => {
-                    if let Err(error) = index.remove_path(&changed.path) {
-                        if error.code() != git2::ErrorCode::NotFound {
-                            return Err(error.into());
-                        }
+                ChangeKind::Deleted => removals.push(changed.path.clone()),
+                _ => additions.push(changed.path.clone()),
+            }
+        }
+        self.ensure_no_filtered_content(&additions, operation)?;
+
+        // A second handle owns its own index object; it is never written to disk.
+        let scratch = Repository::open(&self.root)?;
+        let mut index = scratch.index()?;
+        index.clear()?;
+        if let Ok(head_tree) = self.repo.head().and_then(|head| head.peel_to_tree()) {
+            index.read_tree(&head_tree)?;
+        }
+        for path in &removals {
+            remove_index_path(&mut index, path)?;
+        }
+        for path in &additions {
+            index.add_path(path)?;
+        }
+        let affected_paths = removals.into_iter().chain(additions).collect::<Vec<_>>();
+
+        Ok((index.write_tree()?, affected_paths))
+    }
+
+    /// Commits `changed_files` on top of HEAD, then syncs only the saved paths
+    /// in the real index so `git status` stays clean for them.
+    fn commit_content_changes(
+        &self,
+        changed_files: &[ChangedFile],
+        operation: &str,
+        label: &str,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Version> {
+        let (tree_id, affected_paths) = self.content_changes_tree(changed_files, operation)?;
+        let tree = self.repo.find_tree(tree_id)?;
+        let (author, committer) = self.workspace_signatures(profile)?;
+        let parent = self
+            .repo
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok());
+        let parents = parent.iter().collect::<Vec<_>>();
+        let oid = self
+            .repo
+            .commit(Some("HEAD"), &author, &committer, label, &tree, &parents)?;
+        let commit = self.repo.find_commit(oid)?;
+        if !affected_paths.is_empty() {
+            self.repo.reset_default(
+                Some(commit.as_object()),
+                affected_paths.iter().map(PathBuf::as_path),
+            )?;
+        }
+        Ok(version_from_commit(&commit))
+    }
+
+    /// Refuses content that needs a Git filter driver (for example Git LFS),
+    /// which libgit2 cannot run; committing it raw would corrupt the repository.
+    fn ensure_no_filtered_content(&self, paths: &[PathBuf], operation: &str) -> Result<()> {
+        let mut hazards = Vec::new();
+        for path in paths {
+            let filter = self.repo.get_attr(
+                path,
+                "filter",
+                git2::AttrCheckFlags::FILE_THEN_INDEX,
+            )?;
+            if matches!(
+                git2::AttrValue::from_string(filter),
+                git2::AttrValue::True | git2::AttrValue::String(_)
+            ) {
+                hazards.push(FileHazard {
+                    path: path.clone(),
+                    kind: FileHazardKind::GitFilter,
+                });
+            }
+        }
+        if hazards.is_empty() {
+            Ok(())
+        } else {
+            Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                operation,
+                false,
+                Vec::new(),
+                hazards,
+                None,
+            ))))
+        }
+    }
+
+    /// Moves working files from the current HEAD tree to `target` the way
+    /// `git checkout` does: files with local edits are never overwritten.
+    /// Must run before HEAD or its branch moves, since HEAD is the baseline.
+    fn checkout_tree_safely(&self, target: &Tree<'_>) -> Result<()> {
+        let mut checkout = CheckoutBuilder::new();
+        checkout.safe().overwrite_ignored(false);
+        self.repo
+            .checkout_tree(target.as_object(), Some(&mut checkout))?;
+        Ok(())
+    }
+
+    /// Forces only the project folder to `target`; paths outside it are untouched.
+    fn checkout_scope_forced(&self, target: &Tree<'_>) -> Result<()> {
+        let mut checkout = CheckoutBuilder::new();
+        checkout.force();
+        if let Some(pathspec) = scope_pathspec(self.scope()) {
+            checkout.disable_pathspec_match(true).path(pathspec);
+        }
+        self.repo
+            .checkout_tree(target.as_object(), Some(&mut checkout))?;
+        Ok(())
+    }
+
+    /// `base` with its project folder replaced by `source`'s project folder.
+    /// Unscoped workspaces use `source` as-is.
+    fn compose_scoped_tree(&self, base: &Tree<'_>, source: &Tree<'_>) -> Result<Oid> {
+        let Some(pathspec) = scope_pathspec(self.scope()) else {
+            return Ok(source.id());
+        };
+        let source_entry = optional_tree_entry(source, self.scope())?;
+        let base_entry = optional_tree_entry(base, self.scope())?;
+        let mut update = git2::build::TreeUpdateBuilder::new();
+        match (source_entry, base_entry) {
+            (Some(entry), _) => {
+                update.upsert(pathspec.as_str(), entry, git2::FileMode::Tree);
+            }
+            (None, Some(_)) => {
+                update.remove(pathspec.as_str());
+            }
+            (None, None) => return Ok(base.id()),
+        }
+        Ok(update.create_updated(&self.repo, base)?)
+    }
+
+    /// HEAD with only the content paths the shelf changed replaced by the
+    /// shelf's versions, plus those paths. Everything else stays at HEAD, so
+    /// applying a shelf never reverts commits made since it was created.
+    fn shelf_target_tree(&self, shelf: &Commit<'_>) -> Result<(Oid, Vec<PathBuf>)> {
+        let shelf_tree = shelf.tree()?;
+        let parent_tree = match shelf.parent(0) {
+            Ok(parent) => Some(parent.tree()?),
+            Err(_) => None,
+        };
+        let head_tree = self.repo.head()?.peel_to_tree()?;
+        let diff = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&shelf_tree), None)?;
+        let mut paths = BTreeSet::new();
+        for delta in diff.deltas() {
+            for file in [delta.old_file(), delta.new_file()] {
+                if let Some(path) = file.path() {
+                    if self.content_policy.tracks(path)? {
+                        paths.insert(path.to_path_buf());
                     }
                 }
-                _ => index.add_path(&changed.path)?,
             }
         }
 
-        index.write()?;
-        let selected_tree_id = index.write_tree()?;
-
-        for (path, entry) in original_index_entries {
-            if let Some(entry) = entry {
-                index.add(&entry)?;
-            } else if let Err(error) = index.remove_path(&path) {
-                if error.code() != git2::ErrorCode::NotFound {
-                    return Err(error.into());
+        let mut update = git2::build::TreeUpdateBuilder::new();
+        for path in &paths {
+            let key = path.to_string_lossy().replace('\\', "/");
+            match shelf_tree.get_path(path) {
+                Ok(entry) => {
+                    update.upsert(key.as_str(), entry.id(), blob_file_mode(entry.filemode()));
                 }
+                Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                    update.remove(key.as_str());
+                }
+                Err(error) => return Err(error.into()),
             }
         }
-        index.write()?;
+        let tree = update.create_updated(&self.repo, &head_tree)?;
+        Ok((tree, paths.into_iter().collect()))
+    }
 
-        Ok(selected_tree_id)
+    /// Writes the shelf's content paths into the working tree without staging
+    /// them, leaving every other path and the index alone.
+    fn apply_shelf_paths(&self, shelf: &Commit<'_>) -> Result<()> {
+        let (tree_id, paths) = self.shelf_target_tree(shelf)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let tree = self.repo.find_tree(tree_id)?;
+        let mut checkout = CheckoutBuilder::new();
+        checkout
+            .force()
+            .update_index(false)
+            .disable_pathspec_match(true);
+        for path in &paths {
+            checkout.path(path.to_string_lossy().replace('\\', "/"));
+        }
+        self.repo
+            .checkout_tree(tree.as_object(), Some(&mut checkout))?;
+        Ok(())
     }
 
     fn discard_changed_files(&self, changed_files: &[ChangedFile]) -> Result<()> {
@@ -10168,7 +10348,12 @@ impl Workspace {
                     remove_workspace_path_if_exists(&self.root.join(&changed.path))?;
                 }
                 ChangeKind::Renamed => {
-                    if let Some(target) = self.staged_rename_target_for_path(&changed.path)? {
+                    let target = match self.staged_rename_target_for_path(&changed.path)? {
+                        Some(target) if self.content_policy.tracks(&target)? => Some(target),
+                        _ => None,
+                    };
+                    // A target outside the content policy belongs to the developer.
+                    if let Some(target) = target {
                         checkout.path(&target);
                         paths_to_reset.push(target.clone());
                         paths_to_remove_after_checkout.push(target);
@@ -10248,22 +10433,7 @@ impl Workspace {
         })?;
 
         let changed_files = self.changed_files_unchecked()?;
-        let untracked_content: Vec<PathBuf> = changed_files
-            .iter()
-            .filter(|changed| changed.kind == ChangeKind::Added)
-            .map(|changed| changed.path.clone())
-            .collect();
-
-        let mut index = self.repo.index()?;
-        for changed in changed_files {
-            match changed.kind {
-                ChangeKind::Deleted => index.remove_path(&changed.path)?,
-                _ => index.add_path(&changed.path)?,
-            }
-        }
-        index.write()?;
-
-        let tree_id = index.write_tree()?;
+        let (tree_id, _) = self.content_changes_tree(&changed_files, "shelve_changes")?;
         let tree = self.repo.find_tree(tree_id)?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
@@ -10281,15 +10451,7 @@ impl Workspace {
             "shelve changes",
         )?;
 
-        self.repo
-            .checkout_head(Some(CheckoutBuilder::new().force()))?;
-
-        for path in untracked_content {
-            let full_path = self.root.join(path);
-            if full_path.is_file() {
-                fs::remove_file(full_path)?;
-            }
-        }
+        self.discard_changed_files(&changed_files)?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -12284,6 +12446,29 @@ fn diff_deltas_to_changed_files(diff: &git2::Diff<'_>) -> Vec<ChangedFile> {
     files
 }
 
+fn remove_index_path(index: &mut git2::Index, path: &Path) -> Result<()> {
+    match index.remove_path(path) {
+        Err(error) if error.code() != git2::ErrorCode::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+fn blob_file_mode(mode: i32) -> git2::FileMode {
+    match mode {
+        0o100755 => git2::FileMode::BlobExecutable,
+        0o120000 => git2::FileMode::Link,
+        _ => git2::FileMode::Blob,
+    }
+}
+
+fn optional_tree_entry(tree: &Tree<'_>, path: &Path) -> Result<Option<Oid>> {
+    match tree.get_path(path) {
+        Ok(entry) => Ok(Some(entry.id())),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Literal (non-glob) pathspec for the project folder, or `None` when unscoped.
 fn scope_pathspec(scope: &Path) -> Option<String> {
     if scope.as_os_str().is_empty() {
@@ -14200,6 +14385,48 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.root().join("post.md")).unwrap(),
             "incoming"
+        );
+    }
+
+    #[test]
+    fn repair_recovery_leaves_apply_incoming_alone_when_branch_moved_elsewhere() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"incoming");
+        let incoming = workspace.save_version("Incoming").unwrap();
+        let base_oid = Oid::from_str(base.id().as_str()).unwrap();
+        workspace
+            .repo
+            .reference("refs/heads/main", base_oid, true, "rewind")
+            .unwrap();
+        workspace
+            .repo
+            .checkout_head(Some(CheckoutBuilder::new().force()))
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"developer");
+        let developer = workspace.save_version("Developer commit").unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::ApplyIncoming,
+                original_variation: Some("main".to_string()),
+                target: Some(incoming.id().as_str().to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        let repair = workspace.repair_recovery("interrupted").unwrap();
+
+        assert!(!repair.completed);
+        assert_eq!(
+            workspace.repo.head().unwrap().target().unwrap().to_string(),
+            developer.id().as_str()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "developer"
         );
     }
 

@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use draftline::{ContentPolicy, Workspace};
+use draftline::{ContentPolicy, DraftlineError, FileHazardKind, RemoteOptions, Workspace};
 
 fn write_file(root: &Path, relative: &str, content: &str) {
     let path = root.join(relative);
@@ -15,6 +15,7 @@ fn write_file(root: &Path, relative: &str, content: &str) {
 
 fn commit_all(repo: &git2::Repository, message: &str) -> git2::Oid {
     let mut index = repo.index().unwrap();
+    index.read(true).unwrap();
     index
         .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
         .unwrap();
@@ -55,6 +56,49 @@ fn code_repo() -> (tempfile::TempDir, git2::Repository) {
     write_file(temp.path(), "cutready/intro.sk", "scene one\n");
     commit_all(&repo, "Initial app");
     (temp, repo)
+}
+
+fn stage(repo: &git2::Repository, relative: &str) {
+    let mut index = repo.index().unwrap();
+    index.read(true).unwrap();
+    index.add_path(Path::new(relative)).unwrap();
+    index.write().unwrap();
+}
+
+fn status(repo: &git2::Repository, relative: &str) -> git2::Status {
+    repo.status_file(Path::new(relative)).unwrap()
+}
+
+/// File text with line endings normalized, since checkouts honor `core.autocrlf`.
+fn read(root: &Path, relative: &str) -> String {
+    fs::read_to_string(root.join(relative))
+        .unwrap()
+        .replace("\r\n", "\n")
+}
+
+fn head_paths_changed(repo: &git2::Repository) -> Vec<PathBuf> {
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    let parent = head.parent(0).unwrap();
+    repo.diff_tree_to_tree(
+        Some(&parent.tree().unwrap()),
+        Some(&head.tree().unwrap()),
+        None,
+    )
+    .unwrap()
+    .deltas()
+    .map(|delta| delta.new_file().path().unwrap().to_path_buf())
+    .collect()
+}
+
+fn hazard_kinds(error: DraftlineError) -> Vec<(PathBuf, FileHazardKind)> {
+    match error {
+        DraftlineError::PreflightFailed(report) => report
+            .file_hazards
+            .into_iter()
+            .map(|hazard| (hazard.path, hazard.kind))
+            .collect(),
+        other => panic!("expected a preflight failure, got {other:?}"),
+    }
 }
 
 fn cutready_policy() -> ContentPolicy {
@@ -280,4 +324,361 @@ fn project_symlinked_outside_repo_is_rejected() {
     let error = Workspace::open_with_policy(temp.path().join("linked"), cutready_policy());
 
     assert!(error.is_err(), "must not silently widen scope to the whole repo");
+}
+
+#[test]
+fn save_leaves_developer_staged_changes_staged_and_uncommitted() {
+    let (temp, repo) = code_repo();
+    let workspace =
+        Workspace::init_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    write_file(temp.path(), "src/lib.rs", "pub fn staged() {}\n");
+    stage(&repo, "src/lib.rs");
+    write_file(temp.path(), "README.md", "# staged readme\n");
+    stage(&repo, "README.md");
+
+    write_file(temp.path(), "cutready/intro.sk", "scene one, revised\n");
+    workspace.save_version("Revise intro").unwrap();
+
+    assert_eq!(head_paths_changed(&repo), vec![PathBuf::from("cutready/intro.sk")]);
+    assert_eq!(status(&repo, "src/lib.rs"), git2::Status::INDEX_NEW);
+    assert_eq!(status(&repo, "README.md"), git2::Status::INDEX_MODIFIED);
+    assert_eq!(status(&repo, "cutready/intro.sk"), git2::Status::CURRENT);
+}
+
+#[test]
+fn shelve_and_apply_leave_code_alone() {
+    let (temp, repo) = code_repo();
+    let workspace =
+        Workspace::init_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    write_file(temp.path(), "README.md", "# dev edit\n");
+    write_file(temp.path(), "src/lib.rs", "pub fn staged() {}\n");
+    stage(&repo, "src/lib.rs");
+    write_file(temp.path(), "cutready/intro.sk", "scene one, revised\n");
+    write_file(temp.path(), "cutready/outro.sk", "the end\n");
+
+    workspace.shelve_changes("wip").unwrap();
+
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one\n");
+    assert!(!temp.path().join("cutready/outro.sk").exists());
+    assert_eq!(read(temp.path(), "README.md"), "# dev edit\n");
+    assert_eq!(status(&repo, "src/lib.rs"), git2::Status::INDEX_NEW);
+
+    // The developer commits code after the shelf was made.
+    commit_all(&repo, "Dev work");
+    write_file(temp.path(), "src/main.rs", "fn main() { uncommitted(); }\n");
+
+    workspace.apply_shelf("wip").unwrap();
+
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one, revised\n");
+    assert_eq!(read(temp.path(), "cutready/outro.sk"), "the end\n");
+    assert_eq!(read(temp.path(), "README.md"), "# dev edit\n", "dev commit not reverted");
+    assert_eq!(read(temp.path(), "src/lib.rs"), "pub fn staged() {}\n");
+    assert_eq!(read(temp.path(), "src/main.rs"), "fn main() { uncommitted(); }\n");
+    assert_eq!(status(&repo, "cutready/intro.sk"), git2::Status::WT_MODIFIED, "not staged");
+    assert_eq!(status(&repo, "README.md"), git2::Status::CURRENT);
+}
+
+#[test]
+fn restore_rolls_back_only_project_content() {
+    let (temp, repo) = code_repo();
+    let workspace =
+        Workspace::init_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    let original = workspace.versions().unwrap()[0].id().clone();
+    write_file(temp.path(), "src/main.rs", "fn main() { committed(); }\n");
+    commit_all(&repo, "Dev commit");
+    write_file(temp.path(), "cutready/intro.sk", "scene two\n");
+    workspace.save_version("Scene two").unwrap();
+    write_file(temp.path(), "README.md", "# uncommitted\n");
+    write_file(temp.path(), "src/lib.rs", "pub fn staged() {}\n");
+    stage(&repo, "src/lib.rs");
+
+    workspace
+        .restore_version_as_new_save(&original, "Back to scene one")
+        .unwrap();
+
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one\n");
+    assert_eq!(head_paths_changed(&repo), vec![PathBuf::from("cutready/intro.sk")]);
+    let head_tree = repo.head().unwrap().peel_to_tree().unwrap();
+    let main_rs = head_tree.get_path(Path::new("src/main.rs")).unwrap();
+    let blob = repo.find_blob(main_rs.id()).unwrap();
+    assert_eq!(blob.content(), b"fn main() { committed(); }\n", "dev commit kept");
+    assert_eq!(read(temp.path(), "README.md"), "# uncommitted\n");
+    assert_eq!(status(&repo, "src/lib.rs"), git2::Status::INDEX_NEW);
+    assert_eq!(status(&repo, "cutready/intro.sk"), git2::Status::CURRENT);
+}
+
+#[test]
+fn unscoped_restore_refuses_to_overwrite_local_non_content_edits() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init_with_policy(temp.path(), cutready_policy()).unwrap();
+    let repo = git2::Repository::open(temp.path()).unwrap();
+    {
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Dev").unwrap();
+        config.set_str("user.email", "dev@example.test").unwrap();
+    }
+    write_file(temp.path(), "intro.sk", "one\n");
+    write_file(temp.path(), "build.txt", "v1\n");
+    commit_all(&repo, "v1");
+    let v1 = workspace.versions().unwrap()[0].id().clone();
+    write_file(temp.path(), "build.txt", "v2\n");
+    commit_all(&repo, "v2");
+    write_file(temp.path(), "build.txt", "local\n");
+
+    let error = workspace
+        .restore_version_as_new_save(&v1, "Restore")
+        .unwrap_err();
+
+    assert_eq!(
+        hazard_kinds(error),
+        vec![(PathBuf::from("build.txt"), FileHazardKind::LocalChanges)]
+    );
+    assert_eq!(read(temp.path(), "build.txt"), "local\n");
+}
+
+/// A bare `origin` with `main` pushed from `repo`, plus a second clone.
+fn with_remote(repo: &git2::Repository) -> (tempfile::TempDir, tempfile::TempDir, git2::Repository) {
+    let bare = tempfile::tempdir().unwrap();
+    let mut bare_options = git2::RepositoryInitOptions::new();
+    bare_options.bare(true).initial_head("main");
+    git2::Repository::init_opts(bare.path(), &bare_options).unwrap();
+    let mut origin = repo.remote("origin", bare.path().to_str().unwrap()).unwrap();
+    origin
+        .push(&["refs/heads/main:refs/heads/main"], None)
+        .unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = git2::Repository::clone(bare.path().to_str().unwrap(), other_dir.path()).unwrap();
+    {
+        let mut config = other.config().unwrap();
+        config.set_str("user.name", "Other dev").unwrap();
+        config.set_str("user.email", "other@example.test").unwrap();
+    }
+    (bare, other_dir, other)
+}
+
+fn push_main(repo: &git2::Repository) {
+    repo.find_remote("origin")
+        .unwrap()
+        .push(&["refs/heads/main:refs/heads/main"], None)
+        .unwrap();
+}
+
+#[test]
+fn apply_incoming_keeps_unrelated_local_code_edits_and_refuses_overlaps() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let workspace =
+        Workspace::init_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+
+    write_file(other_dir.path(), "README.md", "# from teammate\n");
+    write_file(other_dir.path(), "cutready/intro.sk", "teammate scene\n");
+    commit_all(&other, "Teammate");
+    push_main(&other);
+    write_file(temp.path(), "src/main.rs", "fn main() { local(); }\n");
+    write_file(temp.path(), "src/lib.rs", "pub fn staged() {}\n");
+    stage(&repo, "src/lib.rs");
+
+    let result = workspace
+        .apply_incoming("origin", &mut RemoteOptions::new())
+        .unwrap();
+
+    assert_eq!(result.applied_count, 1);
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "teammate scene\n");
+    assert_eq!(read(temp.path(), "README.md"), "# from teammate\n");
+    assert_eq!(read(temp.path(), "src/main.rs"), "fn main() { local(); }\n");
+    assert_eq!(status(&repo, "src/lib.rs"), git2::Status::INDEX_NEW);
+    assert_eq!(status(&repo, "README.md"), git2::Status::CURRENT);
+
+    write_file(other_dir.path(), "src/main.rs", "fn main() { teammate(); }\n");
+    commit_all(&other, "Teammate code");
+    push_main(&other);
+    let before = repo.head().unwrap().target().unwrap();
+
+    let error = workspace
+        .apply_incoming("origin", &mut RemoteOptions::new())
+        .unwrap_err();
+
+    assert_eq!(
+        hazard_kinds(error),
+        vec![(PathBuf::from("src/main.rs"), FileHazardKind::LocalChanges)]
+    );
+    assert_eq!(repo.head().unwrap().target().unwrap(), before);
+    assert_eq!(read(temp.path(), "src/main.rs"), "fn main() { local(); }\n");
+}
+
+#[test]
+fn save_refuses_content_that_needs_a_git_filter() {
+    let (temp, repo) = code_repo();
+    write_file(temp.path(), ".gitattributes", "*.sk filter=lfs diff=lfs merge=lfs -text\n");
+    commit_all(&repo, "Track sketches with LFS");
+    let workspace =
+        Workspace::init_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, revised\n");
+
+    let error = workspace.save_version("Revise intro").unwrap_err();
+
+    assert_eq!(
+        hazard_kinds(error),
+        vec![(PathBuf::from("cutready/intro.sk"), FileHazardKind::GitFilter)]
+    );
+}
+
+
+#[test]
+fn save_of_a_rename_out_of_the_project_leaves_the_target_to_the_developer() {
+    let (temp, repo) = code_repo();
+    let workspace =
+        Workspace::init_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    fs::create_dir_all(temp.path().join("notes")).unwrap();
+    fs::rename(
+        temp.path().join("cutready/intro.sk"),
+        temp.path().join("notes/intro.sk"),
+    )
+    .unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        index.remove_path(Path::new("cutready/intro.sk")).unwrap();
+        index.add_path(Path::new("notes/intro.sk")).unwrap();
+        index.write().unwrap();
+    }
+
+    workspace.save_version("Move intro").unwrap();
+
+    assert_eq!(
+        head_paths_changed(&repo),
+        vec![PathBuf::from("cutready/intro.sk")]
+    );
+    assert!(status(&repo, "notes/intro.sk").contains(git2::Status::INDEX_NEW));
+}
+
+#[test]
+fn save_refuses_a_rename_onto_a_filtered_path() {
+    let (temp, repo) = code_repo();
+    write_file(temp.path(), ".gitattributes", "cutready/lfs/** filter=lfs -text\n");
+    commit_all(&repo, "LFS folder");
+    let workspace =
+        Workspace::init_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    fs::create_dir_all(temp.path().join("cutready/lfs")).unwrap();
+    fs::rename(
+        temp.path().join("cutready/intro.sk"),
+        temp.path().join("cutready/lfs/intro.sk"),
+    )
+    .unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        index.remove_path(Path::new("cutready/intro.sk")).unwrap();
+        index.add_path(Path::new("cutready/lfs/intro.sk")).unwrap();
+        index.write().unwrap();
+    }
+
+    let error = workspace.save_version("Move intro").unwrap_err();
+
+    assert_eq!(
+        hazard_kinds(error),
+        vec![(PathBuf::from("cutready/lfs/intro.sk"), FileHazardKind::GitFilter)]
+    );
+}
+
+fn unscoped_repo() -> (tempfile::TempDir, Workspace, git2::Repository) {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init_with_policy(temp.path(), cutready_policy()).unwrap();
+    let repo = git2::Repository::open(temp.path()).unwrap();
+    {
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Dev").unwrap();
+        config.set_str("user.email", "dev@example.test").unwrap();
+    }
+    (temp, workspace, repo)
+}
+
+fn delete_and_commit(repo: &git2::Repository, root: &Path, relative: &str, message: &str) {
+    let path = root.join(relative);
+    if path.is_dir() {
+        fs::remove_dir_all(&path).unwrap();
+    } else {
+        fs::remove_file(&path).unwrap();
+    }
+    let mut index = repo.index().unwrap();
+    index.read(true).unwrap();
+    index.remove_all([relative], None).unwrap();
+    index.write().unwrap();
+    commit_all(repo, message);
+}
+
+#[test]
+fn restore_refuses_when_an_untracked_folder_blocks_a_file() {
+    let (temp, workspace, repo) = unscoped_repo();
+    write_file(temp.path(), "intro.sk", "one\n");
+    write_file(temp.path(), "assets/logo", "logo\n");
+    commit_all(&repo, "v1");
+    let v1 = workspace.versions().unwrap()[0].id().clone();
+    delete_and_commit(&repo, temp.path(), "assets/logo", "drop logo");
+    write_file(temp.path(), "assets/logo/notes.txt", "mine\n");
+
+    let error = workspace
+        .restore_version_as_new_save(&v1, "Restore")
+        .unwrap_err();
+
+    assert!(!hazard_kinds(error).is_empty());
+    assert_eq!(read(temp.path(), "assets/logo/notes.txt"), "mine\n");
+    assert!(workspace.recovery_state().unwrap().is_none());
+}
+
+#[test]
+fn restore_refuses_when_an_ignored_file_blocks_a_folder() {
+    let (temp, workspace, repo) = unscoped_repo();
+    write_file(temp.path(), ".gitignore", "/assets/logo\n");
+    write_file(temp.path(), "intro.sk", "one\n");
+    commit_all(&repo, "v0");
+    write_file(temp.path(), "assets/logo/a.txt", "a\n");
+    {
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        index.add_path(Path::new("assets/logo/a.txt")).unwrap();
+        index.write().unwrap();
+    }
+    commit_all(&repo, "v1");
+    let v1 = workspace.versions().unwrap()[0].id().clone();
+    delete_and_commit(&repo, temp.path(), "assets/logo", "drop logo");
+    write_file(temp.path(), "assets/logo", "ignored build output\n");
+
+    let error = workspace
+        .restore_version_as_new_save(&v1, "Restore")
+        .unwrap_err();
+
+    let kinds = hazard_kinds(error);
+    assert!(
+        kinds.iter().any(|(_, kind)| *kind == FileHazardKind::Ignored),
+        "{kinds:?}"
+    );
+    assert_eq!(read(temp.path(), "assets/logo"), "ignored build output\n");
+    assert!(workspace.recovery_state().unwrap().is_none());
+}
+
+#[test]
+fn shelving_a_rename_out_of_the_project_keeps_the_developer_target() {
+    let (temp, repo) = code_repo();
+    let workspace =
+        Workspace::init_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    fs::create_dir_all(temp.path().join("notes")).unwrap();
+    fs::rename(
+        temp.path().join("cutready/intro.sk"),
+        temp.path().join("notes/intro.sk"),
+    )
+    .unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        index.remove_path(Path::new("cutready/intro.sk")).unwrap();
+        index.add_path(Path::new("notes/intro.sk")).unwrap();
+        index.write().unwrap();
+    }
+
+    workspace.shelve_changes("park-move").unwrap();
+
+    assert_eq!(read(temp.path(), "notes/intro.sk"), "scene one\n");
+    assert!(status(&repo, "notes/intro.sk").contains(git2::Status::INDEX_NEW));
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one\n");
 }
