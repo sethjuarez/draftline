@@ -932,6 +932,7 @@ fn tauri_contract_smokes_collaboration_incoming_and_merge() {
         workspace_path: author_dir.path().to_path_buf(),
         remote: "origin".to_string(),
         label: "Blocked merge".to_string(),
+        from_base: false,
     }))
     .unwrap_err();
     assert_eq!(blocked_merge.code, "preflight_failed");
@@ -947,6 +948,7 @@ fn tauri_contract_smokes_collaboration_incoming_and_merge() {
         workspace_path: author_dir.path().to_path_buf(),
         remote: "origin".to_string(),
         label: "Workbench contract merge".to_string(),
+        from_base: false,
     })
     .unwrap();
     assert_eq!(merged.merge.version.label, "Workbench contract merge");

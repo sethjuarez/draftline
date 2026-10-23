@@ -134,6 +134,8 @@ export interface DraftlineClient {
   preflightMilestoneMerge(request: RemoteRequest): Promise<MilestoneMergeReport>;
   createMilestoneMerge(request: MilestoneMergeRequest): Promise<MilestoneMergeCommandResult>;
   preflightMergeIncoming(request: RemoteRequest): Promise<MergeIncomingReport>;
+  baseStatus(request: RemoteRequest): Promise<SyncStatus>;
+  preflightMergeBase(request: RemoteRequest): Promise<MergeIncomingReport>;
   mergeIncoming(request: MergeIncomingRequest): Promise<MergeIncomingCommandResult>;
   mergeIncomingWithResolutions(
     request: MergeIncomingWithResolutionsRequest,
@@ -296,6 +298,8 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     preflightMilestoneMerge: (request) => run('preflight_milestone_merge', { request }),
     createMilestoneMerge: (request) => run('create_milestone_merge', { request }),
     preflightMergeIncoming: (request) => run('preflight_merge_incoming', { request }),
+    baseStatus: (request) => run('base_status', { request }),
+    preflightMergeBase: (request) => run('preflight_merge_base', { request }),
     mergeIncoming: (request) => run('merge_incoming', { request }),
     mergeIncomingWithResolutions: (request) =>
       run('merge_incoming_with_resolutions', { request }),
@@ -1459,6 +1463,8 @@ export interface MergeIncomingToken {
   local_oid: string;
   remote_oid: string;
   merge_base_oid: string;
+  /** Branch merged in when it is not the variation's own upstream (the base branch). */
+  source?: string | null;
 }
 
 export interface MergeIncomingReport {
@@ -1466,6 +1472,8 @@ export interface MergeIncomingReport {
   dirty_files: ChangedFile[];
   file_hazards: FileHazard[];
   conflicts: MergeConflict[];
+  /** Conflicts outside the content policy (for example code) that need a developer. */
+  developer_conflicts?: string[];
   token?: MergeIncomingToken | null;
   can_merge_cleanly: boolean;
   changed_workspace: boolean;
@@ -1633,6 +1641,8 @@ export interface FetchRemoteResult {
 
 export interface MergeIncomingRequest extends RemoteRequest {
   label: string;
+  /** Merge the latest base branch (usually `main`) instead of the variation's own upstream. */
+  from_base?: boolean;
 }
 
 export interface MilestoneMergeRequest extends RemoteRequest {
@@ -1772,7 +1782,10 @@ export interface DraftlineHostFacade {
   preflightMilestoneMerge(remote?: string): Promise<MilestoneMergeReport>;
   createMilestoneMerge(label: string, remote?: string): Promise<MilestoneMergeCommandResult>;
   preflightMergeIncoming(remote?: string): Promise<MergeIncomingReport>;
+  baseStatus(remote?: string): Promise<SyncStatus>;
+  preflightMergeBase(remote?: string): Promise<MergeIncomingReport>;
   mergeIncoming(label: string, remote?: string): Promise<MergeIncomingCommandResult>;
+  mergeBase(label: string, remote?: string): Promise<MergeIncomingCommandResult>;
   mergeIncomingWithResolutions(
     label: string,
     token: MergeIncomingToken,
@@ -1955,7 +1968,11 @@ export function createDraftlineHostFacade({
     createMilestoneMerge: (label, remote) =>
       client.createMilestoneMerge({ ...remoteRequest(remote), label }),
     preflightMergeIncoming: (remote) => client.preflightMergeIncoming(remoteRequest(remote)),
+    baseStatus: (remote) => client.baseStatus(remoteRequest(remote)),
+    preflightMergeBase: (remote) => client.preflightMergeBase(remoteRequest(remote)),
     mergeIncoming: (label, remote) => client.mergeIncoming({ ...remoteRequest(remote), label }),
+    mergeBase: (label, remote) =>
+      client.mergeIncoming({ ...remoteRequest(remote), label, from_base: true }),
     mergeIncomingWithResolutions: (label, token, resolutions, remote) =>
       client.mergeIncomingWithResolutions({
         ...remoteRequest(remote),
@@ -2348,6 +2365,14 @@ export async function createMilestoneMerge(
 
 export async function preflightMergeIncoming(request: RemoteRequest): Promise<MergeIncomingReport> {
   return createDraftlineClient().preflightMergeIncoming(request);
+}
+
+export async function baseStatus(request: RemoteRequest): Promise<SyncStatus> {
+  return createDraftlineClient().baseStatus(request);
+}
+
+export async function preflightMergeBase(request: RemoteRequest): Promise<MergeIncomingReport> {
+  return createDraftlineClient().preflightMergeBase(request);
 }
 
 export async function mergeIncoming(

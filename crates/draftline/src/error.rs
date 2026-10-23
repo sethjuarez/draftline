@@ -138,6 +138,9 @@ pub enum DraftlineError {
 
     #[error("pull request provider failed: {0}")]
     PullRequest(String),
+
+    #[error("merge needs a developer: files outside the project conflict: {0:?}")]
+    MergeNeedsDeveloper(Vec<std::path::PathBuf>),
 }
 
 fn timeout_suffix(timeout_ms: u64) -> String {

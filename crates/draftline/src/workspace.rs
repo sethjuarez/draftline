@@ -1105,6 +1105,10 @@ pub struct MergeIncomingReport {
     pub dirty_files: Vec<ChangedFile>,
     pub file_hazards: Vec<FileHazard>,
     pub conflicts: Vec<MergeConflict>,
+    /// Conflicts outside the content policy (for example code); a developer
+    /// has to merge these, so no token is issued.
+    #[serde(default)]
+    pub developer_conflicts: Vec<PathBuf>,
     pub token: Option<MergeIncomingToken>,
     pub can_merge_cleanly: bool,
     pub changed_workspace: bool,
@@ -1119,6 +1123,10 @@ pub struct MergeIncomingToken {
     pub local_oid: String,
     pub remote_oid: String,
     pub merge_base_oid: String,
+    /// Branch merged in when it is not the variation's own upstream (the base
+    /// branch, from [`Workspace::preflight_merge_base`]).
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Read-only preflight report for wrapping local saves in a shared milestone merge.
@@ -2535,7 +2543,7 @@ impl Workspace {
                 self.checkout_variation_unchecked(target)?;
                 self.complete_recovery(state, changed_workspace)
             }
-            RecoveryOperation::ApplyIncoming => {
+            RecoveryOperation::ApplyIncoming | RecoveryOperation::MergeIncoming => {
                 let (Some(variation), Some(target)) =
                     (state.original_variation.as_deref(), state.target.as_deref())
                 else {
@@ -2547,8 +2555,9 @@ impl Workspace {
                 let branch_ref = format!("refs/heads/{}", validate_variation_name(variation)?);
                 let current = self.repo.refname_to_id(&branch_ref).ok();
                 if current == Some(oid) {
-                    // The ref already moved; only the project files may lag behind.
-                    self.checkout_scope_forced(&commit.tree()?)?;
+                    // The ref only moves after a finished checkout, so files are
+                    // already in place; anything different now is a newer edit.
+                    return self.complete_recovery(state, false);
                 } else if current.is_some_and(|current| {
                     self.repo.graph_descendant_of(oid, current).unwrap_or(false)
                 }) {
@@ -2557,7 +2566,7 @@ impl Workspace {
                     // refuses to clobber local edits.
                     self.checkout_tree_safely(&commit.tree()?)?;
                     self.repo
-                        .reference(&branch_ref, oid, true, "repair apply_incoming")?;
+                        .reference(&branch_ref, oid, true, "repair incoming")?;
                 } else {
                     // Someone else moved the branch since; don't guess.
                     return Ok(self.recovery_unavailable(state));
@@ -2636,9 +2645,9 @@ impl Workspace {
             RecoveryOperation::DeleteRemoteVariation => {
                 self.repair_delete_remote_variation_recovery(state, options)
             }
-            RecoveryOperation::RestoreVersionAsNewSave
-            | RecoveryOperation::MergeIncoming
-            | RecoveryOperation::MilestoneMerge => Ok(self.recovery_unavailable(state)),
+            RecoveryOperation::RestoreVersionAsNewSave | RecoveryOperation::MilestoneMerge => {
+                Ok(self.recovery_unavailable(state))
+            }
         }
     }
 
@@ -6532,27 +6541,101 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         self.ensure_no_pending_history_cleanup_for_current_variation("preflight_merge_incoming")?;
         let sync_status = self.sync_status(remote)?;
+        self.preflight_merge_from(sync_status, None)
+    }
+
+    /// Compares the current variation with the base branch (usually `main`) as
+    /// last fetched; `variation` in the result names the base. Use it to show
+    /// "behind main by N" without changing anything.
+    pub fn base_status(&self, remote: impl AsRef<str>) -> Result<SyncStatus> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref();
+        let base = self
+            .default_branch_on(remote)
+            .ok_or(DraftlineError::SendBaseUnknown)?;
+        self.base_status_unchecked(remote, &base)
+    }
+
+    /// Preflights bringing the latest base branch into the current variation.
+    /// The token works with [`Self::merge_incoming`] and
+    /// [`Self::merge_incoming_with_resolutions`]. Developers' changes outside
+    /// the project come along as-is; conflicts there need a developer.
+    pub fn preflight_merge_base(&self, remote: impl AsRef<str>) -> Result<MergeIncomingReport> {
+        let status = self.base_status(remote)?;
+        // On the base itself this is an ordinary incoming merge; when only
+        // behind, use [`Self::apply_incoming`] to fast-forward instead.
+        let source = (status.variation != self.current_variation_unchecked()?)
+            .then(|| status.variation.clone());
+        self.preflight_merge_from(status, source)
+    }
+
+    fn base_status_unchecked(&self, remote: &str, base: &str) -> Result<SyncStatus> {
+        let local = self.repo.head()?.peel_to_commit()?.id();
+        let Ok(remote_oid) = self
+            .repo
+            .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
+        else {
+            return Ok(SyncStatus {
+                remote: remote.to_string(),
+                variation: base.to_string(),
+                ahead: 0,
+                behind: 0,
+                state: SyncState::NoRemoteVersion,
+                incoming: Vec::new(),
+            });
+        };
+        let (ahead, behind) = self.repo.graph_ahead_behind(local, remote_oid)?;
+        let state = match (ahead, behind) {
+            (0, 0) => SyncState::UpToDate,
+            (_, 0) => SyncState::LocalAhead,
+            (0, _) => SyncState::IncomingAvailable,
+            _ => SyncState::NeedsMerge,
+        };
+        Ok(SyncStatus {
+            remote: remote.to_string(),
+            variation: base.to_string(),
+            ahead,
+            behind,
+            state,
+            incoming: self.incoming_versions(local, remote_oid)?,
+        })
+    }
+
+    fn mergeable_state(state: &SyncState, from_base: bool) -> bool {
+        *state == SyncState::NeedsMerge || (from_base && *state == SyncState::IncomingAvailable)
+    }
+
+    fn preflight_merge_from(
+        &self,
+        sync_status: SyncStatus,
+        source: Option<String>,
+    ) -> Result<MergeIncomingReport> {
         let dirty_files = self.changed_files_unchecked()?;
         let mut file_hazards = Vec::new();
         let mut conflicts = Vec::new();
+        let mut developer_conflicts = Vec::new();
         let mut token = None;
 
-        if matches!(sync_status.state, SyncState::NeedsMerge) {
+        if Self::mergeable_state(&sync_status.state, source.is_some()) {
             let merge_input = self.merge_input_for_status(&sync_status)?;
-            file_hazards = self.target_tree_hazards(&merge_input.remote_commit.tree()?)?;
             let plan = self.plan_clean_merge(
                 &merge_input.base_commit.tree()?,
                 &merge_input.local_commit.tree()?,
                 &merge_input.remote_commit.tree()?,
             )?;
+            match self.merged_tree(&merge_input, &plan.files)? {
+                Ok(tree) => file_hazards = self.target_tree_hazards(&self.repo.find_tree(tree)?)?,
+                Err(paths) => developer_conflicts = paths,
+            }
             conflicts = plan.conflicts;
-            if dirty_files.is_empty() && file_hazards.is_empty() {
+            if dirty_files.is_empty() && file_hazards.is_empty() && developer_conflicts.is_empty() {
                 token = Some(MergeIncomingToken {
                     remote: sync_status.remote.clone(),
-                    variation: sync_status.variation.clone(),
+                    variation: self.current_variation_unchecked()?,
                     local_oid: merge_input.local_commit.id().to_string(),
                     remote_oid: merge_input.remote_commit.id().to_string(),
                     merge_base_oid: merge_input.base_commit.id().to_string(),
+                    source,
                 });
             }
         }
@@ -6563,6 +6646,7 @@ impl Workspace {
             dirty_files,
             file_hazards,
             conflicts,
+            developer_conflicts,
             token,
             can_merge_cleanly,
             changed_workspace: false,
@@ -6597,85 +6681,12 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
-        self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation("merge_incoming")?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "merge_incoming")?;
-        let dirty_files = self.changed_files_unchecked()?;
-        if !dirty_files.is_empty() {
-            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "merge_incoming",
-                true,
-                dirty_files,
-                Vec::new(),
-                None,
-            ))));
-        }
-
-        let variation = self.current_variation_unchecked()?;
-        let local_oid = self.repo.head()?.peel_to_commit()?.id().to_string();
-        if variation != token.variation || local_oid != token.local_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{}@{}", token.variation, token.local_oid),
-                actual: format!("{variation}@{local_oid}"),
-            });
-        }
-
-        self.fetch_remote_unchecked(&token.remote, options)?;
-        let status = self.sync_status(&token.remote)?;
-        if status.state != SyncState::NeedsMerge {
-            return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
-        }
-        let remote_oid = remote_tracking_oid(&self.repo, &token.remote, &token.variation);
-        if remote_oid.as_deref() != Some(token.remote_oid.as_str()) {
-            return Err(DraftlineError::RemoteRace {
-                remote: token.remote,
-                variation: token.variation,
-                expected: Some(token.remote_oid),
-                actual: remote_oid,
-            });
-        }
-
-        let merge_input = self.merge_input_for_status(&status)?;
-        if merge_input.base_commit.id().to_string() != token.merge_base_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: token.merge_base_oid,
-                actual: merge_input.base_commit.id().to_string(),
-            });
-        }
-
-        let remote_tree = merge_input.remote_commit.tree()?;
-        let file_hazards = self.target_tree_hazards(&remote_tree)?;
-        if !file_hazards.is_empty() {
-            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "merge_incoming",
-                true,
-                Vec::new(),
-                file_hazards,
-                None,
-            ))));
-        }
-
-        let plan = self.plan_clean_merge(
-            &merge_input.base_commit.tree()?,
-            &merge_input.local_commit.tree()?,
-            &remote_tree,
-        )?;
-        if !plan.conflicts.is_empty() {
-            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "merge_incoming",
-                true,
-                Vec::new(),
-                Vec::new(),
-                Some(plan.conflicts[0].label.clone()),
-            ))));
-        }
-
-        self.write_incoming_merge_version(
-            variation,
-            token.remote_oid,
-            &merge_input,
+        self.merge_incoming_core(
+            "merge_incoming",
+            token,
             label.as_ref(),
-            plan.files,
+            None,
+            options,
             profile,
         )
     }
@@ -6723,15 +6734,32 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
-        self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation(
+        self.merge_incoming_core(
             "merge_incoming_with_resolutions",
-        )?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "merge_incoming_with_resolutions")?;
+            token,
+            label.as_ref(),
+            Some(resolutions.into_iter().collect()),
+            options,
+            profile,
+        )
+    }
+
+    fn merge_incoming_core(
+        &self,
+        operation: &str,
+        token: MergeIncomingToken,
+        label: &str,
+        resolutions: Option<Vec<MergeConflictResolution>>,
+        options: &mut RemoteOptions<'_>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<MergeIncomingResult> {
+        self.ensure_no_pending_recovery()?;
+        self.ensure_no_pending_history_cleanup_for_current_variation(operation)?;
+        let _lock = OperationLock::acquire(&self.lock_path(), operation)?;
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "merge_incoming_with_resolutions",
+                operation,
                 true,
                 dirty_files,
                 Vec::new(),
@@ -6748,16 +6776,29 @@ impl Workspace {
             });
         }
 
-        self.fetch_remote_unchecked(&token.remote, options)?;
-        let status = self.sync_status(&token.remote)?;
-        if status.state != SyncState::NeedsMerge {
+        let from_base = token
+            .source
+            .as_ref()
+            .is_some_and(|source| *source != token.variation);
+        let source = token
+            .source
+            .clone()
+            .unwrap_or_else(|| token.variation.clone());
+        let status = if from_base {
+            self.fetch_remote_variation_ref(&token.remote, &source, options)?;
+            self.base_status_unchecked(&token.remote, &source)?
+        } else {
+            self.fetch_remote_unchecked(&token.remote, options)?;
+            self.sync_status(&token.remote)?
+        };
+        if !Self::mergeable_state(&status.state, from_base) {
             return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
         }
-        let remote_oid = remote_tracking_oid(&self.repo, &token.remote, &token.variation);
+        let remote_oid = remote_tracking_oid(&self.repo, &token.remote, &source);
         if remote_oid.as_deref() != Some(token.remote_oid.as_str()) {
             return Err(DraftlineError::RemoteRace {
                 remote: token.remote,
-                variation: token.variation,
+                variation: source,
                 expected: Some(token.remote_oid),
                 actual: remote_oid,
             });
@@ -6771,11 +6812,32 @@ impl Workspace {
             });
         }
 
-        let remote_tree = merge_input.remote_commit.tree()?;
-        let file_hazards = self.target_tree_hazards(&remote_tree)?;
+        let plan = self.plan_clean_merge(
+            &merge_input.base_commit.tree()?,
+            &merge_input.local_commit.tree()?,
+            &merge_input.remote_commit.tree()?,
+        )?;
+        let files = match resolutions {
+            Some(resolutions) => self.resolve_merge_plan(plan, resolutions)?,
+            None if !plan.conflicts.is_empty() => {
+                return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                    operation,
+                    true,
+                    Vec::new(),
+                    Vec::new(),
+                    Some(plan.conflicts[0].label.clone()),
+                ))));
+            }
+            None => plan.files,
+        };
+        let tree = match self.merged_tree(&merge_input, &files)? {
+            Ok(tree) => self.repo.find_tree(tree)?,
+            Err(paths) => return Err(DraftlineError::MergeNeedsDeveloper(paths)),
+        };
+        let file_hazards = self.target_tree_hazards(&tree)?;
         if !file_hazards.is_empty() {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "merge_incoming_with_resolutions",
+                operation,
                 true,
                 Vec::new(),
                 file_hazards,
@@ -6783,21 +6845,7 @@ impl Workspace {
             ))));
         }
 
-        let plan = self.plan_clean_merge(
-            &merge_input.base_commit.tree()?,
-            &merge_input.local_commit.tree()?,
-            &remote_tree,
-        )?;
-        let files = self.resolve_merge_plan(plan, resolutions)?;
-
-        self.write_incoming_merge_version(
-            variation,
-            token.remote_oid,
-            &merge_input,
-            label.as_ref(),
-            files,
-            profile,
-        )
+        self.write_incoming_merge_version(variation, &merge_input, label, &tree, files, profile)
     }
 
     /// Applies incoming changes from a remote using a fast-forward when possible.
@@ -6905,10 +6953,7 @@ impl Workspace {
         // Bring files up to the incoming tree like `git merge --ff-only`: local
         // edits are never overwritten. This runs before the ref moves so HEAD
         // is still the checkout baseline.
-        if let Err(checkout_err) = self.checkout_tree_safely(&checkout_commit.tree()?) {
-            let _ = self.acknowledge_recovery();
-            return Err(checkout_err);
-        }
+        self.checkout_or_keep_recovery(&checkout_commit.tree()?)?;
         self.repo
             .reference(&branch_ref, target_oid, true, "apply_incoming")?;
 
@@ -8884,6 +8929,7 @@ impl Workspace {
         let mut options = RemoteOptions::new();
         let remote = remote.as_ref().to_string();
         self.fetch_remote_unchecked(&remote, &mut options)?;
+        self.fetch_base_unchecked(&remote, &mut options)?;
         self.fetch_support_refs_with_options(&remote, &mut options)
     }
 
@@ -8896,7 +8942,18 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let remote = remote.as_ref().to_string();
         self.fetch_remote_unchecked(&remote, options)?;
+        self.fetch_base_unchecked(&remote, options)?;
         self.fetch_support_refs_with_options(&remote, options)
+    }
+
+    /// Fetches the base branch too, so [`Self::base_status`] is current.
+    fn fetch_base_unchecked(&self, remote: &str, options: &mut RemoteOptions<'_>) -> Result<()> {
+        match self.default_branch_on(remote) {
+            Some(base) if base != self.current_variation_unchecked()? => {
+                self.fetch_remote_variation_ref(remote, &base, options)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn fetch_remote_unchecked(
@@ -10491,6 +10548,20 @@ impl Workspace {
         Ok(())
     }
 
+    /// Safe checkout for an operation with a pending recovery record. A refused
+    /// checkout (local edits in the way) writes nothing, so the record is
+    /// dropped; any other failure may have written some files, so the record
+    /// stays for [`Self::repair_recovery`].
+    fn checkout_or_keep_recovery(&self, target: &Tree<'_>) -> Result<()> {
+        match self.checkout_tree_safely(target) {
+            Err(DraftlineError::Git(error)) if error.code() == git2::ErrorCode::Conflict => {
+                let _ = self.acknowledge_recovery();
+                Err(DraftlineError::Git(error))
+            }
+            result => result,
+        }
+    }
+
     /// Forces only the project folder to `target`; paths outside it are untouched.
     fn checkout_scope_forced(&self, target: &Tree<'_>) -> Result<()> {
         let mut checkout = CheckoutBuilder::new();
@@ -10978,56 +11049,142 @@ impl Workspace {
             .collect())
     }
 
+    /// The whole-repository merge of `input` with every content path set to
+    /// the planned (resolver-aware) result, built in memory so the real index
+    /// is never touched. Conflicts outside the content policy are returned
+    /// instead: they belong to a developer.
+    fn merged_tree(
+        &self,
+        input: &IncomingMergeInput<'_>,
+        files: &[MergeFileChange],
+    ) -> Result<std::result::Result<Oid, Vec<PathBuf>>> {
+        let base_tree = input.base_commit.tree()?;
+        let local_tree = input.local_commit.tree()?;
+        let remote_tree = input.remote_commit.tree()?;
+        let mut index = self
+            .repo
+            .merge_trees(&base_tree, &local_tree, &remote_tree, None)?;
+
+        let mut developer_conflicts = BTreeSet::new();
+        let mut content_conflicts = BTreeSet::new();
+        for conflict in index.conflicts()? {
+            let conflict = conflict?;
+            for entry in [&conflict.ancestor, &conflict.our, &conflict.their]
+                .into_iter()
+                .flatten()
+            {
+                let path = PathBuf::from(String::from_utf8_lossy(&entry.path).into_owned());
+                if self.content_policy.tracks(&path)? {
+                    content_conflicts.insert(path);
+                } else {
+                    developer_conflicts.insert(path);
+                }
+            }
+        }
+        if !developer_conflicts.is_empty() {
+            return Ok(Err(developer_conflicts.into_iter().collect()));
+        }
+        for path in &content_conflicts {
+            index.conflict_remove(path)?;
+        }
+        let merged = self.repo.find_tree(index.write_tree_to(&self.repo)?)?;
+
+        let mut paths = BTreeSet::new();
+        for tree in [&base_tree, &local_tree, &remote_tree, &merged] {
+            self.collect_tracked_tree_paths(tree, Path::new(""), &mut paths)?;
+        }
+        let planned = files
+            .iter()
+            .map(|file| (file.path.as_path(), file.content.as_deref()))
+            .collect::<BTreeMap<_, _>>();
+        let mut update = git2::build::TreeUpdateBuilder::new();
+        for path in &paths {
+            let desired = match planned.get(path.as_path()) {
+                Some(Some(content)) => Some(self.repo.blob(content)?),
+                Some(None) => None,
+                None => local_tree.get_path(path).ok().map(|entry| entry.id()),
+            };
+            let current = merged
+                .get_path(path)
+                .ok()
+                .map(|entry| (entry.id(), entry.filemode()));
+            let Some(oid) = desired else {
+                if current.is_some() {
+                    update.remove(path);
+                }
+                continue;
+            };
+            // Git's own mode merge when it settled one; otherwise keep a side's.
+            let mode = current
+                .map(|(_, mode)| mode)
+                .or_else(|| local_tree.get_path(path).ok().map(|entry| entry.filemode()))
+                .or_else(|| {
+                    remote_tree
+                        .get_path(path)
+                        .ok()
+                        .map(|entry| entry.filemode())
+                })
+                .unwrap_or(i32::from(git2::FileMode::Blob));
+            let file_mode = [
+                git2::FileMode::Blob,
+                git2::FileMode::BlobExecutable,
+                git2::FileMode::Link,
+            ]
+            .into_iter()
+            .find(|candidate| i32::from(*candidate) == mode);
+            match file_mode {
+                Some(file_mode) if current != Some((oid, mode)) => {
+                    update.upsert(path, oid, file_mode);
+                }
+                Some(_) => {}
+                // A folder, submodule, or other non-file entry: not ours to merge.
+                None => {
+                    developer_conflicts.insert(path.clone());
+                }
+            }
+        }
+        if !developer_conflicts.is_empty() {
+            return Ok(Err(developer_conflicts.into_iter().collect()));
+        }
+        Ok(Ok(update.create_updated(&self.repo, &merged)?))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn write_incoming_merge_version(
         &self,
         variation: String,
-        remote_oid: String,
         merge_input: &IncomingMergeInput<'_>,
         label: &str,
+        tree: &Tree<'_>,
         files: Vec<MergeFileChange>,
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
+        let (author, committer) = self.workspace_signatures(profile)?;
+        let oid = self.repo.commit(
+            None,
+            &author,
+            &committer,
+            label,
+            tree,
+            &[&merge_input.local_commit, &merge_input.remote_commit],
+        )?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
             operation: RecoveryOperation::MergeIncoming,
-            original_variation: Some(variation),
-            target: Some(remote_oid),
+            original_variation: Some(variation.clone()),
+            target: Some(oid.to_string()),
             completed: false,
         })?;
 
-        let mut index = self.repo.index()?;
-        for change in &files {
-            let full_path = self.root.join(&change.path);
-            match &change.content {
-                Some(content) => {
-                    if let Some(parent) = full_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&full_path, content)?;
-                    index.add_path(&change.path)?;
-                }
-                None => {
-                    remove_workspace_path_if_exists(&full_path)?;
-                    if let Err(error) = index.remove_path(&change.path) {
-                        if error.code() != git2::ErrorCode::NotFound {
-                            return Err(error.into());
-                        }
-                    }
-                }
-            }
-        }
-        index.write()?;
-        let tree_id = index.write_tree()?;
-        let tree = self.repo.find_tree(tree_id)?;
-        let (author, committer) = self.workspace_signatures(profile)?;
-        let oid = self.repo.commit(
-            Some("HEAD"),
-            &author,
-            &committer,
-            label,
-            &tree,
-            &[&merge_input.local_commit, &merge_input.remote_commit],
+        // Like `git merge`: files move from HEAD to the merged tree without
+        // overwriting local edits, before the branch moves.
+        self.checkout_or_keep_recovery(tree)?;
+        self.repo.reference(
+            &format!("refs/heads/{variation}"),
+            oid,
+            true,
+            "merge_incoming",
         )?;
 
         self.write_recovery_state(&RecoveryState {

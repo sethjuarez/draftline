@@ -1368,3 +1368,316 @@ fn send_hands_a_stale_local_base_back_to_the_fresh_upstream() {
         .unwrap();
     assert_eq!(repo.refname_to_id("refs/heads/main").unwrap(), fresh);
 }
+
+fn tree_text(repo: &git2::Repository, rev: &str, relative: &str) -> Option<String> {
+    let tree = repo.revparse_single(rev).unwrap().peel_to_tree().unwrap();
+    let entry = tree.get_path(Path::new(relative)).ok()?;
+    let blob = repo.find_blob(entry.id()).unwrap();
+    Some(String::from_utf8_lossy(blob.content()).into_owned())
+}
+
+#[test]
+fn incoming_merge_keeps_teammate_code_and_the_developer_index() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let workspace = scoped(&temp);
+
+    write_file(other_dir.path(), "src/lib.rs", "pub fn shared() {}\n");
+    write_file(other_dir.path(), "cutready/outro.sk", "teammate outro\n");
+    commit_all(&other, "Teammate code and scene");
+    push_main(&other);
+
+    write_file(temp.path(), "cutready/intro.sk", "my intro\n");
+    workspace.save_version("My intro").unwrap();
+    write_file(temp.path(), "src/main.rs", "fn main() { staged(); }\n");
+    stage(&repo, "src/main.rs");
+
+    workspace.fetch_remote("origin").unwrap();
+    let report = workspace.preflight_merge_incoming("origin").unwrap();
+    assert!(report.developer_conflicts.is_empty());
+    assert!(report.can_merge_cleanly, "{report:?}");
+    let result = workspace
+        .merge_incoming(report.token.unwrap(), "Merge", &mut RemoteOptions::new())
+        .unwrap();
+
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.id().to_string(), result.version.id().as_str());
+    assert_eq!(head.parent_count(), 2);
+    assert_eq!(
+        tree_text(&repo, "HEAD", "src/lib.rs").as_deref(),
+        Some("pub fn shared() {}\n")
+    );
+    assert_eq!(
+        tree_text(&repo, "HEAD", "cutready/outro.sk").as_deref(),
+        Some("teammate outro\n")
+    );
+    assert_eq!(
+        tree_text(&repo, "HEAD", "cutready/intro.sk").as_deref(),
+        Some("my intro\n")
+    );
+    assert_eq!(
+        tree_text(&repo, "HEAD", "src/main.rs").as_deref(),
+        Some("fn main() {}\n")
+    );
+    assert_eq!(read(temp.path(), "src/lib.rs"), "pub fn shared() {}\n");
+    assert_eq!(read(temp.path(), "cutready/outro.sk"), "teammate outro\n");
+    assert!(status(&repo, "src/main.rs").contains(git2::Status::INDEX_MODIFIED));
+    assert_eq!(
+        read(temp.path(), "src/main.rs"),
+        "fn main() { staged(); }\n"
+    );
+}
+
+#[test]
+fn incoming_merge_leaves_code_conflicts_to_a_developer() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let workspace = scoped(&temp);
+
+    write_file(other_dir.path(), "src/main.rs", "fn main() { theirs(); }\n");
+    commit_all(&other, "Teammate code");
+    push_main(&other);
+
+    write_file(temp.path(), "src/main.rs", "fn main() { mine(); }\n");
+    commit_all(&repo, "My code");
+    write_file(temp.path(), "cutready/intro.sk", "my intro\n");
+    workspace.save_version("My intro").unwrap();
+    let before = repo.head().unwrap().target().unwrap();
+
+    workspace.fetch_remote("origin").unwrap();
+    let report = workspace.preflight_merge_incoming("origin").unwrap();
+    assert_eq!(
+        report.developer_conflicts,
+        vec![PathBuf::from("src/main.rs")]
+    );
+    assert!(report.token.is_none());
+    assert!(!report.can_merge_cleanly);
+    assert_eq!(repo.head().unwrap().target().unwrap(), before);
+}
+
+#[test]
+fn bringing_in_the_latest_base_merges_everything_into_the_variation() {
+    let (temp, repo) = code_repo();
+    let (bare, other_dir, other) = with_remote(&repo);
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "pitch\n");
+    workspace.save_version("Pitch").unwrap();
+    workspace
+        .send(
+            "origin",
+            &send_request("Pitch"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    let main_before = repo.refname_to_id("refs/heads/main").unwrap();
+
+    write_file(other_dir.path(), "src/lib.rs", "pub fn shared() {}\n");
+    write_file(other_dir.path(), "cutready/outro.sk", "outro\n");
+    commit_all(&other, "Teammate on main");
+    push_main(&other);
+
+    workspace.fetch_remote("origin").unwrap();
+    let status = workspace.base_status("origin").unwrap();
+    assert_eq!(status.variation, "main");
+    assert_eq!((status.ahead, status.behind), (1, 1));
+
+    let report = workspace.preflight_merge_base("origin").unwrap();
+    let token = report.token.unwrap();
+    assert_eq!(token.source.as_deref(), Some("main"));
+    workspace
+        .merge_incoming(token, "Bring in main", &mut RemoteOptions::new())
+        .unwrap();
+
+    assert_eq!(workspace.current_variation().unwrap(), "cutready/pitch");
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.parent_count(), 2);
+    assert_eq!(
+        head.parent_id(1).unwrap(),
+        remote_branch(bare.path(), "main").unwrap()
+    );
+    assert_eq!(read(temp.path(), "src/lib.rs"), "pub fn shared() {}\n");
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "pitch\n");
+    assert_eq!(read(temp.path(), "cutready/outro.sk"), "outro\n");
+    assert_eq!(repo.refname_to_id("refs/heads/main").unwrap(), main_before);
+    assert_eq!(workspace.base_status("origin").unwrap().behind, 0);
+}
+
+#[test]
+fn bringing_in_the_base_when_only_behind_still_records_a_merge() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    repo.branch(
+        "cutready/pitch",
+        &repo.head().unwrap().peel_to_commit().unwrap(),
+        false,
+    )
+    .unwrap();
+    repo.set_head("refs/heads/cutready/pitch").unwrap();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+
+    write_file(other_dir.path(), "src/lib.rs", "pub fn shared() {}\n");
+    commit_all(&other, "Teammate on main");
+    push_main(&other);
+    workspace.fetch_remote("origin").unwrap();
+
+    let report = workspace.preflight_merge_base("origin").unwrap();
+    assert_eq!(report.sync_status.behind, 1);
+    workspace
+        .merge_incoming(
+            report.token.unwrap(),
+            "Bring in main",
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        repo.head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent_count(),
+        2
+    );
+    assert_eq!(read(temp.path(), "src/lib.rs"), "pub fn shared() {}\n");
+}
+
+#[test]
+fn incoming_merge_keeps_executable_and_symlink_modes() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let workspace = scoped(&temp);
+
+    write_file(other_dir.path(), "cutready/run.sk", "teammate script\n");
+    let mut index = other.index().unwrap();
+    index.read(true).unwrap();
+    index.add_path(Path::new("cutready/run.sk")).unwrap();
+    let mut entry = index.get_path(Path::new("cutready/run.sk"), 0).unwrap();
+    entry.mode = 0o100755;
+    index.add(&entry).unwrap();
+    let link = other.blob(b"intro.sk").unwrap();
+    entry.id = link;
+    entry.mode = 0o120000;
+    entry.file_size = 8;
+    entry.path = b"cutready/link.sk".to_vec();
+    index.add(&entry).unwrap();
+    let tree = other.find_tree(index.write_tree().unwrap()).unwrap();
+    let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+    let parent = other.head().unwrap().peel_to_commit().unwrap();
+    other
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Modes",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+    push_main(&other);
+
+    write_file(temp.path(), "cutready/intro.sk", "my intro\n");
+    workspace.save_version("My intro").unwrap();
+    workspace.fetch_remote("origin").unwrap();
+    let report = workspace.preflight_merge_incoming("origin").unwrap();
+    workspace
+        .merge_incoming(report.token.unwrap(), "Merge", &mut RemoteOptions::new())
+        .unwrap();
+
+    let head = repo.head().unwrap().peel_to_tree().unwrap();
+    let mode = |path: &str| head.get_path(Path::new(path)).unwrap().filemode();
+    assert_eq!(mode("cutready/run.sk"), 0o100755);
+    assert_eq!(mode("cutready/link.sk"), 0o120000);
+    assert_eq!(mode("cutready/intro.sk"), 0o100644);
+}
+
+#[test]
+fn preflighting_the_base_from_the_base_itself_is_an_ordinary_merge() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let workspace = scoped(&temp);
+
+    write_file(other_dir.path(), "src/lib.rs", "pub fn shared() {}\n");
+    commit_all(&other, "Teammate on main");
+    push_main(&other);
+    workspace.fetch_remote("origin").unwrap();
+
+    let behind = workspace.preflight_merge_base("origin").unwrap();
+    assert_eq!(behind.sync_status.behind, 1);
+    assert!(behind.token.is_none(), "fast-forward with apply_incoming");
+
+    write_file(temp.path(), "cutready/intro.sk", "my intro\n");
+    workspace.save_version("My intro").unwrap();
+    let diverged = workspace.preflight_merge_base("origin").unwrap();
+    assert_eq!(diverged.token.unwrap().source, None);
+}
+
+#[test]
+fn tauri_merge_reports_code_conflicts_as_needing_a_developer() {
+    use draftline::tauri_contract::{
+        into_tauri_result, merge_incoming_with_context, DraftlineCommandContext,
+        MergeIncomingRequest,
+    };
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let workspace = scoped(&temp);
+
+    write_file(other_dir.path(), "src/main.rs", "fn main() { theirs(); }\n");
+    commit_all(&other, "Teammate code");
+    push_main(&other);
+    write_file(temp.path(), "src/main.rs", "fn main() { mine(); }\n");
+    commit_all(&repo, "My code");
+    write_file(temp.path(), "cutready/intro.sk", "my intro\n");
+    workspace.save_version("My intro").unwrap();
+
+    let mut context = DraftlineCommandContext::new().with_content_policy(cutready_policy());
+    let error = into_tauri_result(merge_incoming_with_context(
+        &mut context,
+        MergeIncomingRequest {
+            workspace_path: temp.path().join("cutready"),
+            remote: "origin".to_string(),
+            label: "Merge".to_string(),
+            from_base: false,
+        },
+    ))
+    .unwrap_err();
+    assert_eq!(error.code, "merge_needs_developer");
+}
+
+#[test]
+fn repairing_a_finished_incoming_merge_keeps_newer_project_edits() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let workspace = scoped(&temp);
+    write_file(other_dir.path(), "cutready/outro.sk", "teammate outro\n");
+    commit_all(&other, "Teammate scene");
+    push_main(&other);
+    write_file(temp.path(), "cutready/intro.sk", "my intro\n");
+    workspace.save_version("My intro").unwrap();
+    workspace.fetch_remote("origin").unwrap();
+    let report = workspace.preflight_merge_incoming("origin").unwrap();
+    let merged = workspace
+        .merge_incoming(report.token.unwrap(), "Merge", &mut RemoteOptions::new())
+        .unwrap();
+
+    // Crash after the ref moved but before the ledger was marked complete.
+    let state = draftline::RecoveryState {
+        operation_id: "interrupted".to_string(),
+        operation: draftline::RecoveryOperation::MergeIncoming,
+        original_variation: Some("main".to_string()),
+        target: Some(merged.version.id().as_str().to_string()),
+        completed: false,
+    };
+    fs::write(
+        repo.path().join("draftline").join("recovery.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "newer edit\n");
+
+    workspace.repair_recovery("interrupted").unwrap();
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "newer edit\n");
+    assert!(workspace
+        .recovery_state()
+        .unwrap()
+        .is_none_or(|state| state.completed));
+}

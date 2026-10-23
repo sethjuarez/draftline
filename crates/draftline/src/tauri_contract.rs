@@ -713,6 +713,10 @@ pub struct MergeIncomingRequest {
     pub workspace_path: PathBuf,
     pub remote: String,
     pub label: String,
+    /// Merge the latest base branch (usually `main`) instead of the
+    /// variation's own upstream.
+    #[serde(default)]
+    pub from_base: bool,
 }
 
 /// Request for wrapping local-ahead saves in a named milestone merge.
@@ -2764,6 +2768,58 @@ pub fn preflight_merge_incoming_with_context(
     workspace.preflight_merge_incoming(&request.remote)
 }
 
+/// Fetches and compares the current variation with the base branch.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn base_status(request: RemoteRequest) -> Result<SyncStatus> {
+    base_status_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Compares with the base branch using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn base_status_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: RemoteRequest,
+) -> Result<SyncStatus> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let mut options = context.remote_options();
+    workspace.fetch_remote_with_options(&request.remote, &mut options)?;
+    workspace.base_status(&request.remote)
+}
+
+/// Preflights bringing the latest base branch into the current variation.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn preflight_merge_base(request: RemoteRequest) -> Result<MergeIncomingReport> {
+    preflight_merge_base_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Preflights a base merge using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn preflight_merge_base_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: RemoteRequest,
+) -> Result<MergeIncomingReport> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let mut options = context.remote_options();
+    workspace.fetch_remote_with_options(&request.remote, &mut options)?;
+    workspace.preflight_merge_base(&request.remote)
+}
+
 /// Preflights wrapping local-ahead saves as a shared milestone merge.
 #[tracing::instrument(
     err,
@@ -2879,7 +2935,11 @@ pub fn merge_incoming_with_context(
     let (preflight, merge) = {
         let mut options = context.remote_options();
         workspace.fetch_remote_with_options(&request.remote, &mut options)?;
-        let preflight = workspace.preflight_merge_incoming(&request.remote)?;
+        let preflight = if request.from_base {
+            workspace.preflight_merge_base(&request.remote)?
+        } else {
+            workspace.preflight_merge_incoming(&request.remote)?
+        };
         let Some(token) = preflight.token.clone() else {
             return Err(merge_preflight_error(preflight));
         };
@@ -2928,7 +2988,11 @@ pub fn merge_incoming_with_resolutions_with_context(
     let contributor_profile = context.contributor_profile.clone();
     let (preflight, merge) = {
         let mut options = context.remote_options();
-        let preflight = workspace.preflight_merge_incoming(&request.remote)?;
+        let preflight = if request.token.source.is_some() {
+            workspace.preflight_merge_base(&request.remote)?
+        } else {
+            workspace.preflight_merge_incoming(&request.remote)?
+        };
         if preflight.token.as_ref() != Some(&request.token) {
             return Err(merge_preflight_error(preflight));
         }
@@ -3045,7 +3109,13 @@ fn conflict_content(conflict: &MergeConflict, source: ConflictContentSource) -> 
 }
 
 fn merge_preflight_error(preflight: MergeIncomingReport) -> DraftlineError {
-    if matches!(preflight.sync_status.state, SyncState::NeedsMerge) {
+    if !preflight.developer_conflicts.is_empty() {
+        return DraftlineError::MergeNeedsDeveloper(preflight.developer_conflicts);
+    }
+    let blocked = !preflight.dirty_files.is_empty()
+        || !preflight.file_hazards.is_empty()
+        || !preflight.conflicts.is_empty();
+    if blocked || matches!(preflight.sync_status.state, SyncState::NeedsMerge) {
         return DraftlineError::PreflightFailed(Box::new(PreflightReport {
             operation: "merge_incoming".to_string(),
             will_write_files: true,
@@ -3160,6 +3230,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::SendBaseUnknown => "send_base_unknown",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
+        DraftlineError::MergeNeedsDeveloper(_) => "merge_needs_developer",
     }
 }
 
