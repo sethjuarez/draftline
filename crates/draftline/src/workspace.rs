@@ -2931,7 +2931,11 @@ impl Workspace {
 
         // Only paths the target actually changes can be overwritten, so scan
         // just those instead of walking the whole (possibly huge) repository.
-        let head_tree = self.repo.head().ok().and_then(|head| head.peel_to_tree().ok());
+        let head_tree = self
+            .repo
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_tree().ok());
         let diff = self
             .repo
             .diff_tree_to_tree(head_tree.as_ref(), Some(target_tree), None)?;
@@ -10196,11 +10200,9 @@ impl Workspace {
     fn ensure_no_filtered_content(&self, paths: &[PathBuf], operation: &str) -> Result<()> {
         let mut hazards = Vec::new();
         for path in paths {
-            let filter = self.repo.get_attr(
-                path,
-                "filter",
-                git2::AttrCheckFlags::FILE_THEN_INDEX,
-            )?;
+            let filter =
+                self.repo
+                    .get_attr(path, "filter", git2::AttrCheckFlags::FILE_THEN_INDEX)?;
             if matches!(
                 git2::AttrValue::from_string(filter),
                 git2::AttrValue::True | git2::AttrValue::String(_)

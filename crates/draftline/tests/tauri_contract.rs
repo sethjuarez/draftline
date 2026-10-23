@@ -48,8 +48,8 @@ use draftline::{
     ContributorProfile, HistoryCleanupRequest, HistoryCompactionCandidatesRequest,
     MergeConflictResolution, MergeResolutionChoice, MilestoneSpec, OperationLockState,
     RemoteRewritePolicy, RestoreVersionTarget, RewriteConfirmation, StaleVersionDisposition,
-    SupportRefScope, SwitchPolicy, SyncState, VariationId, Workspace,
-    WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
+    SupportRefScope, SwitchPolicy, SyncState, VariationId, Workspace, WorkspaceGraphOptions,
+    WorkspaceGraphOverviewOptions,
 };
 use serde_json::Value;
 
@@ -768,7 +768,11 @@ fn tauri_contract_smokes_milestone_merge_commands() {
         .unwrap();
     workspace.publish_changes("origin").unwrap();
 
-    write_file(workspace.root(), "post.md", b"published base\nfirst local save");
+    write_file(
+        workspace.root(),
+        "post.md",
+        b"published base\nfirst local save",
+    );
     let first_local = workspace.save_version("First local save").unwrap();
     write_file(
         workspace.root(),
