@@ -1958,7 +1958,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<RecoveryRepairResult> {
         self.clear_stale_lock()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "repair_recovery")?;
+        let _lock = self.acquire_for_index("repair_recovery")?;
         let state = self.pending_recovery(operation_id.as_ref())?;
 
         match state.operation {
@@ -2085,7 +2085,7 @@ impl Workspace {
     /// prior state needed for a safe rollback.
     pub fn rollback_recovery(&self, operation_id: impl AsRef<str>) -> Result<RecoveryRepairResult> {
         self.clear_stale_lock()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "rollback_recovery")?;
+        let _lock = self.acquire_for_index("rollback_recovery")?;
         let state = self.pending_recovery(operation_id.as_ref())?;
 
         match state.operation {
@@ -2184,6 +2184,7 @@ impl Workspace {
 
     /// Saves the current workspace content as a named version.
     pub fn save_version(&self, label: impl AsRef<str>) -> Result<Version> {
+        let _lock = self.acquire_for_index("save_version")?;
         self.ensure_no_pending_recovery()?;
         self.save_version_unchecked(label, None)
     }
@@ -2194,6 +2195,7 @@ impl Workspace {
         label: impl AsRef<str>,
         profile: &ContributorProfile,
     ) -> Result<Version> {
+        let _lock = self.acquire_for_index("save_version")?;
         self.ensure_no_pending_recovery()?;
         self.save_version_unchecked(label, Some(profile))
     }
@@ -2255,6 +2257,7 @@ impl Workspace {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        let _lock = self.acquire_for_index("save_files")?;
         self.ensure_no_pending_recovery()?;
         let changed_files = self.selected_changed_files(paths)?;
         if changed_files.is_empty() {
@@ -2585,7 +2588,7 @@ impl Workspace {
     /// files are restored from the current `HEAD`.
     pub fn discard_changes(&self) -> Result<ChangeSet> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "discard_changes")?;
+        let _lock = self.acquire_for_index("discard_changes")?;
         let changed_files = self.changed_files_unchecked()?;
         if changed_files.is_empty() {
             return Ok(ChangeSet {
@@ -2641,7 +2644,7 @@ impl Workspace {
     pub fn discard_file(&self, path: impl AsRef<Path>) -> Result<Option<ChangedFile>> {
         self.ensure_no_pending_recovery()?;
         let path = self.normalize_tracked_content_path(path)?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "discard_file")?;
+        let _lock = self.acquire_for_index("discard_file")?;
         let changed_file = self
             .changed_files_unchecked()?
             .into_iter()
@@ -2699,7 +2702,7 @@ impl Workspace {
             });
         }
 
-        let _lock = OperationLock::acquire(&self.lock_path(), "discard_files")?;
+        let _lock = self.acquire_for_index("discard_files")?;
         self.ensure_discard_unfiltered(&changed_files, "discard_files")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
@@ -2875,7 +2878,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "create_variation_from_version")?;
+        let _lock = self.acquire_for_index("create_variation_from_version")?;
         if !is_safe_operation_id(&token.operation_id) {
             return Err(DraftlineError::LocalStateChanged {
                 expected: "create variation operation id issued by preflight".to_string(),
@@ -3141,7 +3144,7 @@ impl Workspace {
     ) -> Result<Shelf> {
         self.ensure_no_pending_recovery()?;
         let safe_name = validate_variation_name(name.as_ref())?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "shelve_changes")?;
+        let _lock = self.acquire_for_index("shelve_changes")?;
         self.shelve_changes_unchecked(&safe_name, profile)?;
         self.shelf_by_id(&safe_name)
     }
@@ -3212,9 +3215,11 @@ impl Workspace {
             )));
         }
 
-        let _lock = OperationLock::acquire(&self.lock_path(), "shelve_files")?;
+        let _lock = self.acquire_for_index("shelve_files")?;
         let (author, committer) = self.rewrite_signatures(profile)?;
-        let (tree_id, _) = self.content_changes_tree(&changed_files, "shelve_files")?;
+        let parent = self.repo.head()?.peel_to_commit()?;
+        let (tree_id, _) =
+            self.content_changes_tree(Some(&parent), &changed_files, "shelve_files")?;
         self.ensure_discard_unfiltered(&changed_files, "shelve_files")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
@@ -3226,7 +3231,6 @@ impl Workspace {
         })?;
 
         let tree = self.repo.find_tree(tree_id)?;
-        let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             None,
             &author,
@@ -3328,7 +3332,7 @@ impl Workspace {
     pub fn apply_shelf(&self, id: impl AsRef<str>) -> Result<Shelf> {
         self.ensure_no_pending_recovery()?;
         let safe_name = validate_variation_name(id.as_ref())?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "apply_shelf")?;
+        let _lock = self.acquire_for_index("apply_shelf")?;
         let report = self.preflight_apply_shelf(&safe_name)?;
         if !report.can_proceed {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
@@ -3947,7 +3951,7 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "switch_variation")?;
+        let _lock = self.acquire_for_index("switch_variation")?;
         let mut report = self.preflight_switch_variation_unchecked(variation)?;
 
         if !report.file_hazards.is_empty() {
@@ -4252,7 +4256,7 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "restore_version_as_new_save")?;
+        let _lock = self.acquire_for_index("restore_version_as_new_save")?;
         let head_commit = self.repo.head()?.peel_to_commit()?;
         let restored_tree = {
             let source = self.find_version_commit(version)?.tree()?;
@@ -4343,10 +4347,7 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<TargetedRestoreVersionResult> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(
-            &self.lock_path(),
-            "restore_version_as_new_save_to_variation",
-        )?;
+        let _lock = self.acquire_for_index("restore_version_as_new_save_to_variation")?;
 
         let source_commit = self.find_version_commit(version)?;
         let source_tree = source_commit.tree()?;
@@ -5737,7 +5738,7 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), operation)?;
+        let _lock = self.acquire_for_index(operation)?;
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
@@ -5857,7 +5858,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<ApplyIncomingResult> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "apply_incoming")?;
+        let _lock = self.acquire_for_index("apply_incoming")?;
 
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
@@ -7530,6 +7531,32 @@ impl Workspace {
             .join(format!("recovery-delete-remote-{operation_id}.json"))
     }
 
+    /// Takes the Draftline lock for an operation that writes Git's index, and
+    /// refuses up front while another Git process holds that index.
+    fn acquire_for_index(&self, operation: &str) -> Result<OperationLock> {
+        let lock = OperationLock::acquire(&self.lock_path(), operation)?;
+        self.ensure_git_index_unlocked()?;
+        Ok(lock)
+    }
+
+    fn ensure_git_index_unlocked(&self) -> Result<()> {
+        let lock = self.repo.path().join("index.lock");
+        if lock.exists() {
+            return Err(DraftlineError::GitIndexLocked(lock));
+        }
+        Ok(())
+    }
+
+    /// Git took its index lock after [`Self::ensure_git_index_unlocked`]
+    /// passed; report it the same way so callers see one retryable error.
+    fn index_busy(&self, error: git2::Error) -> DraftlineError {
+        if error.code() == git2::ErrorCode::Locked && error.class() == git2::ErrorClass::Index {
+            DraftlineError::GitIndexLocked(self.repo.path().join("index.lock"))
+        } else {
+            error.into()
+        }
+    }
+
     fn lock_path(&self) -> PathBuf {
         self.draftline_dir().join("operation.lock")
     }
@@ -7645,6 +7672,7 @@ impl Workspace {
     /// Returns the tree and every path whose real index entry should follow it.
     fn content_changes_tree(
         &self,
+        base: Option<&Commit<'_>>,
         changed_files: &[ChangedFile],
         operation: &str,
     ) -> Result<(Oid, Vec<PathBuf>)> {
@@ -7679,8 +7707,10 @@ impl Workspace {
         let scratch = Repository::open(&self.root)?;
         let mut index = scratch.index()?;
         index.clear()?;
-        if let Ok(head_tree) = self.repo.head().and_then(|head| head.peel_to_tree()) {
-            index.read_tree(&head_tree)?;
+        // Built from the exact parent the commit will get, so a developer
+        // commit landing meanwhile can never be reverted by this tree.
+        if let Some(base) = base {
+            index.read_tree(&base.tree()?)?;
         }
         for path in &removals {
             remove_index_path(&mut index, path)?;
@@ -7702,26 +7732,126 @@ impl Workspace {
         label: &str,
         profile: Option<&ContributorProfile>,
     ) -> Result<Version> {
-        let (tree_id, affected_paths) = self.content_changes_tree(changed_files, operation)?;
-        let tree = self.repo.find_tree(tree_id)?;
-        let (author, committer) = self.workspace_signatures(profile)?;
         let parent = self
             .repo
             .head()
             .ok()
             .and_then(|head| head.peel_to_commit().ok());
+        let (tree_id, affected_paths) =
+            self.content_changes_tree(parent.as_ref(), changed_files, operation)?;
+        let tree = self.repo.find_tree(tree_id)?;
+        let (author, committer) = self.workspace_signatures(profile)?;
         let parents = parent.iter().collect::<Vec<_>>();
+        self.ensure_git_index_unlocked()?;
+        // Like `git commit`: the index is updated before the branch moves, so a
+        // busy index fails the save cleanly instead of leaving a commit the
+        // index would silently revert on the developer's next commit.
         let oid = self
             .repo
-            .commit(Some("HEAD"), &author, &committer, label, &tree, &parents)?;
+            .commit(None, &author, &committer, label, &tree, &parents)?;
         let commit = self.repo.find_commit(oid)?;
-        if !affected_paths.is_empty() {
-            self.repo.reset_default(
-                Some(commit.as_object()),
-                affected_paths.iter().map(PathBuf::as_path),
-            )?;
+        let previous = self.stage_from(&commit, &affected_paths)?;
+        if let Err(error) = self.advance_head(&commit, parent.as_ref(), &committer) {
+            self.restore_index_entries(&affected_paths, previous)?;
+            return Err(error);
         }
         Ok(version_from_commit(&commit))
+    }
+
+    /// Sets the index entries for `paths` to `commit`'s, returning every entry
+    /// (all stages) they replace. libgit2 cannot hold Git's index lock across
+    /// a read and a write, so the index is reread just before the write.
+    fn stage_from(&self, commit: &Commit<'_>, paths: &[PathBuf]) -> Result<Vec<git2::IndexEntry>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        let wanted = paths
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/").into_bytes())
+            .collect::<HashSet<_>>();
+        let previous = index
+            .iter()
+            .filter(|entry| wanted.contains(&entry.path))
+            .collect();
+        drop(index);
+        self.repo
+            .reset_default(Some(commit.as_object()), paths.iter().map(PathBuf::as_path))
+            .map_err(|error| self.index_busy(error))?;
+        Ok(previous)
+    }
+
+    /// Puts back the entries [`Self::stage_from`] replaced. Git holds its index
+    /// lock only briefly, so a busy index is retried for up to a second.
+    fn restore_index_entries(
+        &self,
+        paths: &[PathBuf],
+        entries: Vec<git2::IndexEntry>,
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut attempts = 0;
+        loop {
+            match self.write_index_entries(paths, &entries) {
+                Err(DraftlineError::Git(error))
+                    if error.code() == git2::ErrorCode::Locked && attempts < 20 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(DraftlineError::Git(error)) => return Err(self.index_busy(error)),
+                result => return result,
+            }
+        }
+    }
+
+    fn write_index_entries(&self, paths: &[PathBuf], entries: &[git2::IndexEntry]) -> Result<()> {
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        for path in paths {
+            if let Err(error) = index.remove_path(path) {
+                if error.code() != git2::ErrorCode::NotFound {
+                    return Err(error.into());
+                }
+            }
+        }
+        for entry in entries {
+            index.add(entry)?;
+        }
+        index.write()?;
+        Ok(())
+    }
+
+    /// Moves HEAD's branch (or a detached HEAD) to `commit` only if it still
+    /// points at `parent`, holding the ref's lock as `git commit` does.
+    fn advance_head(
+        &self,
+        commit: &Commit<'_>,
+        parent: Option<&Commit<'_>>,
+        committer: &Signature<'_>,
+    ) -> Result<()> {
+        let head = self.repo.find_reference("HEAD")?;
+        let name = head.symbolic_target().unwrap_or("HEAD").to_string();
+        let mut transaction = self.repo.transaction()?;
+        transaction.lock_ref(&name)?;
+        let current = self.repo.refname_to_id(&name).ok();
+        let expected = parent.map(Commit::id);
+        if current != expected {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{name} at {expected:?}"),
+                actual: format!("{current:?}"),
+            });
+        }
+        let summary = commit.summary().unwrap_or_default();
+        let message = match parent {
+            Some(_) => format!("commit: {summary}"),
+            None => format!("commit (initial): {summary}"),
+        };
+        transaction.set_target(&name, commit.id(), Some(committer), &message)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Refuses content that needs a Git filter driver (for example Git LFS),
@@ -8055,13 +8185,14 @@ impl Workspace {
             }
         }
 
-        index.write()?;
+        index.write().map_err(|error| self.index_busy(error))?;
         drop(index);
 
         if !paths_to_reset.is_empty() {
             let head = self.repo.head()?.peel(ObjectType::Commit)?;
             self.repo
-                .reset_default(Some(&head), paths_to_reset.iter().map(PathBuf::as_path))?;
+                .reset_default(Some(&head), paths_to_reset.iter().map(PathBuf::as_path))
+                .map_err(|error| self.index_busy(error))?;
             let head_tree = head.peel_to_tree()?;
             let refused = RefCell::default();
             self.checkout_refusing_filters(checkout, &refused, &head_tree, |checkout| {
@@ -8112,7 +8243,9 @@ impl Workspace {
         let safe_name = validate_variation_name(name)?;
         let (author, committer) = self.rewrite_signatures(profile)?;
         let changed_files = self.changed_files_unchecked()?;
-        let (tree_id, _) = self.content_changes_tree(&changed_files, "shelve_changes")?;
+        let parent = self.repo.head()?.peel_to_commit()?;
+        let (tree_id, _) =
+            self.content_changes_tree(Some(&parent), &changed_files, "shelve_changes")?;
         self.ensure_discard_unfiltered(&changed_files, "shelve_changes")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
@@ -8124,7 +8257,6 @@ impl Workspace {
         })?;
 
         let tree = self.repo.find_tree(tree_id)?;
-        let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             None,
             &author,
@@ -10510,6 +10642,69 @@ mod tests {
         peer.fetch_remote("origin").unwrap();
 
         (remote, author_dir, peer_dir, peer)
+    }
+
+    #[test]
+    fn a_save_never_reverts_a_commit_that_lands_while_it_is_built() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        let base = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+
+        // A developer commit lands after the save read HEAD.
+        write_file(workspace.root(), "code.rs", b"dev");
+        stage_file(&workspace, "code.rs");
+        let signature = workspace.repo.signature().unwrap();
+        let dev_tree = workspace
+            .repo
+            .find_tree(workspace.repo.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        workspace
+            .repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "dev",
+                &dev_tree,
+                &[&base],
+            )
+            .unwrap();
+
+        write_file(workspace.root(), "plan.sk", b"edited");
+        let changed = vec![ChangedFile {
+            path: PathBuf::from("plan.sk"),
+            kind: ChangeKind::Modified,
+            is_binary: false,
+            is_large: false,
+        }];
+        let (tree_id, _) = workspace
+            .content_changes_tree(Some(&base), &changed, "save")
+            .unwrap();
+        let tree = workspace.repo.find_tree(tree_id).unwrap();
+        assert!(
+            tree.get_name("code.rs").is_none(),
+            "tree must come from the save's parent"
+        );
+        let saved = workspace
+            .repo
+            .find_commit(
+                workspace
+                    .repo
+                    .commit(None, &signature, &signature, "save", &tree, &[&base])
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let moved = workspace.advance_head(&saved, Some(&base), &signature);
+        assert!(matches!(
+            moved,
+            Err(DraftlineError::LocalStateChanged { .. })
+        ));
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary(), Some("dev"));
     }
 
     #[test]

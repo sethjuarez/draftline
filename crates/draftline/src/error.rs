@@ -70,6 +70,12 @@ pub enum DraftlineError {
     #[error("workspace is locked by another Draftline operation")]
     WorkspaceLocked,
 
+    /// Another Git process holds the repository's index, as `git` does while
+    /// it stages, commits, or checks out. Retry once it finishes; if no Git
+    /// process is running, the named lock file was left by a crash.
+    #[error("Git is busy in this repository ({0} exists); try again when it finishes")]
+    GitIndexLocked(PathBuf),
+
     #[error("unsupported switch policy: {0}")]
     UnsupportedSwitchPolicy(&'static str),
 

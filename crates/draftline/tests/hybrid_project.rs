@@ -744,6 +744,186 @@ fn line_endings_round_trip_like_git_with_autocrlf() {
     assert!(workspace.changed_files().unwrap().is_empty());
 }
 
+fn head_id(repo: &git2::Repository) -> git2::Oid {
+    repo.head().unwrap().peel_to_commit().unwrap().id()
+}
+
+fn is_git_index_locked(error: &DraftlineError) -> bool {
+    matches!(error, DraftlineError::GitIndexLocked(_))
+}
+
+/// A business-user edit plus a developer's staged code, ready to save.
+fn busy_project() -> (tempfile::TempDir, git2::Repository, Workspace) {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp);
+    write_file(temp.path(), "src/lib.rs", "pub fn staged() {}\n");
+    stage(&repo, "src/lib.rs");
+    write_file(temp.path(), "cutready/intro.sk", "scene one, revised\n");
+    (temp, repo, workspace)
+}
+
+#[test]
+fn save_waits_while_git_holds_the_index() {
+    let (temp, repo, workspace) = busy_project();
+    let before = head_id(&repo);
+    let lock = repo.path().join("index.lock");
+    fs::write(&lock, "").unwrap();
+
+    let error = workspace.save_version("Revise intro").unwrap_err();
+
+    assert!(is_git_index_locked(&error), "{error:?}");
+    assert_eq!(head_id(&repo), before, "no commit while git is busy");
+    assert!(workspace.recovery_state().unwrap().is_none());
+    fs::remove_file(&lock).unwrap();
+    assert_eq!(
+        status(&repo, "cutready/intro.sk"),
+        git2::Status::WT_MODIFIED
+    );
+    assert_eq!(status(&repo, "src/lib.rs"), git2::Status::INDEX_NEW);
+
+    workspace.save_version("Revise intro").unwrap();
+
+    assert_eq!(status(&repo, "cutready/intro.sk"), git2::Status::CURRENT);
+    assert_eq!(status(&repo, "src/lib.rs"), git2::Status::INDEX_NEW);
+    assert_eq!(
+        read(temp.path(), "cutready/intro.sk"),
+        "scene one, revised\n"
+    );
+}
+
+#[test]
+fn a_save_that_cannot_move_the_branch_leaves_the_index_as_it_was() {
+    let (temp, repo, workspace) = busy_project();
+    let before = head_id(&repo);
+    let ref_lock = repo.path().join("refs").join("heads").join("main.lock");
+    fs::create_dir_all(ref_lock.parent().unwrap()).unwrap();
+    fs::write(&ref_lock, "").unwrap();
+
+    workspace.save_version("Revise intro").unwrap_err();
+
+    assert_eq!(head_id(&repo), before);
+    assert_eq!(
+        status(&repo, "cutready/intro.sk"),
+        git2::Status::WT_MODIFIED,
+        "index rolled back, so a developer commit cannot revert the edit"
+    );
+    assert_eq!(status(&repo, "src/lib.rs"), git2::Status::INDEX_NEW);
+    fs::remove_file(&ref_lock).unwrap();
+
+    workspace.save_version("Revise intro").unwrap();
+    assert_eq!(status(&repo, "cutready/intro.sk"), git2::Status::CURRENT);
+    assert_eq!(
+        read(temp.path(), "cutready/intro.sk"),
+        "scene one, revised\n"
+    );
+}
+
+#[test]
+fn a_failed_save_keeps_a_developer_merge_conflict() {
+    let (temp, repo, workspace) = busy_project();
+    let mut index = repo.index().unwrap();
+    let entry = |stage: u16, text: &str| git2::IndexEntry {
+        ctime: git2::IndexTime::new(0, 0),
+        mtime: git2::IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode: 0o100644,
+        uid: 0,
+        gid: 0,
+        file_size: 0,
+        id: repo.blob(text.as_bytes()).unwrap(),
+        flags: stage << 12,
+        flags_extended: 0,
+        path: b"cutready/intro.sk".to_vec(),
+    };
+    index.remove_path(Path::new("cutready/intro.sk")).unwrap();
+    for (stage, text) in [(1, "base\n"), (2, "ours\n"), (3, "theirs\n")] {
+        index.add(&entry(stage, text)).unwrap();
+    }
+    index.write().unwrap();
+    let ref_lock = repo.path().join("refs").join("heads").join("main.lock");
+    fs::write(&ref_lock, "").unwrap();
+
+    workspace.save_version("Resolve intro").unwrap_err();
+
+    let mut index = repo.index().unwrap();
+    index.read(true).unwrap();
+    let conflict = index
+        .conflicts()
+        .unwrap()
+        .map(Result::unwrap)
+        .next()
+        .expect("conflict kept");
+    let text = |entry: Option<git2::IndexEntry>| blob_text(&repo, &entry.unwrap().id.to_string());
+    assert_eq!(text(conflict.ancestor), b"base\n");
+    assert_eq!(text(conflict.our), b"ours\n");
+    assert_eq!(text(conflict.their), b"theirs\n");
+    assert_eq!(status(&repo, "src/lib.rs"), git2::Status::INDEX_NEW);
+    fs::remove_file(&ref_lock).unwrap();
+    let _ = temp;
+}
+
+#[test]
+fn saves_log_the_saver_in_the_reflog_like_git_commit() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp);
+    write_file(temp.path(), "cutready/intro.sk", "scene one, revised\n");
+    let bea = draftline::Contributor {
+        name: "Bea".to_string(),
+        email: Some("bea@example.test".to_string()),
+    };
+    let profile = draftline::ContributorProfile::new(bea.clone(), bea);
+
+    workspace
+        .save_version_with_profile("Revise intro", &profile)
+        .unwrap();
+
+    for name in ["HEAD", "refs/heads/main"] {
+        let reflog = repo.reflog(name).unwrap();
+        let entry = reflog.get(0).unwrap();
+        assert_eq!(entry.message(), Some("commit: Revise intro"), "{name}");
+        assert_eq!(entry.committer().name(), Some("Bea"), "{name}");
+        assert_eq!(entry.id_new(), head_id(&repo), "{name}");
+    }
+}
+
+#[test]
+fn operations_that_write_the_index_refuse_while_git_holds_it() {
+    let (temp, repo, workspace) = busy_project();
+    let lock = repo.path().join("index.lock");
+    fs::write(&lock, "").unwrap();
+
+    let error = workspace.shelve_changes("wip").unwrap_err();
+    assert!(is_git_index_locked(&error), "shelve: {error:?}");
+    assert!(workspace.list_shelves().unwrap().is_empty());
+    let error = workspace.discard_changes().unwrap_err();
+    assert!(is_git_index_locked(&error), "discard: {error:?}");
+    assert_eq!(
+        read(temp.path(), "cutready/intro.sk"),
+        "scene one, revised\n"
+    );
+    assert!(workspace.recovery_state().unwrap().is_none());
+
+    fs::remove_file(&lock).unwrap();
+    workspace.save_version("Revise intro").unwrap();
+    let original = workspace.versions().unwrap()[1].id().clone();
+    let before = head_id(&repo);
+    fs::write(&lock, "").unwrap();
+
+    let error = workspace
+        .restore_version_as_new_save(&original, "Back")
+        .unwrap_err();
+    assert!(is_git_index_locked(&error), "restore: {error:?}");
+    assert_eq!(head_id(&repo), before);
+    assert_eq!(
+        read(temp.path(), "cutready/intro.sk"),
+        "scene one, revised\n"
+    );
+    assert!(workspace.recovery_state().unwrap().is_none());
+    fs::remove_file(&lock).unwrap();
+    assert_eq!(status(&repo, "src/lib.rs"), git2::Status::INDEX_NEW);
+}
+
 #[test]
 fn discard_and_shelve_never_write_lfs_pointers_over_real_files() {
     let (temp, _repo) = lfs_project();
