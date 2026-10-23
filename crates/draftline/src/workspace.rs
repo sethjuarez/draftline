@@ -1949,10 +1949,15 @@ impl Workspace {
     }
 
     /// Initializes a workspace with an explicit content policy.
+    ///
+    /// When `path` is inside an existing repository (for example a project
+    /// folder in a code repository, or a linked worktree), Draftline joins that
+    /// repository and scopes itself to the folder instead of creating a nested
+    /// repository.
     pub fn init_with_policy(path: impl AsRef<Path>, content_policy: ContentPolicy) -> Result<Self> {
         fs::create_dir_all(path.as_ref())?;
 
-        let repo = match Repository::open(path.as_ref()) {
+        let repo = match Repository::discover(path.as_ref()) {
             Ok(repo) => repo,
             Err(_) => {
                 let initial_head = default_initial_variation_name();
@@ -1962,10 +1967,20 @@ impl Workspace {
             }
         };
 
+        Self::from_repository(repo, path.as_ref(), content_policy)
+    }
+
+    fn from_repository(
+        repo: Repository,
+        project_path: &Path,
+        content_policy: ContentPolicy,
+    ) -> Result<Self> {
         let root = repo
             .workdir()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.as_ref().to_path_buf());
+            .unwrap_or_else(|| project_path.to_path_buf());
+        let scope = project_scope(&root, project_path)?;
+        let content_policy = content_policy.scoped_to(scope)?;
 
         Ok(Self {
             root,
@@ -1982,20 +1997,12 @@ impl Workspace {
     }
 
     /// Opens an existing workspace with an explicit content policy.
+    ///
+    /// Opening a folder below the repository root scopes the workspace to that
+    /// folder; see [`Workspace::init_with_policy`].
     pub fn open_with_policy(path: impl AsRef<Path>, content_policy: ContentPolicy) -> Result<Self> {
         let repo = Repository::discover(path.as_ref())?;
-        let root = repo
-            .workdir()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.as_ref().to_path_buf());
-
-        Ok(Self {
-            root,
-            repo,
-            content_policy,
-            resolver_registry: ResolverRegistry::with_default_resolvers(),
-        }
-        .initialize())
+        Self::from_repository(repo, path.as_ref(), content_policy)
     }
 
     /// Clones a shared workspace from a remote endpoint.
@@ -2047,18 +2054,7 @@ impl Workspace {
             builder.fetch_options(fetch_options);
         }
         let repo = builder.clone(remote_url.as_ref(), path.as_ref())?;
-        let root = repo
-            .workdir()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.as_ref().to_path_buf());
-
-        Ok(Self {
-            root,
-            repo,
-            content_policy,
-            resolver_registry: ResolverRegistry::with_default_resolvers(),
-        }
-        .initialize())
+        Self::from_repository(repo, path.as_ref(), content_policy)
     }
 
     /// Adds a semantic merge resolver ahead of Draftline's built-in resolvers.
@@ -2116,9 +2112,24 @@ impl Workspace {
         self
     }
 
-    /// Returns the root content folder for this workspace.
+    /// Returns the repository working-tree root.
+    ///
+    /// Paths accepted and returned by Draftline are relative to this root. For a
+    /// project folder inside a larger repository, see [`Workspace::scope`] and
+    /// [`Workspace::project_root`].
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Returns the repository-relative project folder, or an empty path when
+    /// the project is the repository root.
+    pub fn scope(&self) -> &Path {
+        self.content_policy.scope()
+    }
+
+    /// Returns the absolute project folder.
+    pub fn project_root(&self) -> PathBuf {
+        self.root.join(self.scope())
     }
 
     /// Returns the current content policy.
@@ -2388,6 +2399,7 @@ impl Workspace {
         policy: ContentPolicy,
     ) -> Result<AdoptionPreflightReport> {
         let inspection = self.inspect()?;
+        let policy = policy.scoped_to(self.scope())?;
         let candidate_policy_diagnostics = self.policy_git_diagnostics_for_policy(&policy)?;
         let blockers: Vec<WorkspaceDiagnostic> = inspection
             .diagnostics
@@ -2890,6 +2902,7 @@ impl Workspace {
             .include_untracked(true)
             .recurse_untracked_dirs(true)
             .renames_head_to_index(true);
+        limit_status_to_scope(&mut options, self.scope());
 
         let statuses = self.repo.statuses(Some(&mut options))?;
         let mut changed = Vec::new();
@@ -2933,6 +2946,7 @@ impl Workspace {
             .include_ignored(true)
             .recurse_untracked_dirs(true)
             .recurse_ignored_dirs(true);
+        limit_status_to_scope(&mut options, policy.scope());
 
         let statuses = self.repo.statuses(Some(&mut options))?;
         let mut ignored_paths = Vec::new();
@@ -7962,6 +7976,7 @@ impl Workspace {
         let to_tree = to_commit.tree()?;
 
         let mut opts = DiffOptions::new();
+        limit_diff_to_scope(&mut opts, self.scope());
         let diff =
             self.repo
                 .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))?;
@@ -8001,6 +8016,7 @@ impl Workspace {
 
         let mut opts = DiffOptions::new();
         opts.include_untracked(true).recurse_untracked_dirs(true);
+        limit_diff_to_scope(&mut opts, self.scope());
         let diff = self
             .repo
             .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts))?;
@@ -8029,6 +8045,7 @@ impl Workspace {
         let mut opts = DiffOptions::new();
         opts.include_untracked(true)
             .recurse_untracked_dirs(true)
+            .disable_pathspec_match(true)
             .pathspec(&path);
         let diff = self
             .repo
@@ -12265,6 +12282,40 @@ fn diff_deltas_to_changed_files(diff: &git2::Diff<'_>) -> Vec<ChangedFile> {
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
+}
+
+/// Literal (non-glob) pathspec for the project folder, or `None` when unscoped.
+fn scope_pathspec(scope: &Path) -> Option<String> {
+    if scope.as_os_str().is_empty() {
+        return None;
+    }
+    Some(scope.to_string_lossy().replace('\\', "/"))
+}
+
+/// Restricts a status scan to the project folder so large code repositories
+/// are not walked in full.
+fn limit_status_to_scope(options: &mut StatusOptions, scope: &Path) {
+    if let Some(pathspec) = scope_pathspec(scope) {
+        options.disable_pathspec_match(true).pathspec(pathspec);
+    }
+}
+
+/// Restricts a diff to the project folder.
+fn limit_diff_to_scope(options: &mut DiffOptions, scope: &Path) {
+    if let Some(pathspec) = scope_pathspec(scope) {
+        options.disable_pathspec_match(true).pathspec(pathspec);
+    }
+}
+
+/// Computes the repository-relative project folder for `project_path`.
+fn project_scope(workdir: &Path, project_path: &Path) -> Result<PathBuf> {
+    let workdir = fs::canonicalize(workdir)?;
+    let project = fs::canonicalize(project_path)?;
+    match project.strip_prefix(&workdir) {
+        Ok(relative) => normalize_workspace_relative(relative),
+        // e.g. a symlinked project folder that resolves outside the repository.
+        Err(_) => Err(DraftlineError::PathEscapesWorkspace(project)),
+    }
 }
 
 /// Collects [`ChangedFile`] entries from a tree-to-workdir diff, filtered by
