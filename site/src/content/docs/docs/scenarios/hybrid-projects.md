@@ -49,8 +49,8 @@ Business goal: "Save my edits without disturbing the developer's code."
 |---|---|
 | Covered today? | Covered. |
 | Correct primitive path | `save_version`, `restore_version_as_new_save`, `shelve_changes` / `apply_shelf` as usual. |
-| Safety behavior | A save builds its commit from HEAD plus the folder's changes. Whatever the developer staged stays staged and uncommitted. Restores and shelves write only the folder and refuse when an untracked or ignored file is in the way. |
-| Tests | `save_leaves_developer_staged_changes_staged_and_uncommitted`, `restore_rolls_back_only_project_content`, `shelve_and_apply_leave_code_alone`. |
+| Safety behavior | A save builds its commit from HEAD plus the folder's changes. Whatever the developer staged stays staged and uncommitted. Restores and shelves write only the folder and refuse when an untracked or ignored file is in the way. Files that need a Git filter (for example Git LFS) are never saved, overwritten, or discarded: Draftline cannot run the filter, so it refuses with a `GitFilter` hazard before writing anything. |
+| Tests | `save_leaves_developer_staged_changes_staged_and_uncommitted`, `restore_rolls_back_only_project_content`, `shelve_and_apply_leave_code_alone`, `restore_and_switch_never_write_lfs_pointers_over_real_files`, `discard_and_shelve_never_write_lfs_pointers_over_real_files`. |
 
 ## Flow 15b: developers commit with plain Git
 
@@ -93,7 +93,7 @@ Business goal: "Start something new without touching what's open."
 |---|---|
 | Covered today? | Covered in Rust; not yet exposed to Tauri or TypeScript. |
 | Correct primitive path | `create_owned_worktree(dir, title, remote, WorktreeStart)`, `owned_worktrees`, `remove_owned_worktree(name, discard_changes)`. Open the returned `project_path`. |
-| Safety behavior | Creates a `draftline-*` worktree on a new namespaced branch, from the last-fetched base (fetch first) or the current version. This checkout is left alone. Removal refuses unsaved work unless `discard_changes` is set, keeps the branch, and never touches other tools' worktrees. A failed create leaves nothing behind. |
+| Safety behavior | Creates a `draftline-*` worktree on a new namespaced branch, from the last-fetched base (fetch first) or the current version. This checkout is left alone. Removal refuses unsaved work unless `discard_changes` is set, keeps the branch, and never touches other tools' worktrees. A failed create leaves nothing behind. Git LFS files arrive as pointer text until someone runs `git lfs pull` in the new copy. |
 | Tests | `owned_worktree_starts_from_the_latest_base_and_leaves_this_checkout_alone`, `removing_an_owned_worktree_keeps_its_branch_and_refuses_unsaved_work`, `a_failed_owned_worktree_leaves_nothing_behind`. |
 
 ## Flow 15f: an operation was interrupted in another project

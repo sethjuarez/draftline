@@ -569,6 +569,168 @@ fn save_refuses_content_that_needs_a_git_filter() {
     );
 }
 
+/// Commits `pointer` for `relative` while the file on disk holds `real`, the way
+/// Git LFS leaves a checkout: the index stat matches, so status is clean.
+fn commit_smudged(
+    repo: &git2::Repository,
+    root: &Path,
+    relative: &str,
+    real: &str,
+    pointer: &str,
+    message: &str,
+) -> git2::Oid {
+    write_file(root, relative, real);
+    let mut index = repo.index().unwrap();
+    index.read(true).unwrap();
+    index.add_path(Path::new(relative)).unwrap();
+    let mut entry = index.get_path(Path::new(relative), 0).unwrap();
+    entry.id = repo.blob(pointer.as_bytes()).unwrap();
+    index.add(&entry).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        message,
+        &tree,
+        &[&parent],
+    )
+    .unwrap()
+}
+
+fn lfs_project() -> (tempfile::TempDir, git2::Repository) {
+    let (temp, repo) = code_repo();
+    write_file(
+        temp.path(),
+        ".gitattributes",
+        "*.sk filter=lfs diff=lfs merge=lfs -text\n",
+    );
+    commit_all(&repo, "Track sketches with LFS");
+    commit_smudged(
+        &repo,
+        temp.path(),
+        "cutready/intro.sk",
+        "scene one\n",
+        "lfs pointer one\n",
+        "Intro in LFS",
+    );
+    assert!(status(&repo, "cutready/intro.sk").is_empty());
+    (temp, repo)
+}
+
+fn is_filter_refusal(error: DraftlineError) -> bool {
+    hazard_kinds(error).iter().any(|(path, kind)| {
+        path == Path::new("cutready/intro.sk") && *kind == FileHazardKind::GitFilter
+    })
+}
+
+#[test]
+fn restore_and_switch_never_write_lfs_pointers_over_real_files() {
+    let (temp, repo) = lfs_project();
+    let workspace = scoped(&temp);
+    let one = workspace.versions().unwrap()[0].id().clone();
+    let old = workspace.create_variation("cutready/old").unwrap();
+    commit_smudged(
+        &repo,
+        temp.path(),
+        "cutready/intro.sk",
+        "scene two\n",
+        "lfs pointer two\n",
+        "Dev: intro two",
+    );
+    let head = repo.head().unwrap().target();
+
+    let error = workspace
+        .restore_version_as_new_save(&one, "Back to one")
+        .unwrap_err();
+    assert!(is_filter_refusal(error));
+    let error = workspace
+        .switch_variation(old.id(), draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap_err();
+    assert!(is_filter_refusal(error));
+
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene two\n");
+    assert_eq!(repo.head().unwrap().target(), head);
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    workspace
+        .preflight_discard_changes()
+        .expect("no pending recovery");
+}
+
+#[test]
+fn switch_refuses_a_branch_whose_own_rules_put_a_file_in_lfs() {
+    let (temp, repo) = code_repo();
+    write_file(temp.path(), "cutready/intro.sk", "scene one\n");
+    commit_all(&repo, "Intro");
+    let workspace = scoped(&temp);
+    let lfs = workspace.create_variation("cutready/lfs").unwrap();
+
+    repo.set_head("refs/heads/cutready/lfs").unwrap();
+    write_file(
+        temp.path(),
+        ".gitattributes",
+        "*.sk filter=lfs diff=lfs merge=lfs -text\n",
+    );
+    commit_all(&repo, "Track sketches with LFS");
+    commit_smudged(
+        &repo,
+        temp.path(),
+        "cutready/intro.sk",
+        "scene two\n",
+        "lfs pointer two\n",
+        "Intro in LFS",
+    );
+    repo.set_head("refs/heads/main").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    assert!(!temp.path().join(".gitattributes").exists());
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one\n");
+
+    let error = workspace
+        .switch_variation(lfs.id(), draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap_err();
+
+    assert!(is_filter_refusal(error));
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one\n");
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    workspace
+        .preflight_discard_changes()
+        .expect("no pending recovery");
+}
+
+#[test]
+fn discard_and_shelve_never_write_lfs_pointers_over_real_files() {
+    let (temp, _repo) = lfs_project();
+    let workspace = scoped(&temp);
+    write_file(temp.path(), "cutready/intro.sk", "scene edited\n");
+
+    let report = workspace.preflight_discard_changes().unwrap();
+    assert!(!report.can_proceed);
+    assert!(is_filter_refusal(DraftlineError::PreflightFailed(
+        Box::new(report)
+    )));
+    assert!(is_filter_refusal(workspace.discard_changes().unwrap_err()));
+    assert!(is_filter_refusal(
+        workspace.discard_file("cutready/intro.sk").unwrap_err()
+    ));
+    assert!(is_filter_refusal(
+        workspace.shelve_changes("aside").unwrap_err()
+    ));
+    fs::remove_file(temp.path().join("cutready/intro.sk")).unwrap();
+    assert!(is_filter_refusal(
+        workspace.shelve_changes("aside").unwrap_err()
+    ));
+    fs::write(temp.path().join("cutready/intro.sk"), "scene edited\n").unwrap();
+
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene edited\n");
+    workspace
+        .preflight_discard_changes()
+        .expect("no pending recovery");
+}
+
 #[test]
 fn save_of_a_rename_out_of_the_project_leaves_the_target_to_the_developer() {
     let (temp, repo) = code_repo();

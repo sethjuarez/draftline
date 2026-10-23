@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -2389,11 +2390,19 @@ impl Workspace {
             .repo
             .diff_tree_to_tree(head_tree.as_ref(), Some(target_tree), None)?;
         let mut target_paths = BTreeSet::new();
+        let mut written = Vec::new();
         for delta in diff.deltas() {
             for file in [delta.old_file(), delta.new_file()] {
                 if let Some(path) = file.path() {
                     target_paths.insert(path.to_string_lossy().replace('\\', "/"));
                 }
+            }
+            if let Some(path) = delta
+                .new_file()
+                .path()
+                .filter(|_| delta.new_file().exists())
+            {
+                written.push(path.to_path_buf());
             }
         }
         if target_paths.is_empty() {
@@ -2480,6 +2489,7 @@ impl Workspace {
             };
             hazards.push(FileHazard { path, kind });
         }
+        hazards.extend(self.filtered_hazards_toward(&written, Some(target_tree))?);
 
         hazards.sort_by(|left, right| left.path.cmp(&right.path));
         hazards.dedup_by(|left, right| left.path == right.path);
@@ -2565,10 +2575,7 @@ impl Workspace {
     /// Preflights discarding all unsaved tracked content changes without mutating files.
     pub fn preflight_discard_changes(&self) -> Result<PreflightReport> {
         self.ensure_no_pending_recovery()?;
-        Ok(discard_preflight_report(
-            "discard_changes",
-            self.changed_files_unchecked()?,
-        ))
+        self.discard_preflight("discard_changes", self.changed_files_unchecked()?)
     }
 
     /// Discards all unsaved changes tracked by the active content policy.
@@ -2587,6 +2594,7 @@ impl Workspace {
             });
         }
 
+        self.ensure_discard_unfiltered(&changed_files, "discard_changes")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -2622,7 +2630,7 @@ impl Workspace {
             .filter(|changed| changed.path == path)
             .collect();
 
-        Ok(discard_preflight_report("discard_file", changed_files))
+        self.discard_preflight("discard_file", changed_files)
     }
 
     /// Discards one changed tracked content file by workspace-relative path.
@@ -2642,6 +2650,7 @@ impl Workspace {
         let Some(changed_file) = changed_file else {
             return Ok(None);
         };
+        self.ensure_discard_unfiltered(std::slice::from_ref(&changed_file), "discard_file")?;
 
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
@@ -2672,10 +2681,7 @@ impl Workspace {
         P: AsRef<Path>,
     {
         self.ensure_no_pending_recovery()?;
-        Ok(discard_preflight_report(
-            "discard_files",
-            self.selected_changed_files(paths)?,
-        ))
+        self.discard_preflight("discard_files", self.selected_changed_files(paths)?)
     }
 
     /// Discards selected changed tracked content files.
@@ -2694,6 +2700,7 @@ impl Workspace {
         }
 
         let _lock = OperationLock::acquire(&self.lock_path(), "discard_files")?;
+        self.ensure_discard_unfiltered(&changed_files, "discard_files")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -3207,6 +3214,8 @@ impl Workspace {
 
         let _lock = OperationLock::acquire(&self.lock_path(), "shelve_files")?;
         let (author, committer) = self.rewrite_signatures(profile)?;
+        let (tree_id, _) = self.content_changes_tree(&changed_files, "shelve_files")?;
+        self.ensure_discard_unfiltered(&changed_files, "shelve_files")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -3216,7 +3225,6 @@ impl Workspace {
             completed: false,
         })?;
 
-        let (tree_id, _) = self.content_changes_tree(&changed_files, "shelve_files")?;
         let tree = self.repo.find_tree(tree_id)?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
@@ -3342,7 +3350,7 @@ impl Workspace {
         })?;
 
         let (_id, commit) = self.find_shelf_commit(&safe_name)?;
-        self.apply_shelf_paths(&commit)?;
+        self.clear_recovery_if_refused(self.apply_shelf_paths(&commit))?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -3982,9 +3990,9 @@ impl Workspace {
             .repo
             .find_branch(variation.as_str(), BranchType::Local)?;
         let reference = branch.into_reference();
-        let target = reference.peel(ObjectType::Commit)?;
+        let target = reference.peel_to_tree()?;
 
-        self.repo.checkout_tree(&target, None)?;
+        self.checkout_or_keep_recovery(&target)?;
         self.repo
             .set_head(&format!("refs/heads/{}", variation.as_str()))?;
 
@@ -4272,7 +4280,7 @@ impl Workspace {
             completed: false,
         })?;
 
-        self.checkout_tree_safely(&restored_tree)?;
+        self.checkout_or_keep_recovery(&restored_tree)?;
         let oid = self.repo.commit(
             Some("HEAD"),
             &author,
@@ -4373,7 +4381,7 @@ impl Workspace {
         })?;
 
         // Move files before any ref so HEAD is still the checkout baseline.
-        self.checkout_tree_safely(&restored_tree)?;
+        self.checkout_or_keep_recovery(&restored_tree)?;
         let target_ref = format!("refs/heads/{target_name}");
         let oid = self.repo.commit(
             Some(&target_ref),
@@ -7719,21 +7727,7 @@ impl Workspace {
     /// Refuses content that needs a Git filter driver (for example Git LFS),
     /// which libgit2 cannot run; committing it raw would corrupt the repository.
     fn ensure_no_filtered_content(&self, paths: &[PathBuf], operation: &str) -> Result<()> {
-        let mut hazards = Vec::new();
-        for path in paths {
-            let filter =
-                self.repo
-                    .get_attr(path, "filter", git2::AttrCheckFlags::FILE_THEN_INDEX)?;
-            if matches!(
-                git2::AttrValue::from_string(filter),
-                git2::AttrValue::True | git2::AttrValue::String(_)
-            ) {
-                hazards.push(FileHazard {
-                    path: path.clone(),
-                    kind: FileHazardKind::GitFilter,
-                });
-            }
-        }
+        let hazards = self.filtered_hazards(paths)?;
         if hazards.is_empty() {
             Ok(())
         } else {
@@ -7747,15 +7741,133 @@ impl Workspace {
         }
     }
 
+    /// A discard rewrites paths from `HEAD`, so `HEAD`'s rules count too.
+    fn discard_filtered_hazards(&self, changed_files: &[ChangedFile]) -> Result<Vec<FileHazard>> {
+        let paths = Self::discard_write_paths(changed_files);
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let head = self.repo.head()?.peel_to_tree()?;
+        self.filtered_hazards_toward(&paths, Some(&head))
+    }
+
+    fn ensure_discard_unfiltered(
+        &self,
+        changed_files: &[ChangedFile],
+        operation: &str,
+    ) -> Result<()> {
+        let hazards = self.discard_filtered_hazards(changed_files)?;
+        if hazards.is_empty() {
+            return Ok(());
+        }
+        Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+            operation,
+            false,
+            Vec::new(),
+            hazards,
+            None,
+        ))))
+    }
+
+    fn filtered_hazards(&self, paths: &[PathBuf]) -> Result<Vec<FileHazard>> {
+        self.filtered_hazards_toward(paths, None)
+    }
+
+    /// Like [`Self::filtered_hazards`], but a path also counts when `target`'s
+    /// own `.gitattributes` would filter it, since a checkout installs those
+    /// rules only after it has written the file.
+    fn filtered_hazards_toward(
+        &self,
+        paths: &[PathBuf],
+        target: Option<&Tree<'_>>,
+    ) -> Result<Vec<FileHazard>> {
+        let attributes = target.map(|tree| self.attributes_of(tree)).transpose()?;
+        let mut hazards = Vec::new();
+        for path in paths {
+            if self.needs_filter(attributes.as_ref(), path)? {
+                hazards.push(FileHazard {
+                    path: path.clone(),
+                    kind: FileHazardKind::GitFilter,
+                });
+            }
+        }
+        Ok(hazards)
+    }
+
+    /// A second handle whose index is `tree`, so attribute lookups see the
+    /// `.gitattributes` rules `tree` carries rather than the checkout's.
+    fn attributes_of(&self, tree: &Tree<'_>) -> Result<Repository> {
+        let repo = Repository::open(self.repo.path())?;
+        let mut index = git2::Index::new()?;
+        index.read_tree(tree)?;
+        repo.set_index(&mut index)?;
+        Ok(repo)
+    }
+
+    fn needs_filter(&self, target: Option<&Repository>, path: &Path) -> Result<bool> {
+        if needs_git_filter(&self.repo, path, git2::AttrCheckFlags::FILE_THEN_INDEX)? {
+            return Ok(true);
+        }
+        match target {
+            Some(repo) => needs_git_filter(repo, path, git2::AttrCheckFlags::INDEX_ONLY),
+            None => Ok(false),
+        }
+    }
+
+    /// libgit2 cannot run filter drivers such as Git LFS, so it would write the
+    /// stored pointer text over the real file. Every checkout here aborts while
+    /// planning, before any file is written, if it would update such a path
+    /// under either the current rules or `target`'s.
+    fn checkout_refusing_filters<'cb>(
+        &'cb self,
+        mut checkout: CheckoutBuilder<'cb>,
+        refused: &'cb RefCell<Vec<PathBuf>>,
+        target: &Tree<'_>,
+        run: impl FnOnce(&mut CheckoutBuilder<'cb>) -> std::result::Result<(), git2::Error>,
+    ) -> Result<()> {
+        let attributes = self.attributes_of(target)?;
+        checkout
+            .notify_on(git2::CheckoutNotificationType::UPDATED)
+            .notify(move |_, path, _, file, _| {
+                let Some(path) = path.filter(|_| file.is_some_and(|file| file.exists())) else {
+                    return true;
+                };
+                if self.needs_filter(Some(&attributes), path).unwrap_or(true) {
+                    refused.borrow_mut().push(path.to_path_buf());
+                    return false;
+                }
+                true
+            });
+        let result = run(&mut checkout);
+        let refused = refused.take();
+        if refused.is_empty() {
+            return Ok(result?);
+        }
+        Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+            "checkout",
+            true,
+            Vec::new(),
+            refused
+                .into_iter()
+                .map(|path| FileHazard {
+                    path,
+                    kind: FileHazardKind::GitFilter,
+                })
+                .collect(),
+            None,
+        ))))
+    }
+
     /// Moves working files from the current HEAD tree to `target` the way
     /// `git checkout` does: files with local edits are never overwritten.
     /// Must run before HEAD or its branch moves, since HEAD is the baseline.
     fn checkout_tree_safely(&self, target: &Tree<'_>) -> Result<()> {
         let mut checkout = CheckoutBuilder::new();
         checkout.safe().overwrite_ignored(false);
-        self.repo
-            .checkout_tree(target.as_object(), Some(&mut checkout))?;
-        Ok(())
+        let refused = RefCell::default();
+        self.checkout_refusing_filters(checkout, &refused, target, |checkout| {
+            self.repo.checkout_tree(target.as_object(), Some(checkout))
+        })
     }
 
     /// Safe checkout for an operation with a pending recovery record. A refused
@@ -7768,8 +7880,17 @@ impl Workspace {
                 let _ = self.clear_recovery_records();
                 Err(DraftlineError::Git(error))
             }
-            result => result,
+            result => self.clear_recovery_if_refused(result),
         }
+    }
+
+    /// A filter refusal aborts a checkout before it writes anything, so the
+    /// pending record has nothing to recover.
+    fn clear_recovery_if_refused(&self, result: Result<()>) -> Result<()> {
+        if matches!(result, Err(DraftlineError::PreflightFailed(_))) {
+            let _ = self.clear_recovery_records();
+        }
+        result
     }
 
     /// Forces only the project folder to `target`; paths outside it are untouched.
@@ -7779,9 +7900,10 @@ impl Workspace {
         if let Some(pathspec) = scope_pathspec(self.scope()) {
             checkout.disable_pathspec_match(true).path(pathspec);
         }
-        self.repo
-            .checkout_tree(target.as_object(), Some(&mut checkout))?;
-        Ok(())
+        let refused = RefCell::default();
+        self.checkout_refusing_filters(checkout, &refused, target, |checkout| {
+            self.repo.checkout_tree(target.as_object(), Some(checkout))
+        })
     }
 
     /// `base` with its project folder replaced by `source`'s project folder.
@@ -7862,12 +7984,37 @@ impl Workspace {
         for path in &paths {
             checkout.path(path.to_string_lossy().replace('\\', "/"));
         }
-        self.repo
-            .checkout_tree(tree.as_object(), Some(&mut checkout))?;
-        Ok(())
+        let refused = RefCell::default();
+        self.checkout_refusing_filters(checkout, &refused, &tree, |checkout| {
+            self.repo.checkout_tree(tree.as_object(), Some(checkout))
+        })
+    }
+
+    fn discard_preflight(
+        &self,
+        operation: &str,
+        changed_files: Vec<ChangedFile>,
+    ) -> Result<PreflightReport> {
+        let hazards = self.discard_filtered_hazards(&changed_files)?;
+        let mut report = discard_preflight_report(operation, changed_files);
+        if !hazards.is_empty() {
+            report.file_hazards.extend(hazards);
+            report.can_proceed = false;
+        }
+        Ok(report)
+    }
+
+    /// Paths a discard would rewrite from `HEAD`.
+    fn discard_write_paths(changed_files: &[ChangedFile]) -> Vec<PathBuf> {
+        changed_files
+            .iter()
+            .filter(|changed| changed.kind != ChangeKind::Added)
+            .map(|changed| changed.path.clone())
+            .collect()
     }
 
     fn discard_changed_files(&self, changed_files: &[ChangedFile]) -> Result<()> {
+        self.ensure_discard_unfiltered(changed_files, "discard")?;
         let mut index = self.repo.index()?;
         let mut checkout = CheckoutBuilder::new();
         checkout.force();
@@ -7915,7 +8062,11 @@ impl Workspace {
             let head = self.repo.head()?.peel(ObjectType::Commit)?;
             self.repo
                 .reset_default(Some(&head), paths_to_reset.iter().map(PathBuf::as_path))?;
-            self.repo.checkout_head(Some(&mut checkout))?;
+            let head_tree = head.peel_to_tree()?;
+            let refused = RefCell::default();
+            self.checkout_refusing_filters(checkout, &refused, &head_tree, |checkout| {
+                self.repo.checkout_head(Some(checkout))
+            })?;
         }
 
         for path in paths_to_remove_after_checkout {
@@ -7960,6 +8111,9 @@ impl Workspace {
     ) -> Result<()> {
         let safe_name = validate_variation_name(name)?;
         let (author, committer) = self.rewrite_signatures(profile)?;
+        let changed_files = self.changed_files_unchecked()?;
+        let (tree_id, _) = self.content_changes_tree(&changed_files, "shelve_changes")?;
+        self.ensure_discard_unfiltered(&changed_files, "shelve_changes")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -7969,8 +8123,6 @@ impl Workspace {
             completed: false,
         })?;
 
-        let changed_files = self.changed_files_unchecked()?;
-        let (tree_id, _) = self.content_changes_tree(&changed_files, "shelve_changes")?;
         let tree = self.repo.find_tree(tree_id)?;
         let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
@@ -8852,6 +9004,15 @@ fn preflight_report(
         variation_divergence,
         can_proceed,
     }
+}
+
+/// Whether Git would run a filter driver (for example Git LFS) for `path`.
+fn needs_git_filter(repo: &Repository, path: &Path, flags: git2::AttrCheckFlags) -> Result<bool> {
+    let filter = repo.get_attr(path, "filter", flags)?;
+    Ok(matches!(
+        git2::AttrValue::from_string(filter),
+        git2::AttrValue::True | git2::AttrValue::String(_)
+    ))
 }
 
 fn discard_preflight_report(
