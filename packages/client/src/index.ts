@@ -284,7 +284,8 @@ export type SafeNextAction =
   | 'save_first'
   | 'discard_changes'
   | 'repair_recovery'
-  | 'configure_remote';
+  | 'configure_remote'
+  | 'finish_in_other_project';
 export type SharingMode = 'local_only' | 'shared_capable';
 export type SupportRefScope = 'local' | 'remote_tracking';
 export type SupportRefKind = 'deleted_variation' | 'rewrite' | 'history_cleanup_backup';

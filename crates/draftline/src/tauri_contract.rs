@@ -2705,6 +2705,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::VariationCreatePreflightFailed(_) => "variation_create_preflight_failed",
         DraftlineError::RecoveryRequired(_) => "recovery_required",
         DraftlineError::RecoveryNotFound(_) => "recovery_not_found",
+        DraftlineError::RecoveryInOtherProject(_) => "recovery_in_other_project",
         DraftlineError::InvalidVariationName(_) => "invalid_variation_name",
         DraftlineError::InvalidGraphOptions(_) => "invalid_graph_options",
         DraftlineError::VariationAlreadyExists(_) => "variation_already_exists",
@@ -2757,6 +2758,9 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
                 "serialization_error": error.to_string(),
             })),
         },
+        DraftlineError::RecoveryInOtherProject(project) => {
+            Some(serde_json::json!({ "project": project }))
+        }
         DraftlineError::SyncNeedsMerge(status) => match serde_json::to_value(status.as_ref()) {
             Ok(value) => Some(value),
             Err(error) => Some(serde_json::json!({

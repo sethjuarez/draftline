@@ -337,6 +337,8 @@ pub enum SafeNextAction {
     DiscardChanges,
     RepairRecovery,
     ConfigureRemote,
+    /// Another project in this checkout must finish its interrupted operation.
+    FinishInOtherProject,
 }
 
 /// Stable diagnostic codes for workspace inspection.
@@ -345,6 +347,7 @@ pub enum SafeNextAction {
 #[non_exhaustive]
 pub enum DiagnosticCode {
     RecoveryRequired,
+    RecoveryInOtherProject,
     WorkspaceLocked,
     DirtyWorkspace,
     LocalOnlyWorkspace,
@@ -417,6 +420,16 @@ pub struct OperationLockInspection {
     pub is_stale: bool,
     pub can_clear: bool,
     pub diagnostics: Vec<WorkspaceDiagnostic>,
+}
+
+/// The recovery file on disk: the state plus the project that wrote it.
+/// Records from older versions have no project.
+#[derive(Serialize, Deserialize)]
+struct RecoveryLedger {
+    #[serde(flatten)]
+    state: RecoveryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
 }
 
 /// Result returned by recovery repair and rollback entry points.
@@ -1652,11 +1665,21 @@ impl Workspace {
         }
 
         if recovery.is_some() {
-            diagnostics.push(workspace_diagnostic(
-                DiagnosticCode::RecoveryRequired,
-                DiagnosticSeverity::Blocking,
-                "workspace has an incomplete Draftline operation",
-            ));
+            diagnostics.push(match self.recovery_owner_elsewhere() {
+                Some(project) => workspace_diagnostic(
+                    DiagnosticCode::RecoveryInOtherProject,
+                    DiagnosticSeverity::Blocking,
+                    format!(
+                        "project {} has an incomplete Draftline operation",
+                        project.display()
+                    ),
+                ),
+                None => workspace_diagnostic(
+                    DiagnosticCode::RecoveryRequired,
+                    DiagnosticSeverity::Blocking,
+                    "workspace has an incomplete Draftline operation",
+                ),
+            });
         }
 
         match self.policy_git_diagnostics_unchecked() {
@@ -1755,6 +1778,13 @@ impl Workspace {
                 code,
                 message: "workspace has an incomplete Draftline operation".to_string(),
                 safe_next_actions: vec![SafeNextAction::RepairRecovery],
+                retry: RetryClass::RetryAfterRepair,
+            },
+            DiagnosticCode::RecoveryInOtherProject => ErrorExplanation {
+                code,
+                message: "another project in this checkout has an incomplete Draftline operation"
+                    .to_string(),
+                safe_next_actions: vec![SafeNextAction::FinishInOtherProject],
                 retry: RetryClass::RetryAfterRepair,
             },
             DiagnosticCode::WorkspaceLocked => ErrorExplanation {
@@ -1871,7 +1901,7 @@ impl Workspace {
         }
 
         let text = fs::read_to_string(path)?;
-        let state: RecoveryState = serde_json::from_str(&text)?;
+        let state = serde_json::from_str::<RecoveryLedger>(&text)?.state;
 
         if state.completed {
             Ok(None)
@@ -2102,6 +2132,14 @@ impl Workspace {
 
     /// Acknowledges an incomplete recovery record and allows normal operations again.
     pub fn acknowledge_recovery(&self) -> Result<()> {
+        self.clear_stale_lock()?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "acknowledge_recovery")?;
+        self.ensure_recovery_is_ours()?;
+        self.clear_recovery_records()
+    }
+
+    /// Deletes recovery records; the caller holds the operation lock.
+    fn clear_recovery_records(&self) -> Result<()> {
         if self.draftline_dir().exists() {
             for entry in fs::read_dir(self.draftline_dir())? {
                 let entry = entry?;
@@ -6091,6 +6129,7 @@ impl Workspace {
     }
 
     fn pending_recovery(&self, operation_id: &str) -> Result<RecoveryState> {
+        self.ensure_recovery_is_ours()?;
         let Some(state) = self.recovery_state()? else {
             return Err(DraftlineError::RecoveryNotFound(operation_id.to_string()));
         };
@@ -7443,7 +7482,11 @@ impl Workspace {
 
     fn write_recovery_state(&self, state: &RecoveryState) -> Result<()> {
         fs::create_dir_all(self.draftline_dir())?;
-        fs::write(self.ledger_path(), serde_json::to_vec_pretty(state)?)?;
+        let ledger = RecoveryLedger {
+            state: state.clone(),
+            project: Some(self.project_key()),
+        };
+        fs::write(self.ledger_path(), serde_json::to_vec_pretty(&ledger)?)?;
         if state.completed && matches!(&state.operation, RecoveryOperation::DeleteRemoteVariation) {
             match fs::remove_file(self.remote_delete_recovery_metadata_path(&state.operation_id)) {
                 Ok(()) => {}
@@ -7484,11 +7527,38 @@ impl Workspace {
     }
 
     fn ensure_no_pending_recovery(&self) -> Result<()> {
+        self.ensure_recovery_is_ours()?;
         if let Some(state) = self.recovery_state()? {
             return Err(DraftlineError::RecoveryRequired(Box::new(state)));
         }
 
         Ok(())
+    }
+
+    /// Projects in one checkout share its branch, so one project's unfinished
+    /// operation blocks the others, but only that project may finish it.
+    fn ensure_recovery_is_ours(&self) -> Result<()> {
+        match self.recovery_owner_elsewhere() {
+            Some(project) => Err(DraftlineError::RecoveryInOtherProject(project)),
+            None => Ok(()),
+        }
+    }
+
+    /// The other project that owns the incomplete recovery record, if any. An
+    /// unreadable record is reported by `recovery_state` and stays clearable.
+    fn recovery_owner_elsewhere(&self) -> Option<PathBuf> {
+        let bytes = fs::read(self.ledger_path()).ok()?;
+        let ledger = serde_json::from_slice::<RecoveryLedger>(&bytes).ok()?;
+        let project = ledger.project?;
+        (!ledger.state.completed && project != self.project_key()).then(|| PathBuf::from(project))
+    }
+
+    fn project_key(&self) -> String {
+        self.scope()
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     fn normalize_tracked_content_path(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -7649,7 +7719,7 @@ impl Workspace {
     fn checkout_or_keep_recovery(&self, target: &Tree<'_>) -> Result<()> {
         match self.checkout_tree_safely(target) {
             Err(DraftlineError::Git(error)) if error.code() == git2::ErrorCode::Conflict => {
-                let _ = self.acknowledge_recovery();
+                let _ = self.clear_recovery_records();
                 Err(DraftlineError::Git(error))
             }
             result => result,
@@ -9631,6 +9701,12 @@ fn safe_next_actions_for_inspection(
     dirty: &DirtySummary,
     diagnostics: &[WorkspaceDiagnostic],
 ) -> Vec<SafeNextAction> {
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == DiagnosticCode::RecoveryInOtherProject)
+    {
+        return vec![SafeNextAction::FinishInOtherProject];
+    }
     if recovery.is_some()
         || operation_lock.state == OperationLockState::Locked
         || diagnostics
@@ -13801,6 +13877,43 @@ mod tests {
             inspection.safe_next_actions,
             vec![SafeNextAction::RepairRecovery]
         );
+    }
+
+    #[test]
+    fn recovery_records_name_the_project_that_wrote_them() {
+        let temp = tempfile::tempdir().unwrap();
+        Workspace::init(temp.path()).unwrap();
+        let workspace = Workspace::init(temp.path().join("decks").join("pitch")).unwrap();
+        let state = RecoveryState {
+            operation_id: "op".to_string(),
+            operation: RecoveryOperation::ShelveChanges,
+            original_variation: None,
+            target: None,
+            completed: false,
+        };
+        workspace.write_recovery_state(&state).unwrap();
+
+        let text = fs::read_to_string(workspace.ledger_path()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["project"], "decks/pitch");
+        assert_eq!(workspace.recovery_state().unwrap(), Some(state));
+        workspace.acknowledge_recovery().unwrap();
+        assert!(!workspace.ledger_path().exists());
+    }
+
+    #[test]
+    fn a_corrupt_recovery_record_can_still_be_cleared() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        fs::write(workspace.ledger_path(), b"{not-json").unwrap();
+        assert!(workspace.save_version("Blocked").is_err());
+        workspace.acknowledge_recovery().unwrap();
+        assert!(!workspace.ledger_path().exists());
+
+        // A record cut off mid-character isn't valid UTF-8.
+        fs::write(workspace.ledger_path(), b"{\"project\": \"caf\xc3").unwrap();
+        workspace.acknowledge_recovery().unwrap();
+        assert!(!workspace.ledger_path().exists());
     }
 
     #[test]

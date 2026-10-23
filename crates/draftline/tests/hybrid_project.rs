@@ -1938,3 +1938,63 @@ fn recovery_records_from_removed_features_still_open_and_can_be_cleared() {
         }
     }
 }
+
+#[test]
+fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let pitch = scoped(&temp);
+    let deck = Workspace::init_with_policy(temp.path().join("deck"), cutready_policy()).unwrap();
+    write_file(other_dir.path(), "cutready/outro.sk", "teammate outro\n");
+    commit_all(&other, "Teammate scene");
+    push_main(&other);
+    write_file(temp.path(), "cutready/intro.sk", "my intro\n");
+    pitch.save_version("My intro").unwrap();
+    pitch.fetch_remote("origin").unwrap();
+    let report = pitch.preflight_merge_incoming("origin").unwrap();
+    let merged = pitch
+        .merge_incoming(report.token.unwrap(), "Merge", &mut RemoteOptions::new())
+        .unwrap();
+
+    // The pitch project crashed after the ref moved.
+    let ledger = serde_json::json!({
+        "operation_id": "interrupted",
+        "operation": "MergeIncoming",
+        "original_variation": "main",
+        "target": merged.version.id().as_str(),
+        "completed": false,
+        "project": "cutready",
+    });
+    fs::write(
+        repo.path().join("draftline").join("recovery.json"),
+        serde_json::to_vec(&ledger).unwrap(),
+    )
+    .unwrap();
+
+    // The deck project shares the branch, so it waits, but it can't finish
+    // or discard the pitch project's operation.
+    write_file(temp.path(), "deck/slide.sk", "slide\n");
+    let in_other = |error: DraftlineError| {
+        assert!(
+            matches!(&error, DraftlineError::RecoveryInOtherProject(project) if project == Path::new("cutready")),
+            "{error:?}"
+        );
+    };
+    in_other(deck.save_version("Slide").unwrap_err());
+    in_other(deck.repair_recovery("interrupted").unwrap_err());
+    in_other(deck.rollback_recovery("interrupted").unwrap_err());
+    in_other(deck.acknowledge_recovery().unwrap_err());
+    assert!(deck.recovery_state().unwrap().is_some());
+    let inspection = deck.inspect().unwrap();
+    assert_eq!(
+        inspection.safe_next_actions,
+        vec![draftline::SafeNextAction::FinishInOtherProject]
+    );
+    assert_eq!(
+        pitch.inspect().unwrap().safe_next_actions,
+        vec![draftline::SafeNextAction::RepairRecovery]
+    );
+
+    pitch.repair_recovery("interrupted").unwrap();
+    deck.save_version("Slide").unwrap();
+}
