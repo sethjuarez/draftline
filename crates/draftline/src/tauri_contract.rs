@@ -114,7 +114,13 @@ impl<'callbacks> DraftlineCommandContext<'callbacks> {
     }
 
     fn open_workspace(&self, path: impl AsRef<std::path::Path>) -> Result<Workspace> {
-        let workspace = Workspace::open_with_policy(path, self.content_policy.clone())?;
+        self.namespaced(Workspace::open_with_policy(
+            path,
+            self.content_policy.clone(),
+        )?)
+    }
+
+    fn namespaced(&self, workspace: Workspace) -> Result<Workspace> {
         match &self.variation_namespace {
             Some(namespace) => workspace.with_variation_namespace(namespace.clone()),
             None => Ok(workspace),
@@ -760,6 +766,7 @@ pub fn clone_workspace_with_context(
             &mut options,
         )?
     };
+    let workspace = context.namespaced(workspace)?;
     context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
     Ok(WorkspaceOpenResult {
         diagnostics: workspace_diagnostics(&workspace)?,
@@ -2744,6 +2751,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidMergeResolution(_) => "invalid_merge_resolution",
         DraftlineError::SendBaseUnknown => "send_base_unknown",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
+        DraftlineError::VariationOutsideNamespace(_) => "variation_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
         DraftlineError::MergeNeedsDeveloper(_) => "merge_needs_developer",
         DraftlineError::NotOwnedWorktree(_) => "not_owned_worktree",

@@ -1561,6 +1561,25 @@ impl Workspace {
         self.variation_namespace.as_deref()
     }
 
+    /// With a namespace set, only branches inside it may be created, renamed,
+    /// deleted, adopted, or restored onto, so developers' branches stay theirs.
+    fn ensure_variation_in_namespace(&self, name: &str) -> Result<()> {
+        match self.variation_namespace.as_deref() {
+            Some(namespace) if !name.starts_with(namespace) => {
+                Err(DraftlineError::VariationOutsideNamespace(name.to_string()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Switching may also reach the base branch, which is always listed.
+    fn ensure_variation_switchable(&self, name: &str) -> Result<()> {
+        if self.variation_namespace.is_some() && self.default_branch().as_deref() != Some(name) {
+            self.ensure_variation_in_namespace(name)?;
+        }
+        Ok(())
+    }
+
     /// Returns the current content policy.
     pub fn content_policy(&self) -> &ContentPolicy {
         &self.content_policy
@@ -1946,6 +1965,7 @@ impl Workspace {
                 let Some(target) = state.target.as_deref() else {
                     return Ok(self.recovery_unavailable(state));
                 };
+                self.ensure_variation_switchable(target)?;
                 let changed_workspace =
                     self.current_variation_unchecked().ok().as_deref() != Some(target);
                 self.checkout_variation_unchecked(target)?;
@@ -2006,9 +2026,12 @@ impl Workspace {
                 self.complete_recovery(state, changed_workspace)
             }
             RecoveryOperation::DeleteVariation => {
-                if state.original_variation.is_none() || state.target.is_none() {
+                let (Some(variation), Some(_)) =
+                    (state.original_variation.as_deref(), state.target.as_deref())
+                else {
                     return Ok(self.recovery_unavailable(state));
-                }
+                };
+                self.ensure_variation_in_namespace(variation)?;
                 self.repair_delete_variation_recovery(&state)?;
                 self.complete_recovery(state, true)
             }
@@ -2066,6 +2089,7 @@ impl Workspace {
 
         match state.operation {
             RecoveryOperation::SwitchVariation => {
+                // Going back to where the user was, like staying on the current branch.
                 let Some(original) = state.original_variation.as_deref() else {
                     return Ok(self.recovery_unavailable(state));
                 };
@@ -2080,6 +2104,7 @@ impl Workspace {
                 else {
                     return Ok(self.recovery_unavailable(state));
                 };
+                self.ensure_variation_in_namespace(variation)?;
                 let oid = Oid::from_str(target)
                     .map_err(|_| DraftlineError::VersionNotFound(target.to_string()))?;
                 let branch_ref = format!("refs/heads/{}", validate_variation_name(variation)?);
@@ -2710,6 +2735,7 @@ impl Workspace {
         &self,
         variation: &VariationId,
     ) -> Result<PreflightReport> {
+        self.ensure_variation_switchable(variation.as_str())?;
         let change_set = self.changes_unchecked()?;
         let target_commit = self
             .repo
@@ -2740,6 +2766,7 @@ impl Workspace {
     ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(name.as_ref())?;
+        self.ensure_variation_in_namespace(&name)?;
         let head = self.repo.head()?.peel_to_commit()?;
         self.repo.branch(&name, &head, false)?;
         self.write_variation_metadata(&name, &metadata)?;
@@ -2769,6 +2796,7 @@ impl Workspace {
     ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(name.as_ref())?;
+        self.ensure_variation_in_namespace(&name)?;
         let commit = self.find_version_commit(version)?;
         if !self.version_is_reachable_from_local_variation(commit.id())? {
             return Err(DraftlineError::VersionNotLocallyReachable(
@@ -2811,6 +2839,7 @@ impl Workspace {
     ) -> Result<VariationCreatePreflight> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(name.as_ref())?;
+        self.ensure_variation_in_namespace(&name)?;
         let commit = self.find_version_commit(version)?;
         if !self.version_is_reachable_from_local_variation(commit.id())? {
             return Err(DraftlineError::VersionNotLocallyReachable(
@@ -2848,6 +2877,7 @@ impl Workspace {
         }
 
         let name = validate_variation_name(token.variation.as_str())?;
+        self.ensure_variation_in_namespace(&name)?;
         let commit = self.find_version_commit(&token.from_version)?;
         if commit.id().to_string() != token.expected_source_oid {
             return Err(DraftlineError::LocalStateChanged {
@@ -3070,6 +3100,7 @@ impl Workspace {
     ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(variation.as_str())?;
+        self.ensure_variation_in_namespace(&name)?;
         let remote_ref = format!("refs/remotes/{}/{}", remote.as_ref(), name);
         let commit = self.repo.find_reference(&remote_ref)?.peel_to_commit()?;
         self.repo.branch(&name, &commit, false)?;
@@ -3518,6 +3549,7 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let id = id.as_ref();
         let name = validate_variation_name(name.as_ref())?;
+        self.ensure_variation_in_namespace(&name)?;
         if self.repo.find_branch(&name, BranchType::Local).is_ok() {
             return Err(DraftlineError::InvalidVariationName(name));
         }
@@ -3566,6 +3598,7 @@ impl Workspace {
     pub fn restore_support_ref(&self, token: SupportRefRestoreToken) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(token.target_variation.as_str())?;
+        self.ensure_variation_in_namespace(&name)?;
         let support_ref = self
             .list_local_support_refs()?
             .into_iter()
@@ -3615,6 +3648,7 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let remote = remote.as_ref().to_string();
         let variation_name = validate_variation_name(variation.as_str())?;
+        self.ensure_variation_in_namespace(&variation_name)?;
         let mut options = RemoteOptions::new();
         self.fetch_remote_variation_ref(&remote, &variation_name, &mut options)?;
         let Some(expected_remote_oid) = remote_tracking_oid(&self.repo, &remote, &variation_name)
@@ -3655,6 +3689,7 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "delete_remote_variation")?;
         let variation_name = validate_variation_name(token.variation.as_str())?;
+        self.ensure_variation_in_namespace(&variation_name)?;
         self.fetch_remote_variation_ref(&token.remote, &variation_name, options)?;
         let actual_remote_oid = remote_tracking_oid(&self.repo, &token.remote, &variation_name);
         if actual_remote_oid.as_deref() != Some(token.expected_remote_oid.as_str()) {
@@ -3973,6 +4008,7 @@ impl Workspace {
         variation: &VariationId,
     ) -> Result<VariationDeletePreflight> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_variation_in_namespace(variation.as_str())?;
         if self.current_variation().ok().as_deref() == Some(variation.as_str()) {
             return Err(DraftlineError::CannotDeleteCurrentVariation(
                 variation.as_str().to_string(),
@@ -4006,6 +4042,7 @@ impl Workspace {
     pub fn delete_variation_with_token(&self, token: VariationDeleteToken) -> Result<()> {
         self.ensure_no_pending_recovery()?;
         let _lock = OperationLock::acquire(&self.lock_path(), "delete_variation")?;
+        self.ensure_variation_in_namespace(token.variation.as_str())?;
         if self.current_variation().ok().as_deref() == Some(token.variation.as_str()) {
             return Err(DraftlineError::CannotDeleteCurrentVariation(
                 token.variation.as_str().to_string(),
@@ -4063,6 +4100,8 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let source_name = validate_variation_name(source.as_str())?;
         let target_name = validate_variation_name(target.as_str())?;
+        self.ensure_variation_in_namespace(&source_name)?;
+        self.ensure_variation_in_namespace(&target_name)?;
         if source_name == target_name {
             return Err(DraftlineError::VariationAlreadyExists(target_name));
         }
@@ -4103,6 +4142,8 @@ impl Workspace {
         let _lock = OperationLock::acquire(&self.lock_path(), "rename_variation")?;
         let source_name = validate_variation_name(token.source_variation.as_str())?;
         let target_name = validate_variation_name(token.target_variation.as_str())?;
+        self.ensure_variation_in_namespace(&source_name)?;
+        self.ensure_variation_in_namespace(&target_name)?;
         if source_name == target_name {
             return Err(DraftlineError::VariationAlreadyExists(target_name));
         }
@@ -6050,6 +6091,9 @@ impl Workspace {
                 Ok((current_variation.to_string(), metadata, parent_oid))
             }
             RestoreVersionTarget::Existing { variation } => {
+                if variation.as_str() != current_variation {
+                    self.ensure_variation_in_namespace(variation.as_str())?;
+                }
                 let branch = self
                     .repo
                     .find_branch(variation.as_str(), BranchType::Local)
@@ -6065,6 +6109,7 @@ impl Workspace {
             }
             RestoreVersionTarget::New { name, metadata } => {
                 let name = validate_variation_name(&name)?;
+                self.ensure_variation_in_namespace(&name)?;
                 match self.repo.find_branch(&name, BranchType::Local) {
                     Ok(_) => Err(DraftlineError::VariationAlreadyExists(name)),
                     Err(error) if error.code() == git2::ErrorCode::NotFound => {
@@ -6319,10 +6364,13 @@ impl Workspace {
         else {
             return Ok(None);
         };
-        Ok(Some((
+        let (source, target) = (
             validate_variation_name(source)?,
             validate_variation_name(target)?,
-        )))
+        );
+        self.ensure_variation_in_namespace(&source)?;
+        self.ensure_variation_in_namespace(&target)?;
+        Ok(Some((source, target)))
     }
 
     fn rename_recovery_oid(&self, source: &str, state: &RecoveryState) -> Result<Option<Oid>> {
@@ -6407,6 +6455,7 @@ impl Workspace {
         let Some(metadata) = self.read_remote_delete_recovery_metadata(&state.operation_id)? else {
             return Ok(self.recovery_unavailable(state));
         };
+        self.ensure_variation_in_namespace(&metadata.variation)?;
         let expected_remote_oid = Oid::from_str(&metadata.expected_remote_oid)
             .map_err(|_| DraftlineError::VersionNotFound(metadata.expected_remote_oid.clone()))?;
         if state.target.as_deref() != Some(metadata.expected_remote_oid.as_str())
@@ -7205,6 +7254,7 @@ impl Workspace {
             Vec::new(),
             None,
         );
+        self.ensure_variation_in_namespace(&self.current_variation_unchecked()?)?;
         if !report.can_proceed {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
@@ -7260,6 +7310,7 @@ impl Workspace {
             Vec::new(),
             None,
         );
+        self.ensure_variation_in_namespace(&self.current_variation_unchecked()?)?;
         if !report.can_proceed {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
@@ -7322,6 +7373,7 @@ impl Workspace {
             Vec::new(),
             None,
         );
+        self.ensure_variation_in_namespace(&self.current_variation_unchecked()?)?;
         if !report.can_proceed {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }

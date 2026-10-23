@@ -121,6 +121,9 @@ pub enum DraftlineError {
     #[error("branch `{0}` is not a variation; switch to one or to the base branch to send")]
     SendOutsideNamespace(String),
 
+    #[error("branch `{0}` is outside this project's variations")]
+    VariationOutsideNamespace(String),
+
     #[error("pull request provider failed: {0}")]
     PullRequest(String),
 

@@ -1314,6 +1314,150 @@ fn send_needs_a_known_base_branch() {
 }
 
 #[test]
+fn namespaced_workspace_leaves_developer_branches_alone() {
+    use draftline::{RestoreVersionTarget, SwitchPolicy, VariationId};
+    let outside = |result: draftline::Result<_>| match result {
+        Err(DraftlineError::VariationOutsideNamespace(_)) => {}
+        Err(other) => panic!("expected VariationOutsideNamespace, got {other:?}"),
+        Ok(_) => panic!("expected VariationOutsideNamespace, got Ok"),
+    };
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/login", &head, false).unwrap();
+    repo.find_remote("origin")
+        .unwrap()
+        .push(&["refs/heads/feature/login:refs/heads/feature/login"], None)
+        .unwrap();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let dev = VariationId::from("feature/login");
+    let version = workspace.versions().unwrap()[0].id().clone();
+
+    outside(workspace.create_variation("feature/new").map(|_| ()));
+    outside(
+        workspace
+            .create_variation_from(&version, "feature/new")
+            .map(|_| ()),
+    );
+    outside(
+        workspace
+            .switch_variation(&dev, SwitchPolicy::AbortIfDirty)
+            .map(|_| ()),
+    );
+    outside(workspace.preflight_delete_variation(&dev).map(|_| ()));
+    outside(workspace.delete_variation(&dev));
+    outside(
+        workspace
+            .preflight_rename_variation(&dev, &VariationId::from("cutready/login"))
+            .map(|_| ()),
+    );
+    outside(
+        workspace
+            .rename_variation(
+                &VariationId::from("main"),
+                &VariationId::from("cutready/main"),
+            )
+            .map(|_| ()),
+    );
+    outside(workspace.adopt_remote_variation("origin", &dev).map(|_| ()));
+    outside(
+        workspace
+            .preflight_delete_remote_variation("origin", &dev)
+            .map(|_| ()),
+    );
+    outside(
+        workspace
+            .restore_version_as_new_save_to_variation(
+                &version,
+                "Back",
+                RestoreVersionTarget::Existing {
+                    variation: dev.clone(),
+                },
+            )
+            .map(|_| ()),
+    );
+    outside(
+        workspace
+            .restore_version_as_new_save_to_variation(
+                &version,
+                "Back",
+                RestoreVersionTarget::New {
+                    name: "feature/back".into(),
+                    metadata: Default::default(),
+                },
+            )
+            .map(|_| ()),
+    );
+    // The base branch is shared with developers; hybrid sharing goes through Send.
+    outside(workspace.preflight_publish("origin").map(|_| ()));
+    outside(workspace.publish_changes("origin").map(|_| ()));
+
+    assert!(repo
+        .find_branch("feature/login", git2::BranchType::Local)
+        .is_ok());
+    assert!(repo
+        .find_branch("feature/new", git2::BranchType::Local)
+        .is_err());
+    assert!(remote_branch(bare.path(), "feature/login").is_some());
+    assert_eq!(
+        repo.head().unwrap().shorthand(),
+        Some("main"),
+        "nothing switched"
+    );
+
+    let pitch = workspace.create_variation("cutready/pitch").unwrap();
+    workspace
+        .switch_variation(pitch.id(), SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    workspace
+        .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    workspace
+        .rename_variation(pitch.id(), &VariationId::from("cutready/demo"))
+        .unwrap();
+    workspace
+        .delete_variation(&VariationId::from("cutready/demo"))
+        .unwrap();
+
+    let unfiltered = scoped(&temp);
+    unfiltered
+        .switch_variation(&dev, SwitchPolicy::AbortIfDirty)
+        .unwrap();
+}
+
+#[test]
+fn namespaced_archive_restore_stays_inside_the_namespace() {
+    let (temp, _repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let old = workspace.create_variation("cutready/old").unwrap();
+    workspace.delete_variation(old.id()).unwrap();
+    let archive = workspace
+        .list_support_refs(draftline::SupportRefScope::Local)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("deleting a variation archives it");
+
+    let error = workspace
+        .preflight_restore_support_ref(&archive.id, "feature/old")
+        .unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::VariationOutsideNamespace(_)),
+        "{error:?}"
+    );
+    let mut token = workspace
+        .preflight_restore_support_ref(&archive.id, "cutready/old")
+        .unwrap()
+        .token;
+    token.target_variation = draftline::VariationId::from("feature/old");
+    let error = workspace.restore_support_ref(token).unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::VariationOutsideNamespace(_)),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn send_rejects_developer_branches_outside_the_variation_namespace() {
     let (temp, repo) = code_repo();
     let (bare, _other_dir, _other) = with_remote(&repo);
