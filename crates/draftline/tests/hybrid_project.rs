@@ -701,6 +701,49 @@ fn switch_refuses_a_branch_whose_own_rules_put_a_file_in_lfs() {
         .expect("no pending recovery");
 }
 
+fn blob_text(repo: &git2::Repository, spec: &str) -> Vec<u8> {
+    repo.revparse_single(spec)
+        .unwrap()
+        .peel_to_blob()
+        .unwrap()
+        .content()
+        .to_vec()
+}
+
+#[test]
+fn line_endings_round_trip_like_git_with_autocrlf() {
+    let (temp, repo) = code_repo();
+    repo.config()
+        .unwrap()
+        .set_bool("core.autocrlf", true)
+        .unwrap();
+    write_file(temp.path(), "cutready/notes.md", "one\r\ntwo\r\n");
+    commit_all(&repo, "Dev: notes");
+    let first = repo.head().unwrap().target().unwrap();
+    assert_eq!(blob_text(&repo, "HEAD:cutready/notes.md"), b"one\ntwo\n");
+    let workspace = scoped(&temp);
+    assert!(workspace.changed_files().unwrap().is_empty());
+
+    write_file(temp.path(), "cutready/notes.md", "one\r\ntwo edited\r\n");
+    workspace.save_version("Edit notes").unwrap();
+    assert_eq!(
+        blob_text(&repo, "HEAD:cutready/notes.md"),
+        b"one\ntwo edited\n"
+    );
+    assert!(status(&repo, "cutready/notes.md").is_empty());
+
+    let first = draftline::VersionId::from_canonical_string(first.to_string()).unwrap();
+    workspace
+        .restore_version_as_new_save(&first, "Back")
+        .unwrap();
+    assert_eq!(
+        fs::read(temp.path().join("cutready/notes.md")).unwrap(),
+        b"one\r\ntwo\r\n"
+    );
+    assert!(status(&repo, "cutready/notes.md").is_empty());
+    assert!(workspace.changed_files().unwrap().is_empty());
+}
+
 #[test]
 fn discard_and_shelve_never_write_lfs_pointers_over_real_files() {
     let (temp, _repo) = lfs_project();

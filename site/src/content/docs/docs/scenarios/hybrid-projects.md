@@ -49,8 +49,8 @@ Business goal: "Save my edits without disturbing the developer's code."
 |---|---|
 | Covered today? | Covered. |
 | Correct primitive path | `save_version`, `restore_version_as_new_save`, `shelve_changes` / `apply_shelf` as usual. |
-| Safety behavior | A save builds its commit from HEAD plus the folder's changes. Whatever the developer staged stays staged and uncommitted. Restores and shelves write only the folder and refuse when an untracked or ignored file is in the way. Files that need a Git filter (for example Git LFS) are never saved, overwritten, or discarded: Draftline cannot run the filter, so it refuses with a `GitFilter` hazard before writing anything. |
-| Tests | `save_leaves_developer_staged_changes_staged_and_uncommitted`, `restore_rolls_back_only_project_content`, `shelve_and_apply_leave_code_alone`, `restore_and_switch_never_write_lfs_pointers_over_real_files`, `discard_and_shelve_never_write_lfs_pointers_over_real_files`. |
+| Safety behavior | A save builds its commit from HEAD plus the folder's changes. Whatever the developer staged stays staged and uncommitted. Restores and shelves write only the folder and refuse when an untracked or ignored file is in the way. Files that need a Git filter (for example Git LFS) are never saved, overwritten, or discarded: Draftline cannot run the filter, so it refuses with a `GitFilter` hazard before writing anything. Line endings follow `core.autocrlf` and `.gitattributes` the same way Git does. |
+| Tests | `save_leaves_developer_staged_changes_staged_and_uncommitted`, `restore_rolls_back_only_project_content`, `shelve_and_apply_leave_code_alone`, `restore_and_switch_never_write_lfs_pointers_over_real_files`, `discard_and_shelve_never_write_lfs_pointers_over_real_files`, `switch_refuses_a_branch_whose_own_rules_put_a_file_in_lfs`, `line_endings_round_trip_like_git_with_autocrlf`. |
 
 ## Flow 15b: developers commit with plain Git
 
