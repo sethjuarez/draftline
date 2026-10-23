@@ -84,6 +84,7 @@ pub mod recovery;
 pub mod remote;
 pub mod tauri_contract;
 pub mod workspace;
+pub mod worktree;
 
 pub use content_policy::ContentPolicy;
 pub use error::{DraftlineError, Result};
@@ -139,3 +140,4 @@ pub use workspace::{
     WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection, WorkspaceSummary,
     WorkspaceVerification,
 };
+pub use worktree::{OwnedWorktree, WorktreeStart, OWNED_WORKTREE_PREFIX};

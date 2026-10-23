@@ -141,6 +141,15 @@ pub enum DraftlineError {
 
     #[error("merge needs a developer: files outside the project conflict: {0:?}")]
     MergeNeedsDeveloper(Vec<std::path::PathBuf>),
+
+    #[error("worktree `{0}` was not created by Draftline")]
+    NotOwnedWorktree(String),
+
+    #[error("worktree `{0}` is the one this workspace is open in")]
+    OwnedWorktreeInUse(String),
+
+    #[error("worktree has unsaved or untracked files: {0:?}")]
+    OwnedWorktreeHasChanges(Vec<std::path::PathBuf>),
 }
 
 fn timeout_suffix(timeout_ms: u64) -> String {

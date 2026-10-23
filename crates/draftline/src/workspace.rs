@@ -14,6 +14,7 @@ use crate::merge::{MergeConflict, MergeInput, ResolverRegistry};
 use crate::pull_request::{PullRequestProvider, PullRequestRequest, SendRequest, SendResult};
 use crate::recovery::RecoveryOperation;
 use crate::remote::{ensure_supported_remote_url, PushRefExpectation};
+use crate::worktree::{OwnedWorktree, WorktreeStart, OWNED_WORKTREE_PREFIX};
 use crate::{
     path::normalize_workspace_relative, ContentPolicy, Contributor, ContributorProfile,
     DraftlineError, PublishPreflight, PublishResult, PublishToken, RecoveryState, RemoteEndpoint,
@@ -9150,6 +9151,169 @@ impl Workspace {
             pull_request,
             created_pull_request,
         })
+    }
+
+    /// Creates a separate checkout under `worktrees_dir` on a new branch named
+    /// after `title` (inside the variation namespace), like the Copilot app's
+    /// per-task worktrees. This checkout, its index, and its branch are left
+    /// alone. Fetch first to start from the latest base, then open the
+    /// returned `project_path` as usual.
+    pub fn create_owned_worktree(
+        &self,
+        worktrees_dir: impl AsRef<Path>,
+        title: impl AsRef<str>,
+        remote: impl AsRef<str>,
+        start: WorktreeStart,
+    ) -> Result<OwnedWorktree> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref();
+        let start_commit = match start {
+            WorktreeStart::CurrentVersion => self.repo.head()?.peel_to_commit()?,
+            WorktreeStart::LatestBase => {
+                let base = self
+                    .default_branch_on(remote)
+                    .ok_or(DraftlineError::SendBaseUnknown)?;
+                let oid = self
+                    .repo
+                    .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
+                    .or_else(|_| self.repo.refname_to_id(&format!("refs/heads/{base}")))?;
+                self.repo.find_commit(oid)?
+            }
+        };
+        let worktrees_dir = worktrees_dir.as_ref();
+        let worktree_name =
+            |branch: &str| format!("{OWNED_WORKTREE_PREFIX}{}", branch.replace('/', "-"));
+        let variation = self.unused_send_branch_name(title.as_ref(), |name| {
+            self.repo.find_branch(name, BranchType::Local).is_ok()
+                || self
+                    .repo
+                    .find_reference(&format!("refs/remotes/{remote}/{name}"))
+                    .is_ok()
+                || self.repo.find_worktree(&worktree_name(name)).is_ok()
+                || worktrees_dir.join(worktree_name(name)).exists()
+        })?;
+        let name = worktree_name(&variation);
+        let path = worktrees_dir.join(&name);
+        fs::create_dir_all(worktrees_dir)?;
+
+        let reference = self
+            .repo
+            .branch(&variation, &start_commit, false)?
+            .into_reference();
+        let mut options = git2::WorktreeAddOptions::new();
+        options.reference(Some(&reference));
+        // The project may not exist yet where the branch starts.
+        let project_path = path.join(self.scope());
+        let added = self
+            .repo
+            .worktree(&name, &path, Some(&options))
+            .map_err(DraftlineError::from)
+            .and_then(|_| fs::create_dir_all(&project_path).map_err(DraftlineError::from));
+        if let Err(error) = added {
+            drop(reference);
+            self.roll_back_owned_worktree(&name, &path, &variation)?;
+            return Err(error);
+        }
+        Ok(OwnedWorktree {
+            name,
+            path,
+            project_path,
+            variation: Some(variation),
+        })
+    }
+
+    /// Lists the checkouts [`Self::create_owned_worktree`] made in this
+    /// repository. Other tools' worktrees are never included.
+    pub fn owned_worktrees(&self) -> Result<Vec<OwnedWorktree>> {
+        let mut owned = Vec::new();
+        for name in self.repo.worktrees()?.iter().flatten() {
+            if !name.starts_with(OWNED_WORKTREE_PREFIX) {
+                continue;
+            }
+            let worktree = self.repo.find_worktree(name)?;
+            let path = worktree.path().components().collect::<PathBuf>();
+            let variation = Repository::open_from_worktree(&worktree)
+                .ok()
+                .and_then(|repo| {
+                    repo.head()
+                        .ok()
+                        .and_then(|head| head.shorthand().map(str::to_string))
+                });
+            owned.push(OwnedWorktree {
+                name: name.to_string(),
+                project_path: path.join(self.scope()),
+                path,
+                variation,
+            });
+        }
+        Ok(owned)
+    }
+
+    /// Deletes an owned checkout's folder; its branch and versions stay, like
+    /// `git worktree remove`. Refuses while it has unsaved or untracked files
+    /// unless `discard_changes`, and refuses the checkout this workspace is in.
+    pub fn remove_owned_worktree(
+        &self,
+        name: impl AsRef<str>,
+        discard_changes: bool,
+    ) -> Result<()> {
+        let name = name.as_ref();
+        if !name.starts_with(OWNED_WORKTREE_PREFIX) {
+            return Err(DraftlineError::NotOwnedWorktree(name.to_string()));
+        }
+        let worktree = self.repo.find_worktree(name)?;
+        let path = worktree.path().to_path_buf();
+        let in_use = match (fs::canonicalize(&path), fs::canonicalize(&self.root)) {
+            (Ok(path), Ok(root)) => path == root,
+            _ => false,
+        };
+        if in_use {
+            return Err(DraftlineError::OwnedWorktreeInUse(name.to_string()));
+        }
+        if !discard_changes && path.exists() {
+            // Damaged metadata means its changes can't be checked; keep it.
+            if worktree.validate().is_err() {
+                return Err(DraftlineError::OwnedWorktreeHasChanges(vec![path]));
+            }
+            let repo = Repository::open_from_worktree(&worktree)?;
+            let mut options = StatusOptions::new();
+            options.include_untracked(true).recurse_untracked_dirs(true);
+            let statuses = repo.statuses(Some(&mut options))?;
+            if !statuses.is_empty() {
+                let changed = statuses
+                    .iter()
+                    .map(|entry| {
+                        PathBuf::from(String::from_utf8_lossy(entry.path_bytes()).as_ref())
+                    })
+                    .collect();
+                return Err(DraftlineError::OwnedWorktreeHasChanges(changed));
+            }
+        }
+        let mut prune = git2::WorktreePruneOptions::new();
+        prune.valid(true).working_tree(true);
+        worktree.prune(Some(&mut prune))?;
+        Ok(())
+    }
+
+    /// Undoes a half-made owned worktree: its folder, admin data, then the
+    /// new branch. Errors if anything is left so it isn't silently orphaned.
+    fn roll_back_owned_worktree(&self, name: &str, path: &Path, branch: &str) -> Result<()> {
+        if let Ok(worktree) = self.repo.find_worktree(name) {
+            let mut prune = git2::WorktreePruneOptions::new();
+            prune.valid(true).working_tree(true).locked(true);
+            worktree.prune(Some(&mut prune))?;
+        }
+        if path.exists() {
+            fs::remove_dir_all(path)?;
+        }
+        let admin = self.repo.commondir().join("worktrees").join(name);
+        if admin.exists() {
+            fs::remove_dir_all(admin)?;
+        }
+        if let Ok(mut created) = self.repo.find_branch(branch, BranchType::Local) {
+            created.delete()?;
+        }
+        Ok(())
     }
 
     fn unused_send_branch_name(&self, title: &str, taken: impl Fn(&str) -> bool) -> Result<String> {

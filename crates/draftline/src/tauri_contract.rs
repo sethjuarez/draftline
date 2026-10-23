@@ -3231,6 +3231,9 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
         DraftlineError::MergeNeedsDeveloper(_) => "merge_needs_developer",
+        DraftlineError::NotOwnedWorktree(_) => "not_owned_worktree",
+        DraftlineError::OwnedWorktreeInUse(_) => "owned_worktree_in_use",
+        DraftlineError::OwnedWorktreeHasChanges(_) => "owned_worktree_has_changes",
     }
 }
 

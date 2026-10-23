@@ -1681,3 +1681,228 @@ fn repairing_a_finished_incoming_merge_keeps_newer_project_edits() {
         .unwrap()
         .is_none_or(|state| state.completed));
 }
+
+#[test]
+fn owned_worktree_starts_from_the_latest_base_and_leaves_this_checkout_alone() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    write_file(other_dir.path(), "cutready/outro.sk", "outro on main\n");
+    commit_all(&other, "Teammate scene");
+    push_main(&other);
+    workspace.fetch_remote("origin").unwrap();
+    write_file(temp.path(), "src/main.rs", "fn main() { staged(); }\n");
+    stage(&repo, "src/main.rs");
+    let head_before = repo.head().unwrap().target().unwrap();
+
+    let worktrees = tempfile::tempdir().unwrap();
+    let owned = workspace
+        .create_owned_worktree(
+            worktrees.path(),
+            "Pitch deck",
+            "origin",
+            draftline::WorktreeStart::LatestBase,
+        )
+        .unwrap();
+    assert_eq!(owned.variation.as_deref(), Some("cutready/pitch-deck"));
+    assert_eq!(owned.name, "draftline-cutready-pitch-deck");
+    assert_eq!(owned.project_path, owned.path.join("cutready"));
+    assert_eq!(read(&owned.path, "cutready/outro.sk"), "outro on main\n");
+
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert_eq!(repo.head().unwrap().target().unwrap(), head_before);
+    assert!(status(&repo, "src/main.rs").contains(git2::Status::INDEX_MODIFIED));
+
+    let copy = Workspace::open_with_policy(&owned.project_path, cutready_policy()).unwrap();
+    write_file(&owned.path, "cutready/intro.sk", "in the copy\n");
+    copy.save_version("Copy edit").unwrap();
+    assert_eq!(copy.current_variation().unwrap(), "cutready/pitch-deck");
+    assert_eq!(repo.head().unwrap().target().unwrap(), head_before);
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one\n");
+
+    let again = workspace
+        .create_owned_worktree(
+            worktrees.path(),
+            "Pitch deck",
+            "origin",
+            draftline::WorktreeStart::LatestBase,
+        )
+        .unwrap();
+    assert_eq!(again.variation.as_deref(), Some("cutready/pitch-deck-2"));
+}
+
+#[test]
+fn owned_worktree_can_carry_the_current_version_and_lists_only_its_own() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "unsent save\n");
+    workspace.save_version("Unsent").unwrap();
+
+    let other_tools = tempfile::tempdir().unwrap();
+    let copilot_branch = repo
+        .branch(
+            "copilot/task",
+            &repo.head().unwrap().peel_to_commit().unwrap(),
+            false,
+        )
+        .unwrap()
+        .into_reference();
+    let mut options = git2::WorktreeAddOptions::new();
+    options.reference(Some(&copilot_branch));
+    repo.worktree(
+        "copilot-task",
+        &other_tools.path().join("task"),
+        Some(&options),
+    )
+    .unwrap();
+
+    let worktrees = tempfile::tempdir().unwrap();
+    let owned = workspace
+        .create_owned_worktree(
+            worktrees.path(),
+            "Carry on",
+            "origin",
+            draftline::WorktreeStart::CurrentVersion,
+        )
+        .unwrap();
+    assert_eq!(read(&owned.path, "cutready/intro.sk"), "unsent save\n");
+    assert_eq!(workspace.owned_worktrees().unwrap(), vec![owned.clone()]);
+    assert!(matches!(
+        workspace.remove_owned_worktree("copilot-task", true),
+        Err(DraftlineError::NotOwnedWorktree(_))
+    ));
+    assert!(other_tools.path().join("task").exists());
+}
+
+#[test]
+fn removing_an_owned_worktree_keeps_its_branch_and_refuses_unsaved_work() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let worktrees = tempfile::tempdir().unwrap();
+    let owned = workspace
+        .create_owned_worktree(
+            worktrees.path(),
+            "Draft",
+            "origin",
+            draftline::WorktreeStart::LatestBase,
+        )
+        .unwrap();
+    let copy = Workspace::open_with_policy(&owned.project_path, cutready_policy()).unwrap();
+    write_file(&owned.path, "cutready/intro.sk", "saved in copy\n");
+    copy.save_version("Saved").unwrap();
+    assert!(matches!(
+        copy.remove_owned_worktree(&owned.name, true),
+        Err(DraftlineError::OwnedWorktreeInUse(_))
+    ));
+    drop(copy);
+
+    write_file(&owned.path, "notes.txt", "scratch\n");
+    assert!(matches!(
+        workspace.remove_owned_worktree(&owned.name, false),
+        Err(DraftlineError::OwnedWorktreeHasChanges(paths)) if paths == [PathBuf::from("notes.txt")]
+    ));
+    assert!(owned.path.exists());
+
+    workspace.remove_owned_worktree(&owned.name, true).unwrap();
+    assert!(!owned.path.exists());
+    assert!(workspace.owned_worktrees().unwrap().is_empty());
+    let branch = repo
+        .find_branch("cutready/draft", git2::BranchType::Local)
+        .unwrap();
+    assert_eq!(
+        tree_text(&repo, "cutready/draft", "cutready/intro.sk").as_deref(),
+        Some("saved in copy\n")
+    );
+    drop(branch);
+}
+
+#[test]
+fn removing_an_owned_worktree_with_damaged_metadata_keeps_its_files() {
+    let (temp, _repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let worktrees = tempfile::tempdir().unwrap();
+    let owned = workspace
+        .create_owned_worktree(
+            worktrees.path(),
+            "Damaged",
+            "origin",
+            draftline::WorktreeStart::LatestBase,
+        )
+        .unwrap();
+    write_file(&owned.path, "cutready/unsaved.sk", "only copy\n");
+    std::fs::remove_file(
+        temp.path()
+            .join(".git/worktrees")
+            .join(&owned.name)
+            .join("HEAD"),
+    )
+    .unwrap();
+
+    let result = workspace.remove_owned_worktree(&owned.name, false);
+    assert!(result.is_err(), "{result:?}");
+
+    assert_eq!(read(&owned.path, "cutready/unsaved.sk"), "only copy\n");
+}
+
+#[test]
+fn a_failed_owned_worktree_leaves_nothing_behind() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    // A base where the project folder's name is taken by a file.
+    let blob = repo.blob(b"not a folder\n").unwrap();
+    let mut tree = repo.treebuilder(None).unwrap();
+    tree.insert("cutready", blob, 0o100644).unwrap();
+    let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+    let signature = git2::Signature::now("Teammate", "t@example.com").unwrap();
+    let commit = repo
+        .commit(None, &signature, &signature, "Odd base", &tree, &[])
+        .unwrap();
+    repo.reference("refs/remotes/origin/main", commit, true, "test")
+        .unwrap();
+
+    let worktrees = tempfile::tempdir().unwrap();
+    assert!(workspace
+        .create_owned_worktree(
+            worktrees.path(),
+            "Broken",
+            "origin",
+            draftline::WorktreeStart::LatestBase,
+        )
+        .is_err());
+    assert!(repo
+        .find_branch("cutready/broken", git2::BranchType::Local)
+        .is_err());
+    assert!(repo.worktrees().unwrap().is_empty());
+    assert!(!worktrees.path().join("draftline-cutready-broken").exists());
+    assert!(!temp
+        .path()
+        .join(".git/worktrees/draftline-cutready-broken")
+        .exists());
+
+    // The same from inside a linked worktree, whose own .git is elsewhere.
+    let linked = workspace
+        .create_owned_worktree(
+            worktrees.path(),
+            "Linked",
+            "origin",
+            draftline::WorktreeStart::CurrentVersion,
+        )
+        .unwrap();
+    let inner = Workspace::open_with_policy(&linked.project_path, cutready_policy())
+        .unwrap()
+        .with_variation_namespace("cutready/")
+        .unwrap();
+    assert!(inner
+        .create_owned_worktree(
+            worktrees.path(),
+            "Broken",
+            "origin",
+            draftline::WorktreeStart::LatestBase
+        )
+        .is_err());
+    assert_eq!(repo.worktrees().unwrap().len(), 1);
+    assert!(!temp
+        .path()
+        .join(".git/worktrees/draftline-cutready-broken")
+        .exists());
+}
