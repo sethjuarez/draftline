@@ -237,38 +237,19 @@ Support refs should be:
 - fetched into remote-tracking layout
 - included in purge/redaction enumeration
 
-## Phase 6: shared cleanup and history replacement
+## Phase 6: shared cleanup
 
 | API | Purpose |
 |---|---|
-| `Workspace::preview_history_cleanup(request)` | Durable local-first timeline cleanup preview with candidate commits, hidden preview refs, graph diff, structured warnings, and commit/snapshot remapping ledger. Implemented for linear milestone compaction. |
-| `Workspace::apply_history_cleanup(plan_id, confirmation)` | Applies a preflighted cleanup only when the target visible ref and hidden preview ref still match the durable plan, creating a backup ref before moving visible history. Implemented for local cleanup. |
-| `Workspace::resolve_rewritten_version(request)` | Resolves stale version IDs through applied cleanup ledgers and support refs. Implemented. |
-| `Workspace::preflight_undo_history_cleanup(plan_id)` / `Workspace::undo_history_cleanup(token)` | Restores a cleanup backup ref after checking the current visible ref still matches the applied cleanup. Implemented. |
 | `Workspace::preflight_delete_variation(id)` | Local delete preflight with archive details. Implemented. |
 | `Workspace::delete_variation_with_token(token)` | Local delete after archive. Implemented. |
 | `Workspace::delete_variation(id)` | Compatibility helper that preflights and executes. Implemented. |
 | `Workspace::preflight_delete_remote_variation(id)` | Shared delete preflight with expected remote OID and support-ref plan. |
 | `Workspace::delete_remote_variation(token)` | Publish support ref first, then delete visible remote ref by lease. |
-| `Workspace::preflight_squash_versions(count)` | Local squash preflight with archive details. Implemented. |
-| `Workspace::squash_versions_with_token(token)` | Local squash after archive. Implemented. |
-| `Workspace::squash_versions(count, label)` | Compatibility helper that preflights and executes. Implemented. |
-| `Workspace::history_compaction_candidates(request)` | Finds safe local compaction partner endpoints, blockers, descendant replay counts, and optional remote impact for a selected version. Implemented. |
-| `Workspace::preflight_replace_remote_history(remote)` | Current-variation shared history replacement preflight with support-ref plan. Implemented. |
-| `RemoteHistoryReplaceToken::confirm_shared_history_rewrite()` | Explicit confirmation boundary before shared history replacement. Implemented. |
-| `Workspace::replace_remote_history(token)` | Lease-protected replacement after confirmation and shared support ref publication. Implemented. |
-| `Workspace::preflight_history_cleanup_remote_impact(plan_id, remote)` | Classifies a cleanup plan as no-upstream, local-only, normal publish, shared-history rewrite, or remote-incoming. Implemented. |
-| `Workspace::preflight_publish_history_cleanup(plan_id, remote)` | Captures expected remote OID, replacement OID, and support-ref publish token for a local cleanup that is ready to share. Implemented. |
-| `Workspace::publish_history_cleanup(token, confirmation)` | Publishes cleanup support refs first, then moves the visible remote branch with expected-OID lease protection. Implemented. |
-| `Workspace::fetch_remote(remote)` / `Workspace::apply_incoming(remote)` | Fetch support refs with visible refs and apply recognized incoming compaction rewrites, including safe first-parent replay of local-only snapshots. Implemented. |
-| `Workspace::preflight_milestone_merge(remote)` | Validate a clean local-ahead current variation can be wrapped as an additive milestone merge without rewriting save history. Implemented for Flow 10a. |
-| `Workspace::create_milestone_merge(token, label)` | Create a normal two-parent milestone commit whose first parent is the shared remote tip and second parent is the local save-chain tip, then leave publication to normal guarded publish. Implemented for Flow 10a. |
 
-Shared visible refs should never be deleted or replaced unless the recovery support ref is durably published to the shared remote.
+Shared visible refs should never be deleted unless the recovery support ref is durably published to the shared remote.
 
-Timeline cleanup remains local-first for the rewrite itself: hosts preview and apply locally before sharing. Shared publication is explicit through `preflight_publish_history_cleanup` / `publish_history_cleanup`, which publishes support refs before the lease-guarded visible branch move. Incoming shared compaction is handled through normal fetch/sync/apply paths once support refs are fetched; dirty work blocks and ambiguous merge-shaped local history stays in merge flow.
-
-Milestone merge is the non-rewrite alternative for sharing a clean main line. It preserves every original save commit and creates one named merge commit that can be published with normal fast-forward/lease semantics; it is not part of cleanup publish and must not require force-push or remote replacement.
+Draftline does not rewrite existing history. Operations that rewrote local or shared history (including force-with-lease replacement of a remote branch) were removed so Draftline can share a branch with developers using plain Git without ever asking them to reconcile rewritten history.
 
 ## Phase 7: purge/redaction
 
@@ -280,7 +261,7 @@ Purge is a destructive, admin-permissioned, best-effort workflow. It cannot guar
 | `Workspace::purge_content(token)` | Execute destructive rewrite/deletion after approval. |
 | `Workspace::verify_purge(token)` | Post-purge reachability verification. |
 
-This should remain separate from cleanup, support-ref expiration, and normal delete/squash.
+This should remain separate from cleanup, support-ref expiration, and normal delete.
 
 ## Agent and tool facade
 
@@ -333,7 +314,7 @@ This table tracks the intended API shape and the current implementation state. "
 | 6. Shelf lifecycle | shelve in place, list, preview, apply with conflicts, delete | "Put aside" becomes a complete workflow. | Implemented for all-work and selected-file shelves; conflict-resolution apply remains. |
 | 7. Support refs | publish/fetch/list/restore/expire support refs | Shared recovery works across machines. | Implemented for local publish/fetch/list/restore and local expiration; remote retention remains. |
 | 8. Collaboration expansion | remote variation lifecycle and merge incoming | Team workflows cover created/deleted/renamed/diverged variations. | Partial: fetch-all/prune diagnostics, remote list/adopt, merge preflight, and clean merge execution exist; rename inference/conflict execution remain. |
-| 9. Shared cleanup | timeline cleanup, remote delete, and shared history replacement | Team cleanup becomes previewable, lease-protected, recoverable, and consumable by product timeline UIs. | Partial: local milestone timeline cleanup with durable preview/apply/ledger/resolver/undo is implemented; remote delete and current-variation replacement are implemented with explicit confirmation plus support-ref-first lease mechanics; direct remote cleanup apply and broader admin UX remain. |
+| 9. Shared cleanup | remote delete | Team cleanup is lease-protected and recoverable without rewriting history. | Implemented: remote delete publishes support refs first and deletes with expected-OID lease mechanics; broader admin UX remains. |
 | 10. Admin deletion | purge/redaction | Sensitive-content deletion is explicit and best-effort. | Partial planning only: purge preflight and verify exist; destructive execution is missing. |
 
 ## Open design questions

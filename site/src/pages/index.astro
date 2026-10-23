@@ -20,7 +20,7 @@ const safetyDiagram = `flowchart LR
     D -- No --> F[append-only or ref-creating action]
     E --> G[operation lock and recovery state]
     F --> G
-    G --> H{Visible ref deleted or rewritten?}
+    G --> H{Visible ref deleted?}
     H -- Yes --> I[archive old tip under refs/draftline]
     H -- No --> J[business-shaped result]
     I --> J`;
@@ -105,7 +105,7 @@ const safetyDiagram = `flowchart LR
         <article><span>Try another direction</span><strong>Create a variation</strong></article>
         <article><span>Go back</span><strong>Restore as a new save</strong></article>
         <article><span>Share</span><strong>Fetch, compare, publish</strong></article>
-        <article><span>Clean up</span><strong>Archive first, then rewrite</strong></article>
+        <article><span>Clean up</span><strong>Archive first, then delete</strong></article>
         <article><span>Recover</span><strong>Use hidden support refs</strong></article>
       </div>
     </section>

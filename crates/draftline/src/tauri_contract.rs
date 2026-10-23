@@ -10,20 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     merge::MergeConflict, AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult,
-    ChangeSet, CleanupPlanId, ContentPolicy, ContentPolicyAudit, ContributorProfile,
-    CurrentFileDiff, CurrentFilePreview, DirtySummary, DraftlineError, HistoryCleanupPreview,
-    HistoryCleanupPublishPreflight, HistoryCleanupPublishResult, HistoryCleanupPublishToken,
-    HistoryCleanupRemoteImpact, HistoryCleanupRequest, HistoryCleanupUndoPreflight,
-    HistoryCleanupUndoToken, HistoryCompactionCandidates, HistoryCompactionCandidatesRequest,
-    HistoryEntry, MergeConflictResolution, MergeIncomingReport, MergeIncomingResult,
-    MergeIncomingToken, MergeResolutionChoice, MilestoneMergeReport, MilestoneMergeResult,
-    OperationLockInspection, PendingHistoryCleanup, PreflightReport, PreviewFile, PublishPreflight,
-    PublishResult, RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest,
-    RemoteEndpoint, RemoteOptions, RemoteVariation, RemoteVariationDiagnostics,
-    RestoreVersionTarget, Result, RewriteConfirmation, Shelf, ShelfApplyReport,
-    StaleVersionResolution, StaleVersionResolutionRequest, SupportRef, SupportRefScope,
-    SwitchPolicy, SyncState, SyncStatus, TimelineCleanupResult, Variation,
-    VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
+    ChangeSet, ContentPolicy, ContentPolicyAudit, ContributorProfile, CurrentFileDiff,
+    CurrentFilePreview, DirtySummary, DraftlineError, HistoryEntry, MergeConflictResolution,
+    MergeIncomingReport, MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice,
+    OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight, PublishResult,
+    RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
+    RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result,
+    Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SwitchPolicy, SyncState, SyncStatus,
+    Variation, VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
     VariationRenamePreflight, VariationRenameToken, VariationSummary, Version, VersionDiff,
     VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
     WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
@@ -115,9 +109,9 @@ impl<'callbacks> DraftlineCommandContext<'callbacks> {
         if let Some(provider) = self.credential_provider.as_ref() {
             RemoteOptions::new().with_credentials(move |request| {
                 let mut provider = provider.lock().map_err(|_| {
-                    DraftlineError::InvalidHistoryCleanup(
-                        "remote credential provider lock was poisoned".to_string(),
-                    )
+                    DraftlineError::Io(std::io::Error::other(
+                        "remote credential provider lock was poisoned",
+                    ))
                 })?;
                 provider(request)
             })
@@ -351,104 +345,6 @@ pub struct SwitchVariationRequest {
 pub struct VersionRequest {
     pub workspace_path: PathBuf,
     pub version_id: String,
-}
-
-/// Request for previewing a durable history cleanup plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreviewHistoryCleanupRequest {
-    pub workspace_path: PathBuf,
-    pub cleanup: HistoryCleanupRequest,
-}
-
-/// Request for listing viable compaction partners for a selected version.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCompactionCandidatesCommandRequest {
-    pub workspace_path: PathBuf,
-    pub request: HistoryCompactionCandidatesRequest,
-}
-
-/// Request for applying a durable history cleanup plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApplyHistoryCleanupRequest {
-    pub workspace_path: PathBuf,
-    pub plan_id: String,
-    pub confirmation: RewriteConfirmation,
-}
-
-/// Request for listing durable pending history cleanups.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListPendingHistoryCleanupsRequest {
-    pub workspace_path: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_variation: Option<String>,
-}
-
-/// Request for preflighting cleanup remote impact.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCleanupRemoteImpactRequest {
-    pub workspace_path: PathBuf,
-    pub plan_id: String,
-    pub remote: String,
-}
-
-/// Request for explicitly preflighting cleanup rewrite publication.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublishHistoryCleanupPreflightRequest {
-    pub workspace_path: PathBuf,
-    pub plan_id: String,
-    pub remote: String,
-}
-
-/// Request for explicitly publishing a cleanup rewrite.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublishHistoryCleanupRequest {
-    pub workspace_path: PathBuf,
-    pub token: HistoryCleanupPublishToken,
-    pub confirmation: RewriteConfirmation,
-}
-
-/// Request for preflighting and publishing a pending cleanup in one command.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublishPendingHistoryCleanupRequest {
-    pub workspace_path: PathBuf,
-    pub plan_id: String,
-    pub remote: String,
-    pub confirmation: RewriteConfirmation,
-}
-
-/// Request for resolving a stale version through cleanup ledgers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolveRewrittenVersionRequest {
-    pub workspace_path: PathBuf,
-    pub version_id: String,
-}
-
-/// Request for preflighting history cleanup undo.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UndoHistoryCleanupPreflightRequest {
-    pub workspace_path: PathBuf,
-    pub plan_id: String,
-}
-
-/// Request for applying history cleanup undo.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UndoHistoryCleanupRequest {
-    pub workspace_path: PathBuf,
-    pub token: HistoryCleanupUndoToken,
-}
-
-/// Request for undoing a pending cleanup in one command.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UndoPendingHistoryCleanupRequest {
-    pub workspace_path: PathBuf,
-    pub plan_id: String,
-}
-
-/// Request for explicitly abandoning a pending cleanup marker.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AbandonPendingHistoryCleanupRequest {
-    pub workspace_path: PathBuf,
-    pub plan_id: String,
 }
 
 /// Request for reading diff/preview content for one current workspace file.
@@ -719,14 +615,6 @@ pub struct MergeIncomingRequest {
     pub from_base: bool,
 }
 
-/// Request for wrapping local-ahead saves in a named milestone merge.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MilestoneMergeRequest {
-    pub workspace_path: PathBuf,
-    pub remote: String,
-    pub label: String,
-}
-
 /// Request for writing an incoming merge after explicit conflict resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeIncomingWithResolutionsRequest {
@@ -742,14 +630,6 @@ pub struct MergeIncomingWithResolutionsRequest {
 pub struct MergeIncomingCommandResult {
     pub preflight: MergeIncomingReport,
     pub merge: MergeIncomingResult,
-    pub postconditions: CommandPostconditions,
-}
-
-/// Milestone merge result with the preflight and postcondition state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MilestoneMergeCommandResult {
-    pub preflight: MilestoneMergeReport,
-    pub merge: MilestoneMergeResult,
     pub postconditions: CommandPostconditions,
 }
 
@@ -1180,293 +1060,6 @@ pub fn get_full_history_with_context(
     context
         .open_workspace(&request.workspace_path)?
         .full_history()
-}
-
-/// Returns viable compaction partners for a selected version.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn get_history_compaction_candidates(
-    request: HistoryCompactionCandidatesCommandRequest,
-) -> Result<HistoryCompactionCandidates> {
-    get_history_compaction_candidates_with_context(&DraftlineCommandContext::new(), request)
-}
-
-/// Returns viable compaction partners using a configured host context.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn get_history_compaction_candidates_with_context(
-    context: &DraftlineCommandContext<'_>,
-    request: HistoryCompactionCandidatesCommandRequest,
-) -> Result<HistoryCompactionCandidates> {
-    context
-        .open_workspace(&request.workspace_path)?
-        .history_compaction_candidates(request.request)
-}
-
-/// Previews a durable history cleanup plan.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn preview_history_cleanup(
-    request: PreviewHistoryCleanupRequest,
-) -> Result<HistoryCleanupPreview> {
-    preview_history_cleanup_with_context(&DraftlineCommandContext::new(), request)
-}
-
-/// Previews a durable history cleanup plan using a configured host context.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn preview_history_cleanup_with_context(
-    context: &DraftlineCommandContext<'_>,
-    request: PreviewHistoryCleanupRequest,
-) -> Result<HistoryCleanupPreview> {
-    let workspace = context.open_workspace(&request.workspace_path)?;
-    let mut options = context.remote_options();
-    if let Some(profile) = context.contributor_profile.as_ref() {
-        workspace.preview_history_cleanup_with_options_and_profile(
-            request.cleanup,
-            &mut options,
-            profile,
-        )
-    } else {
-        workspace.preview_history_cleanup_with_options(request.cleanup, &mut options)
-    }
-}
-
-/// Applies a durable history cleanup plan.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn apply_history_cleanup(request: ApplyHistoryCleanupRequest) -> Result<TimelineCleanupResult> {
-    apply_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
-}
-
-/// Applies a durable history cleanup plan using a configured host context.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn apply_history_cleanup_with_context(
-    context: &mut DraftlineCommandContext<'_>,
-    request: ApplyHistoryCleanupRequest,
-) -> Result<TimelineCleanupResult> {
-    let workspace = context.open_workspace(&request.workspace_path)?;
-    let plan_id = CleanupPlanId::from_string(request.plan_id)?;
-    let result = if let Some(profile) = context.contributor_profile.as_ref() {
-        workspace.apply_history_cleanup_with_profile(plan_id, request.confirmation, profile)?
-    } else {
-        workspace.apply_history_cleanup(plan_id, request.confirmation)?
-    };
-    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
-    Ok(result)
-}
-
-/// Lists durable pending history cleanups for a workspace or variation.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn list_pending_history_cleanups(
-    request: ListPendingHistoryCleanupsRequest,
-) -> Result<Vec<PendingHistoryCleanup>> {
-    list_pending_history_cleanups_with_context(&DraftlineCommandContext::new(), request)
-}
-
-/// Lists durable pending history cleanups using a configured host context.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn list_pending_history_cleanups_with_context(
-    context: &DraftlineCommandContext<'_>,
-    request: ListPendingHistoryCleanupsRequest,
-) -> Result<Vec<PendingHistoryCleanup>> {
-    let target_variation = request.target_variation.map(VariationId::from);
-    context
-        .open_workspace(&request.workspace_path)?
-        .pending_history_cleanups(target_variation.as_ref())
-}
-
-/// Preflights origin-aware cleanup impact for a prepared plan.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn preflight_history_cleanup_remote_impact(
-    request: HistoryCleanupRemoteImpactRequest,
-) -> Result<HistoryCleanupRemoteImpact> {
-    preflight_history_cleanup_remote_impact_with_context(&DraftlineCommandContext::new(), request)
-}
-
-/// Preflights origin-aware cleanup impact using a configured host context.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn preflight_history_cleanup_remote_impact_with_context(
-    context: &DraftlineCommandContext<'_>,
-    request: HistoryCleanupRemoteImpactRequest,
-) -> Result<HistoryCleanupRemoteImpact> {
-    let plan_id = CleanupPlanId::from_string(request.plan_id)?;
-    let workspace = context.open_workspace(&request.workspace_path)?;
-    let mut options = context.remote_options();
-    workspace.preflight_history_cleanup_remote_impact_with_options(
-        plan_id,
-        request.remote,
-        &mut options,
-    )
-}
-
-/// Preflights explicit publication of an applied cleanup rewrite.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn preflight_publish_history_cleanup(
-    request: PublishHistoryCleanupPreflightRequest,
-) -> Result<HistoryCleanupPublishPreflight> {
-    preflight_publish_history_cleanup_with_context(&DraftlineCommandContext::new(), request)
-}
-
-/// Preflights explicit cleanup publication using a configured host context.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn preflight_publish_history_cleanup_with_context(
-    context: &DraftlineCommandContext<'_>,
-    request: PublishHistoryCleanupPreflightRequest,
-) -> Result<HistoryCleanupPublishPreflight> {
-    let plan_id = CleanupPlanId::from_string(request.plan_id)?;
-    let workspace = context.open_workspace(&request.workspace_path)?;
-    let mut options = context.remote_options();
-    workspace.preflight_publish_history_cleanup_with_options(plan_id, request.remote, &mut options)
-}
-
-/// Publishes an applied cleanup rewrite after explicit confirmation.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn publish_history_cleanup(
-    request: PublishHistoryCleanupRequest,
-) -> Result<HistoryCleanupPublishResult> {
-    publish_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
-}
-
-/// Publishes an applied cleanup rewrite using a configured host context.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn publish_history_cleanup_with_context(
-    context: &mut DraftlineCommandContext<'_>,
-    request: PublishHistoryCleanupRequest,
-) -> Result<HistoryCleanupPublishResult> {
-    let workspace = context.open_workspace(&request.workspace_path)?;
-    let result = {
-        let mut options = context.remote_options();
-        workspace.publish_history_cleanup_with_options(
-            request.token,
-            request.confirmation,
-            &mut options,
-        )?
-    };
-    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
-    Ok(result)
-}
-
-/// Preflights and publishes a durable pending cleanup by plan id.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display(), remote = %request.remote))]
-pub fn publish_pending_history_cleanup(
-    request: PublishPendingHistoryCleanupRequest,
-) -> Result<HistoryCleanupPublishResult> {
-    publish_pending_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
-}
-
-/// Preflights and publishes a durable pending cleanup using a configured host context.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display(), remote = %request.remote))]
-pub fn publish_pending_history_cleanup_with_context(
-    context: &mut DraftlineCommandContext<'_>,
-    request: PublishPendingHistoryCleanupRequest,
-) -> Result<HistoryCleanupPublishResult> {
-    let workspace = context.open_workspace(&request.workspace_path)?;
-    let plan_id = CleanupPlanId::from_string(request.plan_id)?;
-    let result = {
-        let mut options = context.remote_options();
-        workspace.publish_pending_history_cleanup_with_options(
-            plan_id,
-            request.remote,
-            request.confirmation,
-            &mut options,
-        )?
-    };
-    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
-    Ok(result)
-}
-
-/// Resolves an old version through applied cleanup ledgers.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn resolve_rewritten_version(
-    request: ResolveRewrittenVersionRequest,
-) -> Result<StaleVersionResolution> {
-    resolve_rewritten_version_with_context(&DraftlineCommandContext::new(), request)
-}
-
-/// Resolves an old version through applied cleanup ledgers using a configured host context.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn resolve_rewritten_version_with_context(
-    context: &DraftlineCommandContext<'_>,
-    request: ResolveRewrittenVersionRequest,
-) -> Result<StaleVersionResolution> {
-    let version = parse_version_id(request.version_id)?;
-    context
-        .open_workspace(&request.workspace_path)?
-        .resolve_rewritten_version(StaleVersionResolutionRequest { version })
-}
-
-/// Preflights undoing a history cleanup.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn preflight_undo_history_cleanup(
-    request: UndoHistoryCleanupPreflightRequest,
-) -> Result<HistoryCleanupUndoPreflight> {
-    preflight_undo_history_cleanup_with_context(&DraftlineCommandContext::new(), request)
-}
-
-/// Preflights undoing a history cleanup using a configured host context.
-#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn preflight_undo_history_cleanup_with_context(
-    context: &DraftlineCommandContext<'_>,
-    request: UndoHistoryCleanupPreflightRequest,
-) -> Result<HistoryCleanupUndoPreflight> {
-    let plan_id = CleanupPlanId::from_string(request.plan_id)?;
-    context
-        .open_workspace(&request.workspace_path)?
-        .preflight_undo_history_cleanup(plan_id)
-}
-
-/// Undoes a history cleanup from a preflight token.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn undo_history_cleanup(request: UndoHistoryCleanupRequest) -> Result<TimelineCleanupResult> {
-    undo_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
-}
-
-/// Undoes a history cleanup from a preflight token using a configured host context.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn undo_history_cleanup_with_context(
-    context: &mut DraftlineCommandContext<'_>,
-    request: UndoHistoryCleanupRequest,
-) -> Result<TimelineCleanupResult> {
-    let workspace = context.open_workspace(&request.workspace_path)?;
-    let result = workspace.undo_history_cleanup(request.token)?;
-    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
-    Ok(result)
-}
-
-/// Preflights and undoes a durable pending cleanup by plan id.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn undo_pending_history_cleanup(
-    request: UndoPendingHistoryCleanupRequest,
-) -> Result<TimelineCleanupResult> {
-    undo_pending_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
-}
-
-/// Preflights and undoes a durable pending cleanup using a configured host context.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn undo_pending_history_cleanup_with_context(
-    context: &mut DraftlineCommandContext<'_>,
-    request: UndoPendingHistoryCleanupRequest,
-) -> Result<TimelineCleanupResult> {
-    let workspace = context.open_workspace(&request.workspace_path)?;
-    let plan_id = CleanupPlanId::from_string(request.plan_id)?;
-    let result = workspace.undo_pending_history_cleanup(plan_id)?;
-    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
-    Ok(result)
-}
-
-/// Explicitly abandons a pending cleanup marker after user confirmation in the host.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn abandon_pending_history_cleanup(
-    request: AbandonPendingHistoryCleanupRequest,
-) -> Result<PendingHistoryCleanup> {
-    abandon_pending_history_cleanup_with_context(&DraftlineCommandContext::new(), request)
-}
-
-/// Explicitly abandons a pending cleanup marker using a configured host context.
-#[tracing::instrument(err(level = tracing::Level::WARN), skip_all, fields(workspace_path = %request.workspace_path.display()))]
-pub fn abandon_pending_history_cleanup_with_context(
-    context: &DraftlineCommandContext<'_>,
-    request: AbandonPendingHistoryCleanupRequest,
-) -> Result<PendingHistoryCleanup> {
-    let workspace = context.open_workspace(&request.workspace_path)?;
-    let plan_id = CleanupPlanId::from_string(request.plan_id)?;
-    workspace.abandon_pending_history_cleanup(plan_id)
 }
 
 /// Returns a graph-ready full-history snapshot over Draftline variations.
@@ -2820,96 +2413,6 @@ pub fn preflight_merge_base_with_context(
     workspace.preflight_merge_base(&request.remote)
 }
 
-/// Preflights wrapping local-ahead saves as a shared milestone merge.
-#[tracing::instrument(
-    err,
-    skip_all,
-    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
-)]
-pub fn preflight_milestone_merge(request: RemoteRequest) -> Result<MilestoneMergeReport> {
-    preflight_milestone_merge_with_context(&mut DraftlineCommandContext::new(), request)
-}
-
-/// Preflights milestone merge using a configured host context.
-#[tracing::instrument(
-    err,
-    skip_all,
-    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
-)]
-pub fn preflight_milestone_merge_with_context(
-    context: &mut DraftlineCommandContext<'_>,
-    request: RemoteRequest,
-) -> Result<MilestoneMergeReport> {
-    let workspace = context.open_workspace(&request.workspace_path)?;
-    let mut options = context.remote_options();
-    workspace.fetch_remote_with_options(&request.remote, &mut options)?;
-    workspace.preflight_milestone_merge(&request.remote)
-}
-
-/// Creates an additive milestone merge through Draftline's tokenized path.
-#[tracing::instrument(
-    err(level = tracing::Level::WARN),
-    skip_all,
-    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
-)]
-pub fn create_milestone_merge(
-    request: MilestoneMergeRequest,
-) -> Result<MilestoneMergeCommandResult> {
-    create_milestone_merge_with_context(&mut DraftlineCommandContext::new(), request)
-}
-
-/// Creates an additive milestone merge using a configured host context.
-#[tracing::instrument(
-    err(level = tracing::Level::WARN),
-    skip_all,
-    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
-)]
-pub fn create_milestone_merge_with_context(
-    context: &mut DraftlineCommandContext<'_>,
-    request: MilestoneMergeRequest,
-) -> Result<MilestoneMergeCommandResult> {
-    let workspace = context.open_workspace(&request.workspace_path)?;
-    let contributor_profile = context.contributor_profile.clone();
-    let (preflight, merge) = {
-        let mut options = context.remote_options();
-        workspace.fetch_remote_with_options(&request.remote, &mut options)?;
-        let preflight = workspace.preflight_milestone_merge(&request.remote)?;
-        let Some(token) = preflight.token.clone() else {
-            return Err(DraftlineError::PreflightFailed(Box::new(PreflightReport {
-                operation: "create_milestone_merge".to_string(),
-                will_write_files: false,
-                dirty_files: preflight.dirty_files.clone(),
-                file_hazards: Vec::new(),
-                untracked_assets: Vec::new(),
-                unresolved_conflicts: Vec::new(),
-                large_files: Vec::new(),
-                binary_files: Vec::new(),
-                variation_divergence: Some(format!(
-                    "milestone merge requires local-ahead state, found {:?}",
-                    preflight.sync_status.state
-                )),
-                can_proceed: false,
-            })));
-        };
-        let merge = match contributor_profile.as_ref() {
-            Some(profile) => workspace.create_milestone_merge_with_profile(
-                token,
-                request.label,
-                &mut options,
-                profile,
-            )?,
-            None => workspace.create_milestone_merge(token, request.label, &mut options)?,
-        };
-        (preflight, merge)
-    };
-    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
-    Ok(MilestoneMergeCommandResult {
-        preflight,
-        merge,
-        postconditions: collect_postconditions(&workspace, true),
-    })
-}
-
 /// Writes a clean incoming merge through Draftline's tokenized merge path.
 #[tracing::instrument(
     err(level = tracing::Level::WARN),
@@ -3219,14 +2722,9 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::RemoteRace { .. } => "remote_race",
         DraftlineError::LocalStateChanged { .. } => "local_state_changed",
         DraftlineError::UnsupportedRemoteTransport { .. } => "unsupported_remote_transport",
-        DraftlineError::ConsentRequired(_) => "consent_required",
-        DraftlineError::InvalidSquashCount(_) => "invalid_squash_count",
-        DraftlineError::NotEnoughVersionsToSquash { .. } => "not_enough_versions_to_squash",
         DraftlineError::InvalidContributorIdentity(_) => "invalid_contributor_identity",
         DraftlineError::RemoteOperationTimedOut { .. } => "remote_operation_timed_out",
         DraftlineError::InvalidMergeResolution(_) => "invalid_merge_resolution",
-        DraftlineError::InvalidHistoryCleanup(_) => "invalid_history_cleanup",
-        DraftlineError::HistoryCleanupBlocked(_) => "history_cleanup_blocked",
         DraftlineError::SendBaseUnknown => "send_base_unknown",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
@@ -3246,14 +2744,6 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
             })),
         },
         DraftlineError::VariationCreatePreflightFailed(report) => {
-            match serde_json::to_value(report.as_ref()) {
-                Ok(value) => Some(value),
-                Err(error) => Some(serde_json::json!({
-                    "serialization_error": error.to_string(),
-                })),
-            }
-        }
-        DraftlineError::HistoryCleanupBlocked(report) => {
             match serde_json::to_value(report.as_ref()) {
                 Ok(value) => Some(value),
                 Err(error) => Some(serde_json::json!({

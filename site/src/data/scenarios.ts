@@ -125,22 +125,20 @@ export const scenarioGroups: ScenarioGroup[] = [
     title: "Recovery and cleanup",
     eyebrow: "Simplify without losing recoverability",
     summary:
-      "Shelve unfinished work, compact noisy history, clean up old variations, sync hidden support refs, and separate retention from purge.",
+      "Shelve unfinished work, clean up old variations, sync hidden support refs, and separate retention from purge.",
     source: "docs/scenario-flows/recovery-cleanup.md",
     docsPath: "/docs/scenarios/recovery-cleanup/",
     primitives: [
       "shelve_changes",
-      "apply_history_cleanup",
+      "delete_variation",
       "publish_support_refs",
       "preflight_purge_content",
     ],
     diagram: `flowchart TD
     A[User asks to clean up] --> B{Cleanup kind}
     B -- shelve --> C[local shelf ref]
-    B -- compact --> D[preview cleanup]
     B -- delete variation --> E[archive old tip]
-    D --> F[move visible refs after backup]
-    E --> F
+    E --> F[delete visible ref after backup]
     C --> G[recoverable state]
     F --> G
     G --> H{Shared work?}
@@ -343,22 +341,15 @@ export const flowMatrix: Flow[] = [
     id: "13",
     title: "Remove or clean up work",
     group: "Recovery and cleanup",
-    status: "Covered for local delete, local squash, and local milestone compaction",
-    outcome: "Archive old tips under Draftline support refs before visible refs move.",
-  },
-  {
-    id: "13a",
-    title: "Compact local version history",
-    group: "Recovery and cleanup",
-    status: "Covered for linear milestone compaction",
-    outcome: "Simplify noisy saves while preserving final content, backups, and stale-version mapping.",
+    status: "Covered for local delete",
+    outcome: "Archive old tips under Draftline support refs before visible refs are deleted.",
   },
   {
     id: "13b",
-    title: "Remove or rewrite shared work",
+    title: "Remove shared work",
     group: "Recovery and cleanup",
-    status: "Covered for shared variation delete, current-variation replacement, and published compaction",
-    outcome: "Publish support refs first, then change visible shared refs with leases.",
+    status: "Covered for shared variation delete",
+    outcome: "Publish support refs first, then delete visible shared refs with leases.",
   },
   {
     id: "13c",
@@ -373,13 +364,6 @@ export const flowMatrix: Flow[] = [
     group: "Recovery and cleanup",
     status: "Covered for fetched support refs",
     outcome: "Fetch support refs and restore archived work as a visible variation.",
-  },
-  {
-    id: "13e",
-    title: "Sync incoming compacted remote history",
-    group: "Recovery and cleanup",
-    status: "Covered for safe incoming rewrites",
-    outcome: "Recognize published compaction and replay safe local-only saves.",
   },
   {
     id: "13f",

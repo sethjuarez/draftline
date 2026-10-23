@@ -1,9 +1,6 @@
 use std::path::PathBuf;
 
-use crate::{
-    workspace::{HistoryCleanupBlockReport, VariationCreatePreflight},
-    PreflightReport, RecoveryState, SyncStatus,
-};
+use crate::{workspace::VariationCreatePreflight, PreflightReport, RecoveryState, SyncStatus};
 
 /// Result type used by Draftline APIs.
 pub type Result<T> = std::result::Result<T, DraftlineError>;
@@ -106,15 +103,6 @@ pub enum DraftlineError {
         required_feature: &'static str,
     },
 
-    #[error("operation requires explicit confirmation: {0}")]
-    ConsentRequired(String),
-
-    #[error("squash requires at least 2 versions, got {0}")]
-    InvalidSquashCount(usize),
-
-    #[error("not enough versions to squash: need {needed}, available {available}")]
-    NotEnoughVersionsToSquash { needed: usize, available: usize },
-
     #[error("invalid contributor identity: {0}")]
     InvalidContributorIdentity(String),
 
@@ -123,12 +111,6 @@ pub enum DraftlineError {
 
     #[error("invalid merge resolution: {0}")]
     InvalidMergeResolution(String),
-
-    #[error("invalid history cleanup request: {0}")]
-    InvalidHistoryCleanup(String),
-
-    #[error("history cleanup request is blocked")]
-    HistoryCleanupBlocked(Box<HistoryCleanupBlockReport>),
 
     #[error("cannot tell which branch to send to; pass a base branch")]
     SendBaseUnknown,

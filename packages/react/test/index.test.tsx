@@ -444,11 +444,11 @@ describe('@draftline/react', () => {
     expect(selected).toHaveBeenCalledTimes(1);
   });
 
-  it('creates first-parent and expanded WorkspaceGraph models for milestone merges', () => {
-    const expanded = createDraftlineWorkspaceGraphModel(milestoneWorkspaceGraph, {
+  it('creates first-parent and expanded WorkspaceGraph models for merge commits', () => {
+    const expanded = createDraftlineWorkspaceGraphModel(mergeWorkspaceGraph, {
       view: 'expanded',
     });
-    const firstParent = createDraftlineWorkspaceGraphModel(milestoneWorkspaceGraph, {
+    const firstParent = createDraftlineWorkspaceGraphModel(mergeWorkspaceGraph, {
       view: 'first-parent',
     });
 
@@ -473,14 +473,14 @@ describe('@draftline/react', () => {
       expect.objectContaining({
         hiddenParentCount: 1,
         isFirstParentProjection: true,
-        label: 'Milestone',
+        label: 'Merge',
         refs: ['main'],
       }),
     );
   });
 
   it('renders WorkspaceGraph nodes with host-owned content and selection', () => {
-    const model = createDraftlineWorkspaceGraphModel(milestoneWorkspaceGraph, {
+    const model = createDraftlineWorkspaceGraphModel(mergeWorkspaceGraph, {
       view: 'first-parent',
     });
     const selected = vi.fn();
@@ -493,9 +493,9 @@ describe('@draftline/react', () => {
       />,
     );
 
-    const milestoneButton = screen.getByText('commit:Milestone').closest('button');
-    expect(milestoneButton).not.toBeNull();
-    fireEvent.click(milestoneButton as HTMLButtonElement);
+    const mergeButton = screen.getByText('commit:Merge').closest('button');
+    expect(mergeButton).not.toBeNull();
+    fireEvent.click(mergeButton as HTMLButtonElement);
 
     expect(screen.getByText('commit:Shared base')).toBeTruthy();
     expect(selected).toHaveBeenCalledWith(
@@ -906,7 +906,7 @@ const preflightReport = {
   will_write_files: true,
 };
 
-const milestoneWorkspaceGraph = {
+const mergeWorkspaceGraph = {
   current_variation: 'main',
   current_version: 'mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm',
   dirty: { files: [], is_dirty: false },
@@ -938,7 +938,7 @@ const milestoneWorkspaceGraph = {
       id: 'node-m',
       isCurrent: true,
       isMerge: true,
-      label: 'Milestone',
+      label: 'Merge',
       parentIds: ['node-a', 'node-c'],
       row: 3,
       versionId: 'mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm',

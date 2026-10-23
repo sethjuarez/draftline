@@ -40,7 +40,7 @@ flowchart LR
     D -- No --> F[append-only or ref-creating action]
     E --> G[operation lock and recovery state]
     F --> G
-    G --> H{Visible ref deleted or rewritten?}
+    G --> H{Visible ref deleted?}
     H -- Yes --> I[archive old tip under refs/draftline]
     H -- No --> J[business-shaped result]
     I --> J
@@ -57,4 +57,4 @@ safe primitive path, and calls out current coverage or gaps.
 | [Content policy](/docs/scenarios/content-policy/) | Decide which files count as business content and detect policy-vs-Git hazards. |
 | [Authoring and versions](/docs/scenarios/authoring/) | Save, discard, branch, switch, preview, diff, and restore work safely. |
 | [Collaboration](/docs/scenarios/collaboration/) | Publish, receive updates, discover teammate variations, and reconcile divergence. |
-| [Recovery and cleanup](/docs/scenarios/recovery-cleanup/) | Shelve, compact, archive, sync support refs, plan purge, and recover unusual states. |
+| [Recovery and cleanup](/docs/scenarios/recovery-cleanup/) | Shelve, archive, sync support refs, plan purge, and recover unusual states. |

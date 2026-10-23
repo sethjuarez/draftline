@@ -45,7 +45,7 @@ export function App() {
 
 For Git/DAG history, pass Draftline's `WorkspaceGraph` DTO directly into
 `createDraftlineWorkspaceGraphModel`. Use `view: 'first-parent'` for a compact
-main-line milestone view and `view: 'expanded'` to show every saved side commit
+main-line view and `view: 'expanded'` to show every saved side commit
 and merge parent. Hosts can supply `renderNode` to use product-specific labels,
 badges, and theme tokens while Draftline keeps the graph semantics.
 

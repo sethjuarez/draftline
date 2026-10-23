@@ -170,7 +170,7 @@ flowchart TD
     C --> D{Intent}
     D -- Inspect history/status --> E[Safe read-only Git or Draftline summary]
     D -- Edit files for a code task --> F[Use normal worktree edits and tests]
-    D -- Branch/rewrite/delete refs --> G[Use Draftline variation/cleanup primitives]
+    D -- Branch/delete refs --> G[Use Draftline variation primitives]
     D -- Debug support refs/recovery --> H[Use recovery/admin tooling]
     D -- Run raw Git anyway --> I[Out-of-band mutation diagnostics]
 ```
@@ -192,7 +192,7 @@ Implementation shape:
 | Draftline helper output | A generated rules-of-engagement summary that can be displayed by the host app or written into agent instruction files. |
 | Adoption/setup report | Tells the agent whether the repo is local-only, shared-capable, recovering, locked, or outside normal Draftline assumptions. |
 
-The instruction content should be generated from the same Draftline safety model rather than hand-maintained independently. At minimum it should say: do not rewrite/delete Draftline-owned refs directly, do not remove `refs/draftline/...` unless running a purge/retention flow, do not clear operation locks manually, fetch before reasoning about shared state, avoid destructive Git commands, and use Draftline/admin primitives for recovery, cleanup, support-ref sync, and shared history replacement.
+The instruction content should be generated from the same Draftline safety model rather than hand-maintained independently. At minimum it should say: do not rewrite/delete Draftline-owned refs directly, do not remove `refs/draftline/...` unless running a purge/retention flow, do not clear operation locks manually, fetch before reasoning about shared state, avoid destructive Git commands, and use Draftline/admin primitives for recovery, variation delete, and support-ref sync.
 
 ## Flow 1f: agent uses Draftline APIs directly
 

@@ -1906,3 +1906,35 @@ fn a_failed_owned_worktree_leaves_nothing_behind() {
         .join(".git/worktrees/draftline-cutready-broken")
         .exists());
 }
+
+#[test]
+fn recovery_records_from_removed_features_still_open_and_can_be_cleared() {
+    for operation in ["MilestoneMerge", "SquashVersions", "HistoryCleanup"] {
+        for completed in [true, false] {
+            let (temp, repo) = code_repo();
+            let workspace = scoped(&temp);
+            let ledger = repo.path().join("draftline").join("recovery.json");
+            fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+            fs::write(
+                &ledger,
+                format!(
+                    r#"{{"operation_id":"old","operation":"{operation}","original_variation":"main","target":null,"completed":{completed}}}"#
+                ),
+            )
+            .unwrap();
+
+            let pending = workspace.recovery_state().unwrap();
+            assert_eq!(pending.is_some(), !completed);
+            write_file(temp.path(), "cutready/intro.sk", "after upgrade\n");
+            if !completed {
+                assert!(workspace.save_version("Blocked").is_err());
+                let repair = workspace.repair_recovery("old").unwrap();
+                assert!(!repair.completed && !repair.changed_workspace);
+                let rollback = workspace.rollback_recovery("old").unwrap();
+                assert!(!rollback.completed && !rollback.changed_workspace);
+                workspace.acknowledge_recovery().unwrap();
+            }
+            workspace.save_version("After upgrade").unwrap();
+        }
+    }
+}

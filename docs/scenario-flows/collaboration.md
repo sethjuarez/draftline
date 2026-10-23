@@ -41,33 +41,6 @@ sequenceDiagram
 | Tests | `scenario_flow_10_11_12_collaboration_fast_forward_and_clean_merge`, `scenario_flow_1c_11a_11b_remote_bootstrap_variation_diagnostics_and_adoption`, and `tauri_contract_smokes_publish_current_variation`. |
 | Gap | Broader product result copy for branch disappeared, branch recreated, first-publish race, and remote rewind remains future UX work. |
 
-## Flow 10a: publish local saves as a milestone
-
-Business goal: "Share my current direction as one named milestone, but keep every save I made."
-
-Why this flow exists: user saves are direct interventions. Cleanup/compaction should not erase or replace those saves just to make the shared timeline readable. A host can show the shared first-parent line as named milestones while preserving the local save chain as an expandable side branch.
-
-```mermaid
-flowchart TD
-    A[User chooses Send as milestone] --> B[fetch_remote]
-    B --> C[preflight_milestone_merge]
-    C --> D{Local saves ahead of shared tip?}
-    D -- No --> E[Use normal publish/apply/merge flow]
-    D -- Yes --> F[create_milestone_merge]
-    F --> G[Merge commit: first parent shared tip, second parent local save tip]
-    G --> H[publish_changes]
-    H --> I[Normal forward publish; no shared rewrite]
-```
-
-| Question | Answer |
-|---|---|
-| Covered today? | Covered for the current variation's local-ahead save chain. |
-| Intended primitive path | `fetch_remote` -> `preflight_milestone_merge` -> `create_milestone_merge` -> `publish_changes`. |
-| Safety behavior | The workspace must be clean, no pending recovery or cleanup may be active, the current variation must be locally ahead of the fetched shared tip, and execution must re-fetch and reject changed local or remote state. The milestone commit's first parent is the shared/upstream tip and its second parent is the user's local save tip, so first-parent graph views stay on the shared milestone line while the full DAG still contains every save. |
-| Edge cases | If the remote has incoming or diverged work, the user must apply or merge first. If there is no remote version or no local-ahead work, normal publish is the right primitive. The default milestone tree is the current local tip tree, so conflict resolution is not needed for the common "send my current work" case. Explicit selected ranges need a separate conservative safety model before they can be added. |
-| Tests | `scenario_flow_10a_milestone_merge_preserves_save_chain_and_publishes_forward` and `tauri_contract_smokes_milestone_merge_commands`. |
-| Gap | Need host copy that distinguishes readable milestone display from destructive history cleanup. Explicit selected ranges remain future expansion. |
-
 ## Flow 11: receive teammate updates
 
 Business goal: "Bring in the latest work from the team."

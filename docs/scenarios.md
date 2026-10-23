@@ -14,7 +14,7 @@ See the [Draftline API plan](api-plan.md) for the roadmap from these scenarios t
 | [Content policy](scenario-flows/content-policy.md) | Business-content boundaries, policy changes, and Git ignore/attributes hazards. |
 | [Authoring and versions](scenario-flows/authoring.md) | Current state, saves, discard, variations, switching, preview, and restore. |
 | [Collaboration](scenario-flows/collaboration.md) | Publish, apply incoming, remote variation lifecycle, remote destination changes, and merge. |
-| [Recovery and cleanup](scenario-flows/recovery-cleanup.md) | Shelves, delete/squash, support refs, purge/redaction, binary assets, interruption, out-of-band mutation, and stale locks. |
+| [Recovery and cleanup](scenario-flows/recovery-cleanup.md) | Shelves, variation delete, support refs, purge/redaction, binary assets, interruption, out-of-band mutation, and stale locks. |
 | [Coverage and roadmap](coverage.md) | Executive coverage, primitive coverage, and follow-up priority gaps. |
 | [Product language](product-language.md) | Mapping between product actions and Git-backed implementation. |
 
@@ -58,19 +58,16 @@ Every documented flow must either name executable coverage or explain why the re
 | Flow 9: restore older work | Partially covered | `scenario_flow_6_7_9_13_local_variation_restore_and_support_ref_lifecycle`, `targeted_restore_creates_save_on_existing_variation_without_wrong_branch_write`, `tauri_contract_restores_version_to_target_variation` | Richer restore preflight for old-policy content remains future work. |
 | Flow 9a: target tree collides with local non-versioned files | Partially covered | `scenario_flow_6_7_9_13_local_variation_restore_and_support_ref_lifecycle`, `tauri_contract_smokes_collaboration_incoming_and_merge` | Symlink, submodule, case, Unicode, generated-file, and richer untracked hazard reporting remain future work. |
 | Flow 10: publish my work to the team | Covered for current variation | `scenario_flow_10_11_12_collaboration_fast_forward_and_clean_merge`, `scenario_flow_1c_11a_11b_remote_bootstrap_variation_diagnostics_and_adoption`, `tauri_contract_smokes_publish_current_variation` | Broader product result copy for branch disappearance/recreation remains future work. |
-| Flow 10a: publish local saves as a milestone | Covered for current local-ahead variation | `scenario_flow_10a_milestone_merge_preserves_save_chain_and_publishes_forward`, `tauri_contract_smokes_milestone_merge_commands` | Explicit selected ranges remain future work; current support wraps the whole local-ahead save chain. |
 | Flow 11: receive teammate updates | Covered for current-variation fast-forward only | `scenario_flow_10_11_12_collaboration_fast_forward_and_clean_merge`, `tauri_contract_smokes_collaboration_incoming_and_merge` | Diverged conflict UX is Flow 12; broad remote lifecycle diagnostics remain separate. |
 | Flow 11a: discover teammate-created directions | Partially covered | `scenario_flow_1c_11a_11b_remote_bootstrap_variation_diagnostics_and_adoption`, `remote_variations_can_be_discovered_and_adopted_locally` | Tokenized adoption and richer product copy remain future work. |
 | Flow 11b: remote variation was deleted or renamed | Partially covered | `scenario_flow_1c_11a_11b_remote_bootstrap_variation_diagnostics_and_adoption`, `remote_variation_diagnostics_reports_local_and_remote_only_variations_after_prune` | Rename inference and higher-level host messaging remain future work. |
 | Flow 11c: change or remove remote destination | Partially covered | `tauri_contract_smokes_publish_current_variation` | Updating an existing remote URL is still silent; preflight/confirmation/remove APIs are not implemented. |
 | Flow 12: reconcile teammate changes | Covered for clean semantic merges | `scenario_flow_10_11_12_collaboration_fast_forward_and_clean_merge`, `scenario_flow_12_conflict_preflight_reports_without_mutating`, `tauri_contract_smokes_collaboration_incoming_and_merge` | User-driven execution for unresolved conflicts remains future work. |
 | Flow 12a: apply shelved work | Covered for clean all-work shelves | `scenario_flow_12a_shelf_apply_preview_and_delete_roundtrip`, `tauri_contract_smokes_history_preview_restore_shelf_and_policy_commands` | Selected-file shelves and conflict-resolution apply remain future work. |
-| Flow 13: remove or clean up work | Covered for local delete, local squash, and local milestone compaction | `scenario_flow_6_7_9_13_local_variation_restore_and_support_ref_lifecycle`, `scenario_flow_13a_local_milestone_compaction_preview_apply_resolve_and_undo` | Product copy for candidate selection and unsupported ranges remains future work. Flow 10a is the sharing-friendly alternative when the user wants a clean main line without rewriting save history. |
-| Flow 13a: compact local version history | Covered for linear milestone compaction | `scenario_flow_13a_local_milestone_compaction_preview_apply_resolve_and_undo`, `history_cleanup_compacts_milestones_maps_old_versions_and_undoes`, `history_cleanup_compacts_middle_range_and_replays_descendants` | Multi-range and richer semantic conflict handling remain future work. |
-| Flow 13b: remove or rewrite shared work | Covered for shared variation delete, current-variation replacement, and published compaction | `replace_remote_history_publishes_support_ref_before_force_with_lease`, `delete_remote_variation_publishes_support_ref_before_deleting_visible_ref`, `history_cleanup_publish_replaces_remote_with_support_ref_and_lease`, `history_cleanup_publish_support_ref_targets_remote_tip_when_local_was_ahead` | Protected-branch/server-capability diagnostics and teammate-facing copy remain future work. |
+| Flow 13: remove or clean up work | Covered for local delete | `scenario_flow_6_7_9_13_local_variation_restore_and_support_ref_lifecycle` | Draftline never rewrites existing history; product copy for restoring deleted variations remains future work. |
+| Flow 13b: remove shared work | Covered for shared variation delete | `delete_remote_variation_publishes_support_ref_before_deleting_visible_ref` | Protected-branch/server-capability diagnostics and teammate-facing copy remain future work. |
 | Flow 13c: sync hidden recovery support refs | Covered for local publish/fetch/restore | `scenario_flow_13c_13d_remote_support_refs_roundtrip_restore_and_local_expire`, `support_refs_publish_create_only_and_fetch_remote_tracking_refs`, `support_ref_publish_preflight_rejects_same_name_different_oid_collision` | Remote retention is not implemented. |
 | Flow 13d: recover cleanup after clone or device loss | Covered for fetched support refs | `scenario_flow_13c_13d_remote_support_refs_roundtrip_restore_and_local_expire`, `support_refs_publish_create_only_and_fetch_remote_tracking_refs` | Remote retention/expiration policy remains future work. |
-| Flow 13e: sync incoming compacted remote history | Covered for safe incoming rewrites | `scenario_flow_13e_remote_compaction_publish_sync_replay_and_dirty_block`, `apply_incoming_accepts_published_remote_compaction_when_clean`, `apply_incoming_replays_local_snapshots_after_published_remote_compaction`, `remote_compaction_with_non_first_parent_local_work_stays_needs_merge` | Host copy for dirty-work choices and "incoming compaction" remains future work. |
 | Flow 13f: permanently purge or redact content | Planning-only | `scenario_flow_13f_purge_api_is_explicitly_planning_only` | Destructive purge execution is intentionally not implemented because distributed Git cannot guarantee deletion from existing clones. |
 | Flow 13g: expire old support refs | Partially covered locally | `scenario_flow_13c_13d_remote_support_refs_roundtrip_restore_and_local_expire` | Remote support-ref retention with permissions, audit, and GC guidance remains future work. |
 | Flow 13h: large or binary business assets | Partially covered | `tauri_contract_keeps_frontend_json_shape_stable` | Detection exists; block/warn/stream/external storage policy is host/future work. |
@@ -125,7 +122,7 @@ flowchart LR
     E -- No --> G[Append-only or ref-creating primitive]
     F --> H[Mutate with operation lock and recovery state]
     G --> H
-    H --> I{Ref deleted or rewritten?}
+    H --> I{Ref deleted?}
     I -- Yes --> J[Archive old tip under refs/draftline]
     I -- No --> K[Complete operation]
     J --> K
@@ -148,7 +145,7 @@ flowchart LR
 | Receive work | Apply incoming | Fetch, preflight, fast-forward only | Remote updates are safe only when local history can advance without merge. |
 | Reconcile work | Merge incoming | Three-way merge with semantic conflict model | Divergence needs human-readable conflict decisions, not hidden Git merges. |
 | Go back | Restore as new save | New commit from old tree | Restoring should preserve the audit trail instead of moving history backward. |
-| Clean up | Compact, squash, or delete | Archive old tip as a support ref, then rewrite/delete visible ref | Cleanup should simplify UI while preserving a hidden recovery pointer and stale-version mapping. |
+| Clean up | Delete variation | Archive old tip as a support ref, then delete visible ref | Cleanup should simplify UI while preserving a hidden recovery pointer. Existing history is never rewritten. |
 | Recover | Recovery prompt | Read ledger, block normal operations, repair/rollback/acknowledge | Interrupted operations should be visible and deliberate. |
 | Permanently remove content | Purge/redact | Not yet exposed | True deletion conflicts with archive-first safety and needs a separate explicit workflow. |
 
@@ -161,9 +158,9 @@ Draftline should distinguish normal business views from the hidden support refs 
 | `refs/heads/<variation>` | Visible team variations | Shown in normal variation/history views | Published/fetched as shared work. |
 | `refs/draftline/shelves/...` | Work intentionally set aside | Hidden from normal views; shown in shelf/recovery views | Local-only by default; any sharing must be explicit and separately permissioned. |
 | `refs/draftline/deleted-variations/...` | Recovery points for deleted variations | Hidden from normal views; shown in recovery/admin views | Published/fetched explicitly as shared support refs when the user shares cleanup recovery. |
-| `refs/draftline/rewrites/...` | Recovery points for history rewrites such as squash or compaction | Hidden from normal views; shown in recovery/admin views | Published before shared history replacement and fetched with remote sync so incoming compaction can be recognized safely. |
+| `refs/draftline/rewrites/...`, `refs/draftline/backups/...` | Legacy recovery points written by older Draftline versions that could rewrite history | Hidden from normal views; shown in recovery/admin views | No longer created; still fetched, listed, and restorable so existing recovery points stay usable. |
 
-Shared recovery support refs are **not private**. They live inside the same shared repository trust boundary as visible work. They are hidden because they are not primary business objects, not because they contain secret content. Git server ACLs and refspec policy, not naming, determine who can fetch them. If content must not be retained by collaborators, the right scenario is purge/redaction, not delete, squash, or shared recovery.
+Shared recovery support refs are **not private**. They live inside the same shared repository trust boundary as visible work. They are hidden because they are not primary business objects, not because they contain secret content. Git server ACLs and refspec policy, not naming, determine who can fetch them. If content must not be retained by collaborators, the right scenario is purge/redaction, not delete or shared recovery.
 
 Shelves are different from cleanup archives. A shelf may contain unfinished or sensitive local work that the user never intended to publish, so shelf sync must be local-only by default or require an explicit "share shelved work" flow with clear warning copy and permissions.
 
@@ -173,7 +170,7 @@ Support-ref sync needs its own ref contract:
 |---|---|
 | Unique names | Archive refs should include operation identity and source context, such as source ref, old tip OID, operation UUID, actor/device, and time. |
 | Immutability | Once published, a recovery support ref must not be force-updated or reused for another old tip. |
-| Race safety | Shared cleanup must push support refs with "create only" semantics and delete/rewrite visible refs only with expected-OID or lease checks. |
+| Race safety | Shared cleanup must push support refs with "create only" semantics and delete visible refs only with expected-OID or lease checks. |
 | Local/remote mapping | Fetched remote support refs should not overwrite unsynced local support refs; use a remote-tracking layout such as `refs/draftline/remotes/<remote>/...` or an equivalent indexed model. |
 | Host permissions | Some Git servers may reject non-branch namespaces. Support-ref sync must surface that as a host/remote capability issue, not silently fall back to unsafe cleanup. |
 

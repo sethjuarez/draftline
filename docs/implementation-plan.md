@@ -100,7 +100,7 @@ This plan turns the scenario gaps in [coverage and roadmap](coverage.md) and the
 
 **Goal:** make recovery points for shared work durable across machines without showing them as normal variations.
 
-**Current status:** Implemented for local publish/fetch/restore sync. Local and remote-tracking support-ref listing and restoration exist, and local expiration exists. Support refs can be published with create-only remote updates and fetched into a remote-tracking support-ref layout; remote variation delete and shared history replacement publish support refs before visible remote mutation.
+**Current status:** Implemented for local publish/fetch/restore sync. Local and remote-tracking support-ref listing and restoration exist, and local expiration exists. Support refs can be published with create-only remote updates and fetched into a remote-tracking support-ref layout; remote variation delete publishes support refs before deleting the visible remote ref.
 
 | Work item | Outcome |
 |---|---|
@@ -109,22 +109,20 @@ This plan turns the scenario gaps in [coverage and roadmap](coverage.md) and the
 | Add support-ref fetch layout | Implemented with `fetch_support_refs`, fetching into `refs/remotes/<remote>/draftline/...` without overwriting local support refs. |
 | Add restore-as-variation | Implemented for local and remote-tracking support refs through `preflight_restore_support_ref`, `restore_support_ref`, and compatibility `restore_support_ref_as_variation`. |
 
-**Acceptance:** delete/squash recovery points can be listed and restored without polluting normal variation views, and they can be published/fetched across machines into hidden remote-tracking support refs. Remote retention remains future work.
+**Acceptance:** delete recovery points can be listed and restored without polluting normal variation views, and they can be published/fetched across machines into hidden remote-tracking support refs. Remote retention remains future work.
 
-## Slice 8: shared cleanup and history replacement
+## Slice 8: shared cleanup
 
-**Goal:** support team-visible delete and history replacement only when shared recovery is durable first.
+**Goal:** support team-visible delete only when shared recovery is durable first.
 
-**Current status:** Implemented for remote variation deletion and current-variation shared history replacement. Replacement tokens require explicit confirmation before execution. Broader admin UX and multi-variation replacement policy remain host/future work.
+**Current status:** Implemented for remote variation deletion. Shared history replacement was removed: Draftline never rewrites history that collaborators may already have. Broader admin UX remains host/future work.
 
 | Work item | Outcome |
 |---|---|
 | Add `preflight_delete_remote_variation` | Plans archive support ref, support-ref publish, and expected-OID remote deletion. |
 | Add `delete_remote_variation` | Publishes support ref first with create-only negotiation, then deletes the visible remote ref with expected-OID negotiation after fetch-and-compare. |
-| Add `preflight_replace_remote_history` | Implemented for the current variation with replacement details, support-ref plan, and force-with-lease target. |
-| Add `replace_remote_history` | Implemented: requires explicit token confirmation, publishes support refs first, then performs lease-protected history replacement. |
 
-**Acceptance:** remote variation delete and current-variation shared history replacement preserve recovery support refs before visible remote mutation and guard remote pushes with negotiated expectations; shared history replacement also requires explicit token confirmation.
+**Acceptance:** remote variation delete preserves recovery support refs before visible remote mutation and guards remote pushes with negotiated expectations.
 
 ## Slice 9: collaboration expansion
 
