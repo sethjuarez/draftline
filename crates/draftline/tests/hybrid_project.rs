@@ -580,6 +580,15 @@ fn commit_smudged(
     message: &str,
 ) -> git2::Oid {
     write_file(root, relative, real);
+    // Back-date the file so the index entry isn't "racily clean": Git (and
+    // libgit2) would rehash it and see that it differs from the pointer.
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(root.join(relative))
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
     let mut index = repo.index().unwrap();
     index.read(true).unwrap();
     index.add_path(Path::new(relative)).unwrap();
