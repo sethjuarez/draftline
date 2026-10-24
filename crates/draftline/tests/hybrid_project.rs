@@ -1825,22 +1825,35 @@ fn send_retries_safely_after_the_host_fails_and_avoids_taken_branch_names() {
         fail_next_create: true,
         ..Default::default()
     };
+    let approve = |workspace: &Workspace| draftline::SendRequest {
+        expected: Some(
+            workspace
+                .preflight_send("origin", &send_request("Pitch"), &mut RemoteOptions::new())
+                .unwrap()
+                .token,
+        ),
+        ..send_request("Pitch")
+    };
+    let approved = approve(&workspace);
 
     let error = workspace
-        .send(
-            "origin",
-            &send_request("Pitch"),
-            &mut host,
-            &mut RemoteOptions::new(),
-        )
+        .send("origin", &approved, &mut host, &mut RemoteOptions::new())
         .unwrap_err();
     assert!(matches!(error, DraftlineError::PullRequest(_)), "{error:?}");
     assert!(remote_branch(bare.path(), "cutready/pitch-2").is_some());
 
+    // The token approved one attempt; the retry needs a fresh preflight.
+    let error = workspace
+        .send("origin", &approved, &mut host, &mut RemoteOptions::new())
+        .unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::LocalStateChanged { .. }),
+        "{error:?}"
+    );
     let retry = workspace
         .send(
             "origin",
-            &send_request("Pitch"),
+            &approve(&workspace),
             &mut host,
             &mut RemoteOptions::new(),
         )
@@ -2525,6 +2538,94 @@ fn send_refuses_a_variation_started_on_unpushed_developer_work() {
 }
 
 #[test]
+fn send_acts_only_on_the_branch_base_and_commit_the_host_approved() {
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    workspace.start_variation_here("cutready/pitch").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "pitch\n");
+    workspace.save_version("Pitch").unwrap();
+    let approved = workspace
+        .preflight_send("origin", &send_request("Pitch"), &mut RemoteOptions::new())
+        .unwrap();
+    assert_eq!(approved.token.branch, "cutready/pitch");
+    assert_eq!(approved.token.variation, "cutready/pitch");
+    assert_eq!(approved.token.base, "main");
+    let approved_request = draftline::SendRequest {
+        expected: Some(approved.token.clone()),
+        ..send_request("Pitch")
+    };
+
+    // Same commit, different branch: not what the host approved.
+    workspace.start_variation_here("cutready/other").unwrap();
+    let error = workspace
+        .send(
+            "origin",
+            &approved_request,
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::LocalStateChanged { .. }),
+        "{error:?}"
+    );
+    assert_eq!(remote_branch(bare.path(), "cutready/other"), None);
+
+    // The default branch renamed between preflight and Send.
+    workspace
+        .switch_variation(
+            &draftline::VariationId::from("cutready/pitch"),
+            draftline::SwitchPolicy::AbortIfDirty,
+        )
+        .unwrap();
+    let remote = git2::Repository::open_bare(bare.path()).unwrap();
+    let tip = remote.refname_to_id("refs/heads/main").unwrap();
+    remote
+        .reference("refs/heads/trunk", tip, false, "rename")
+        .unwrap();
+    remote.set_head("refs/heads/trunk").unwrap();
+    remote
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .delete()
+        .unwrap();
+    let error = workspace
+        .send(
+            "origin",
+            &approved_request,
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::LocalStateChanged { .. }),
+        "{error:?}"
+    );
+    assert_eq!(remote_branch(bare.path(), "cutready/pitch"), None);
+
+    // A fresh approval goes through.
+    let approved = workspace
+        .preflight_send("origin", &send_request("Pitch"), &mut RemoteOptions::new())
+        .unwrap();
+    assert_eq!(approved.token.base, "trunk");
+    let mut host = FakeHost::default();
+    workspace
+        .send(
+            "origin",
+            &draftline::SendRequest {
+                expected: Some(approved.token),
+                ..send_request("Pitch")
+            },
+            &mut host,
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    assert_eq!(host.open[0].0.base, "trunk");
+    assert!(remote_branch(bare.path(), "cutready/pitch").is_some());
+}
+
+#[test]
 fn send_and_publish_preflights_report_large_files_and_lfs_pointers_going_out() {
     let (temp, repo) = code_repo();
     let (_bare, _other_dir, _other) = with_remote(&repo);
@@ -2578,7 +2679,7 @@ fn send_and_publish_preflights_report_large_files_and_lfs_pointers_going_out() {
         .preflight_send("origin", &send_request("Big"), &mut RemoteOptions::new())
         .unwrap();
     assert_eq!(kinds(&approved.outgoing_files), expected);
-    assert_eq!(approved.head, Some(head.to_string()));
+    assert_eq!(approved.token.head, Some(head.to_string()));
 
     // Send refuses a head the host never checked.
     write_file(temp.path(), "cutready/later.md", "later\n");
@@ -2587,7 +2688,7 @@ fn send_and_publish_preflights_report_large_files_and_lfs_pointers_going_out() {
         .send(
             "origin",
             &draftline::SendRequest {
-                expected_head: approved.head.clone(),
+                expected: Some(approved.token.clone()),
                 ..send_request("Big")
             },
             &mut FakeHost::default(),

@@ -97,7 +97,7 @@ pub use profile::{
 };
 pub use pull_request::{
     DeveloperCommit, PullRequest, PullRequestProvider, PullRequestRequest, SendPreflight,
-    SendRequest, SendResult,
+    SendRequest, SendResult, SendToken,
 };
 pub use recovery::{RecoveryOperation, RecoveryState};
 pub use remote::{

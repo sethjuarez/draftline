@@ -46,10 +46,26 @@ pub struct SendRequest {
     /// the variation namespace plus a slug of the title.
     #[serde(default)]
     pub branch: Option<String>,
-    /// [SendPreflight::head] the host approved. Send refuses with
-    /// local_state_changed if the branch has moved since.
+    /// [SendPreflight::token] the host approved. Send refuses with
+    /// local_state_changed if anything it names has changed since.
     #[serde(default)]
-    pub expected_head: Option<String>,
+    pub expected: Option<SendToken>,
+}
+
+/// What a [SendPreflight] checked. Pass it back as [SendRequest::expected] so
+/// Send acts only on what the host approved. A token approves one attempt:
+/// a failed Send may have moved to its new branch, so preflight again before
+/// retrying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendToken {
+    pub remote: String,
+    pub base: String,
+    /// The branch checked out when the preflight ran.
+    pub branch: String,
+    /// The branch Send would push.
+    pub variation: String,
+    /// The commit checked.
+    pub head: Option<String>,
 }
 
 /// What [`crate::Workspace::send`] did.
@@ -86,9 +102,8 @@ pub struct SendPreflight {
     /// The branch Send would push: the current one, or the one it would create.
     pub variation: String,
     pub creates_variation: bool,
-    /// The commit checked; pass it as [SendRequest::expected_head].
-    #[serde(default)]
-    pub head: Option<String>,
+    /// What was checked; pass it as [SendRequest::expected].
+    pub token: SendToken,
     /// Commits the base on the remote doesn't have yet.
     pub outgoing_versions: usize,
     /// Unsaved project changes; Send refuses them on the base branch.

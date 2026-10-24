@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::merge::{MergeConflict, MergeInput, ResolverRegistry};
 use crate::pull_request::{
     DeveloperCommit, PullRequestProvider, PullRequestRequest, SendPreflight, SendRequest,
-    SendResult,
+    SendResult, SendToken,
 };
 use crate::recovery::RecoveryOperation;
 use crate::remote::{ensure_supported_remote_url, PushRefExpectation};
@@ -7790,12 +7790,35 @@ impl Workspace {
         // Every later step works on this exact commit, so a developer commit
         // landing mid-send is never carried unscanned.
         let scanned = self.repo.head().ok().and_then(|head| head.target());
-        if let Some(expected) = &request.expected_head {
-            let actual = scanned.map(|oid| oid.to_string()).unwrap_or_default();
+        if current == base {
+            let report = preflight_report(
+                "send",
+                false,
+                self.changed_files_unchecked()?,
+                Vec::new(),
+                None,
+            );
+            if !report.can_proceed {
+                return Err(DraftlineError::PreflightFailed(Box::new(report)));
+            }
+        }
+        let planned = if current == base {
+            self.new_send_branch_name(request, &advertised)?
+        } else {
+            current.clone()
+        };
+        if let Some(expected) = &request.expected {
+            let actual = SendToken {
+                remote: remote.to_string(),
+                base: base.clone(),
+                branch: current.clone(),
+                variation: planned.clone(),
+                head: scanned.map(|oid| oid.to_string()),
+            };
             if *expected != actual {
                 return Err(DraftlineError::LocalStateChanged {
-                    expected: expected.clone(),
-                    actual,
+                    expected: Self::send_token_label(expected),
+                    actual: Self::send_token_label(&actual),
                 });
             }
         }
@@ -7818,17 +7841,7 @@ impl Workspace {
 
         let mut created_variation = false;
         let variation = if current == base {
-            let report = preflight_report(
-                "send",
-                false,
-                self.changed_files_unchecked()?,
-                Vec::new(),
-                None,
-            );
-            if !report.can_proceed {
-                return Err(DraftlineError::PreflightFailed(Box::new(report)));
-            }
-            let name = self.new_send_branch_name(request, &advertised)?;
+            let name = planned;
             let head = self.repo.find_commit(ensure_unmoved()?)?;
             let mut branch = self.repo.branch(&name, &head, false)?;
             let switched = (|| -> Result<()> {
@@ -7947,12 +7960,19 @@ impl Workspace {
         let (outgoing_files, outgoing_files_truncated) =
             self.outgoing_files(head, &advertised_oids)?;
         let can_proceed = developer_commits.is_empty() && !has_unsaved_changes;
+        let token = SendToken {
+            remote: remote.to_string(),
+            base: base.clone(),
+            branch: current,
+            variation: variation.clone(),
+            head: head.map(|oid| oid.to_string()),
+        };
         Ok(SendPreflight {
             remote: remote.to_string(),
             base,
             variation,
+            token,
             creates_variation,
-            head: head.map(|oid| oid.to_string()),
             outgoing_versions,
             has_unsaved_changes,
             developer_commits,
@@ -7960,6 +7980,17 @@ impl Workspace {
             outgoing_files_truncated,
             can_proceed,
         })
+    }
+
+    fn send_token_label(token: &SendToken) -> String {
+        format!(
+            "{}/{} from {} as {}@{}",
+            token.remote,
+            token.base,
+            token.branch,
+            token.variation,
+            token.head.as_deref().unwrap_or("none")
+        )
     }
 
     /// Resolves Send's base, enforces the variation namespace, and refreshes
