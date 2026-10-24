@@ -2877,6 +2877,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::SendBaseUnknown => "send_base_unknown",
         DraftlineError::SendBaseNotOnRemote(_) => "send_base_not_on_remote",
         DraftlineError::WorkspaceAlreadyInCheckout(_) => "workspace_already_in_checkout",
+        DraftlineError::WorkspaceClaimStale(_) => "workspace_claim_stale",
         DraftlineError::InvalidWorkspaceClaim(_) => "invalid_workspace_claim",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::SendCarriesDeveloperCommits(_) => "send_carries_developer_commits",
@@ -2915,7 +2916,8 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         DraftlineError::RecoveryInOtherProject(project) => {
             Some(serde_json::json!({ "project": project }))
         }
-        DraftlineError::WorkspaceAlreadyInCheckout(project) => {
+        DraftlineError::WorkspaceAlreadyInCheckout(project)
+        | DraftlineError::WorkspaceClaimStale(project) => {
             Some(serde_json::json!({ "project": project }))
         }
         DraftlineError::BranchOutsideNamespace(branch) => {

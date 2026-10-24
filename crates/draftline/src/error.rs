@@ -134,6 +134,14 @@ pub enum DraftlineError {
     )]
     WorkspaceAlreadyInCheckout(std::path::PathBuf),
 
+    /// The checkout's workspace claim names a folder that isn't here: it was
+    /// renamed or deleted, or the current branch doesn't have it.
+    #[error(
+        "this checkout's Draftline workspace was {}, which is missing here; switch back to the branch that has it, or relocate the workspace",
+        workspace_folder(.0)
+    )]
+    WorkspaceClaimStale(std::path::PathBuf),
+
     #[error("unreadable Draftline workspace record: {0}")]
     InvalidWorkspaceClaim(String),
 

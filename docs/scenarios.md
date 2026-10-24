@@ -81,7 +81,7 @@ Every documented flow must either name executable coverage or explain why the re
 | Flow 15c: send work for review | Covered | `send_from_the_default_branch_moves_work_to_a_new_branch_and_opens_a_pull_request`, `send_retries_safely_after_the_host_fails_and_avoids_taken_branch_names`, `send_refuses_to_carry_a_developers_unpushed_base_commits` | The host supplies the pull request provider and auth. Send refuses to carry developer commits; `preflight_send` lists them. |
 | Flow 15d: get updates | Covered for clean merges in the project folder | `incoming_merge_keeps_teammate_code_and_the_developer_index`, `incoming_merge_leaves_code_conflicts_to_a_developer`, `bringing_in_the_latest_base_merges_everything_into_the_variation` | Conflicts outside the project folder are handed to a developer. |
 | Flow 15e: work in a separate copy | Covered in Rust | `owned_worktree_starts_from_the_latest_base_and_leaves_this_checkout_alone`, `a_failed_owned_worktree_leaves_nothing_behind` | Not yet exposed to Tauri or TypeScript. |
-| Flow 15f: one workspace per checkout | Covered | `a_checkout_holds_one_workspace`, `relocate_moves_the_workspace_and_refuses_while_an_operation_runs` | None known. |
+| Flow 15f: one workspace per checkout | Covered | `a_checkout_holds_one_workspace`, `relocate_moves_the_workspace_and_refuses_while_an_operation_runs`, `a_claim_on_a_missing_folder_is_reported_stale_and_relocate_recovers` | None known. |
 | Flow 15g: a developer switched the shared checkout | Covered | `saves_and_updates_refuse_a_developer_branch_until_a_variation_starts_here`, `a_detached_checkout_refuses_namespaced_saves` | Host UX for offering `start_variation_here` is host work. |
 
 ## Business safety principles

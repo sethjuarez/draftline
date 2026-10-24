@@ -3281,6 +3281,109 @@ fn relocate_moves_the_workspace_and_refuses_while_an_operation_runs() {
 }
 
 #[test]
+fn a_claim_on_a_missing_folder_is_reported_stale_and_relocate_recovers() {
+    let (temp, _repo) = code_repo();
+    let pitch = scoped(&temp);
+    write_file(temp.path(), "cutready/intro.sk", "intro\n");
+    pitch.save_version("Intro").unwrap();
+
+    // Someone renames the claimed folder outside Draftline. The handle that
+    // was open refuses to save rather than record every file as deleted.
+    fs::rename(temp.path().join("cutready"), temp.path().join("pitch")).unwrap();
+    let error = pitch.save_version("Gone").unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::WorkspaceClaimStale(_)),
+        "{error:?}"
+    );
+    drop(pitch);
+    let renamed = temp.path().join("pitch");
+    let error = refused(Workspace::open_with_policy(&renamed, cutready_policy()));
+    assert!(
+        matches!(&error, DraftlineError::WorkspaceClaimStale(project) if project == Path::new("cutready")),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("missing"), "{error}");
+    let tauri = draftline::tauri_contract::TauriCommandError::from(error);
+    assert_eq!(tauri.code, "workspace_claim_stale");
+    assert_eq!(tauri.details.unwrap()["project"], "cutready");
+
+    // A refused init cleans up the folders it created.
+    let error = refused(Workspace::init_with_policy(
+        temp.path().join("deck"),
+        cutready_policy(),
+    ));
+    assert!(
+        matches!(error, DraftlineError::WorkspaceClaimStale(_)),
+        "{error:?}"
+    );
+    assert!(!temp.path().join("deck").exists());
+
+    let moved = Workspace::relocate_with_policy(&renamed, cutready_policy()).unwrap();
+    assert_eq!(moved.scope(), Path::new("pitch"));
+    Workspace::open_with_policy(&renamed, cutready_policy()).unwrap();
+}
+
+#[test]
+fn a_branch_without_the_folder_reports_a_stale_claim_but_can_switch_back() {
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    let base = draftline::VariationId::from(pitch.current_variation().unwrap());
+    write_file(temp.path(), "cutready/intro.sk", "intro\n");
+    pitch.save_version("Intro").unwrap();
+
+    // A developer branch that drops the project folder is checked out.
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/old", &head, false).unwrap();
+    repo.set_head("refs/heads/feature/old").unwrap();
+    fs::remove_dir_all(temp.path().join("cutready")).unwrap();
+    let mut index = repo.index().unwrap();
+    index.remove_dir(Path::new("cutready"), 0).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: drop the deck");
+
+    // Opening another folder points at the missing one, not a live claim.
+    fs::create_dir_all(temp.path().join("deck")).unwrap();
+    let error = refused(Workspace::open_with_policy(
+        temp.path().join("deck"),
+        cutready_policy(),
+    ));
+    assert!(
+        matches!(&error, DraftlineError::WorkspaceClaimStale(project) if project == Path::new("cutready")),
+        "{error:?}"
+    );
+
+    // The open handle can still switch back to where the folder lives.
+    pitch
+        .switch_variation(&base, draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "intro\n");
+}
+
+#[test]
+fn a_claim_naming_a_folder_outside_the_checkout_is_invalid() {
+    let (temp, repo) = code_repo();
+    scoped(&temp);
+    let claim = repo.path().join("draftline").join("workspace.json");
+    let mut projects = vec!["../elsewhere", "/abs"];
+    if cfg!(windows) {
+        // A backslash is a separator only on Windows; claims always use `/`.
+        projects.push("cutready\\\\scenes");
+    }
+    for project in projects {
+        fs::write(&claim, format!(r#"{{"project":"{project}"}}"#)).unwrap();
+        let error = refused(Workspace::open_with_policy(
+            temp.path().join("cutready"),
+            cutready_policy(),
+        ));
+        assert!(
+            matches!(error, DraftlineError::InvalidWorkspaceClaim(_)),
+            "{project}: {error:?}"
+        );
+    }
+    Workspace::relocate_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+}
+
+#[test]
 fn an_unreadable_claim_is_reported_and_relocate_resets_it() {
     let (temp, repo) = code_repo();
     scoped(&temp);

@@ -1466,7 +1466,10 @@ impl Workspace {
         };
 
         let result = Self::from_repository(repo, path, content_policy);
-        if let Err(DraftlineError::WorkspaceAlreadyInCheckout(_)) = &result {
+        if let Err(
+            DraftlineError::WorkspaceAlreadyInCheckout(_) | DraftlineError::WorkspaceClaimStale(_),
+        ) = &result
+        {
             // Leave no trace of a refused folder; `remove_dir` only removes empty ones.
             for dir in created.iter().rev() {
                 if fs::remove_dir(dir).is_err() {
@@ -8758,12 +8761,31 @@ impl Workspace {
         }
 
         let claimed = self.read_claim(&path)?;
+        let project = claimed_project(&claimed, &path)?;
+        let missing = self.claimed_folder_missing(&project)?;
         if claimed.project == self.project_key() {
+            // Our own folder vanished while HEAD still tracks it (renamed or
+            // deleted outside Draftline): refuse, or a save would record
+            // every file as deleted. A branch that lacks the folder is fine,
+            // so the host can still switch back.
+            if missing && self.head_tree_or_empty()?.get_path(&project).is_ok() {
+                return Err(DraftlineError::WorkspaceClaimStale(project));
+            }
             Ok(())
+        } else if missing {
+            Err(DraftlineError::WorkspaceClaimStale(project))
         } else {
-            Err(DraftlineError::WorkspaceAlreadyInCheckout(PathBuf::from(
-                claimed.project,
-            )))
+            Err(DraftlineError::WorkspaceAlreadyInCheckout(project))
+        }
+    }
+
+    /// Whether the claimed folder is absent; other filesystem errors surface
+    /// rather than inviting a relocate.
+    fn claimed_folder_missing(&self, project: &Path) -> Result<bool> {
+        match fs::metadata(self.root.join(project)) {
+            Ok(metadata) => Ok(!metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -11894,6 +11916,28 @@ fn create_missing_dirs(path: &Path) -> std::io::Result<Vec<PathBuf>> {
         }
     }
     Ok(created)
+}
+
+/// A claim's folder must be a canonical path inside the checkout, so a
+/// tampered claim can't point the host at a folder elsewhere.
+fn claimed_project(claim: &WorkspaceClaim, path: &Path) -> Result<PathBuf> {
+    let invalid = || {
+        DraftlineError::InvalidWorkspaceClaim(format!(
+            "{}: project {:?} is not a folder inside this checkout; use Workspace::relocate to reset it",
+            path.display(),
+            claim.project
+        ))
+    };
+    let project = normalize_workspace_relative(&claim.project).map_err(|_| invalid())?;
+    let canonical = project
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if canonical != claim.project {
+        return Err(invalid());
+    }
+    Ok(project)
 }
 
 fn unique_claim_temp(path: &Path) -> PathBuf {
