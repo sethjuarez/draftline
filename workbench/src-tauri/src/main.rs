@@ -5,6 +5,7 @@ use draftline::tauri_contract::{
     CreateVariationFromVersionRequest, CreateVariationFromVersionResult, CurrentFileRequest,
     DeleteShelfResult, DiffVersionsRequest, FetchRemoteResult,
     GuardedCreateVariationFromVersionRequest, GuardedCreateVariationFromVersionResult,
+    LegacyHistoryCleanupRequest, LegacyHistoryCleanupResult,
     ListSupportRefsRequest, MergeIncomingCommandResult, MergeIncomingRequest,
     MergeIncomingWithResolutionsRequest, PreflightCreateVariationFromVersionRequest,
     PreviewVersionFileRequest, PublishCurrentVariationRequest, PublishCurrentVariationResult,
@@ -573,6 +574,30 @@ fn rollback_recovery(
 }
 
 #[tauri::command]
+fn acknowledge_recovery(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<CommandPostconditions> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::acknowledge_recovery_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn resolve_legacy_history_cleanup(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: LegacyHistoryCleanupRequest,
+) -> TauriCommandResult<LegacyHistoryCleanupResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::resolve_legacy_history_cleanup_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
 fn selected_save(
     state: tauri::State<'_, DraftlineContextState>,
     request: SelectedSaveRequest,
@@ -758,6 +783,8 @@ fn main() {
             clear_stale_lock,
             repair_recovery,
             rollback_recovery,
+            acknowledge_recovery,
+            resolve_legacy_history_cleanup,
             selected_save,
             selected_shelve,
             selected_discard,

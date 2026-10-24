@@ -2616,6 +2616,94 @@ fn recovery_records_from_removed_features_still_open_and_can_be_cleared() {
     }
 }
 
+/// Fabricates what Draftline 0.5 left behind after a history cleanup it
+/// applied locally but never published: `main` points at a squashed
+/// replacement with the same files, and `pending.json` remembers the original.
+fn legacy_cleanup(temp: &tempfile::TempDir, repo: &git2::Repository) -> (git2::Oid, git2::Oid) {
+    let base = repo.head().unwrap().peel_to_commit().unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "draft one\n");
+    commit_all(repo, "Draft one");
+    write_file(temp.path(), "cutready/intro.sk", "draft two\n");
+    let original = commit_all(repo, "Draft two");
+    let tree = repo.find_commit(original).unwrap().tree().unwrap();
+    let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+    let replacement = repo
+        .commit(None, &signature, &signature, "Cleaned up", &tree, &[&base])
+        .unwrap();
+    repo.reference("refs/heads/main", replacement, true, "0.5 cleanup")
+        .unwrap();
+    let pending = serde_json::json!([{
+        "plan_id": "cleanup-1",
+        "target_variation": "main",
+        "expected_local_head": original.to_string(),
+        "replacement_head": replacement.to_string(),
+        "backup_refs": ["refs/draftline/backups/history-cleanup/cleanup-1"],
+        "ref_updates": [],
+        "publish_status": "not_published",
+    }]);
+    let path = repo.path().join("draftline/history-cleanup/pending.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+    (original, replacement)
+}
+
+#[test]
+fn unpublished_0_5_history_cleanup_goes_back_to_the_original_history() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp);
+    let (original, replacement) = legacy_cleanup(&temp, &repo);
+
+    let summary = workspace.workspace_summary().unwrap();
+    let [cleanup] = summary.legacy_history_cleanups.as_slice() else {
+        panic!("{:?}", summary.legacy_history_cleanups);
+    };
+    assert_eq!(cleanup.plan_id, "cleanup-1");
+    assert_eq!(cleanup.replacement_head, replacement.to_string());
+    assert!(cleanup.can_restore_original);
+
+    let resolution = workspace
+        .resolve_legacy_history_cleanup("cleanup-1")
+        .unwrap();
+    assert_eq!(
+        resolution,
+        draftline::LegacyCleanupResolution::RestoredOriginal
+    );
+    assert_eq!(
+        repo.find_reference("refs/heads/main").unwrap().target(),
+        Some(original)
+    );
+    assert!(!workspace.workspace_summary().unwrap().is_dirty);
+    assert!(workspace.legacy_history_cleanups().unwrap().is_empty());
+    assert!(!repo
+        .path()
+        .join("draftline/history-cleanup/pending.json")
+        .exists());
+    assert!(matches!(
+        workspace.resolve_legacy_history_cleanup("cleanup-1"),
+        Err(DraftlineError::RecoveryNotFound(_))
+    ));
+}
+
+#[test]
+fn legacy_history_cleanup_with_newer_saves_is_only_forgotten() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp);
+    legacy_cleanup(&temp, &repo);
+    write_file(temp.path(), "cutready/intro.sk", "after upgrade\n");
+    let saved = workspace.save_version("After upgrade").unwrap();
+
+    assert!(!workspace.legacy_history_cleanups().unwrap()[0].can_restore_original);
+    let resolution = workspace
+        .resolve_legacy_history_cleanup("cleanup-1")
+        .unwrap();
+    assert_eq!(resolution, draftline::LegacyCleanupResolution::Forgotten);
+    assert_eq!(
+        repo.find_reference("refs/heads/main").unwrap().target(),
+        Some(git2::Oid::from_str(saved.id().as_str()).unwrap())
+    );
+    assert!(workspace.legacy_history_cleanups().unwrap().is_empty());
+}
+
 #[test]
 fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
     let (temp, repo) = code_repo();

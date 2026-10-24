@@ -283,6 +283,8 @@ describe('createDraftlineClient', () => {
     await client.clearStaleLock('C:\\repo');
     await client.repairRecovery(recoveryRequest);
     await client.rollbackRecovery(recoveryRequest);
+    await client.acknowledgeRecovery('C:\\repo');
+    await client.resolveLegacyHistoryCleanup({ workspace_path: 'C:\\repo', plan_id: 'plan-1' });
 
     expect(invoke).toHaveBeenCalledWith('get_changes', {
       request: { workspace_path: 'C:\\repo' },
@@ -434,6 +436,12 @@ describe('createDraftlineClient', () => {
     });
     expect(invoke).toHaveBeenCalledWith('repair_recovery', { request: recoveryRequest });
     expect(invoke).toHaveBeenCalledWith('rollback_recovery', { request: recoveryRequest });
+    expect(invoke).toHaveBeenCalledWith('acknowledge_recovery', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('resolve_legacy_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'plan-1' },
+    });
   });
 
   it('invokes reusable host setup, file preview, facade, and remote variation commands', async () => {

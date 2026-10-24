@@ -310,6 +310,52 @@ pub struct WorkspaceSummary {
     /// describe two different Git states simultaneously and should not be
     /// rendered as a coherent history view.
     pub state_may_be_inconsistent: bool,
+    /// History cleanups that Draftline 0.5 applied locally but never
+    /// resolved. Resolve each with [`Workspace::resolve_legacy_history_cleanup`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_history_cleanups: Vec<LegacyHistoryCleanup>,
+}
+
+/// A history cleanup (squash) that Draftline 0.5 applied to a local branch
+/// and recorded as pending publication. Current Draftline never rewrites
+/// shared history, so the record is only reported and resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct LegacyHistoryCleanup {
+    pub plan_id: String,
+    pub variation: String,
+    /// The branch tip before the cleanup rewrote it.
+    pub original_head: String,
+    /// The rewritten tip the cleanup left on the branch.
+    pub replacement_head: String,
+    /// Backup refs the cleanup made; they stay listed as support refs.
+    pub backup_refs: Vec<String>,
+    /// `true` while the branch still points at `replacement_head` with the
+    /// same files as `original_head`, so resolving can put the original
+    /// history back without touching any file.
+    pub can_restore_original: bool,
+}
+
+/// What [`Workspace::resolve_legacy_history_cleanup`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LegacyCleanupResolution {
+    /// The branch was moved back to its pre-cleanup history; no file changed.
+    RestoredOriginal,
+    /// The record was dropped and the branch left as it is. The next publish
+    /// merges the remote's history in instead of overwriting it.
+    Forgotten,
+}
+
+#[derive(Deserialize)]
+struct LegacyPendingCleanupRecord {
+    plan_id: String,
+    target_variation: String,
+    expected_local_head: String,
+    replacement_head: String,
+    #[serde(default)]
+    backup_refs: Vec<String>,
 }
 
 /// Stable workspace identity returned by [`Workspace::inspect`].
@@ -2548,6 +2594,116 @@ impl Workspace {
         let _lock = self.acquire_operation_lock("acknowledge_recovery")?;
         self.ensure_recovery_is_ours()?;
         self.clear_recovery_records()
+    }
+
+    fn legacy_pending_cleanup_path(&self) -> PathBuf {
+        self.draftline_dir()
+            .join("history-cleanup")
+            .join("pending.json")
+    }
+
+    fn read_legacy_pending_cleanups(&self) -> Result<Vec<LegacyPendingCleanupRecord>> {
+        match fs::read(self.legacy_pending_cleanup_path()) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Lists history cleanups that Draftline 0.5 applied locally but never
+    /// published. Current Draftline ignores them otherwise: the branch keeps
+    /// its rewritten history and the next publish merges the remote in.
+    pub fn legacy_history_cleanups(&self) -> Result<Vec<LegacyHistoryCleanup>> {
+        Ok(self
+            .read_legacy_pending_cleanups()?
+            .into_iter()
+            .map(|record| {
+                let can_restore_original = self.can_restore_legacy_original(&record);
+                LegacyHistoryCleanup {
+                    plan_id: record.plan_id,
+                    variation: record.target_variation,
+                    original_head: record.expected_local_head,
+                    replacement_head: record.replacement_head,
+                    backup_refs: record.backup_refs,
+                    can_restore_original,
+                }
+            })
+            .collect())
+    }
+
+    fn can_restore_legacy_original(&self, record: &LegacyPendingCleanupRecord) -> bool {
+        let tree_of = |id: &str| {
+            Oid::from_str(id)
+                .ok()
+                .and_then(|oid| self.repo.find_commit(oid).ok())
+                .map(|commit| commit.tree_id())
+        };
+        let at_replacement = self
+            .repo
+            .find_branch(&record.target_variation, BranchType::Local)
+            .ok()
+            .and_then(|branch| branch.get().target())
+            .is_some_and(|oid| oid.to_string() == record.replacement_head);
+        let original = tree_of(&record.expected_local_head);
+        at_replacement && original.is_some() && original == tree_of(&record.replacement_head)
+    }
+
+    /// Resolves a history cleanup left pending by Draftline 0.5. While the
+    /// branch is still exactly where the cleanup left it, it is moved back to
+    /// its original history (same files, so nothing on disk changes). Otherwise
+    /// only the record is dropped. Either way no history is rewritten.
+    pub fn resolve_legacy_history_cleanup(
+        &self,
+        plan_id: impl AsRef<str>,
+    ) -> Result<LegacyCleanupResolution> {
+        let plan_id = plan_id.as_ref();
+        let _lock = self.acquire_operation_lock("resolve_legacy_history_cleanup")?;
+        self.ensure_no_pending_recovery()?;
+        let records = self.read_legacy_pending_cleanups()?;
+        let Some(record) = records.into_iter().find(|record| record.plan_id == plan_id) else {
+            return Err(DraftlineError::RecoveryNotFound(plan_id.to_string()));
+        };
+        let resolution = if self.can_restore_legacy_original(&record) {
+            let original = Oid::from_str(&record.expected_local_head)
+                .map_err(|_| DraftlineError::VersionNotFound(record.expected_local_head.clone()))?;
+            let name = format!("refs/heads/{}", record.target_variation);
+            // Hold the ref lock and recheck, so a commit made meanwhile (from
+            // another worktree or plain git) is never dropped.
+            let mut transaction = self.repo.transaction()?;
+            transaction.lock_ref(&name)?;
+            let current = self.repo.refname_to_id(&name).ok();
+            if current.map(|oid| oid.to_string()).as_deref() == Some(&record.replacement_head) {
+                transaction.set_target(
+                    &name,
+                    original,
+                    None,
+                    "draftline: restore history from an unpublished 0.5 cleanup",
+                )?;
+                transaction.commit()?;
+                LegacyCleanupResolution::RestoredOriginal
+            } else {
+                LegacyCleanupResolution::Forgotten
+            }
+        } else {
+            LegacyCleanupResolution::Forgotten
+        };
+        let path = self.legacy_pending_cleanup_path();
+        let raw: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(&path)?)?;
+        let remaining = raw
+            .into_iter()
+            .filter(|value| value.get("plan_id").and_then(|id| id.as_str()) != Some(plan_id))
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            fs::remove_file(&path)?;
+        } else {
+            let temp = unique_claim_temp(&path);
+            fs::write(&temp, serde_json::to_vec_pretty(&remaining)?)?;
+            if let Err(error) = fs::rename(&temp, &path) {
+                let _ = fs::remove_file(&temp);
+                return Err(error.into());
+            }
+        }
+        Ok(resolution)
     }
 
     /// Deletes recovery records; the caller holds the operation lock.
@@ -5002,6 +5158,7 @@ impl Workspace {
         let dirty_files = self.changed_files_unchecked().unwrap_or_default();
         let is_dirty = !dirty_files.is_empty();
         let state_may_be_inconsistent = recovery.is_some();
+        let legacy_history_cleanups = self.legacy_history_cleanups().unwrap_or_default();
 
         Ok(WorkspaceSummary {
             active_variation,
@@ -5011,6 +5168,7 @@ impl Workspace {
             is_dirty,
             recovery,
             state_may_be_inconsistent,
+            legacy_history_cleanups,
         })
     }
 

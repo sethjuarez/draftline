@@ -510,6 +510,20 @@ pub struct RecoveryRequest {
     pub operation_id: String,
 }
 
+/// Request to resolve a history cleanup left pending by Draftline 0.5.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyHistoryCleanupRequest {
+    pub workspace_path: PathBuf,
+    pub plan_id: String,
+}
+
+/// Result of resolving a legacy history cleanup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyHistoryCleanupResult {
+    pub resolution: crate::LegacyCleanupResolution,
+    pub postconditions: CommandPostconditions,
+}
+
 /// Request for selected-file save operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectedSaveRequest {
@@ -1982,6 +1996,68 @@ pub fn rollback_recovery_with_context(
     let result = workspace.rollback_recovery(request.operation_id)?;
     context.emit(&workspace, DraftlineEventKind::RecoveryRequired, None);
     Ok(result)
+}
+
+/// Acknowledges an interrupted operation without repairing or rolling it back.
+///
+/// This is the supported exit for recovery records that cannot be repaired or
+/// rolled back, such as records left by operations older Draftline versions
+/// ran (milestone merge, squash, history cleanup). It clears only Draftline's
+/// record; refs and files stay as they are.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn acknowledge_recovery(request: WorkspaceRequest) -> Result<CommandPostconditions> {
+    acknowledge_recovery_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Acknowledges an interrupted operation using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn acknowledge_recovery_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: WorkspaceRequest,
+) -> Result<CommandPostconditions> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    workspace.acknowledge_recovery()?;
+    context.emit(&workspace, DraftlineEventKind::RecoveryRequired, None);
+    Ok(collect_postconditions(&workspace, false))
+}
+
+/// Resolves a history cleanup left pending by Draftline 0.5.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn resolve_legacy_history_cleanup(
+    request: LegacyHistoryCleanupRequest,
+) -> Result<LegacyHistoryCleanupResult> {
+    resolve_legacy_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Resolves a legacy history cleanup using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn resolve_legacy_history_cleanup_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: LegacyHistoryCleanupRequest,
+) -> Result<LegacyHistoryCleanupResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let resolution = workspace.resolve_legacy_history_cleanup(&request.plan_id)?;
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(LegacyHistoryCleanupResult {
+        resolution,
+        postconditions: collect_postconditions(&workspace, false),
+    })
 }
 
 /// Saves selected files after preflighting the exact selection.
