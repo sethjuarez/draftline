@@ -36,6 +36,34 @@ impl ContributorProfile {
     }
 }
 
+/// The user's Git identity (`user.name` / `user.email`) from global, XDG and
+/// system config, for hosts that attribute work before a workspace is open.
+///
+/// Returns `Ok(None)` when no non-empty `user.name` is configured, and an
+/// error when the config cannot be read. Use
+/// [`crate::Workspace::git_identity`] once a workspace is open so repository
+/// config is honoured too.
+pub fn default_git_identity() -> Result<Option<Contributor>> {
+    identity_from_config(&git2::Config::open_default()?)
+}
+
+pub(crate) fn identity_from_config(config: &git2::Config) -> Result<Option<Contributor>> {
+    let value = |key: &str| -> Result<Option<String>> {
+        match config.get_string(key) {
+            Ok(value) => Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty())),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let Some(name) = value("user.name")? else {
+        return Ok(None);
+    };
+    Ok(Some(Contributor {
+        name,
+        email: value("user.email")?,
+    }))
+}
+
 /// Operation kind passed to host attribution providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,4 +84,40 @@ pub trait ContributorProvider: Send {
         &mut self,
         operation: AttributionOperation,
     ) -> Result<ContributorProfile>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(lines: &str) -> Option<Contributor> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(&path, lines).unwrap();
+        identity_from_config(&git2::Config::open(&path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn identity_reads_trimmed_name_and_email() {
+        assert_eq!(
+            identity("[user]\n\tname = \" Avery \"\n\temail = avery@example.test\n"),
+            Some(Contributor {
+                name: "Avery".to_string(),
+                email: Some("avery@example.test".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn identity_needs_a_name_but_not_an_email() {
+        assert_eq!(identity("[user]\n\temail = a@example.test\n"), None);
+        assert_eq!(identity("[user]\n\tname = \"  \"\n"), None);
+        assert_eq!(
+            identity("[user]\n\tname = Avery\n\temail = \n"),
+            Some(Contributor {
+                name: "Avery".to_string(),
+                email: None,
+            })
+        );
+    }
 }

@@ -1712,6 +1712,26 @@ fn send_needs_a_known_base_branch() {
 }
 
 #[test]
+fn workspace_reports_the_enclosing_repository_git_identity() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp);
+    assert_eq!(
+        workspace.git_identity().unwrap(),
+        Some(draftline::Contributor {
+            name: "Dev".to_string(),
+            email: Some("dev@example.test".to_string()),
+        })
+    );
+
+    repo.config().unwrap().set_str("user.name", " ").unwrap();
+    assert_eq!(
+        workspace.git_identity().unwrap(),
+        None,
+        "a blank name is no identity"
+    );
+}
+
+#[test]
 fn send_refuses_a_base_the_remote_lacks_before_changing_anything() {
     let (temp, repo) = code_repo();
     let bare = tempfile::tempdir().unwrap();

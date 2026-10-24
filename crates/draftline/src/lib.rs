@@ -92,7 +92,9 @@ pub use merge::{
     MarkdownResolver, MergeConflict, MergeInput, MergeOutcome, PlainTextResolver, ResolutionKind,
     ResolverRegistry, SemanticMergeResolver,
 };
-pub use profile::{AttributionOperation, ContributorProfile, ContributorProvider};
+pub use profile::{
+    default_git_identity, AttributionOperation, ContributorProfile, ContributorProvider,
+};
 pub use pull_request::{
     PullRequest, PullRequestProvider, PullRequestRequest, SendRequest, SendResult,
 };

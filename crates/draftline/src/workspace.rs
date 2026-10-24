@@ -1550,6 +1550,14 @@ impl Workspace {
         self.content_policy.scope()
     }
 
+    /// The Git identity (`user.name` / `user.email`) this repository resolves,
+    /// honouring repository, global, XDG and system config. Returns `Ok(None)`
+    /// when no non-empty `user.name` is configured, and an error when the
+    /// config cannot be read.
+    pub fn git_identity(&self) -> Result<Option<Contributor>> {
+        crate::profile::identity_from_config(&self.repo.config()?)
+    }
+
     /// Returns the absolute project folder.
     pub fn project_root(&self) -> PathBuf {
         self.root.join(self.scope())

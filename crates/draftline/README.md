@@ -187,6 +187,13 @@ let profile = ContributorProfile::new(
 # let _ = profile;
 ```
 
+When a host does want the developer's Git identity (for example as a fallback
+author), read it through Draftline rather than linking `git2` directly.
+`Workspace::git_identity()` honours repository config, and
+`draftline::default_git_identity()` reads global config before a project is
+open. Both return `Ok(None)` when no `user.name` is set and an error when Git
+config cannot be read.
+
 Every operation that writes a commit honors the profile: save, selected save,
 merge, shelve (including `switch_variation` with `SaveFirst`/`Shelve`), restore
 as a new save. On `Workspace`, use the `*_with_profile` variants, such as
