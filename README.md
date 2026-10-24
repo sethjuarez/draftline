@@ -26,7 +26,7 @@ The first crate focuses on an embeddable core:
 - recovery ledger metadata for multi-step operations
 - structured merge conflicts with pluggable resolvers
 - plain-text and lightweight Markdown/frontmatter merge proof points
-- project folders inside code repositories, shared with developers who use plain Git ([hybrid projects](docs/scenario-flows/hybrid-projects.md))
+- project folders inside code repositories, shared with developers who use plain Git, one Draftline workspace per checkout ([hybrid projects](docs/scenario-flows/hybrid-projects.md))
 
 Ghost publishing, CutReady-specific file formats, UI components, LLM provider logic, and CLI-first workflows are intentionally out of scope for the first pass.
 

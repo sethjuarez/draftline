@@ -10,6 +10,7 @@ does and never takes it over.
 | Rule | What Draftline does |
 |---|---|
 | One repository | Opening a folder inside a repository joins it. Draftline never creates a nested `.git`. |
+| One workspace per checkout | A checkout has one branch, so it holds one Draftline workspace. A host with many projects keeps them inside that workspace's folder; separate copies use owned worktrees. |
 | Stay in the folder | Saves, restores, and shelves read and write only the project folder. Merges bring in the whole branch but keep the developer's index and unrelated local edits. |
 | Never rewrite | No squash, cleanup, or force push. Shared history only grows. |
 | Share by pull request | Send pushes a branch and opens a pull request. It never pushes to the base branch. |
@@ -92,13 +93,13 @@ Business goal: "Start something new without touching what's open."
 | Safety behavior | Creates a `draftline-*` worktree on a new namespaced branch, from the last-fetched base (fetch first) or the current version. This checkout is left alone. Removal refuses unsaved work unless `discard_changes` is set, keeps the branch, and never touches other tools' worktrees. A failed create leaves nothing behind. Git LFS files arrive as pointer text until someone runs `git lfs pull` in the new copy. |
 | Tests | `owned_worktree_starts_from_the_latest_base_and_leaves_this_checkout_alone`, `removing_an_owned_worktree_keeps_its_branch_and_refuses_unsaved_work`, `a_failed_owned_worktree_leaves_nothing_behind`. |
 
-## Flow 15f: an operation was interrupted in another project
+## Flow 15f: one workspace per checkout
 
-Business goal: "Another deck in this repository was interrupted; what can I do?"
+Business goal: "Open a second deck in the same repository."
 
 | Question | Answer |
 |---|---|
 | Covered today? | Covered. |
-| Correct primitive path | `inspect` reports `recovery_in_other_project` with next action `finish_in_other_project`. |
-| Safety behavior | Projects in one checkout share its branch, so the operation lock and the recovery record are per checkout. An unfinished operation blocks every project there, but only the project that started it can repair, roll back, or acknowledge it. Others get `RecoveryInOtherProject`. |
-| Tests | `only_the_project_that_was_interrupted_can_finish_its_recovery`. |
+| Correct primitive path | Keep every project inside one workspace folder (CutReady lists them in `.cutready/projects.json`). To move the workspace on purpose, call `Workspace::relocate_with_policy(new_folder, policy)`. For an independent copy, use an owned worktree. |
+| Safety behavior | Variations, Send, merges, the operation lock and recovery all act on the checkout's one branch, so the first folder opened claims the checkout. The claim lives in the checkout's own Git directory, so each linked worktree has its own. Opening or initializing any other folder, including the repository root or a folder inside the workspace, fails with `WorkspaceAlreadyInCheckout` (`workspace_already_in_checkout`, details `{ "project": "<folder>" }`) before anything changes; a refused `init` removes the folders it created. `relocate` refuses while an operation runs (`WorkspaceLocked`) or is unfinished, including one from the old folder (`RecoveryInOtherProject`, next action `finish_in_other_project`). After a relocate, every later operation on a handle still open on the old folder fails with `WorkspaceAlreadyInCheckout`. The claim is published atomically, so a crash never leaves a partial one; a record damaged by another tool fails with `InvalidWorkspaceClaim`, and `relocate` resets it. Checkouts from older Draftline versions are claimed on first open. |
+| Tests | `a_checkout_holds_one_workspace`, `a_refused_init_keeps_folders_that_already_existed`, `a_root_workspace_refuses_project_folders`, `each_linked_worktree_holds_its_own_workspace`, `relocate_moves_the_workspace_and_refuses_while_an_operation_runs`, `only_the_project_that_was_interrupted_can_finish_its_recovery`, `an_unreadable_claim_is_reported_and_relocate_resets_it`, `an_interrupted_claim_never_leaves_a_partial_one`, `a_checkout_from_an_older_draftline_is_claimed_on_first_open`, `concurrent_opens_of_different_folders_let_exactly_one_claim_the_checkout`. |

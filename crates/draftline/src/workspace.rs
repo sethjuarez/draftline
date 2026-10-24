@@ -423,6 +423,13 @@ pub struct OperationLockInspection {
     pub diagnostics: Vec<WorkspaceDiagnostic>,
 }
 
+/// The folder a checkout's Draftline workspace manages, relative to the
+/// repository root (`""` for the root itself).
+#[derive(Serialize, Deserialize)]
+struct WorkspaceClaim {
+    project: String,
+}
+
 /// The recovery file on disk: the state plus the project that wrote it.
 /// Records from older versions have no project.
 #[derive(Serialize, Deserialize)]
@@ -1377,22 +1384,66 @@ impl Workspace {
     /// repository and scopes itself to the folder instead of creating a nested
     /// repository.
     pub fn init_with_policy(path: impl AsRef<Path>, content_policy: ContentPolicy) -> Result<Self> {
-        fs::create_dir_all(path.as_ref())?;
+        let path = path.as_ref();
+        let created = create_missing_dirs(path)?;
 
-        let repo = match Repository::discover(path.as_ref()) {
+        let repo = match Repository::discover(path) {
             Ok(repo) => repo,
             Err(_) => {
                 let initial_head = default_initial_variation_name();
                 let mut options = RepositoryInitOptions::new();
                 options.initial_head(&initial_head);
-                Repository::init_opts(path.as_ref(), &options)?
+                Repository::init_opts(path, &options)?
             }
         };
 
-        Self::from_repository(repo, path.as_ref(), content_policy)
+        let result = Self::from_repository(repo, path, content_policy);
+        if let Err(DraftlineError::WorkspaceAlreadyInCheckout(_)) = &result {
+            // Leave no trace of a refused folder; `remove_dir` only removes empty ones.
+            for dir in created.iter().rev() {
+                if fs::remove_dir(dir).is_err() {
+                    break;
+                }
+            }
+        }
+        result
+    }
+
+    /// Moves this checkout's Draftline workspace to the folder at `path`.
+    ///
+    /// A checkout holds one Draftline workspace (see
+    /// [`DraftlineError::WorkspaceAlreadyInCheckout`]); use this when the
+    /// project folder moved or the host deliberately manages a different one.
+    /// Refuses while a Draftline operation is running or left unfinished.
+    pub fn relocate(path: impl AsRef<Path>) -> Result<Self> {
+        Self::relocate_with_policy(path, ContentPolicy::default())
+    }
+
+    /// Moves this checkout's Draftline workspace with an explicit content
+    /// policy; see [`Workspace::relocate`].
+    pub fn relocate_with_policy(
+        path: impl AsRef<Path>,
+        content_policy: ContentPolicy,
+    ) -> Result<Self> {
+        let repo = Repository::discover(path.as_ref())?;
+        let workspace = Self::unclaimed(repo, path.as_ref(), content_policy)?;
+        let _lock = OperationLock::acquire(&workspace.lock_path(), "relocate workspace")?;
+        workspace.ensure_no_pending_recovery_in_checkout()?;
+        workspace.write_claim()?;
+        Ok(workspace)
     }
 
     fn from_repository(
+        repo: Repository,
+        project_path: &Path,
+        content_policy: ContentPolicy,
+    ) -> Result<Self> {
+        let workspace = Self::unclaimed(repo, project_path, content_policy)?;
+        workspace.claim_checkout()?;
+        Ok(workspace)
+    }
+
+    fn unclaimed(
         repo: Repository,
         project_path: &Path,
         content_policy: ContentPolicy,
@@ -1949,6 +2000,7 @@ impl Workspace {
 
     /// Clears an abandoned operation lock only when lock metadata marks it stale.
     pub fn clear_stale_lock(&self) -> Result<()> {
+        self.claim_checkout()?;
         let inspection = self.inspect_operation_lock()?;
         if inspection.state == OperationLockState::Unlocked {
             return Ok(());
@@ -2493,7 +2545,7 @@ impl Workspace {
     /// Acknowledges an incomplete recovery record and allows normal operations again.
     pub fn acknowledge_recovery(&self) -> Result<()> {
         self.clear_stale_lock()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "acknowledge_recovery")?;
+        let _lock = self.acquire_operation_lock("acknowledge_recovery")?;
         self.ensure_recovery_is_ours()?;
         self.clear_recovery_records()
     }
@@ -4106,7 +4158,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<()> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "delete_remote_variation")?;
+        let _lock = self.acquire_operation_lock("delete_remote_variation")?;
         let variation_name = validate_variation_name(token.variation.as_str())?;
         self.ensure_variation_in_namespace(&variation_name)?;
         self.fetch_remote_variation_ref(&token.remote, &variation_name, options)?;
@@ -4244,7 +4296,7 @@ impl Workspace {
     /// Expires selected local support refs as retention cleanup, not purge.
     pub fn expire_support_refs(&self, token: SupportRefExpirationToken) -> Result<()> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "expire_support_refs")?;
+        let _lock = self.acquire_operation_lock("expire_support_refs")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -4458,7 +4510,7 @@ impl Workspace {
     /// Deletes a preflighted alternate variation.
     pub fn delete_variation_with_token(&self, token: VariationDeleteToken) -> Result<()> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "delete_variation")?;
+        let _lock = self.acquire_operation_lock("delete_variation")?;
         self.ensure_variation_in_namespace(token.variation.as_str())?;
         if self.current_variation().ok().as_deref() == Some(token.variation.as_str()) {
             return Err(DraftlineError::CannotDeleteCurrentVariation(
@@ -4556,7 +4608,7 @@ impl Workspace {
     /// Renames a preflighted visible local variation while preserving its tip in a support ref.
     pub fn rename_variation_with_token(&self, token: VariationRenameToken) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "rename_variation")?;
+        let _lock = self.acquire_operation_lock("rename_variation")?;
         let source_name = validate_variation_name(token.source_variation.as_str())?;
         let target_name = validate_variation_name(token.target_variation.as_str())?;
         self.ensure_variation_in_namespace(&source_name)?;
@@ -7971,7 +8023,7 @@ impl Workspace {
     /// Takes the Draftline lock for an operation that writes Git's index, and
     /// refuses up front while another Git process holds that index.
     fn acquire_for_index(&self, operation: &str) -> Result<OperationLock> {
-        let lock = OperationLock::acquire(&self.lock_path(), operation)?;
+        let lock = self.acquire_operation_lock(operation)?;
         self.while_git_busy(|| self.ensure_git_index_unlocked())?;
         Ok(lock)
     }
@@ -8005,6 +8057,14 @@ impl Workspace {
         }
         test_hooks::fire("after_index_precheck", self.repo.path());
         Ok(())
+    }
+
+    /// Takes the Draftline lock, then confirms this workspace still holds the
+    /// checkout, so a handle opened before a relocate can't keep writing.
+    fn acquire_operation_lock(&self, operation: &str) -> Result<OperationLock> {
+        let lock = OperationLock::acquire(&self.lock_path(), operation)?;
+        self.claim_checkout()?;
+        Ok(lock)
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -8097,7 +8157,106 @@ impl Workspace {
         self
     }
 
+    fn claim_path(&self) -> PathBuf {
+        self.draftline_dir().join("workspace.json")
+    }
+
+    /// A checkout has one current branch, and variations, sends, merges, the
+    /// operation lock and recovery all act on it, so it holds one Draftline
+    /// workspace. The first workspace opened in a checkout claims it; any other
+    /// folder is refused until [`Workspace::relocate`] moves the claim.
+    fn claim_checkout(&self) -> Result<()> {
+        let path = self.claim_path();
+        if !path.exists() {
+            match self.publish_new_claim(&path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let claimed = self.read_claim(&path)?;
+        if claimed.project == self.project_key() {
+            Ok(())
+        } else {
+            Err(DraftlineError::WorkspaceAlreadyInCheckout(PathBuf::from(
+                claimed.project,
+            )))
+        }
+    }
+
+    /// Publishes a complete claim only if none exists, so a crash never leaves
+    /// a partial one: the claim is written and synced to a temporary file,
+    /// then hard-linked into place, which fails if another opener won. File
+    /// systems without hard links fall back to an exclusive create.
+    fn publish_new_claim(&self, path: &Path) -> std::io::Result<()> {
+        use std::io::Write as _;
+        fs::create_dir_all(self.draftline_dir())?;
+        let bytes = self.claim_bytes().map_err(std::io::Error::other)?;
+        let temp = unique_claim_temp(path);
+        let written = fs::File::create(&temp).and_then(|mut file| {
+            file.write_all(&bytes)?;
+            file.sync_all()
+        });
+        let linked = written.and_then(|()| fs::hard_link(&temp, path));
+        let _ = fs::remove_file(&temp);
+        match linked {
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists && !path.exists() => {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?;
+                file.write_all(&bytes)?;
+                file.sync_all()
+            }
+            result => result,
+        }
+    }
+
+    /// Reads the claim, waiting briefly for a racing opener that created the
+    /// file but has not written it yet.
+    fn read_claim(&self, path: &Path) -> Result<WorkspaceClaim> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let bytes = fs::read(path)?;
+            if !bytes.is_empty() || std::time::Instant::now() >= deadline {
+                return serde_json::from_slice(&bytes).map_err(|error| {
+                    DraftlineError::InvalidWorkspaceClaim(format!(
+                        "{}: {error}; use Workspace::relocate to reset it",
+                        path.display()
+                    ))
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn write_claim(&self) -> Result<()> {
+        fs::create_dir_all(self.draftline_dir())?;
+        let path = self.claim_path();
+        let temp = unique_claim_temp(&path);
+        fs::write(&temp, self.claim_bytes()?)?;
+        if let Err(error) = fs::rename(&temp, &path) {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn claim_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec_pretty(&WorkspaceClaim {
+            project: self.project_key(),
+        })?)
+    }
+
+    /// Every operation that reads or writes the checkout passes here, so a
+    /// handle whose folder no longer holds the checkout's claim is refused.
     fn ensure_no_pending_recovery(&self) -> Result<()> {
+        self.claim_checkout()?;
+        self.ensure_no_pending_recovery_in_checkout()
+    }
+
+    fn ensure_no_pending_recovery_in_checkout(&self) -> Result<()> {
         self.ensure_recovery_is_ours()?;
         if let Some(state) = self.recovery_state()? {
             return Err(DraftlineError::RecoveryRequired(Box::new(state)));
@@ -11112,6 +11271,31 @@ fn redact_remote_url(url: &str) -> String {
         &authority[userinfo_end + 1..],
         &url[path_start..]
     )
+}
+
+/// Creates `path` and any missing parents, returning only the folders this
+/// call created, outermost first.
+fn create_missing_dirs(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut missing: Vec<&Path> = path
+        .ancestors()
+        .take_while(|ancestor| !ancestor.as_os_str().is_empty() && !ancestor.is_dir())
+        .collect();
+    missing.reverse();
+    let mut created = Vec::new();
+    for dir in missing {
+        match fs::create_dir(dir) {
+            Ok(()) => created.push(dir.to_path_buf()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(created)
+}
+
+fn unique_claim_temp(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("json.{}.{next}.tmp", std::process::id()))
 }
 
 struct OperationLock {
@@ -16077,7 +16261,7 @@ mod tests {
     #[test]
     fn recovery_records_name_the_project_that_wrote_them() {
         let temp = tempfile::tempdir().unwrap();
-        Workspace::init(temp.path()).unwrap();
+        Repository::init(temp.path()).unwrap();
         let workspace = Workspace::init(temp.path().join("decks").join("pitch")).unwrap();
         let state = RecoveryState {
             operation_id: "op".to_string(),

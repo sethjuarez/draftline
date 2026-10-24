@@ -473,10 +473,10 @@ export const flowMatrix: Flow[] = [
   },
   {
     id: "15f",
-    title: "An operation was interrupted in another project",
+    title: "One workspace per checkout",
     group: "Hybrid projects",
     status: "Covered",
-    outcome: "Block every project in the checkout, but let only the owning project finish recovery.",
+    outcome: "Keep many projects in one workspace folder; refuse a second folder until it is relocated.",
   },
 ];
 

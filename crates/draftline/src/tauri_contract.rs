@@ -2752,6 +2752,8 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidMergeResolution(_) => "invalid_merge_resolution",
         DraftlineError::SendBaseUnknown => "send_base_unknown",
         DraftlineError::SendBaseNotOnRemote(_) => "send_base_not_on_remote",
+        DraftlineError::WorkspaceAlreadyInCheckout(_) => "workspace_already_in_checkout",
+        DraftlineError::InvalidWorkspaceClaim(_) => "invalid_workspace_claim",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::VariationOutsideNamespace(_) => "variation_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
@@ -2785,6 +2787,9 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
             })),
         },
         DraftlineError::RecoveryInOtherProject(project) => {
+            Some(serde_json::json!({ "project": project }))
+        }
+        DraftlineError::WorkspaceAlreadyInCheckout(project) => {
             Some(serde_json::json!({ "project": project }))
         }
         DraftlineError::SyncNeedsMerge(status) => match serde_json::to_value(status.as_ref()) {

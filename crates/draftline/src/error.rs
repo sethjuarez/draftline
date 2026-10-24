@@ -128,6 +128,15 @@ pub enum DraftlineError {
     #[error("the remote has no branch `{0}` to send to; publish it first or pass a base branch")]
     SendBaseNotOnRemote(String),
 
+    #[error(
+        "this checkout's Draftline workspace is {}; open that folder, or relocate the workspace",
+        workspace_folder(.0)
+    )]
+    WorkspaceAlreadyInCheckout(std::path::PathBuf),
+
+    #[error("unreadable Draftline workspace record: {0}")]
+    InvalidWorkspaceClaim(String),
+
     #[error("branch `{0}` is not a variation; switch to one or to the base branch to send")]
     SendOutsideNamespace(String),
 
@@ -159,6 +168,14 @@ impl From<git2::Error> for DraftlineError {
         } else {
             DraftlineError::Git(error)
         }
+    }
+}
+
+fn workspace_folder(project: &std::path::Path) -> String {
+    if project.as_os_str().is_empty() {
+        "the repository root".to_string()
+    } else {
+        format!("`{}`", project.display())
     }
 }
 

@@ -2621,7 +2621,6 @@ fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
     let (temp, repo) = code_repo();
     let (_bare, other_dir, other) = with_remote(&repo);
     let pitch = scoped(&temp);
-    let deck = Workspace::init_with_policy(temp.path().join("deck"), cutready_policy()).unwrap();
     write_file(other_dir.path(), "cutready/outro.sk", "teammate outro\n");
     commit_all(&other, "Teammate scene");
     push_main(&other);
@@ -2648,24 +2647,13 @@ fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
     )
     .unwrap();
 
-    // The deck project shares the branch, so it waits, but it can't finish
-    // or discard the pitch project's operation.
-    write_file(temp.path(), "deck/slide.sk", "slide\n");
-    let in_other = |error: DraftlineError| {
-        assert!(
-            matches!(&error, DraftlineError::RecoveryInOtherProject(project) if project == Path::new("cutready")),
-            "{error:?}"
-        );
-    };
-    in_other(deck.save_version("Slide").unwrap_err());
-    in_other(deck.repair_recovery("interrupted").unwrap_err());
-    in_other(deck.rollback_recovery("interrupted").unwrap_err());
-    in_other(deck.acknowledge_recovery().unwrap_err());
-    assert!(deck.recovery_state().unwrap().is_some());
-    let inspection = deck.inspect().unwrap();
-    assert_eq!(
-        inspection.safe_next_actions,
-        vec![draftline::SafeNextAction::FinishInOtherProject]
+    // The workspace can't move to another folder until pitch finishes.
+    let deck = temp.path().join("deck");
+    fs::create_dir_all(&deck).unwrap();
+    let error = refused(Workspace::relocate_with_policy(&deck, cutready_policy()));
+    assert!(
+        matches!(&error, DraftlineError::RecoveryInOtherProject(project) if project == Path::new("cutready")),
+        "{error:?}"
     );
     assert_eq!(
         pitch.inspect().unwrap().safe_next_actions,
@@ -2673,5 +2661,232 @@ fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
     );
 
     pitch.repair_recovery("interrupted").unwrap();
+    let deck = Workspace::relocate_with_policy(&deck, cutready_policy()).unwrap();
+    write_file(temp.path(), "deck/slide.sk", "slide\n");
     deck.save_version("Slide").unwrap();
+}
+
+fn refused(result: draftline::Result<Workspace>) -> DraftlineError {
+    match result {
+        Ok(workspace) => panic!("expected a refusal, opened {:?}", workspace.scope()),
+        Err(error) => error,
+    }
+}
+
+fn claimed_elsewhere(error: DraftlineError) -> PathBuf {
+    match error {
+        DraftlineError::WorkspaceAlreadyInCheckout(project) => project,
+        other => panic!("expected WorkspaceAlreadyInCheckout, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_checkout_holds_one_workspace() {
+    let (temp, _repo) = code_repo();
+    let pitch = scoped(&temp);
+    write_file(temp.path(), "cutready/intro.sk", "intro\n");
+    pitch.save_version("Intro").unwrap();
+
+    // Another folder, the repository root, and a nested folder are all refused.
+    let deck = temp.path().join("deck").join("slides");
+    let error = refused(Workspace::init_with_policy(&deck, cutready_policy()));
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("cutready"));
+    assert!(
+        !temp.path().join("deck").exists(),
+        "a refused init leaves no folder behind"
+    );
+    for path in [
+        temp.path().to_path_buf(),
+        temp.path().join("cutready").join("scenes"),
+    ] {
+        fs::create_dir_all(&path).unwrap();
+        let error = refused(Workspace::open_with_policy(&path, cutready_policy()));
+        assert_eq!(claimed_elsewhere(error), PathBuf::from("cutready"));
+    }
+
+    // The claimed folder opens normally, however it is reached.
+    Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    Workspace::init_with_policy(temp.path().join("cutready").join("."), cutready_policy()).unwrap();
+}
+
+#[test]
+fn a_refused_init_keeps_folders_that_already_existed() {
+    let (temp, _repo) = code_repo();
+    scoped(&temp);
+    write_file(temp.path(), "deck/notes.txt", "keep\n");
+    let error = refused(Workspace::init_with_policy(
+        temp.path().join("deck").join("new"),
+        cutready_policy(),
+    ));
+    claimed_elsewhere(error);
+    assert!(!temp.path().join("deck").join("new").exists());
+    assert_eq!(read(temp.path(), "deck/notes.txt"), "keep\n");
+}
+
+#[test]
+fn a_root_workspace_refuses_project_folders() {
+    let (temp, _repo) = code_repo();
+    Workspace::open_with_policy(temp.path(), cutready_policy()).unwrap();
+    let error = refused(Workspace::init_with_policy(
+        temp.path().join("cutready"),
+        cutready_policy(),
+    ));
+    assert!(error.to_string().contains("the repository root"), "{error}");
+    assert_eq!(claimed_elsewhere(error), PathBuf::new());
+}
+
+#[test]
+fn each_linked_worktree_holds_its_own_workspace() {
+    let (temp, repo) = code_repo();
+    scoped(&temp);
+    let other = tempfile::tempdir().unwrap();
+    let linked = other.path().join("linked");
+    repo.worktree("linked", &linked, None).unwrap();
+
+    let deck = Workspace::init_with_policy(linked.join("deck"), cutready_policy()).unwrap();
+    assert_eq!(deck.scope(), Path::new("deck"));
+    Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    let error = refused(Workspace::open_with_policy(
+        linked.join("cutready"),
+        cutready_policy(),
+    ));
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("deck"));
+}
+
+#[test]
+fn relocate_moves_the_workspace_and_refuses_while_an_operation_runs() {
+    let (temp, repo) = code_repo();
+    let stale = scoped(&temp);
+    let deck = temp.path().join("deck");
+    fs::create_dir_all(&deck).unwrap();
+
+    let lock = repo.path().join("draftline").join("operation.lock");
+    fs::write(&lock, r#"{"operation":"save","pid":1,"created_at":"now"}"#).unwrap();
+    assert!(matches!(
+        refused(Workspace::relocate_with_policy(&deck, cutready_policy())),
+        DraftlineError::WorkspaceLocked
+    ));
+    fs::remove_file(&lock).unwrap();
+
+    let moved = Workspace::relocate_with_policy(&deck, cutready_policy()).unwrap();
+    assert_eq!(moved.scope(), Path::new("deck"));
+
+    // A handle opened before the move can't keep writing to the old folder.
+    write_file(temp.path(), "cutready/intro.sk", "late edit\n");
+    let error = stale.save_version("Late").unwrap_err();
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("deck"));
+    assert!(!lock.exists(), "the refused save released the lock");
+    let error = stale.create_variation("cutready/late").unwrap_err();
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("deck"));
+    let error = stale.fetch_remote("origin").unwrap_err();
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("deck"));
+    let error = stale.clear_stale_lock().unwrap_err();
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("deck"));
+    assert!(repo
+        .find_branch("cutready/late", git2::BranchType::Local)
+        .is_err());
+    Workspace::open_with_policy(&deck, cutready_policy()).unwrap();
+    let error = refused(Workspace::open_with_policy(
+        temp.path().join("cutready"),
+        cutready_policy(),
+    ));
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("deck"));
+}
+
+#[test]
+fn an_unreadable_claim_is_reported_and_relocate_resets_it() {
+    let (temp, repo) = code_repo();
+    scoped(&temp);
+    fs::write(
+        repo.path().join("draftline").join("workspace.json"),
+        "not json",
+    )
+    .unwrap();
+    let error = refused(Workspace::open_with_policy(
+        temp.path().join("cutready"),
+        cutready_policy(),
+    ));
+    assert!(
+        matches!(error, DraftlineError::InvalidWorkspaceClaim(_)),
+        "{error:?}"
+    );
+    Workspace::relocate_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+}
+
+#[test]
+fn an_interrupted_claim_never_leaves_a_partial_one() {
+    let (temp, repo) = code_repo();
+    let dir = repo.path().join("draftline");
+    fs::create_dir_all(&dir).unwrap();
+    // A crash after writing the temporary claim, before publishing it.
+    fs::write(dir.join("workspace.json.1.0.tmp"), "").unwrap();
+    fs::create_dir_all(temp.path().join("cutready")).unwrap();
+    let workspace =
+        Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    assert_eq!(workspace.scope(), Path::new("cutready"));
+    let claim = fs::read_to_string(dir.join("workspace.json")).unwrap();
+    assert!(claim.contains("\"cutready\""), "{claim}");
+    let temps = fs::read_dir(&dir)
+        .unwrap()
+        .filter(|entry| {
+            let name = entry.as_ref().unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".tmp") && name != "workspace.json.1.0.tmp"
+        })
+        .count();
+    assert_eq!(
+        temps, 0,
+        "publishing the claim cleans up its temporary file"
+    );
+}
+
+#[test]
+fn a_checkout_from_an_older_draftline_is_claimed_on_first_open() {
+    let (temp, repo) = code_repo();
+    scoped(&temp);
+    fs::remove_file(repo.path().join("draftline").join("workspace.json")).unwrap();
+    let deck = temp.path().join("deck");
+    fs::create_dir_all(&deck).unwrap();
+    Workspace::open_with_policy(&deck, cutready_policy()).unwrap();
+    let error = refused(Workspace::open_with_policy(
+        temp.path().join("cutready"),
+        cutready_policy(),
+    ));
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("deck"));
+}
+
+#[test]
+fn concurrent_opens_of_different_folders_let_exactly_one_claim_the_checkout() {
+    for _ in 0..20 {
+        let (temp, _repo) = code_repo();
+        let folders = ["alpha", "beta", "gamma", "delta"];
+        for folder in folders {
+            fs::create_dir_all(temp.path().join(folder)).unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(folders.len()));
+        let handles: Vec<_> = folders
+            .iter()
+            .map(|folder| {
+                let path = temp.path().join(folder);
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Workspace::open_with_policy(&path, cutready_policy())
+                        .map(|workspace| workspace.scope().to_path_buf())
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(winners.len(), 1, "{results:?}");
+        for result in &results {
+            if let Err(error) = result {
+                assert!(
+                    matches!(error, DraftlineError::WorkspaceAlreadyInCheckout(p) if p == winners[0]),
+                    "{error:?}"
+                );
+            }
+        }
+    }
 }
