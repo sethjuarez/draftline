@@ -419,6 +419,15 @@ pub struct CreateVariationFromVersionRequest {
     pub metadata: VariationMetadata,
 }
 
+/// Request for starting a variation at the current commit, keeping every file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartVariationHereRequest {
+    pub workspace_path: PathBuf,
+    pub name: String,
+    #[serde(default)]
+    pub metadata: VariationMetadata,
+}
+
 /// Request for remote-aware variation creation preflight.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightCreateVariationFromVersionRequest {
@@ -456,6 +465,13 @@ pub struct TargetedRestoreVersionCommandResult {
 /// Variation creation result with postcondition state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateVariationFromVersionResult {
+    pub variation: Variation,
+    pub postconditions: CommandPostconditions,
+}
+
+/// Started variation with postcondition state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartVariationHereResult {
     pub variation: Variation,
     pub postconditions: CommandPostconditions,
 }
@@ -1649,6 +1665,38 @@ pub fn create_variation_from_version_with_context(
     })
 }
 
+/// Starts a variation at the current commit and moves the checkout onto it,
+/// keeping files and unsaved edits. The way out of `branch_outside_namespace`.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), variation = %request.name)
+)]
+pub fn start_variation_here(
+    request: StartVariationHereRequest,
+) -> Result<StartVariationHereResult> {
+    start_variation_here_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Starts a variation at the current commit using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), variation = %request.name)
+)]
+pub fn start_variation_here_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: StartVariationHereRequest,
+) -> Result<StartVariationHereResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let variation = workspace.start_variation_here_with_metadata(request.name, request.metadata)?;
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(StartVariationHereResult {
+        variation,
+        postconditions: collect_postconditions(&workspace, false),
+    })
+}
+
 /// Preflights remote-aware local variation creation from a saved version.
 #[tracing::instrument(
     err,
@@ -2832,6 +2880,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidWorkspaceClaim(_) => "invalid_workspace_claim",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::VariationOutsideNamespace(_) => "variation_outside_namespace",
+        DraftlineError::BranchOutsideNamespace(_) => "branch_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
         DraftlineError::MergeNeedsDeveloper(_) => "merge_needs_developer",
         DraftlineError::NotOwnedWorktree(_) => "not_owned_worktree",
@@ -2867,6 +2916,9 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         }
         DraftlineError::WorkspaceAlreadyInCheckout(project) => {
             Some(serde_json::json!({ "project": project }))
+        }
+        DraftlineError::BranchOutsideNamespace(branch) => {
+            Some(serde_json::json!({ "branch": branch }))
         }
         DraftlineError::SyncNeedsMerge(status) => match serde_json::to_value(status.as_ref()) {
             Ok(value) => Some(value),

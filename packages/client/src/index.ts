@@ -81,6 +81,7 @@ export interface DraftlineClient {
   createVariationFromVersionGuarded(
     request: GuardedCreateVariationFromVersionRequest,
   ): Promise<GuardedCreateVariationFromVersionResult>;
+  startVariationHere(request: StartVariationHereRequest): Promise<StartVariationHereResult>;
   save(request: SaveRequest): Promise<SaveResult>;
   listShelves(workspacePath: string): Promise<Shelf[]>;
   previewShelf(request: ShelfRequest): Promise<VersionPreview>;
@@ -220,6 +221,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     createVariationFromVersion: (request) => run('create_variation_from_version', { request }),
     createVariationFromVersionGuarded: (request) =>
       run('create_variation_from_version_guarded', { request }),
+    startVariationHere: (request) => run('start_variation_here', { request }),
     save: (request) => run('save', { request }),
     listShelves: (workspacePath) =>
       run('list_shelves', {
@@ -295,7 +297,8 @@ export type SafeNextAction =
   | 'discard_changes'
   | 'repair_recovery'
   | 'configure_remote'
-  | 'finish_in_other_project';
+  | 'finish_in_other_project'
+  | 'start_variation_here';
 export type SharingMode = 'local_only' | 'shared_capable';
 export type SupportRefScope = 'local' | 'remote_tracking';
 export type SupportRefKind = 'deleted_variation' | 'rewrite' | 'history_cleanup_backup';
@@ -892,6 +895,11 @@ export interface GuardedCreateVariationFromVersionResult {
   postconditions: CommandPostconditions;
 }
 
+export interface StartVariationHereResult {
+  variation: Variation;
+  postconditions: CommandPostconditions;
+}
+
 export interface SaveResult {
   version: Version;
   postconditions: CommandPostconditions;
@@ -1162,6 +1170,12 @@ export interface GuardedCreateVariationFromVersionRequest extends WorkspaceReque
   metadata?: VariationMetadata;
 }
 
+/** Starts a variation at the current commit, keeping files and unsaved edits. */
+export interface StartVariationHereRequest extends WorkspaceRequest {
+  name: string;
+  metadata?: VariationMetadata;
+}
+
 export interface SaveRequest extends WorkspaceRequest {
   label: string;
 }
@@ -1313,6 +1327,7 @@ export interface DraftlineHostFacade {
     token: VariationCreateToken,
     metadata?: VariationMetadata,
   ): Promise<GuardedCreateVariationFromVersionResult>;
+  startVariationHere(name: string, metadata?: VariationMetadata): Promise<StartVariationHereResult>;
   shelves(): Promise<Shelf[]>;
   previewShelf(shelfId: string): Promise<VersionPreview>;
   applyShelf(shelfId: string): Promise<ApplyShelfCommandResult>;
@@ -1458,6 +1473,8 @@ export function createDraftlineHostFacade({
       client.preflightCreateVariationFromVersion({ ...versionRequest(versionId), name, remote }),
     createVariationFromVersionGuarded: (token, metadata) =>
       client.createVariationFromVersionGuarded({ ...workspaceRequest(), token, metadata }),
+    startVariationHere: (name, metadata) =>
+      client.startVariationHere({ ...workspaceRequest(), name, metadata }),
     shelves: () => client.listShelves(workspacePath),
     previewShelf: (shelfId) => client.previewShelf({ ...workspaceRequest(), shelf_id: shelfId }),
     applyShelf: (shelfId) => client.applyShelf({ ...workspaceRequest(), shelf_id: shelfId }),
@@ -1780,6 +1797,12 @@ export async function createVariationFromVersionGuarded(
   request: GuardedCreateVariationFromVersionRequest,
 ): Promise<GuardedCreateVariationFromVersionResult> {
   return createDraftlineClient().createVariationFromVersionGuarded(request);
+}
+
+export async function startVariationHere(
+  request: StartVariationHereRequest,
+): Promise<StartVariationHereResult> {
+  return createDraftlineClient().startVariationHere(request);
 }
 
 export async function save(request: SaveRequest): Promise<SaveResult> {

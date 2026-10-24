@@ -772,6 +772,7 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
       postconditions: { errors: [] },
       resolution: 'forgotten',
     }) as never),
+    startVariationHere: vi.fn(async () => ({}) as never),
     save: vi.fn(async () => ({
       postconditions: { errors: [] },
       version,

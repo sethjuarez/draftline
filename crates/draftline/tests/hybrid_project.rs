@@ -1363,6 +1363,57 @@ fn command_context_applies_the_variation_namespace_on_every_open() {
 }
 
 #[test]
+fn command_contract_reports_developer_branches_and_starts_a_variation_there() {
+    use draftline::tauri_contract::{
+        save_with_context, start_variation_here_with_context, DraftlineCommandContext, SaveRequest,
+        StartVariationHereRequest, TauriCommandError,
+    };
+    let (temp, repo) = code_repo();
+    scoped(&temp);
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/x", &head, false).unwrap();
+    repo.set_head("refs/heads/feature/x").unwrap();
+    let folder = temp.path().join("cutready");
+    std::fs::write(folder.join("intro.sk"), "pitch").unwrap();
+    let mut context = DraftlineCommandContext::new()
+        .with_content_policy(cutready_policy())
+        .with_variation_namespace("cutready/")
+        .unwrap();
+
+    let error = TauriCommandError::from(
+        save_with_context(
+            &mut context,
+            SaveRequest {
+                workspace_path: folder.clone(),
+                label: "Pitch".into(),
+            },
+        )
+        .unwrap_err(),
+    );
+    assert_eq!(error.code, "branch_outside_namespace");
+    assert_eq!(error.details.unwrap()["branch"], "feature/x");
+
+    let started = start_variation_here_with_context(
+        &mut context,
+        StartVariationHereRequest {
+            workspace_path: folder.clone(),
+            name: "cutready/rescue".into(),
+            metadata: Default::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!(started.variation.name, "cutready/rescue");
+    save_with_context(
+        &mut context,
+        SaveRequest {
+            workspace_path: folder,
+            label: "Pitch".into(),
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn variation_namespace_hides_developer_branches() {
     let (temp, repo) = code_repo();
     let head = repo.head().unwrap().peel_to_commit().unwrap();
@@ -1997,6 +2048,164 @@ fn send_rejects_developer_branches_outside_the_variation_namespace() {
     assert!(repo
         .find_branch("feature/login-2", git2::BranchType::Local)
         .is_err());
+}
+
+#[test]
+fn saves_and_updates_refuse_a_developer_branch_until_a_variation_starts_here() {
+    use draftline::{DiagnosticCode, RestoreVersionTarget, SafeNextAction, VariationId};
+    let on_dev_branch = |result: draftline::Result<()>| match result {
+        Err(DraftlineError::BranchOutsideNamespace(name)) => assert_eq!(name, "feature/x"),
+        other => panic!("expected BranchOutsideNamespace, got {other:?}"),
+    };
+    let (temp, repo) = code_repo();
+    let (_bare, _other_dir, _other) = with_remote(&repo);
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let version = workspace.versions().unwrap()[0].id().clone();
+    // A developer runs `git switch -c feature/x` in the shared checkout.
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/x", &head, false).unwrap();
+    repo.set_head("refs/heads/feature/x").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, revised\n");
+
+    on_dev_branch(workspace.save_version("Pitch").map(|_| ()));
+    on_dev_branch(workspace.save_files(["intro.sk"], "Pitch").map(|_| ()));
+    on_dev_branch(workspace.preflight_save_files(["intro.sk"]).map(|_| ()));
+    on_dev_branch(
+        workspace
+            .restore_version_as_new_save(&version, "Back")
+            .map(|_| ()),
+    );
+    for target in [
+        RestoreVersionTarget::Current,
+        RestoreVersionTarget::Existing {
+            variation: VariationId::from("feature/x"),
+        },
+    ] {
+        on_dev_branch(
+            workspace
+                .restore_version_as_new_save_to_variation(&version, "Back", target)
+                .map(|_| ()),
+        );
+    }
+    on_dev_branch(workspace.preflight_apply_incoming("origin").map(|_| ()));
+    on_dev_branch(workspace.preflight_merge_incoming("origin").map(|_| ()));
+    on_dev_branch(workspace.preflight_merge_base("origin").map(|_| ()));
+    on_dev_branch(
+        workspace
+            .apply_incoming("origin", &mut RemoteOptions::new())
+            .map(|_| ()),
+    );
+    assert_eq!(
+        repo.head().unwrap().peel_to_commit().unwrap().id(),
+        head.id()
+    );
+
+    let inspection = workspace.inspect().unwrap();
+    assert!(inspection
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == DiagnosticCode::BranchOutsideNamespace));
+    assert_eq!(
+        inspection.safe_next_actions,
+        vec![SafeNextAction::StartVariationHere]
+    );
+
+    // Shelving stays available, and leaves the developer's branch alone.
+    workspace.shelve_changes("wip").unwrap();
+    workspace.apply_shelf("wip").unwrap();
+    assert_eq!(
+        read(temp.path(), "cutready/intro.sk"),
+        "scene one, revised\n"
+    );
+
+    let error = workspace.start_variation_here("feature/y").unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::VariationOutsideNamespace(_)),
+        "{error:?}"
+    );
+    let rescue = workspace.start_variation_here("cutready/rescue").unwrap();
+    assert!(rescue.is_current);
+    assert_eq!(workspace.current_variation().unwrap(), "cutready/rescue");
+    assert_eq!(
+        read(temp.path(), "cutready/intro.sk"),
+        "scene one, revised\n",
+        "unsaved edits come along"
+    );
+    assert_eq!(
+        workspace.inspect().unwrap().safe_next_actions,
+        vec![SafeNextAction::SaveFirst, SafeNextAction::DiscardChanges]
+    );
+    workspace.save_version("Pitch").unwrap();
+    assert_eq!(
+        repo.refname_to_id("refs/heads/feature/x").unwrap(),
+        head.id(),
+        "the developer's branch never moved"
+    );
+    assert_eq!(
+        repo.find_reference("refs/heads/cutready/rescue")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent_id(0)
+            .unwrap(),
+        head.id()
+    );
+}
+
+#[test]
+fn a_detached_checkout_refuses_namespaced_saves() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+    repo.set_head_detached(head).unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, revised\n");
+
+    let error = workspace.save_version("Pitch").unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::BranchOutsideNamespace(ref name) if name == "HEAD"),
+        "{error:?}"
+    );
+    assert_eq!(
+        workspace.inspect().unwrap().safe_next_actions,
+        [draftline::SafeNextAction::StartVariationHere]
+    );
+    workspace.start_variation_here("cutready/rescue").unwrap();
+    workspace.save_version("Pitch").unwrap();
+    assert_eq!(workspace.current_variation().unwrap(), "cutready/rescue");
+}
+
+#[test]
+fn starting_a_variation_on_an_unborn_developer_branch_keeps_it_unborn() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init(temp.path()).unwrap();
+    repo.set_head("refs/heads/feature/x").unwrap();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+
+    workspace.start_variation_here("cutready/first").unwrap();
+
+    assert_eq!(
+        repo.find_reference("HEAD")
+            .unwrap()
+            .symbolic_target()
+            .unwrap(),
+        Some("refs/heads/cutready/first")
+    );
+    assert!(repo.find_reference("refs/heads/cutready/first").is_err());
+    assert!(repo.find_reference("refs/heads/feature/x").is_err());
+}
+
+#[test]
+fn starting_a_variation_refuses_an_existing_name_and_leaves_head_alone() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("cutready/taken", &head, false).unwrap();
+
+    assert!(matches!(
+        workspace.start_variation_here("cutready/taken"),
+        Err(DraftlineError::VariationAlreadyExists(_))
+    ));
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "main");
 }
 
 #[test]

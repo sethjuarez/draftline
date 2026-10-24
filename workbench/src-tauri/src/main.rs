@@ -12,7 +12,8 @@ use draftline::tauri_contract::{
     RecoveryRequest, RemoteRequest, RemoteVariationRequest, RestoreVersionRequest,
     RestoreVersionResult, SaveRequest, SaveResult, SelectedDiscardRequest, SelectedDiscardResult,
     SelectedSaveRequest, SelectedSaveResult, SelectedShelveRequest, SelectedShelveResult,
-    ShelfRequest, SwitchVariationRequest, SwitchVariationResult,
+    ShelfRequest, StartVariationHereRequest, StartVariationHereResult, SwitchVariationRequest,
+    SwitchVariationResult,
     TargetedRestoreVersionCommandResult, TargetedRestoreVersionRequest, TauriCommandError,
     TauriCommandResult, VersionRequest, WorkspaceDiagnostics, WorkspaceGraphAroundVersionRequest,
     WorkspaceGraphNeighborhoodRequest, WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest,
@@ -449,6 +450,18 @@ fn create_variation_from_version(
 }
 
 #[tauri_plugin_auditaur::auditaur_command]
+fn start_variation_here(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: StartVariationHereRequest,
+) -> TauriCommandResult<StartVariationHereResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::start_variation_here_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
 fn preflight_create_variation_from_version(
     state: tauri::State<'_, DraftlineContextState>,
     request: PreflightCreateVariationFromVersionRequest,
@@ -773,6 +786,7 @@ fn main() {
             create_variation_from_version,
             preflight_create_variation_from_version,
             create_variation_from_version_guarded,
+            start_variation_here,
             save,
             list_shelves,
             preview_shelf,

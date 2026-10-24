@@ -386,6 +386,9 @@ pub enum SafeNextAction {
     ConfigureRemote,
     /// Another project in this checkout must finish its interrupted operation.
     FinishInOtherProject,
+    /// A developer's branch is checked out; start a variation at this commit
+    /// with [`Workspace::start_variation_here`] to keep working.
+    StartVariationHere,
 }
 
 /// Stable diagnostic codes for workspace inspection.
@@ -402,6 +405,9 @@ pub enum DiagnosticCode {
     NoCurrentVariation,
     WorkspaceReadFailed,
     PolicyTrackedFileIgnored,
+    /// The checkout is on a developer's branch, outside this project's
+    /// variations; saves and updates refuse until the user starts a variation.
+    BranchOutsideNamespace,
 }
 
 /// Severity for a workspace diagnostic.
@@ -1696,6 +1702,25 @@ impl Workspace {
         Ok(())
     }
 
+    /// With a namespace set, Draftline writes history only on the base branch
+    /// or its own variations. A developer who switched the shared checkout to
+    /// their own branch keeps it: saves and updates refuse instead of
+    /// committing onto it. Shelve and discard stay available.
+    fn ensure_current_branch_writable(&self) -> Result<()> {
+        if self.variation_namespace.is_none() {
+            return Ok(());
+        }
+        let current = match self.current_variation_unchecked() {
+            Ok(current) => current,
+            Err(DraftlineError::NoCurrentVariation) => {
+                return Err(DraftlineError::BranchOutsideNamespace("HEAD".to_string()))
+            }
+            Err(error) => return Err(error),
+        };
+        self.ensure_variation_switchable(&current)
+            .map_err(|_| DraftlineError::BranchOutsideNamespace(current))
+    }
+
     /// Returns the current content policy.
     pub fn content_policy(&self) -> &ContentPolicy {
         &self.content_policy
@@ -1723,7 +1748,26 @@ impl Workspace {
         };
 
         let current_variation = match self.current_variation_unchecked() {
-            Ok(variation) => Some(VariationId::from(variation)),
+            Ok(variation) => {
+                if self.ensure_current_branch_writable().is_err() {
+                    diagnostics.push(workspace_diagnostic(
+                        DiagnosticCode::BranchOutsideNamespace,
+                        DiagnosticSeverity::Blocking,
+                        format!(
+                            "branch `{variation}` belongs to a developer; start a variation here to keep saving"
+                        ),
+                    ));
+                }
+                Some(VariationId::from(variation))
+            }
+            Err(DraftlineError::NoCurrentVariation) if self.variation_namespace.is_some() => {
+                diagnostics.push(workspace_diagnostic(
+                    DiagnosticCode::BranchOutsideNamespace,
+                    DiagnosticSeverity::Blocking,
+                    "checkout is detached; start a variation here to keep saving",
+                ));
+                None
+            }
             Err(DraftlineError::NoCurrentVariation) => {
                 diagnostics.push(workspace_diagnostic(
                     DiagnosticCode::NoCurrentVariation,
@@ -1956,6 +2000,13 @@ impl Workspace {
                 code,
                 message: "Git ignore rules hide content tracked by policy".to_string(),
                 safe_next_actions: Vec::new(),
+                retry: RetryClass::RetryAfterUserChoice,
+            },
+            DiagnosticCode::BranchOutsideNamespace => ErrorExplanation {
+                code,
+                message: "a developer's branch is checked out; Draftline won't save onto it"
+                    .to_string(),
+                safe_next_actions: vec![SafeNextAction::StartVariationHere],
                 retry: RetryClass::RetryAfterUserChoice,
             },
         }
@@ -2770,6 +2821,7 @@ impl Workspace {
         P: AsRef<Path>,
     {
         self.ensure_no_pending_recovery()?;
+        self.ensure_current_branch_writable()?;
         let changed_files = self.selected_changed_files(paths)?;
         Ok(selected_files_preflight_report(
             "save_files",
@@ -2813,6 +2865,7 @@ impl Workspace {
     {
         let _lock = self.acquire_for_index("save_files")?;
         self.ensure_no_pending_recovery()?;
+        self.ensure_current_branch_writable()?;
         let paths = paths
             .into_iter()
             .map(|path| path.as_ref().to_path_buf())
@@ -3376,6 +3429,99 @@ impl Workspace {
             file_hazards,
             Some(format!("current -> {}", variation.as_str())),
         ))
+    }
+
+    /// Starts a variation at the current commit and moves this checkout onto
+    /// it without touching any file or the index, like `git switch -c`.
+    /// Unsaved edits come along. This is the way out when a developer
+    /// switched the shared checkout to their own branch: their branch keeps
+    /// its commits, and later saves land on the new variation instead.
+    pub fn start_variation_here(&self, name: impl AsRef<str>) -> Result<Variation> {
+        self.start_variation_here_with_metadata(name, VariationMetadata::default())
+    }
+
+    /// [`Self::start_variation_here`] with display metadata.
+    pub fn start_variation_here_with_metadata(
+        &self,
+        name: impl AsRef<str>,
+        metadata: VariationMetadata,
+    ) -> Result<Variation> {
+        let _lock = self.acquire_operation_lock("start_variation_here")?;
+        self.ensure_no_pending_recovery()?;
+        let name = validate_variation_name(name.as_ref())?;
+        self.ensure_variation_in_namespace(&name)?;
+        let branch_ref = format!("refs/heads/{name}");
+        if self.repo.find_reference(&branch_ref).is_ok() {
+            return Err(DraftlineError::VariationAlreadyExists(name));
+        }
+        let read_head = || -> Result<(Option<String>, Option<Oid>)> {
+            let head = self.repo.find_reference("HEAD")?;
+            let symbolic = head.symbolic_target().ok().flatten().map(str::to_string);
+            let commit = head.resolve().ok().and_then(|head| head.target());
+            Ok((symbolic, commit))
+        };
+        let (previous, commit) = read_head()?;
+        self.write_variation_metadata(&name, &metadata)?;
+        // HEAD, the old branch, and the new one stay locked while HEAD is
+        // rechecked and the branch is created, so a developer's commit or
+        // switch meanwhile refuses and nothing is left behind.
+        let switched = (|| -> Result<()> {
+            let mut transaction = self.repo.transaction()?;
+            transaction.lock_ref("HEAD")?;
+            if let Some(previous) = previous.as_deref() {
+                transaction.lock_ref(previous)?;
+            }
+            transaction.lock_ref(&branch_ref)?;
+            let now = read_head()?;
+            if now != (previous.clone(), commit) {
+                return Err(DraftlineError::LocalStateChanged {
+                    expected: format!("{previous:?}@{commit:?}"),
+                    actual: format!("{:?}@{:?}", now.0, now.1),
+                });
+            }
+            if self.repo.find_reference(&branch_ref).is_ok() {
+                return Err(DraftlineError::VariationAlreadyExists(name.clone()));
+            }
+            let message = format!("draftline: start variation {name} here");
+            if let Some(commit) = commit {
+                transaction.set_target(&branch_ref, commit, None, &message)?;
+            }
+            transaction.set_symbolic_target("HEAD", &branch_ref, None, &message)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = switched {
+            // libgit2 applies a transaction's refs one by one, so a failed
+            // commit may have applied some. Finish or undo what landed.
+            let head_on_new = self
+                .repo
+                .find_reference("HEAD")
+                .ok()
+                .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string))
+                .as_deref()
+                == Some(branch_ref.as_str());
+            let new_tip = self.repo.refname_to_id(&branch_ref).ok();
+            if head_on_new && new_tip == commit {
+                return Ok(variation_from_name(name.clone(), Some(&name), metadata));
+            }
+            if head_on_new {
+                if let Some(previous) = previous.as_deref() {
+                    let _ = self.repo.reference_symbolic(
+                        "HEAD",
+                        previous,
+                        true,
+                        "draftline: undo start variation",
+                    );
+                }
+            } else if new_tip.is_some() && new_tip == commit {
+                if let Ok(mut reference) = self.repo.find_reference(&branch_ref) {
+                    let _ = reference.delete();
+                }
+            }
+            let _ = self.clear_variation_metadata(&name);
+            return Err(error);
+        }
+        Ok(variation_from_name(name.clone(), Some(&name), metadata))
     }
 
     /// Creates a new variation from the current version.
@@ -4870,6 +5016,7 @@ impl Workspace {
     ) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
         let _lock = self.acquire_for_index("restore_version_as_new_save")?;
+        self.ensure_current_branch_writable()?;
         let head_commit = self.repo.head()?.peel_to_commit()?;
         let restored_tree = {
             let source = self.find_version_commit(version)?.tree()?;
@@ -4903,13 +5050,14 @@ impl Workspace {
 
         self.checkout_or_keep_recovery(&restored_tree)?;
         let oid = self.repo.commit(
-            Some("HEAD"),
+            None,
             &author,
             &committer,
             label.as_ref(),
             &restored_tree,
             &[&head_commit],
         )?;
+        self.advance_head(&self.repo.find_commit(oid)?, Some(&head_commit), &committer)?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -6122,6 +6270,7 @@ impl Workspace {
     /// ```
     pub fn preflight_apply_incoming(&self, remote: impl AsRef<str>) -> Result<ApplyIncomingReport> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_current_branch_writable()?;
         let sync_status = self.sync_status(remote)?;
         let dirty_files = self.changed_files_unchecked()?;
 
@@ -6221,6 +6370,7 @@ impl Workspace {
         sync_status: SyncStatus,
         source: Option<String>,
     ) -> Result<MergeIncomingReport> {
+        self.ensure_current_branch_writable()?;
         let dirty_files = self.changed_files_unchecked()?;
         let mut file_hazards = Vec::new();
         let mut conflicts = Vec::new();
@@ -6366,6 +6516,7 @@ impl Workspace {
     ) -> Result<MergeIncomingResult> {
         self.ensure_no_pending_recovery()?;
         let _lock = self.acquire_for_index(operation)?;
+        self.ensure_current_branch_writable()?;
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
@@ -6486,6 +6637,7 @@ impl Workspace {
     ) -> Result<ApplyIncomingResult> {
         self.ensure_no_pending_recovery()?;
         let _lock = self.acquire_for_index("apply_incoming")?;
+        self.ensure_current_branch_writable()?;
 
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
@@ -6728,6 +6880,7 @@ impl Workspace {
     ) -> Result<(String, VariationMetadata, Oid)> {
         match target {
             RestoreVersionTarget::Current => {
+                self.ensure_current_branch_writable()?;
                 let parent_oid = self.repo.head()?.peel_to_commit()?.id();
                 let metadata = self.read_variation_metadata(current_variation)?;
                 Ok((current_variation.to_string(), metadata, parent_oid))
@@ -6735,6 +6888,8 @@ impl Workspace {
             RestoreVersionTarget::Existing { variation } => {
                 if variation.as_str() != current_variation {
                     self.ensure_variation_in_namespace(variation.as_str())?;
+                } else {
+                    self.ensure_current_branch_writable()?;
                 }
                 let branch = self
                     .repo
@@ -8539,6 +8694,7 @@ impl Workspace {
         label: &str,
         profile: Option<&ContributorProfile>,
     ) -> Result<Version> {
+        self.ensure_current_branch_writable()?;
         let parent = self
             .repo
             .head()
@@ -8634,7 +8790,21 @@ impl Workspace {
             .unwrap_or("HEAD")
             .to_string();
         let mut transaction = self.repo.transaction()?;
-        transaction.lock_ref(&name)?;
+        transaction.lock_ref("HEAD")?;
+        if name != "HEAD" {
+            transaction.lock_ref(&name)?;
+        }
+        // Rechecked under the locks: a switch to a developer branch at the
+        // same commit after the guard must not let this save move it.
+        let now = self.repo.find_reference("HEAD")?;
+        let now = now.symbolic_target().ok().flatten().unwrap_or("HEAD");
+        if now != name {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: name,
+                actual: now.to_string(),
+            });
+        }
+        self.ensure_current_branch_writable()?;
         let current = self.repo.refname_to_id(&name).ok();
         let expected = parent.map(Commit::id);
         if current != expected {
@@ -11010,11 +11180,18 @@ fn safe_next_actions_for_inspection(
     }
     if recovery.is_some()
         || operation_lock.state == OperationLockState::Locked
-        || diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Blocking)
+        || diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == DiagnosticSeverity::Blocking
+                && diagnostic.code != DiagnosticCode::BranchOutsideNamespace
+        })
     {
         return vec![SafeNextAction::RepairRecovery];
+    }
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == DiagnosticCode::BranchOutsideNamespace)
+    {
+        return vec![SafeNextAction::StartVariationHere];
     }
 
     if dirty.is_dirty {
@@ -12578,6 +12755,36 @@ mod tests {
             .find_blob(tree.get_name("plan.sk").unwrap().id());
         assert_eq!(plan.unwrap().content(), b"edit");
         assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_namespaced_save_refuses_a_switch_to_a_developer_branch_at_the_same_commit() {
+        let (_temp, workspace, _) = two_saves();
+        let workspace = workspace.with_variation_namespace("cutready/").unwrap();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        workspace.repo.branch("feature/x", &head, false).unwrap();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_parent_read", move |_| {
+            Repository::open(&root)
+                .unwrap()
+                .set_head("refs/heads/feature/x")
+                .unwrap();
+        });
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::BranchOutsideNamespace(ref name) if name == "feature/x"),
+            "{error:?}"
+        );
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id("refs/heads/feature/x")
+                .unwrap(),
+            head.id()
+        );
     }
 
     #[test]

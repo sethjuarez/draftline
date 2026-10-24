@@ -143,6 +143,13 @@ pub enum DraftlineError {
     #[error("branch `{0}` is outside this project's variations")]
     VariationOutsideNamespace(String),
 
+    /// A developer checked out a branch that is neither the base nor one of
+    /// this project's variations; Draftline won't write onto it.
+    #[error(
+        "branch `{0}` belongs to a developer; switch back to the base branch or move this work to its own worktree"
+    )]
+    BranchOutsideNamespace(String),
+
     #[error("pull request provider failed: {0}")]
     PullRequest(String),
 

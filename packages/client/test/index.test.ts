@@ -285,6 +285,7 @@ describe('createDraftlineClient', () => {
     await client.rollbackRecovery(recoveryRequest);
     await client.acknowledgeRecovery('C:\\repo');
     await client.resolveLegacyHistoryCleanup({ workspace_path: 'C:\\repo', plan_id: 'plan-1' });
+    await client.startVariationHere({ workspace_path: 'C:\\repo', name: 'cutready/rescue' });
 
     expect(invoke).toHaveBeenCalledWith('get_changes', {
       request: { workspace_path: 'C:\\repo' },
@@ -441,6 +442,9 @@ describe('createDraftlineClient', () => {
     });
     expect(invoke).toHaveBeenCalledWith('resolve_legacy_history_cleanup', {
       request: { workspace_path: 'C:\\repo', plan_id: 'plan-1' },
+    });
+    expect(invoke).toHaveBeenCalledWith('start_variation_here', {
+      request: { workspace_path: 'C:\\repo', name: 'cutready/rescue' },
     });
   });
 
