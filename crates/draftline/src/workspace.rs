@@ -7779,7 +7779,7 @@ impl Workspace {
                 });
             }
         }
-        let developer_commits = self.developer_commits_to_send(remote, &base, &current, scanned)?;
+        let developer_commits = self.developer_commits_to_send(remote, &base, scanned)?;
         if !developer_commits.is_empty() {
             return Err(DraftlineError::SendCarriesDeveloperCommits(
                 developer_commits,
@@ -7912,7 +7912,7 @@ impl Workspace {
             current.clone()
         };
         let head = self.repo.head().ok().and_then(|head| head.target());
-        let developer_commits = self.developer_commits_to_send(remote, &base, &current, head)?;
+        let developer_commits = self.developer_commits_to_send(remote, &base, head)?;
         let has_unsaved_changes = !self.changed_files_unchecked()?.is_empty();
         let outgoing_versions = match self
             .repo
@@ -8089,8 +8089,7 @@ impl Workspace {
     }
 
     /// Commits Send would push that change files outside the project folder.
-    /// Outgoing means reachable from `head` but not from the remote base or
-    /// the variation's own remote-tracking ref. Draftline saves only touch the
+    /// Outgoing means reachable from `head` but not from the remote base. Draftline saves only touch the
     /// folder. A merge is listed only for outside paths that match none of its
     /// parents (a hand-made resolution), so Draftline's merges of the base
     /// pass. Anything listed is a developer's work. Standalone projects own
@@ -8099,7 +8098,6 @@ impl Workspace {
         &self,
         remote: &str,
         base: &str,
-        variation: &str,
         head: Option<git2::Oid>,
     ) -> Result<Vec<DeveloperCommit>> {
         const MAX_PATHS: usize = 20;
@@ -8112,13 +8110,14 @@ impl Workspace {
         };
         let mut walk = self.repo.revwalk()?;
         walk.push(head)?;
-        for name in [base, variation] {
-            if let Ok(oid) = self
-                .repo
-                .refname_to_id(&format!("refs/remotes/{remote}/{name}"))
-            {
-                walk.hide(oid)?;
-            }
+        // Only the base proves a commit isn't new to the pull request; the
+        // variation's own remote branch may already hold published developer
+        // commits.
+        if let Ok(oid) = self
+            .repo
+            .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
+        {
+            walk.hide(oid)?;
         }
         let outside_changes =
             |from: Option<&git2::Tree<'_>>, to: &git2::Tree<'_>| -> Result<BTreeSet<PathBuf>> {
@@ -8617,12 +8616,8 @@ impl Workspace {
                     ),
                 });
             }
-            let developer_commits = self.developer_commits_to_send(
-                &remote_name,
-                guard.base,
-                guard.variation,
-                Some(guard.head),
-            )?;
+            let developer_commits =
+                self.developer_commits_to_send(&remote_name, guard.base, Some(guard.head))?;
             if !developer_commits.is_empty() {
                 return Err(DraftlineError::SendCarriesDeveloperCommits(
                     developer_commits,

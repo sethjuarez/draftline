@@ -2506,6 +2506,22 @@ fn send_refuses_a_variation_started_on_unpushed_developer_work() {
         "{error:?}"
     );
     assert_eq!(remote_branch(bare.path(), "cutready/x"), None);
+
+    // Publishing the variation first doesn't launder the developer commit.
+    workspace.publish_changes("origin").unwrap();
+    assert!(remote_branch(bare.path(), "cutready/x").is_some());
+    let error = workspace
+        .send(
+            "origin",
+            &send_request("X pitch"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&error, DraftlineError::SendCarriesDeveloperCommits(commits) if commits.len() == 1),
+        "{error:?}"
+    );
 }
 
 #[test]
