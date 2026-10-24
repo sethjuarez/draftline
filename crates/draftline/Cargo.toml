@@ -16,7 +16,7 @@ default = []
 vendored-mobile-git = ["git2/vendored-libgit2", "git2/vendored-openssl"]
 
 [dependencies]
-git2 = { version = "0.20", default-features = false, features = ["https", "ssh"] }
+git2 = { version = "0.21", default-features = false, features = ["https", "ssh"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -5,11 +5,9 @@ use draftline::tauri_contract::{
     CreateVariationFromVersionRequest, CreateVariationFromVersionResult, CurrentFileRequest,
     DeleteShelfResult, DiffVersionsRequest, FetchRemoteResult,
     GuardedCreateVariationFromVersionRequest, GuardedCreateVariationFromVersionResult,
-    HistoryCompactionCandidatesCommandRequest, ListSupportRefsRequest,
-    MergeIncomingCommandResult, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
-    MilestoneMergeCommandResult, MilestoneMergeRequest, PreflightCreateVariationFromVersionRequest,
-    PreviewVersionFileRequest,
-    PublishCurrentVariationRequest, PublishCurrentVariationResult,
+    ListSupportRefsRequest, MergeIncomingCommandResult, MergeIncomingRequest,
+    MergeIncomingWithResolutionsRequest, PreflightCreateVariationFromVersionRequest,
+    PreviewVersionFileRequest, PublishCurrentVariationRequest, PublishCurrentVariationResult,
     RecoveryRequest, RemoteRequest, RemoteVariationRequest, RestoreVersionRequest,
     RestoreVersionResult, SaveRequest, SaveResult, SelectedDiscardRequest, SelectedDiscardResult,
     SelectedSaveRequest, SelectedSaveResult, SelectedShelveRequest, SelectedShelveResult,
@@ -22,13 +20,12 @@ use draftline::tauri_contract::{
 };
 use draftline::{
     ApplyIncomingReport, ChangeSet, ContentPolicyAudit, CurrentFileDiff, CurrentFilePreview,
-    HistoryCompactionCandidates, HistoryEntry, MergeIncomingReport, MilestoneMergeReport,
-    PreflightReport, PreviewFile, RecoveryRepairResult, RemoteEndpoint, RemoteVariation,
-    RemoteVariationDiagnostics, Shelf, ShelfApplyReport, SupportRef, VariationCreatePreflight,
-    VariationSummary, VersionDiff, VersionPreview, WorkspaceGraph, WorkspaceGraphAgentSummary,
-    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail,
-    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
-    WorkspaceVerification,
+    HistoryEntry, MergeIncomingReport, PreflightReport, PreviewFile, RecoveryRepairResult,
+    RemoteEndpoint, RemoteVariation, RemoteVariationDiagnostics, Shelf, ShelfApplyReport,
+    SupportRef, VariationCreatePreflight, VariationSummary, VersionDiff, VersionPreview,
+    WorkspaceGraph, WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor,
+    WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail, WorkspaceGraphPath, WorkspaceGraphRefs,
+    WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceVerification,
 };
 use std::sync::{Mutex, MutexGuard};
 use tauri::{Emitter, Manager};
@@ -70,7 +67,10 @@ fn clone_workspace(
     request: CloneWorkspaceRequest,
 ) -> TauriCommandResult<WorkspaceOpenResult> {
     let mut context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::clone_workspace_with_context(&mut context, request))
+    contract::into_tauri_result(contract::clone_workspace_with_context(
+        &mut context,
+        request,
+    ))
 }
 
 #[tauri::command]
@@ -79,7 +79,10 @@ fn adopt_workspace(
     request: WorkspaceRequest,
 ) -> TauriCommandResult<AdoptWorkspaceResult> {
     let mut context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::adopt_workspace_with_context(&mut context, request))
+    contract::into_tauri_result(contract::adopt_workspace_with_context(
+        &mut context,
+        request,
+    ))
 }
 
 #[tauri::command]
@@ -205,23 +208,14 @@ fn get_full_history(
 }
 
 #[tauri_plugin_auditaur::auditaur_command]
-fn get_history_compaction_candidates(
-    state: tauri::State<'_, DraftlineContextState>,
-    request: HistoryCompactionCandidatesCommandRequest,
-) -> TauriCommandResult<HistoryCompactionCandidates> {
-    let context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::get_history_compaction_candidates_with_context(
-        &context, request,
-    ))
-}
-
-#[tauri_plugin_auditaur::auditaur_command]
 fn get_workspace_graph(
     state: tauri::State<'_, DraftlineContextState>,
     request: WorkspaceGraphRequest,
 ) -> TauriCommandResult<WorkspaceGraph> {
     let context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::get_workspace_graph_with_context(&context, request))
+    contract::into_tauri_result(contract::get_workspace_graph_with_context(
+        &context, request,
+    ))
 }
 
 #[tauri_plugin_auditaur::auditaur_command]
@@ -230,7 +224,9 @@ fn get_workspace_graph_refs(
     request: WorkspaceGraphRequest,
 ) -> TauriCommandResult<WorkspaceGraphRefs> {
     let context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::get_workspace_graph_refs_with_context(&context, request))
+    contract::into_tauri_result(contract::get_workspace_graph_refs_with_context(
+        &context, request,
+    ))
 }
 
 #[tauri_plugin_auditaur::auditaur_command]
@@ -389,7 +385,9 @@ fn preview_version_file(
     request: PreviewVersionFileRequest,
 ) -> TauriCommandResult<Option<PreviewFile>> {
     let context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::preview_version_file_with_context(&context, request))
+    contract::into_tauri_result(contract::preview_version_file_with_context(
+        &context, request,
+    ))
 }
 
 #[tauri::command]
@@ -398,7 +396,9 @@ fn diff_workspace_file(
     request: CurrentFileRequest,
 ) -> TauriCommandResult<Option<CurrentFileDiff>> {
     let context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::diff_workspace_file_with_context(&context, request))
+    contract::into_tauri_result(contract::diff_workspace_file_with_context(
+        &context, request,
+    ))
 }
 
 #[tauri::command]
@@ -430,10 +430,9 @@ fn restore_version_as_new_save_to_variation(
     request: TargetedRestoreVersionRequest,
 ) -> TauriCommandResult<TargetedRestoreVersionCommandResult> {
     let mut context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::restore_version_as_new_save_to_variation_with_context(
-        &mut context,
-        request,
-    ))
+    contract::into_tauri_result(
+        contract::restore_version_as_new_save_to_variation_with_context(&mut context, request),
+    )
 }
 
 #[tauri_plugin_auditaur::auditaur_command]
@@ -454,10 +453,9 @@ fn preflight_create_variation_from_version(
     request: PreflightCreateVariationFromVersionRequest,
 ) -> TauriCommandResult<VariationCreatePreflight> {
     let mut context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::preflight_create_variation_from_version_with_context(
-        &mut context,
-        request,
-    ))
+    contract::into_tauri_result(
+        contract::preflight_create_variation_from_version_with_context(&mut context, request),
+    )
 }
 
 #[tauri_plugin_auditaur::auditaur_command]
@@ -466,10 +464,9 @@ fn create_variation_from_version_guarded(
     request: GuardedCreateVariationFromVersionRequest,
 ) -> TauriCommandResult<GuardedCreateVariationFromVersionResult> {
     let mut context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::create_variation_from_version_guarded_with_context(
-        &mut context,
-        request,
-    ))
+    contract::into_tauri_result(
+        contract::create_variation_from_version_guarded_with_context(&mut context, request),
+    )
 }
 
 #[tauri::command]
@@ -505,7 +502,9 @@ fn preflight_apply_shelf(
     request: ShelfRequest,
 ) -> TauriCommandResult<ShelfApplyReport> {
     let context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::preflight_apply_shelf_with_context(&context, request))
+    contract::into_tauri_result(contract::preflight_apply_shelf_with_context(
+        &context, request,
+    ))
 }
 
 #[tauri::command]
@@ -532,7 +531,9 @@ fn audit_content_policy(
     request: WorkspaceRequest,
 ) -> TauriCommandResult<ContentPolicyAudit> {
     let context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::audit_content_policy_with_context(&context, request))
+    contract::into_tauri_result(contract::audit_content_policy_with_context(
+        &context, request,
+    ))
 }
 
 #[tauri::command]
@@ -553,7 +554,10 @@ fn repair_recovery(
     request: RecoveryRequest,
 ) -> TauriCommandResult<RecoveryRepairResult> {
     let mut context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::repair_recovery_with_context(&mut context, request))
+    contract::into_tauri_result(contract::repair_recovery_with_context(
+        &mut context,
+        request,
+    ))
 }
 
 #[tauri::command]
@@ -583,7 +587,10 @@ fn selected_shelve(
     request: SelectedShelveRequest,
 ) -> TauriCommandResult<SelectedShelveResult> {
     let mut context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::selected_shelve_with_context(&mut context, request))
+    contract::into_tauri_result(contract::selected_shelve_with_context(
+        &mut context,
+        request,
+    ))
 }
 
 #[tauri::command]
@@ -592,7 +599,10 @@ fn selected_discard(
     request: SelectedDiscardRequest,
 ) -> TauriCommandResult<SelectedDiscardResult> {
     let mut context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::selected_discard_with_context(&mut context, request))
+    contract::into_tauri_result(contract::selected_discard_with_context(
+        &mut context,
+        request,
+    ))
 }
 
 #[tauri::command]
@@ -635,30 +645,6 @@ fn apply_incoming(
 ) -> TauriCommandResult<ApplyIncomingCommandResult> {
     let mut context = lock_context(state.inner())?;
     contract::into_tauri_result(contract::apply_incoming_with_context(&mut context, request))
-}
-
-#[tauri::command]
-fn preflight_milestone_merge(
-    state: tauri::State<'_, DraftlineContextState>,
-    request: RemoteRequest,
-) -> TauriCommandResult<MilestoneMergeReport> {
-    let mut context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::preflight_milestone_merge_with_context(
-        &mut context,
-        request,
-    ))
-}
-
-#[tauri::command]
-fn create_milestone_merge(
-    state: tauri::State<'_, DraftlineContextState>,
-    request: MilestoneMergeRequest,
-) -> TauriCommandResult<MilestoneMergeCommandResult> {
-    let mut context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::create_milestone_merge_with_context(
-        &mut context,
-        request,
-    ))
 }
 
 #[tauri::command]
@@ -738,7 +724,6 @@ fn main() {
             get_changes,
             get_history,
             get_full_history,
-            get_history_compaction_candidates,
             get_workspace_graph,
             get_workspace_graph_refs,
             get_workspace_graph_summary,
@@ -780,8 +765,6 @@ fn main() {
             fetch_remote,
             preflight_apply_incoming,
             apply_incoming,
-            preflight_milestone_merge,
-            create_milestone_merge,
             preflight_merge_incoming,
             merge_incoming,
             merge_incoming_with_resolutions

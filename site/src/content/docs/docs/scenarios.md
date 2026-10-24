@@ -22,7 +22,8 @@ scenario.
 | [Content policy](/docs/scenarios/content-policy/) | Business-content boundaries, policy changes, and Git ignore/attributes hazards. |
 | [Authoring and versions](/docs/scenarios/authoring/) | Current state, saves, discard, variations, switching, preview, and restore. |
 | [Collaboration](/docs/scenarios/collaboration/) | Publish, apply incoming, remote variation lifecycle, remote destination changes, and merge. |
-| [Recovery and cleanup](/docs/scenarios/recovery-cleanup/) | Shelves, delete/squash, support refs, purge/redaction, binary assets, interruption, out-of-band mutation, and stale locks. |
+| [Hybrid projects](/docs/scenarios/hybrid-projects/) | A project folder inside a code repository, shared with developers who use plain Git. |
+| [Recovery and cleanup](/docs/scenarios/recovery-cleanup/) | Shelves, variation delete, support refs, purge/redaction, binary assets, interruption, out-of-band mutation, and stale locks. |
 
 ## Coverage legend
 
@@ -69,7 +70,7 @@ flowchart LR
     E -- No --> G[Append-only or ref-creating primitive]
     F --> H[Mutate with operation lock and recovery state]
     G --> H
-    H --> I{Ref deleted or rewritten?}
+    H --> I{Ref deleted?}
     I -- Yes --> J[Archive old tip under refs/draftline]
     I -- No --> K[Complete operation]
     J --> K

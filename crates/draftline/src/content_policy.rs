@@ -9,6 +9,7 @@ pub struct ContentPolicy {
     excludes: Vec<PathBuf>,
     include_extensions: Vec<String>,
     large_file_threshold_bytes: u64,
+    scope: PathBuf,
 }
 
 impl Default for ContentPolicy {
@@ -18,6 +19,7 @@ impl Default for ContentPolicy {
             excludes: vec![PathBuf::from(".draftline")],
             include_extensions: Vec::new(),
             large_file_threshold_bytes: 10 * 1024 * 1024,
+            scope: PathBuf::new(),
         }
     }
 }
@@ -91,8 +93,31 @@ impl ContentPolicy {
         self.large_file_threshold_bytes
     }
 
+    /// Repository-relative project folder that bounds this policy.
+    ///
+    /// Empty when the project is the repository root. Include and exclude rules
+    /// are relative to this folder, and nothing outside it is ever tracked.
+    pub fn scope(&self) -> &Path {
+        &self.scope
+    }
+
+    /// Bounds the policy to one repository-relative project folder.
+    pub fn scoped_to(mut self, scope: impl AsRef<Path>) -> Result<Self> {
+        self.scope = normalize_workspace_relative(scope)?;
+        Ok(self)
+    }
+
+    /// Returns whether a repository-relative path is project content.
     pub fn tracks(&self, path: impl AsRef<Path>) -> Result<bool> {
         let path = normalize_workspace_relative(path)?;
+        let path = if self.scope.as_os_str().is_empty() {
+            path
+        } else {
+            match path.strip_prefix(&self.scope) {
+                Ok(relative) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
+                _ => return Ok(false),
+            }
+        };
 
         let included = (self.includes.is_empty() && self.include_extensions.is_empty())
             || self
@@ -204,6 +229,37 @@ mod tests {
         assert!(policy.tracks("public/notes.md").unwrap());
         assert!(!policy.tracks("private/notes.md").unwrap());
         assert!(!policy.tracks("scratch/idea.sk").unwrap());
+    }
+
+    #[test]
+    fn scope_bounds_tracking_and_rebases_rules() {
+        let policy = ContentPolicy::new()
+            .include_extensions(["sk", "md"])
+            .unwrap()
+            .include(".cutready/projects.json")
+            .unwrap()
+            .exclude("private")
+            .unwrap()
+            .scoped_to("cutready")
+            .unwrap();
+
+        assert!(policy.tracks("cutready/intro.sk").unwrap());
+        assert!(policy.tracks("cutready/.cutready/projects.json").unwrap());
+        assert!(!policy.tracks("cutready/private/notes.md").unwrap());
+        assert!(!policy.tracks("README.md").unwrap());
+        assert!(!policy.tracks("src/docs/design.md").unwrap());
+        assert!(!policy.tracks(".cutready/projects.json").unwrap());
+        assert!(!policy.tracks("cutready").unwrap());
+        assert!(!policy.tracks("cutready-old/intro.sk").unwrap());
+        assert!(!policy.tracks("cutready/.draftline/state.json").unwrap());
+    }
+
+    #[test]
+    fn scope_without_rules_tracks_everything_inside() {
+        let policy = ContentPolicy::new().scoped_to("deck").unwrap();
+
+        assert!(policy.tracks("deck/a.txt").unwrap());
+        assert!(!policy.tracks("app/main.rs").unwrap());
     }
 
     #[test]

@@ -1,9 +1,6 @@
 use std::path::PathBuf;
 
-use crate::{
-    workspace::{HistoryCleanupBlockReport, VariationCreatePreflight},
-    PreflightReport, RecoveryState, SyncStatus,
-};
+use crate::{workspace::VariationCreatePreflight, PreflightReport, RecoveryState, SyncStatus};
 
 /// Result type used by Draftline APIs.
 pub type Result<T> = std::result::Result<T, DraftlineError>;
@@ -12,7 +9,7 @@ pub type Result<T> = std::result::Result<T, DraftlineError>;
 #[derive(Debug, thiserror::Error)]
 pub enum DraftlineError {
     #[error("git operation failed: {0}")]
-    Git(#[from] git2::Error),
+    Git(git2::Error),
 
     #[error("I/O operation failed: {0}")]
     Io(#[from] std::io::Error),
@@ -43,6 +40,9 @@ pub enum DraftlineError {
     #[error("recovery operation was not found: {0}")]
     RecoveryNotFound(String),
 
+    #[error("another project in this checkout has an incomplete Draftline operation: {0}")]
+    RecoveryInOtherProject(PathBuf),
+
     #[error("invalid variation name: {0}")]
     InvalidVariationName(String),
 
@@ -69,6 +69,13 @@ pub enum DraftlineError {
 
     #[error("workspace is locked by another Draftline operation")]
     WorkspaceLocked,
+
+    /// Another Git process holds one of the repository's lock files (its
+    /// `index.lock` or a ref's `.lock`), as `git` does while it stages,
+    /// commits, or checks out. Retry once it finishes; if no Git process is
+    /// running, the lock file was left by a crash.
+    #[error("Git is busy in this repository (a .lock file exists); try again when it finishes")]
+    GitIndexLocked,
 
     #[error("unsupported switch policy: {0}")]
     UnsupportedSwitchPolicy(&'static str),
@@ -106,15 +113,6 @@ pub enum DraftlineError {
         required_feature: &'static str,
     },
 
-    #[error("operation requires explicit confirmation: {0}")]
-    ConsentRequired(String),
-
-    #[error("squash requires at least 2 versions, got {0}")]
-    InvalidSquashCount(usize),
-
-    #[error("not enough versions to squash: need {needed}, available {available}")]
-    NotEnoughVersionsToSquash { needed: usize, available: usize },
-
     #[error("invalid contributor identity: {0}")]
     InvalidContributorIdentity(String),
 
@@ -124,11 +122,61 @@ pub enum DraftlineError {
     #[error("invalid merge resolution: {0}")]
     InvalidMergeResolution(String),
 
-    #[error("invalid history cleanup request: {0}")]
-    InvalidHistoryCleanup(String),
+    #[error("cannot tell which branch to send to; pass a base branch")]
+    SendBaseUnknown,
 
-    #[error("history cleanup request is blocked")]
-    HistoryCleanupBlocked(Box<HistoryCleanupBlockReport>),
+    #[error("the remote has no branch `{0}` to send to; publish it first or pass a base branch")]
+    SendBaseNotOnRemote(String),
+
+    #[error(
+        "this checkout's Draftline workspace is {}; open that folder, or relocate the workspace",
+        workspace_folder(.0)
+    )]
+    WorkspaceAlreadyInCheckout(std::path::PathBuf),
+
+    #[error("unreadable Draftline workspace record: {0}")]
+    InvalidWorkspaceClaim(String),
+
+    #[error("branch `{0}` is not a variation; switch to one or to the base branch to send")]
+    SendOutsideNamespace(String),
+
+    #[error("branch `{0}` is outside this project's variations")]
+    VariationOutsideNamespace(String),
+
+    #[error("pull request provider failed: {0}")]
+    PullRequest(String),
+
+    #[error("merge needs a developer: files outside the project conflict: {0:?}")]
+    MergeNeedsDeveloper(Vec<std::path::PathBuf>),
+
+    #[error("worktree `{0}` was not created by Draftline")]
+    NotOwnedWorktree(String),
+
+    #[error("worktree `{0}` is the one this workspace is open in")]
+    OwnedWorktreeInUse(String),
+
+    #[error("worktree has unsaved or untracked files: {0:?}")]
+    OwnedWorktreeHasChanges(Vec<std::path::PathBuf>),
+}
+
+impl From<git2::Error> for DraftlineError {
+    /// libgit2 reports a lock file held by Git (index or ref) as `Locked`;
+    /// every operation surfaces it as the same retryable error.
+    fn from(error: git2::Error) -> Self {
+        if error.code() == git2::ErrorCode::Locked {
+            DraftlineError::GitIndexLocked
+        } else {
+            DraftlineError::Git(error)
+        }
+    }
+}
+
+fn workspace_folder(project: &std::path::Path) -> String {
+    if project.as_os_str().is_empty() {
+        "the repository root".to_string()
+    } else {
+        format!("`{}`", project.display())
+    }
 }
 
 fn timeout_suffix(timeout_ms: u64) -> String {

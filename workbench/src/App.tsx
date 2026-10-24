@@ -155,7 +155,7 @@ function WorkspaceGraphPanel({
             onChange={(event) => setView(event.target.value as DraftlineWorkspaceGraphView)}
             value={view}
           >
-            <option value="first-parent">First-parent milestones</option>
+            <option value="first-parent">First-parent main line</option>
             <option value="expanded">Expanded DAG</option>
           </select>
         </label>

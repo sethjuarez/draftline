@@ -69,6 +69,7 @@ export default defineConfig({
             { label: "Content policy", slug: "docs/scenarios/content-policy" },
             { label: "Authoring and versions", slug: "docs/scenarios/authoring" },
             { label: "Collaboration", slug: "docs/scenarios/collaboration" },
+            { label: "Hybrid projects", slug: "docs/scenarios/hybrid-projects" },
             { label: "Recovery and cleanup", slug: "docs/scenarios/recovery-cleanup" },
           ],
         },

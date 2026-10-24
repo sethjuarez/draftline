@@ -2,12 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use draftline::tauri_contract::{
-    adopt_remote_variation, adopt_workspace, apply_history_cleanup,
-    apply_history_cleanup_with_context, apply_incoming, apply_shelf, audit_content_policy,
-    clone_workspace, create_milestone_merge, create_variation_from_version,
-    create_variation_from_version_guarded, diff_version_to_workspace, diff_versions,
-    diff_workspace_file, fetch_remote, get_changes, get_full_history, get_history,
-    get_history_compaction_candidates, get_workspace_graph, get_workspace_graph_agent_summary,
+    adopt_remote_variation, adopt_workspace, apply_incoming, apply_shelf, audit_content_policy,
+    clone_workspace, create_variation_from_version, create_variation_from_version_guarded,
+    diff_version_to_workspace, diff_versions, diff_workspace_file, fetch_remote, get_changes,
+    get_full_history, get_history, get_workspace_graph, get_workspace_graph_agent_summary,
     get_workspace_graph_around_version, get_workspace_graph_common_ancestor,
     get_workspace_graph_compare_summary, get_workspace_graph_for_variation,
     get_workspace_graph_neighborhood, get_workspace_graph_node, get_workspace_graph_overview,
@@ -16,40 +14,30 @@ use draftline::tauri_contract::{
     list_support_refs, list_variations, merge_conflict_view_model, merge_incoming,
     merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context, open_workspace,
     preflight_apply_incoming, preflight_apply_shelf, preflight_create_variation_from_version,
-    preflight_history_cleanup_remote_impact, preflight_merge_incoming, preflight_milestone_merge,
-    preflight_publish_history_cleanup, preflight_rename_variation, preflight_switch_variation,
-    preflight_undo_history_cleanup, preview_history_cleanup, preview_history_cleanup_with_context,
+    preflight_merge_incoming, preflight_rename_variation, preflight_switch_variation,
     preview_shelf, preview_version, preview_version_file, preview_workspace_file,
-    publish_current_variation, publish_history_cleanup, rename_variation,
-    resolve_rewritten_version, restore_version_as_new_save,
+    publish_current_variation, rename_variation, restore_version_as_new_save,
     restore_version_as_new_save_to_variation,
     restore_version_as_new_save_to_variation_with_context,
     restore_version_as_new_save_with_context, save, search_workspace_graph, selected_discard,
     selected_save, selected_save_with_context, selected_shelve, selected_shelve_with_context,
-    switch_variation, undo_history_cleanup, verify_workspace, whole_file_use_content_resolutions,
-    ApplyHistoryCleanupRequest, CloneWorkspaceRequest, ConflictContentSource,
-    CreateVariationFromVersionRequest, CurrentFileRequest, DiffVersionsRequest,
-    DraftlineCommandContext, DraftlineEventKind, GuardedCreateVariationFromVersionRequest,
-    HistoryCleanupRemoteImpactRequest, HistoryCompactionCandidatesCommandRequest,
-    ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
-    MilestoneMergeRequest, PreflightCreateVariationFromVersionRequest,
-    PreviewHistoryCleanupRequest, PreviewVersionFileRequest, PublishCurrentVariationRequest,
-    PublishHistoryCleanupPreflightRequest, PublishHistoryCleanupRequest, RemoteRequest,
-    RemoteVariationRequest, RenameVariationRequest, ResolveRewrittenVersionRequest,
-    RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
-    SelectedShelveRequest, ShelfRequest, SwitchVariationRequest, TargetedRestoreVersionRequest,
-    UndoHistoryCleanupPreflightRequest, UndoHistoryCleanupRequest, VersionRequest,
+    switch_variation, verify_workspace, whole_file_use_content_resolutions, CloneWorkspaceRequest,
+    ConflictContentSource, CreateVariationFromVersionRequest, CurrentFileRequest,
+    DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
+    GuardedCreateVariationFromVersionRequest, ListSupportRefsRequest, MergeIncomingRequest,
+    MergeIncomingWithResolutionsRequest, PreflightCreateVariationFromVersionRequest,
+    PreviewVersionFileRequest, PublishCurrentVariationRequest, RemoteRequest,
+    RemoteVariationRequest, RenameVariationRequest, RestoreVersionRequest, SaveRequest,
+    SelectedDiscardRequest, SelectedSaveRequest, SelectedShelveRequest, ShelfRequest,
+    SwitchVariationRequest, TargetedRestoreVersionRequest, VersionRequest,
     WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
     WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest, WorkspaceGraphRequest,
     WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest, WorkspaceRequest,
 };
 use draftline::{
-    CleanupBase, CleanupMode, CleanupSafety, CommitRange, ContentPolicy, Contributor,
-    ContributorProfile, HistoryCleanupRequest, HistoryCompactionCandidatesRequest,
-    MergeConflictResolution, MergeResolutionChoice, MilestoneSpec, OperationLockState,
-    RemoteRewritePolicy, RestoreVersionTarget, RewriteConfirmation, StaleVersionDisposition,
-    SupportRefScope, SwitchPolicy, SyncState, VariationId, Workspace,
-    WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
+    ContentPolicy, Contributor, ContributorProfile, MergeConflictResolution, MergeResolutionChoice,
+    OperationLockState, RestoreVersionTarget, SupportRefScope, SwitchPolicy, SyncState,
+    VariationId, Workspace, WorkspaceGraphOverviewOptions,
 };
 use serde_json::Value;
 
@@ -754,118 +742,6 @@ fn tauri_contract_smokes_publish_current_variation() {
 }
 
 #[test]
-fn tauri_contract_smokes_milestone_merge_commands() {
-    let remote_dir = tempfile::tempdir().unwrap();
-    init_bare_remote(remote_dir.path());
-
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = Workspace::init(temp.path()).unwrap();
-    configure_identity(workspace.root());
-    write_file(workspace.root(), "post.md", b"published base");
-    let base = workspace.save_version("Published base").unwrap();
-    workspace
-        .add_remote("origin", remote_dir.path().to_string_lossy())
-        .unwrap();
-    workspace.publish_changes("origin").unwrap();
-
-    write_file(workspace.root(), "post.md", b"published base\nfirst local save");
-    let first_local = workspace.save_version("First local save").unwrap();
-    write_file(
-        workspace.root(),
-        "post.md",
-        b"published base\nfirst local save\nsecond local save",
-    );
-    let second_local = workspace.save_version("Second local save").unwrap();
-
-    let request = RemoteRequest {
-        workspace_path: temp.path().to_path_buf(),
-        remote: "origin".to_string(),
-    };
-    let preflight = preflight_milestone_merge(request.clone()).unwrap();
-    assert!(preflight.can_create_milestone);
-    assert_eq!(preflight.unpublished_versions, 2);
-    assert_eq!(preflight.first_parent.as_ref(), Some(base.id()));
-    assert_eq!(&preflight.second_parent, second_local.id());
-
-    let result = create_milestone_merge(MilestoneMergeRequest {
-        workspace_path: temp.path().to_path_buf(),
-        remote: "origin".to_string(),
-        label: "Review milestone".to_string(),
-    })
-    .unwrap();
-    assert_eq!(result.preflight.sync_status.state, SyncState::LocalAhead);
-    assert_eq!(result.merge.version.label, "Review milestone");
-    assert_eq!(&result.merge.first_parent, base.id());
-    assert_eq!(&result.merge.second_parent, second_local.id());
-    assert!(result.postconditions.errors.is_empty());
-
-    let json = serde_json::to_value(&result).unwrap();
-    assert_eq!(json["merge"]["first_parent"], base.id().as_str());
-    assert_eq!(json["merge"]["second_parent"], second_local.id().as_str());
-
-    let graph = get_workspace_graph_for_variation(WorkspaceGraphVariationRequest {
-        workspace_path: temp.path().to_path_buf(),
-        variation_id: "main".to_string(),
-        options: WorkspaceGraphOptions::default(),
-    })
-    .unwrap();
-    let milestone_node = graph
-        .nodes
-        .iter()
-        .find(|node| node.version.id() == result.merge.version.id())
-        .unwrap();
-    assert_eq!(
-        milestone_node
-            .parent_version_ids
-            .iter()
-            .map(|id| id.as_str())
-            .collect::<Vec<_>>(),
-        vec![base.id().as_str(), second_local.id().as_str()]
-    );
-
-    let published = publish_current_variation(PublishCurrentVariationRequest {
-        workspace_path: temp.path().to_path_buf(),
-        remote: "origin".to_string(),
-    })
-    .unwrap();
-    assert_eq!(published.publish.published_versions, 3);
-    assert!(published.postconditions.errors.is_empty());
-
-    let remote = git2::Repository::open_bare(remote_dir.path()).unwrap();
-    let remote_tip = remote.refname_to_id("refs/heads/main").unwrap();
-    assert_eq!(remote_tip.to_string(), result.merge.version.id().as_str());
-
-    let mut first_parent_walk = remote.revwalk().unwrap();
-    first_parent_walk.push(remote_tip).unwrap();
-    first_parent_walk.simplify_first_parent().unwrap();
-    let first_parent_ids = first_parent_walk
-        .map(|oid| oid.unwrap().to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        first_parent_ids,
-        vec![result.merge.version.id().as_str(), base.id().as_str()]
-    );
-
-    let mut full_walk = remote.revwalk().unwrap();
-    full_walk.push(remote_tip).unwrap();
-    full_walk.set_sorting(git2::Sort::TOPOLOGICAL).unwrap();
-    let full_ids = full_walk
-        .map(|oid| oid.unwrap().to_string())
-        .collect::<Vec<_>>();
-    assert!(full_ids.iter().any(|id| id == first_local.id().as_str()));
-    assert!(full_ids.iter().any(|id| id == second_local.id().as_str()));
-
-    let fresh_clone_dir = tempfile::tempdir().unwrap();
-    let fresh_clone = git2::Repository::clone(
-        remote_dir.path().to_string_lossy().as_ref(),
-        fresh_clone_dir.path(),
-    )
-    .unwrap();
-    let fresh_tip = fresh_clone.refname_to_id("refs/heads/main").unwrap();
-    assert_eq!(fresh_tip, remote_tip);
-}
-
-#[test]
 fn tauri_contract_smokes_collaboration_incoming_and_merge() {
     let remote_dir = tempfile::tempdir().unwrap();
     init_bare_remote(remote_dir.path());
@@ -928,6 +804,7 @@ fn tauri_contract_smokes_collaboration_incoming_and_merge() {
         workspace_path: author_dir.path().to_path_buf(),
         remote: "origin".to_string(),
         label: "Blocked merge".to_string(),
+        from_base: false,
     }))
     .unwrap_err();
     assert_eq!(blocked_merge.code, "preflight_failed");
@@ -943,6 +820,7 @@ fn tauri_contract_smokes_collaboration_incoming_and_merge() {
         workspace_path: author_dir.path().to_path_buf(),
         remote: "origin".to_string(),
         label: "Workbench contract merge".to_string(),
+        from_base: false,
     })
     .unwrap();
     assert_eq!(merged.merge.version.label, "Workbench contract merge");
@@ -1196,236 +1074,6 @@ fn tauri_contract_serializes_errors_for_frontend_calls() {
 }
 
 #[test]
-fn tauri_contract_smokes_history_cleanup_commands() {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = Workspace::init(temp.path()).unwrap();
-    configure_identity(workspace.root());
-    write_file(workspace.root(), "post.md", b"v1");
-    workspace.save_version("v1").unwrap();
-    write_file(workspace.root(), "post.md", b"v2");
-    let v2 = workspace.save_version("noisy v2").unwrap();
-    write_file(workspace.root(), "post.md", b"v3");
-    let v3 = workspace.save_version("noisy v3").unwrap();
-
-    let cleanup = HistoryCleanupRequest {
-        target_variation: None,
-        base: CleanupBase::Auto,
-        mode: CleanupMode::CompactMilestones {
-            milestones: vec![MilestoneSpec {
-                title: "Clean milestone".to_string(),
-                description: Some("Compacted noisy saves".to_string()),
-                include_range: CommitRange {
-                    start: v2.id().clone(),
-                    end: v3.id().clone(),
-                },
-            }],
-            preserve_named_branches: true,
-            preserve_merge_boundaries: true,
-        },
-        safety: CleanupSafety::default_user_facing(),
-        remote_policy: RemoteRewritePolicy::LocalOnly,
-    };
-
-    let preview = preview_history_cleanup(PreviewHistoryCleanupRequest {
-        workspace_path: temp.path().to_path_buf(),
-        cleanup,
-    })
-    .unwrap();
-    let preview_json = serde_json::to_value(&preview).unwrap();
-    assert_object_keys(
-        &preview_json,
-        &[],
-        &[
-            "affected_refs",
-            "commit_map",
-            "descendant_rewrite_count",
-            "graph_diff",
-            "new_head",
-            "old_head",
-            "operations",
-            "plan_id",
-            "planned_backup_ref",
-            "planned_ref_updates",
-            "preview_ref",
-            "selected_commit_count",
-            "snapshot_map",
-            "target_variation",
-            "warnings",
-        ],
-    );
-    let candidates = get_history_compaction_candidates(HistoryCompactionCandidatesCommandRequest {
-        workspace_path: temp.path().to_path_buf(),
-        request: HistoryCompactionCandidatesRequest {
-            target_variation: None,
-            selected_version: v2.id().clone(),
-            remote: None,
-            preserve_named_branches: true,
-            preserve_merge_boundaries: true,
-        },
-    })
-    .unwrap();
-    let candidates_json = serde_json::to_value(&candidates).unwrap();
-    assert_object_keys(
-        &candidates_json,
-        &[],
-        &[
-            "candidates",
-            "selected_version",
-            "target_head",
-            "target_variation",
-        ],
-    );
-
-    let result = apply_history_cleanup(ApplyHistoryCleanupRequest {
-        workspace_path: temp.path().to_path_buf(),
-        plan_id: preview.plan_id.to_string(),
-        confirmation: RewriteConfirmation::UserConfirmed,
-    })
-    .unwrap();
-    assert_eq!(result.new_head, preview.new_head);
-
-    let resolution = resolve_rewritten_version(ResolveRewrittenVersionRequest {
-        workspace_path: temp.path().to_path_buf(),
-        version_id: v2.id().to_string(),
-    })
-    .unwrap();
-    assert!(matches!(
-        resolution.disposition,
-        StaleVersionDisposition::SquashedInto { .. }
-    ));
-
-    let undo = preflight_undo_history_cleanup(UndoHistoryCleanupPreflightRequest {
-        workspace_path: temp.path().to_path_buf(),
-        plan_id: result.plan_id.to_string(),
-    })
-    .unwrap();
-    assert!(undo.can_undo);
-    let undo_result = undo_history_cleanup(UndoHistoryCleanupRequest {
-        workspace_path: temp.path().to_path_buf(),
-        token: undo.token,
-    })
-    .unwrap();
-    assert_eq!(undo_result.new_head, v3.id().clone());
-}
-
-#[test]
-fn tauri_contract_smokes_history_cleanup_remote_publish_commands() {
-    let remote = tempfile::tempdir().unwrap();
-    init_bare_remote(remote.path());
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = Workspace::init(temp.path()).unwrap();
-    configure_identity(workspace.root());
-    workspace
-        .add_remote("origin", remote.path().to_string_lossy())
-        .unwrap();
-    write_file(workspace.root(), "post.md", b"v1");
-    workspace.save_version("v1").unwrap();
-    write_file(workspace.root(), "post.md", b"v2");
-    let v2 = workspace.save_version("noisy v2").unwrap();
-    write_file(workspace.root(), "post.md", b"v3");
-    let v3 = workspace.save_version("noisy v3").unwrap();
-    workspace.publish_changes("origin").unwrap();
-
-    let cleanup = HistoryCleanupRequest {
-        target_variation: None,
-        base: CleanupBase::Auto,
-        mode: CleanupMode::CompactMilestones {
-            milestones: vec![MilestoneSpec {
-                title: "Clean milestone".to_string(),
-                description: Some("Compacted noisy saves".to_string()),
-                include_range: CommitRange {
-                    start: v2.id().clone(),
-                    end: v3.id().clone(),
-                },
-            }],
-            preserve_named_branches: true,
-            preserve_merge_boundaries: true,
-        },
-        safety: CleanupSafety::default_user_facing(),
-        remote_policy: RemoteRewritePolicy::PushWithLease {
-            remote: "origin".to_string(),
-            branch: "main".to_string(),
-        },
-    };
-
-    let preview = preview_history_cleanup(PreviewHistoryCleanupRequest {
-        workspace_path: temp.path().to_path_buf(),
-        cleanup,
-    })
-    .unwrap();
-    let impact = preflight_history_cleanup_remote_impact(HistoryCleanupRemoteImpactRequest {
-        workspace_path: temp.path().to_path_buf(),
-        plan_id: preview.plan_id.to_string(),
-        remote: "origin".to_string(),
-    })
-    .unwrap();
-    assert_object_keys(
-        &serde_json::to_value(&impact).unwrap(),
-        &[],
-        &[
-            "descendants",
-            "local_head",
-            "publish_status",
-            "remote",
-            "replacement_head",
-            "selected",
-            "tracking_ref",
-            "upstream_head",
-            "variation",
-            "warnings",
-        ],
-    );
-
-    let result = apply_history_cleanup(ApplyHistoryCleanupRequest {
-        workspace_path: temp.path().to_path_buf(),
-        plan_id: preview.plan_id.to_string(),
-        confirmation: RewriteConfirmation::UserConfirmed,
-    })
-    .unwrap();
-    let preflight = preflight_publish_history_cleanup(PublishHistoryCleanupPreflightRequest {
-        workspace_path: temp.path().to_path_buf(),
-        plan_id: result.plan_id.to_string(),
-        remote: "origin".to_string(),
-    })
-    .unwrap();
-    assert_object_keys(
-        &serde_json::to_value(&preflight).unwrap(),
-        &[],
-        &[
-            "can_publish",
-            "expected_remote_oid",
-            "plan_id",
-            "remote",
-            "remote_impact",
-            "replacement_oid",
-            "support_refs",
-            "token",
-            "variation",
-        ],
-    );
-
-    let publish = publish_history_cleanup(PublishHistoryCleanupRequest {
-        workspace_path: temp.path().to_path_buf(),
-        token: preflight.token.unwrap(),
-        confirmation: RewriteConfirmation::UserConfirmed,
-    })
-    .unwrap();
-    assert_object_keys(
-        &serde_json::to_value(&publish).unwrap(),
-        &[],
-        &[
-            "expected_remote_oid",
-            "plan_id",
-            "ref_updates",
-            "remote",
-            "replacement_oid",
-            "support_refs",
-            "variation",
-        ],
-    );
-}
-
-#[test]
 fn tauri_contract_context_applies_policy_profile_and_events() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::init(temp.path()).unwrap();
@@ -1597,108 +1245,6 @@ fn tauri_contract_restore_with_context_records_profile() {
     .unwrap();
     assert_eq!(plain.version.author.name, "Dogfood Bot");
     assert_eq!(plain.version.saved_by.name, "Dogfood Bot");
-}
-
-fn cleanup_workspace_with_noise() -> (tempfile::TempDir, HistoryCleanupRequest) {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = Workspace::init(temp.path()).unwrap();
-    configure_identity(workspace.root());
-    write_file(workspace.root(), "post.md", b"v1");
-    workspace.save_version("v1").unwrap();
-    write_file(workspace.root(), "post.md", b"v2");
-    let v2 = workspace.save_version("noisy v2").unwrap();
-    write_file(workspace.root(), "post.md", b"v3");
-    let v3 = workspace.save_version("noisy v3").unwrap();
-    let cleanup = HistoryCleanupRequest {
-        target_variation: None,
-        base: CleanupBase::Auto,
-        mode: CleanupMode::CompactMilestones {
-            milestones: vec![MilestoneSpec {
-                title: "Clean milestone".to_string(),
-                description: None,
-                include_range: CommitRange {
-                    start: v2.id().clone(),
-                    end: v3.id().clone(),
-                },
-            }],
-            preserve_named_branches: true,
-            preserve_merge_boundaries: true,
-        },
-        safety: CleanupSafety::default_user_facing(),
-        remote_policy: RemoteRewritePolicy::LocalOnly,
-    };
-    (temp, cleanup)
-}
-
-fn commit_attribution(root: &Path, id: &str) -> (Contributor, Contributor) {
-    let repo = git2::Repository::open(root).unwrap();
-    let commit = repo.find_commit(git2::Oid::from_str(id).unwrap()).unwrap();
-    let contributor = |signature: git2::Signature<'_>| Contributor {
-        name: signature.name().unwrap().to_string(),
-        email: signature.email().map(ToString::to_string),
-    };
-    (
-        contributor(commit.author()),
-        contributor(commit.committer()),
-    )
-}
-
-fn assert_context_commit_attribution(root: &Path, id: &str) {
-    let (author, saved_by) = commit_attribution(root, id);
-    assert_eq!(author.name, "Context Author");
-    assert_eq!(author.email.as_deref(), Some("author@context.invalid"));
-    assert_eq!(saved_by.name, "Context Saver");
-    assert_eq!(saved_by.email.as_deref(), Some("saver@context.invalid"));
-}
-
-#[test]
-fn tauri_contract_history_cleanup_with_context_records_profile() {
-    let (temp, cleanup) = cleanup_workspace_with_noise();
-    let mut context =
-        DraftlineCommandContext::new().with_contributor_profile(attribution_profile());
-    let preview = preview_history_cleanup_with_context(
-        &context,
-        PreviewHistoryCleanupRequest {
-            workspace_path: temp.path().to_path_buf(),
-            cleanup,
-        },
-    )
-    .unwrap();
-    assert_context_commit_attribution(temp.path(), preview.new_head.as_str());
-    let result = apply_history_cleanup_with_context(
-        &mut context,
-        ApplyHistoryCleanupRequest {
-            workspace_path: temp.path().to_path_buf(),
-            plan_id: preview.plan_id.to_string(),
-            confirmation: RewriteConfirmation::UserConfirmed,
-        },
-    )
-    .unwrap();
-    assert_eq!(result.new_head, preview.new_head);
-
-    let (temp, cleanup) = cleanup_workspace_with_noise();
-    let preview = preview_history_cleanup(PreviewHistoryCleanupRequest {
-        workspace_path: temp.path().to_path_buf(),
-        cleanup,
-    })
-    .unwrap();
-    assert_eq!(
-        commit_attribution(temp.path(), preview.new_head.as_str())
-            .0
-            .name,
-        "Dogfood Bot"
-    );
-    let result = apply_history_cleanup_with_context(
-        &mut context,
-        ApplyHistoryCleanupRequest {
-            workspace_path: temp.path().to_path_buf(),
-            plan_id: preview.plan_id.to_string(),
-            confirmation: RewriteConfirmation::UserConfirmed,
-        },
-    )
-    .unwrap();
-    assert_ne!(result.new_head, preview.new_head);
-    assert_context_commit_attribution(temp.path(), result.new_head.as_str());
 }
 
 #[test]

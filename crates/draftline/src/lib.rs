@@ -79,10 +79,12 @@ pub mod merge;
 pub mod mobile_ffi;
 pub mod path;
 pub mod profile;
+pub mod pull_request;
 pub mod recovery;
 pub mod remote;
 pub mod tauri_contract;
 pub mod workspace;
+pub mod worktree;
 
 pub use content_policy::ContentPolicy;
 pub use error::{DraftlineError, Result};
@@ -90,7 +92,12 @@ pub use merge::{
     MarkdownResolver, MergeConflict, MergeInput, MergeOutcome, PlainTextResolver, ResolutionKind,
     ResolverRegistry, SemanticMergeResolver,
 };
-pub use profile::{AttributionOperation, ContributorProfile, ContributorProvider};
+pub use profile::{
+    default_git_identity, AttributionOperation, ContributorProfile, ContributorProvider,
+};
+pub use pull_request::{
+    PullRequest, PullRequestProvider, PullRequestRequest, SendRequest, SendResult,
+};
 pub use recovery::{RecoveryOperation, RecoveryState};
 pub use remote::{
     Contributor, PublishPreflight, PublishResult, PublishToken, RemoteCredential,
@@ -99,39 +106,27 @@ pub use remote::{
 };
 pub use workspace::{
     AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult, ChangeKind, ChangeSet,
-    ChangedFile, CleanupAffectedRef, CleanupBase, CleanupGraphDiff, CleanupMode, CleanupOperation,
-    CleanupPlanId, CleanupPublicationSummary, CleanupPublishStatus, CleanupRefImpact,
-    CleanupSafety, CleanupWarning, CleanupWarningCode, CommitMapEntry, CommitRange,
-    CommitRewriteMap, CompactionSelectionRole, ContentPolicyAudit, CurrentFileDiff,
-    CurrentFilePreview, DiagnosticCode, DiagnosticSeverity, DirtySummary, ErrorExplanation,
-    FileHazard, FileHazardKind, HistoryCleanupBlockReport, HistoryCleanupPreview,
-    HistoryCleanupPublishPreflight, HistoryCleanupPublishResult, HistoryCleanupPublishToken,
-    HistoryCleanupRemoteImpact, HistoryCleanupRequest, HistoryCleanupUndoPreflight,
-    HistoryCleanupUndoToken, HistoryCompactionCandidate, HistoryCompactionCandidates,
-    HistoryCompactionCandidatesRequest, HistoryEntry, MergeConflictResolution, MergeIncomingReport,
-    MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice, MilestoneMergeReport,
-    MilestoneMergeResult, MilestoneMergeToken, MilestoneSpec, OperationLockInspection,
-    OperationLockMetadata, OperationLockState, OperationLockSummary, PendingHistoryCleanup,
-    PreflightReport, PreviewFile, PurgePreflight, PurgeToken, PurgeVerification,
-    RecoveryRepairResult, RefName, RefUpdate, RemoteHistoryReplacePreflight,
-    RemoteHistoryReplaceToken, RemoteRewritePolicy, RemoteVariation,
-    RemoteVariationDeletePreflight, RemoteVariationDeleteToken, RemoteVariationDiagnostics,
-    RestoreVersionTarget, RetryClass, RewriteConfirmation, RewriteDisposition, SafeNextAction,
-    SharingMode, Shelf, ShelfApplyReport, SnapshotMapEntry, SnapshotRewriteMap,
-    SquashVersionsPreflight, SquashVersionsToken, StaleVersionDisposition, StaleVersionResolution,
-    StaleVersionResolutionRequest, SupportRef, SupportRefExpirationPreflight,
-    SupportRefExpirationToken, SupportRefKind, SupportRefPublishItem, SupportRefPublishPreflight,
-    SupportRefPublishToken, SupportRefRestorePreflight, SupportRefRestoreToken, SupportRefScope,
-    SupportRefSummary, SwitchPolicy, TargetedRestoreVersionResult, TimelineCleanupResult,
-    Variation, VariationCreatePreflight, VariationCreateToken, VariationDeletePreflight,
-    VariationDeleteToken, VariationId, VariationMetadata, VariationRenamePreflight,
-    VariationRenameToken, VariationSummary, Version, VersionDiff, VersionId, VersionPreview,
-    Workspace, WorkspaceCapabilities, WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAction,
-    WorkspaceGraphActionHint, WorkspaceGraphAgentSummary, WorkspaceGraphBoundary,
-    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphLayoutHint,
-    WorkspaceGraphNode, WorkspaceGraphNodeDetail, WorkspaceGraphNodeId, WorkspaceGraphNodeKind,
-    WorkspaceGraphOptions, WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRef,
-    WorkspaceGraphRefKind, WorkspaceGraphRefScope, WorkspaceGraphRefs, WorkspaceGraphSearchResult,
-    WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection, WorkspaceSummary,
-    WorkspaceVerification,
+    ChangedFile, ContentPolicyAudit, CurrentFileDiff, CurrentFilePreview, DiagnosticCode,
+    DiagnosticSeverity, DirtySummary, ErrorExplanation, FileHazard, FileHazardKind, HistoryEntry,
+    MergeConflictResolution, MergeIncomingReport, MergeIncomingResult, MergeIncomingToken,
+    MergeResolutionChoice, OperationLockInspection, OperationLockMetadata, OperationLockState,
+    OperationLockSummary, PreflightReport, PreviewFile, PurgePreflight, PurgeToken,
+    PurgeVerification, RecoveryRepairResult, RemoteVariation, RemoteVariationDeletePreflight,
+    RemoteVariationDeleteToken, RemoteVariationDiagnostics, RestoreVersionTarget, RetryClass,
+    SafeNextAction, SharingMode, Shelf, ShelfApplyReport, SupportRef,
+    SupportRefExpirationPreflight, SupportRefExpirationToken, SupportRefKind,
+    SupportRefPublishItem, SupportRefPublishPreflight, SupportRefPublishToken,
+    SupportRefRestorePreflight, SupportRefRestoreToken, SupportRefScope, SupportRefSummary,
+    SwitchPolicy, TargetedRestoreVersionResult, Variation, VariationCreatePreflight,
+    VariationCreateToken, VariationDeletePreflight, VariationDeleteToken, VariationId,
+    VariationMetadata, VariationRenamePreflight, VariationRenameToken, VariationSummary, Version,
+    VersionDiff, VersionId, VersionPreview, Workspace, WorkspaceCapabilities, WorkspaceDiagnostic,
+    WorkspaceGraph, WorkspaceGraphAction, WorkspaceGraphActionHint, WorkspaceGraphAgentSummary,
+    WorkspaceGraphBoundary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
+    WorkspaceGraphLayoutHint, WorkspaceGraphNode, WorkspaceGraphNodeDetail, WorkspaceGraphNodeId,
+    WorkspaceGraphNodeKind, WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
+    WorkspaceGraphPath, WorkspaceGraphRef, WorkspaceGraphRefKind, WorkspaceGraphRefScope,
+    WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceId,
+    WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
 };
+pub use worktree::{OwnedWorktree, WorktreeStart, OWNED_WORKTREE_PREFIX};

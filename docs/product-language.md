@@ -18,7 +18,5 @@
 | Put work aside | Local shelf support ref by default | Shelve changes |
 | Remove option | Delete branch after archive | Delete variation |
 | Remove shared option | Archive support ref, then expected-OID remote deletion | Remove variation for the team |
-| Clean up local history | Rewrite branch after archive | Squash versions |
-| Replace shared history | Archive support ref, then consented force-with-lease replacement | Replace shared history |
 | Recover hidden support state | Fetch/list/restore `refs/draftline/...` | Recover archived work |
 | Permanently delete sensitive content | Not yet exposed | Purge or redact content |

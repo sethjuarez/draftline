@@ -18,14 +18,16 @@ pub enum RecoveryOperation {
     ShelveChanges,
     ApplyIncoming,
     MergeIncoming,
-    MilestoneMerge,
     DiscardChanges,
     DiscardFile,
     DeleteVariation,
-    SquashVersions,
     ApplyShelf,
     DeleteRemoteVariation,
     ExpireSupportRefs,
     RenameVariation,
+    /// Recorded by older versions for features that no longer exist. Still
+    /// read so those workspaces open; repair reports them unavailable.
+    MilestoneMerge,
+    SquashVersions,
     HistoryCleanup,
 }

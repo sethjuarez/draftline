@@ -187,20 +187,19 @@ let profile = ContributorProfile::new(
 # let _ = profile;
 ```
 
+When a host does want the developer's Git identity (for example as a fallback
+author), read it through Draftline rather than linking `git2` directly.
+`Workspace::git_identity()` honours repository config, and
+`draftline::default_git_identity()` reads global config before a project is
+open. Both return `Ok(None)` when no `user.name` is set and an error when Git
+config cannot be read.
+
 Every operation that writes a commit honors the profile: save, selected save,
 merge, shelve (including `switch_variation` with `SaveFirst`/`Shelve`), restore
-as a new save, squash and history-cleanup milestones. On `Workspace`, use the
-`*_with_profile` variants, such as `shelve_files_with_profile`,
-`restore_version_as_new_save_with_profile`, `squash_versions_with_profile` and
-`apply_history_cleanup_with_profile`. The `*_with_context` contract functions
-pass the context profile automatically. Methods without a profile keep using the
-Git config identity.
-
-History cleanup replays descendants with their original author and committer;
-only the minted milestone commits take the profile. If a plan was previewed
-under a different identity, `apply_history_cleanup_with_profile` re-mints the
-milestones before moving any refs. It fails with `InvalidHistoryCleanup` if the
-workspace has drifted since the preview, in which case preview the cleanup again.
+as a new save. On `Workspace`, use the `*_with_profile` variants, such as
+`shelve_files_with_profile` and `restore_version_as_new_save_with_profile`. The
+`*_with_context` contract functions pass the context profile automatically.
+Methods without a profile keep using the Git config identity.
 
 ## Native mobile bridge
 

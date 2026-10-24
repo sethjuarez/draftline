@@ -57,8 +57,6 @@ until the command payloads survive Workbench runs.
 - `publish_current_variation`
 - `delete_remote_variation`
 - `restore_support_ref`
-- `squash_versions`
-- `confirm_replace_remote_history`
 - `repair_recovery`
 
 ## Initial React views
@@ -68,7 +66,7 @@ until the command payloads survive Workbench runs.
 - Variation switcher and remote variation diagnostics.
 - Support-ref list and restore flow.
 - Recovery prompt with repair, rollback, and acknowledge actions.
-- Destructive/shared-history confirmation panel.
+- Destructive-action confirmation panel.
 - Raw JSON inspector for command input/output during Workbench runs.
 
 ## Auditaur workflow
@@ -102,10 +100,9 @@ auditaur explain --active --json
 4. Fetch and display remote-only and local-only variation diagnostics.
 5. Delete a remote variation and verify hidden support refs.
 6. Restore a support ref as a new visible variation.
-7. Squash local history, require explicit confirmation, and replace shared history.
-8. Simulate remote-delete crash windows and repair recovery from the UI.
-9. Surface operation locks and stale-lock recovery prompts.
-10. Export a redacted Auditaur bundle for a failed scenario.
+7. Simulate remote-delete crash windows and repair recovery from the UI.
+8. Surface operation locks and stale-lock recovery prompts.
+9. Export a redacted Auditaur bundle for a failed scenario.
 
 ## Scenario confidence matrix
 

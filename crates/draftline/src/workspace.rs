@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,8 +12,10 @@ use git2::{
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::merge::{MergeConflict, MergeInput, ResolverRegistry};
+use crate::pull_request::{PullRequestProvider, PullRequestRequest, SendRequest, SendResult};
 use crate::recovery::RecoveryOperation;
 use crate::remote::{ensure_supported_remote_url, PushRefExpectation};
+use crate::worktree::{OwnedWorktree, WorktreeStart, OWNED_WORKTREE_PREFIX};
 use crate::{
     path::normalize_workspace_relative, ContentPolicy, Contributor, ContributorProfile,
     DraftlineError, PublishPreflight, PublishResult, PublishToken, RecoveryState, RemoteEndpoint,
@@ -25,6 +28,7 @@ pub struct Workspace {
     repo: Repository,
     content_policy: ContentPolicy,
     resolver_registry: ResolverRegistry,
+    variation_namespace: Option<String>,
 }
 
 /// A named version of the workspace.
@@ -246,6 +250,10 @@ pub enum FileHazardKind {
     Ignored,
     Untracked,
     PolicyExcluded,
+    /// Needs a Git filter driver (for example Git LFS) that Draftline cannot run.
+    GitFilter,
+    /// Has uncommitted local edits that the operation would overwrite.
+    LocalChanges,
 }
 
 /// Read-only view of a version.
@@ -330,9 +338,8 @@ pub enum SafeNextAction {
     DiscardChanges,
     RepairRecovery,
     ConfigureRemote,
-    PublishHistoryCleanup,
-    UndoHistoryCleanup,
-    AbandonHistoryCleanup,
+    /// Another project in this checkout must finish its interrupted operation.
+    FinishInOtherProject,
 }
 
 /// Stable diagnostic codes for workspace inspection.
@@ -341,6 +348,7 @@ pub enum SafeNextAction {
 #[non_exhaustive]
 pub enum DiagnosticCode {
     RecoveryRequired,
+    RecoveryInOtherProject,
     WorkspaceLocked,
     DirtyWorkspace,
     LocalOnlyWorkspace,
@@ -413,6 +421,33 @@ pub struct OperationLockInspection {
     pub is_stale: bool,
     pub can_clear: bool,
     pub diagnostics: Vec<WorkspaceDiagnostic>,
+}
+
+/// The folder a checkout's Draftline workspace manages, relative to the
+/// repository root (`""` for the root itself).
+#[derive(Serialize, Deserialize)]
+struct WorkspaceClaim {
+    project: String,
+}
+
+/// The recovery file on disk: the state plus the project that wrote it.
+/// Records from older versions have no project.
+#[derive(Serialize, Deserialize)]
+struct RecoveryLedger {
+    #[serde(flatten)]
+    state: RecoveryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    /// Trees an interrupted checkout was moving between, so recovery works
+    /// from what was actually written even if branches move afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkout: Option<RecordedCheckout>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecordedCheckout {
+    from_tree: String,
+    to_tree: String,
 }
 
 /// Result returned by recovery repair and rollback entry points.
@@ -1099,6 +1134,10 @@ pub struct MergeIncomingReport {
     pub dirty_files: Vec<ChangedFile>,
     pub file_hazards: Vec<FileHazard>,
     pub conflicts: Vec<MergeConflict>,
+    /// Conflicts outside the content policy (for example code); a developer
+    /// has to merge these, so no token is issued.
+    #[serde(default)]
+    pub developer_conflicts: Vec<PathBuf>,
     pub token: Option<MergeIncomingToken>,
     pub can_merge_cleanly: bool,
     pub changed_workspace: bool,
@@ -1113,31 +1152,10 @@ pub struct MergeIncomingToken {
     pub local_oid: String,
     pub remote_oid: String,
     pub merge_base_oid: String,
-}
-
-/// Read-only preflight report for wrapping local saves in a shared milestone merge.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct MilestoneMergeReport {
-    pub sync_status: SyncStatus,
-    pub dirty_files: Vec<ChangedFile>,
-    pub token: Option<MilestoneMergeToken>,
-    pub can_create_milestone: bool,
-    pub unpublished_versions: usize,
-    pub first_parent: Option<VersionId>,
-    pub second_parent: VersionId,
-    pub changed_workspace: bool,
-}
-
-/// Opaque token tying milestone merge execution to a local-ahead shared state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct MilestoneMergeToken {
-    pub remote: String,
-    pub variation: String,
-    pub local_oid: String,
-    pub remote_oid: String,
-    pub merge_base_oid: String,
+    /// Branch merged in when it is not the variation's own upstream (the base
+    /// branch, from [`Workspace::preflight_merge_base`]).
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Explicit user choice for resolving one merge conflict.
@@ -1193,16 +1211,6 @@ pub struct MergeIncomingResult {
     pub merged_files: Vec<PathBuf>,
 }
 
-/// Result of creating a milestone merge around local saves.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct MilestoneMergeResult {
-    pub version: Version,
-    pub first_parent: VersionId,
-    pub second_parent: VersionId,
-    pub preserved_versions: usize,
-}
-
 struct IncomingMergeInput<'repo> {
     local_commit: Commit<'repo>,
     remote_commit: Commit<'repo>,
@@ -1249,39 +1257,6 @@ struct RemoteVariationDeleteRecoveryMetadata {
     support_ref: String,
 }
 
-/// Preflight for replacing shared remote history with the current local variation tip.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct RemoteHistoryReplacePreflight {
-    pub remote: String,
-    pub variation: VariationId,
-    pub expected_remote_oid: String,
-    pub replacement_oid: String,
-    pub support_refs: Vec<SupportRef>,
-    pub token: Option<RemoteHistoryReplaceToken>,
-    pub can_replace: bool,
-}
-
-/// Token tying shared history replacement to a preflighted remote and local state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct RemoteHistoryReplaceToken {
-    pub remote: String,
-    pub variation: VariationId,
-    pub expected_remote_oid: String,
-    pub replacement_oid: String,
-    pub support_ref_token: SupportRefPublishToken,
-    pub confirmed_rewrite: bool,
-}
-
-impl RemoteHistoryReplaceToken {
-    /// Records explicit host/user confirmation for replacing shared history.
-    pub fn confirm_shared_history_rewrite(mut self) -> Self {
-        self.confirmed_rewrite = true;
-        self
-    }
-}
-
 /// Preflight for deleting a local variation after archiving its tip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1323,32 +1298,6 @@ pub struct VariationRenameToken {
     pub source_variation: VariationId,
     pub target_variation: VariationId,
     pub expected_oid: String,
-    pub support_ref: String,
-}
-
-/// Preflight for squashing recent versions after archiving the current tip.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct SquashVersionsPreflight {
-    pub variation: VariationId,
-    pub count: usize,
-    pub head_oid: String,
-    pub squash_parent_oid: String,
-    pub support_ref: String,
-    pub dirty_files: Vec<ChangedFile>,
-    pub token: Option<SquashVersionsToken>,
-    pub can_squash: bool,
-}
-
-/// Token tying local history squash to a preflighted branch tip and parent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct SquashVersionsToken {
-    pub operation_id: String,
-    pub variation: VariationId,
-    pub count: usize,
-    pub head_oid: String,
-    pub squash_parent_oid: String,
     pub support_ref: String,
 }
 
@@ -1396,526 +1345,6 @@ pub struct PurgeVerification {
     pub limitations: Vec<String>,
 }
 
-/// Opaque identifier for a durable history cleanup preview plan.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct CleanupPlanId(String);
-
-impl CleanupPlanId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn from_string(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        if !is_safe_operation_id(&value) {
-            return Err(DraftlineError::InvalidHistoryCleanup(format!(
-                "unsafe cleanup plan id `{value}`"
-            )));
-        }
-        Ok(Self(value))
-    }
-}
-
-impl std::fmt::Display for CleanupPlanId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-/// Opaque ref name returned by cleanup APIs.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RefName(String);
-
-impl RefName {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<String> for RefName {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&str> for RefName {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl std::fmt::Display for RefName {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-/// Request for previewing a timeline cleanup operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCleanupRequest {
-    pub target_variation: Option<VariationId>,
-    pub base: CleanupBase,
-    pub mode: CleanupMode,
-    pub safety: CleanupSafety,
-    pub remote_policy: RemoteRewritePolicy,
-}
-
-/// Base commit selection for a cleanup rewrite.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum CleanupBase {
-    Auto,
-    Version { version: VersionId },
-}
-
-/// Timeline cleanup mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum CleanupMode {
-    CompactMilestones {
-        milestones: Vec<MilestoneSpec>,
-        preserve_named_branches: bool,
-        preserve_merge_boundaries: bool,
-    },
-}
-
-/// User-facing milestone that replaces a noisy commit range.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MilestoneSpec {
-    pub title: String,
-    pub description: Option<String>,
-    pub include_range: CommitRange,
-}
-
-/// Inclusive commit range, ordered from oldest to newest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitRange {
-    pub start: VersionId,
-    pub end: VersionId,
-}
-
-/// Request for finding viable compaction partners for one selected version.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCompactionCandidatesRequest {
-    pub target_variation: Option<VariationId>,
-    pub selected_version: VersionId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote: Option<String>,
-    pub preserve_named_branches: bool,
-    pub preserve_merge_boundaries: bool,
-}
-
-/// Candidate compaction partners for one selected version.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCompactionCandidates {
-    pub target_variation: VariationId,
-    pub selected_version: VersionId,
-    pub target_head: VersionId,
-    pub candidates: Vec<HistoryCompactionCandidate>,
-}
-
-/// One possible second endpoint for a compaction selection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCompactionCandidate {
-    pub version: Version,
-    pub include_range: CommitRange,
-    pub selected_role: CompactionSelectionRole,
-    pub can_compact: bool,
-    pub requires_descendant_replay: bool,
-    pub selected_commit_count: usize,
-    pub descendant_rewrite_count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_impact: Option<HistoryCleanupRemoteImpact>,
-    pub blockers: Vec<CleanupWarning>,
-    pub warnings: Vec<CleanupWarning>,
-}
-
-/// Whether the originally selected node becomes the older or newer endpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompactionSelectionRole {
-    RangeStart,
-    RangeEnd,
-}
-
-/// Safety settings for cleanup operations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CleanupSafety {
-    pub create_backup_ref: bool,
-    pub backup_ref_name: Option<RefName>,
-    pub require_clean_worktree: bool,
-}
-
-impl CleanupSafety {
-    pub fn default_user_facing() -> Self {
-        Self::default()
-    }
-}
-
-impl Default for CleanupSafety {
-    fn default() -> Self {
-        Self {
-            create_backup_ref: true,
-            backup_ref_name: None,
-            require_clean_worktree: true,
-        }
-    }
-}
-
-/// Remote rewrite behavior requested for cleanup.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum RemoteRewritePolicy {
-    #[default]
-    LocalOnly,
-    PushWithLease {
-        remote: String,
-        branch: String,
-    },
-}
-
-/// Confirmation marker required before applying a prepared rewrite.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RewriteConfirmation {
-    UserConfirmed,
-}
-
-/// Read-only preview of a durable cleanup plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCleanupPreview {
-    pub plan_id: CleanupPlanId,
-    pub target_variation: VariationId,
-    pub old_head: VersionId,
-    pub new_head: VersionId,
-    pub preview_ref: RefName,
-    pub planned_backup_ref: Option<RefName>,
-    pub selected_commit_count: usize,
-    pub descendant_rewrite_count: usize,
-    pub affected_refs: Vec<CleanupAffectedRef>,
-    pub planned_ref_updates: Vec<RefUpdate>,
-    pub operations: Vec<CleanupOperation>,
-    pub graph_diff: CleanupGraphDiff,
-    pub commit_map: Vec<CommitRewriteMap>,
-    pub snapshot_map: Vec<SnapshotRewriteMap>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_impact: Option<HistoryCleanupRemoteImpact>,
-    pub warnings: Vec<CleanupWarning>,
-}
-
-/// Origin-aware safety classification for a cleanup range or preview.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCleanupRemoteImpact {
-    pub remote: Option<String>,
-    pub variation: VariationId,
-    pub tracking_ref: Option<RefName>,
-    pub upstream_head: Option<VersionId>,
-    pub local_head: VersionId,
-    pub replacement_head: Option<VersionId>,
-    pub selected: CleanupPublicationSummary,
-    pub descendants: CleanupPublicationSummary,
-    pub publish_status: CleanupPublishStatus,
-    pub warnings: Vec<CleanupWarning>,
-}
-
-/// Published/private counts for one cleanup commit set.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CleanupPublicationSummary {
-    pub published_count: usize,
-    pub private_count: usize,
-    pub published_versions: Vec<VersionId>,
-    pub private_versions: Vec<VersionId>,
-}
-
-/// Host-facing publish guidance for a cleanup preview.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CleanupPublishStatus {
-    NoUpstream,
-    LocalOnly,
-    NormalPublish,
-    SharedHistoryRewriteRequired,
-    RemoteHasIncoming,
-}
-
-/// One planned cleanup operation shown to product UI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CleanupOperation {
-    pub title: String,
-    pub description: Option<String>,
-    pub old_versions: Vec<VersionId>,
-    pub new_version: VersionId,
-}
-
-/// Summary of old versus new graph shape for a cleanup preview.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CleanupGraphDiff {
-    pub old_head: VersionId,
-    pub new_head: VersionId,
-    pub old_commit_count: usize,
-    pub new_commit_count: usize,
-    pub squashed_commit_count: usize,
-}
-
-/// Mapping from an old commit/version to its cleanup disposition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitRewriteMap {
-    pub old: VersionId,
-    pub new: Option<VersionId>,
-    pub disposition: RewriteDisposition,
-}
-
-/// Mapping from an old snapshot to its cleanup disposition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotRewriteMap {
-    pub old: VersionId,
-    pub new: Option<VersionId>,
-    pub disposition: RewriteDisposition,
-}
-
-/// Final applied commit map entry.
-pub type CommitMapEntry = CommitRewriteMap;
-
-/// Final applied snapshot map entry.
-pub type SnapshotMapEntry = SnapshotRewriteMap;
-
-/// Cleanup disposition for an old commit or snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum RewriteDisposition {
-    Preserved { new_id: VersionId },
-    SquashedInto { new_id: VersionId },
-    DroppedAsNoise,
-    OrphanedButBackedUp { backup_ref: RefName },
-    ConflictRequiresUserChoice,
-}
-
-/// Machine-readable cleanup warning.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CleanupWarning {
-    pub code: CleanupWarningCode,
-    pub message: String,
-    pub related_versions: Vec<VersionId>,
-    pub safe_next_actions: Vec<SafeNextAction>,
-}
-
-/// A ref that cleanup will move, preserve by backup, or require user action for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CleanupAffectedRef {
-    pub name: RefName,
-    pub old: Option<VersionId>,
-    pub new: Option<VersionId>,
-    pub impact: CleanupRefImpact,
-}
-
-/// Machine-readable cleanup ref impact for host UI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CleanupRefImpact {
-    TargetVariationMoved,
-    DescendantVariationRewritten,
-    PointsInsideCompactedRange,
-    RemoteTrackingMayNeedPublish,
-}
-
-/// Structured diagnostics for cleanup requests that cannot be made safe.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCleanupBlockReport {
-    pub operation: String,
-    pub diagnostics: Vec<CleanupWarning>,
-    pub can_proceed: bool,
-}
-
-/// Stable cleanup warning code for host UI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CleanupWarningCode {
-    LocalOnlyRewrite,
-    RemoteRewriteRequiresSeparatePublish,
-    MergeBoundaryRequiresUserChoice,
-    NamedBranchWouldBeAffected,
-    DirtyWorktreeBlocked,
-    PreviewPlanExpired,
-    TargetRefChangedSincePreview,
-    CandidateRefChangedSincePreview,
-    BackupRefAlreadyExists,
-    RangeEndNotAncestorOfTargetHead,
-    MergeBoundaryWouldBeRewritten,
-    NamedBranchInsideCompactedRange,
-    SelectedVersionNotOnTargetVariation,
-    PendingHistoryCleanup,
-}
-
-/// Result of applying a prepared timeline cleanup.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TimelineCleanupResult {
-    pub plan_id: CleanupPlanId,
-    pub old_head: VersionId,
-    pub new_head: VersionId,
-    pub backup_refs: Vec<RefName>,
-    pub ref_updates: Vec<RefUpdate>,
-    pub commit_map: Vec<CommitMapEntry>,
-    pub snapshot_map: Vec<SnapshotMapEntry>,
-    pub warnings: Vec<CleanupWarning>,
-}
-
-/// Durable record for an applied cleanup that still needs explicit publish, undo, or abandon.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct PendingHistoryCleanup {
-    pub plan_id: CleanupPlanId,
-    pub target_variation: VariationId,
-    pub expected_local_head: VersionId,
-    pub replacement_head: VersionId,
-    pub backup_refs: Vec<RefName>,
-    pub ref_updates: Vec<RefUpdate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_impact: Option<HistoryCleanupRemoteImpact>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub publish_status: Option<CleanupPublishStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_remote_oid: Option<VersionId>,
-}
-
-/// Preflight for explicitly publishing an applied cleanup rewrite to a shared remote.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct HistoryCleanupPublishPreflight {
-    pub plan_id: CleanupPlanId,
-    pub remote: String,
-    pub variation: VariationId,
-    pub expected_remote_oid: String,
-    pub replacement_oid: String,
-    pub remote_impact: HistoryCleanupRemoteImpact,
-    pub support_refs: Vec<SupportRef>,
-    pub token: Option<HistoryCleanupPublishToken>,
-    pub can_publish: bool,
-}
-
-/// Token tying cleanup publish to a preflighted local cleanup ledger and remote state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct HistoryCleanupPublishToken {
-    pub plan_id: CleanupPlanId,
-    pub remote: String,
-    pub variation: VariationId,
-    pub expected_remote_oid: String,
-    pub replacement_oid: String,
-    pub support_ref_token: SupportRefPublishToken,
-}
-
-/// Result of publishing a cleanup rewrite to a shared remote.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct HistoryCleanupPublishResult {
-    pub plan_id: CleanupPlanId,
-    pub remote: String,
-    pub variation: VariationId,
-    pub expected_remote_oid: String,
-    pub replacement_oid: String,
-    pub support_refs: Vec<SupportRef>,
-    pub ref_updates: Vec<RefUpdate>,
-}
-
-/// One ref movement performed by cleanup.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RefUpdate {
-    pub name: RefName,
-    pub old: Option<VersionId>,
-    pub new: Option<VersionId>,
-}
-
-/// Request for resolving an old version after cleanup.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StaleVersionResolutionRequest {
-    pub version: VersionId,
-}
-
-/// Resolution for an old version after cleanup.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StaleVersionResolution {
-    pub requested: VersionId,
-    pub disposition: StaleVersionDisposition,
-}
-
-/// Machine-readable stale version resolution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum StaleVersionDisposition {
-    Live { version: VersionId },
-    SquashedInto { version: VersionId },
-    BackedUp { backup_ref: RefName },
-    DroppedAsNoise,
-    Unknown,
-}
-
-/// Preflight for undoing an applied cleanup.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCleanupUndoPreflight {
-    pub plan_id: CleanupPlanId,
-    pub target_variation: VariationId,
-    pub backup_ref: RefName,
-    pub expected_current_head: VersionId,
-    pub restore_head: VersionId,
-    pub ref_updates: Vec<RefUpdate>,
-    pub token: HistoryCleanupUndoToken,
-    pub can_undo: bool,
-}
-
-/// Token tying cleanup undo to a preflighted target state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCleanupUndoToken {
-    pub plan_id: CleanupPlanId,
-    pub target_variation: VariationId,
-    pub backup_ref: RefName,
-    pub expected_current_head: VersionId,
-    pub restore_head: VersionId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct HistoryCleanupStoredPlan {
-    request: HistoryCleanupRequest,
-    preview: HistoryCleanupPreview,
-}
-
-struct PlannedCompactCleanup {
-    new_head_oid: Oid,
-    operations: Vec<CleanupOperation>,
-    commit_map: Vec<CommitRewriteMap>,
-    snapshot_map: Vec<SnapshotRewriteMap>,
-    warnings: Vec<CleanupWarning>,
-    affected_refs: Vec<CleanupAffectedRef>,
-    planned_ref_updates: Vec<RefUpdate>,
-    old_commit_count: usize,
-    new_commit_count: usize,
-    selected_commit_count: usize,
-    descendant_rewrite_count: usize,
-}
-
-struct RemoteRewriteIncoming {
-    support_ref: RefName,
-    old_remote_oid: Oid,
-    replacement_oid: Oid,
-    replay_oids: Vec<Oid>,
-}
-
-struct RemoteRewriteApplication {
-    target_oid: Oid,
-    ledger: TimelineCleanupResult,
-}
-
-struct CompactCleanupPlanInput<'a> {
-    target_variation: &'a VariationId,
-    old_head_oid: Oid,
-    base: &'a CleanupBase,
-    milestones: &'a [MilestoneSpec],
-    preserve_named_branches: bool,
-    preserve_merge_boundaries: bool,
-    profile: Option<&'a ContributorProfile>,
-}
-
 /// Diff between two versions or between a version and the current workspace.
 ///
 /// Returned by [`Workspace::diff_versions`] and
@@ -1949,29 +1378,89 @@ impl Workspace {
     }
 
     /// Initializes a workspace with an explicit content policy.
+    ///
+    /// When `path` is inside an existing repository (for example a project
+    /// folder in a code repository, or a linked worktree), Draftline joins that
+    /// repository and scopes itself to the folder instead of creating a nested
+    /// repository.
     pub fn init_with_policy(path: impl AsRef<Path>, content_policy: ContentPolicy) -> Result<Self> {
-        fs::create_dir_all(path.as_ref())?;
+        let path = path.as_ref();
+        let created = create_missing_dirs(path)?;
 
-        let repo = match Repository::open(path.as_ref()) {
+        let repo = match Repository::discover(path) {
             Ok(repo) => repo,
             Err(_) => {
                 let initial_head = default_initial_variation_name();
                 let mut options = RepositoryInitOptions::new();
                 options.initial_head(&initial_head);
-                Repository::init_opts(path.as_ref(), &options)?
+                Repository::init_opts(path, &options)?
             }
         };
 
+        let result = Self::from_repository(repo, path, content_policy);
+        if let Err(DraftlineError::WorkspaceAlreadyInCheckout(_)) = &result {
+            // Leave no trace of a refused folder; `remove_dir` only removes empty ones.
+            for dir in created.iter().rev() {
+                if fs::remove_dir(dir).is_err() {
+                    break;
+                }
+            }
+        }
+        result
+    }
+
+    /// Moves this checkout's Draftline workspace to the folder at `path`.
+    ///
+    /// A checkout holds one Draftline workspace (see
+    /// [`DraftlineError::WorkspaceAlreadyInCheckout`]); use this when the
+    /// project folder moved or the host deliberately manages a different one.
+    /// Refuses while a Draftline operation is running or left unfinished.
+    pub fn relocate(path: impl AsRef<Path>) -> Result<Self> {
+        Self::relocate_with_policy(path, ContentPolicy::default())
+    }
+
+    /// Moves this checkout's Draftline workspace with an explicit content
+    /// policy; see [`Workspace::relocate`].
+    pub fn relocate_with_policy(
+        path: impl AsRef<Path>,
+        content_policy: ContentPolicy,
+    ) -> Result<Self> {
+        let repo = Repository::discover(path.as_ref())?;
+        let workspace = Self::unclaimed(repo, path.as_ref(), content_policy)?;
+        let _lock = OperationLock::acquire(&workspace.lock_path(), "relocate workspace")?;
+        workspace.ensure_no_pending_recovery_in_checkout()?;
+        workspace.write_claim()?;
+        Ok(workspace)
+    }
+
+    fn from_repository(
+        repo: Repository,
+        project_path: &Path,
+        content_policy: ContentPolicy,
+    ) -> Result<Self> {
+        let workspace = Self::unclaimed(repo, project_path, content_policy)?;
+        workspace.claim_checkout()?;
+        Ok(workspace)
+    }
+
+    fn unclaimed(
+        repo: Repository,
+        project_path: &Path,
+        content_policy: ContentPolicy,
+    ) -> Result<Self> {
         let root = repo
             .workdir()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.as_ref().to_path_buf());
+            .unwrap_or_else(|| project_path.to_path_buf());
+        let scope = project_scope(&root, project_path)?;
+        let content_policy = content_policy.scoped_to(scope)?;
 
         Ok(Self {
             root,
             repo,
             content_policy,
             resolver_registry: ResolverRegistry::with_default_resolvers(),
+            variation_namespace: None,
         }
         .initialize())
     }
@@ -1982,20 +1471,12 @@ impl Workspace {
     }
 
     /// Opens an existing workspace with an explicit content policy.
+    ///
+    /// Opening a folder below the repository root scopes the workspace to that
+    /// folder; see [`Workspace::init_with_policy`].
     pub fn open_with_policy(path: impl AsRef<Path>, content_policy: ContentPolicy) -> Result<Self> {
         let repo = Repository::discover(path.as_ref())?;
-        let root = repo
-            .workdir()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.as_ref().to_path_buf());
-
-        Ok(Self {
-            root,
-            repo,
-            content_policy,
-            resolver_registry: ResolverRegistry::with_default_resolvers(),
-        }
-        .initialize())
+        Self::from_repository(repo, path.as_ref(), content_policy)
     }
 
     /// Clones a shared workspace from a remote endpoint.
@@ -2047,18 +1528,7 @@ impl Workspace {
             builder.fetch_options(fetch_options);
         }
         let repo = builder.clone(remote_url.as_ref(), path.as_ref())?;
-        let root = repo
-            .workdir()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.as_ref().to_path_buf());
-
-        Ok(Self {
-            root,
-            repo,
-            content_policy,
-            resolver_registry: ResolverRegistry::with_default_resolvers(),
-        }
-        .initialize())
+        Self::from_repository(repo, path.as_ref(), content_policy)
     }
 
     /// Adds a semantic merge resolver ahead of Draftline's built-in resolvers.
@@ -2116,9 +1586,68 @@ impl Workspace {
         self
     }
 
-    /// Returns the root content folder for this workspace.
+    /// Returns the repository working-tree root.
+    ///
+    /// Paths accepted and returned by Draftline are relative to this root. For a
+    /// project folder inside a larger repository, see [`Workspace::scope`] and
+    /// [`Workspace::project_root`].
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Returns the repository-relative project folder, or an empty path when
+    /// the project is the repository root.
+    pub fn scope(&self) -> &Path {
+        self.content_policy.scope()
+    }
+
+    /// The Git identity (`user.name` / `user.email`) this repository resolves,
+    /// honouring repository, global, XDG and system config. Returns `Ok(None)`
+    /// when no non-empty `user.name` is configured, and an error when the
+    /// config cannot be read.
+    pub fn git_identity(&self) -> Result<Option<Contributor>> {
+        crate::profile::identity_from_config(&self.repo.config()?)
+    }
+
+    /// Returns the absolute project folder.
+    pub fn project_root(&self) -> PathBuf {
+        self.root.join(self.scope())
+    }
+
+    /// Lists only branches under `namespace` (e.g. `"cutready/"`) as
+    /// variations, plus the default branch and whatever branch is currently
+    /// checked out. Use this
+    /// inside a shared code repository so developers' branches stay out of the
+    /// business user's view; without it every local branch is a variation.
+    pub fn with_variation_namespace(mut self, namespace: impl Into<String>) -> Result<Self> {
+        let namespace = namespace.into();
+        validate_variation_namespace(&namespace)?;
+        self.variation_namespace = Some(namespace);
+        Ok(self)
+    }
+
+    /// The branch namespace set by [`Workspace::with_variation_namespace`].
+    pub fn variation_namespace(&self) -> Option<&str> {
+        self.variation_namespace.as_deref()
+    }
+
+    /// With a namespace set, only branches inside it may be created, renamed,
+    /// deleted, adopted, or restored onto, so developers' branches stay theirs.
+    fn ensure_variation_in_namespace(&self, name: &str) -> Result<()> {
+        match self.variation_namespace.as_deref() {
+            Some(namespace) if !name.starts_with(namespace) => {
+                Err(DraftlineError::VariationOutsideNamespace(name.to_string()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Switching may also reach the base branch, which is always listed.
+    fn ensure_variation_switchable(&self, name: &str) -> Result<()> {
+        if self.variation_namespace.is_some() && self.default_branch().as_deref() != Some(name) {
+            self.ensure_variation_in_namespace(name)?;
+        }
+        Ok(())
     }
 
     /// Returns the current content policy.
@@ -2219,11 +1748,21 @@ impl Workspace {
         }
 
         if recovery.is_some() {
-            diagnostics.push(workspace_diagnostic(
-                DiagnosticCode::RecoveryRequired,
-                DiagnosticSeverity::Blocking,
-                "workspace has an incomplete Draftline operation",
-            ));
+            diagnostics.push(match self.recovery_owner_elsewhere() {
+                Some(project) => workspace_diagnostic(
+                    DiagnosticCode::RecoveryInOtherProject,
+                    DiagnosticSeverity::Blocking,
+                    format!(
+                        "project {} has an incomplete Draftline operation",
+                        project.display()
+                    ),
+                ),
+                None => workspace_diagnostic(
+                    DiagnosticCode::RecoveryRequired,
+                    DiagnosticSeverity::Blocking,
+                    "workspace has an incomplete Draftline operation",
+                ),
+            });
         }
 
         match self.policy_git_diagnostics_unchecked() {
@@ -2324,6 +1863,13 @@ impl Workspace {
                 safe_next_actions: vec![SafeNextAction::RepairRecovery],
                 retry: RetryClass::RetryAfterRepair,
             },
+            DiagnosticCode::RecoveryInOtherProject => ErrorExplanation {
+                code,
+                message: "another project in this checkout has an incomplete Draftline operation"
+                    .to_string(),
+                safe_next_actions: vec![SafeNextAction::FinishInOtherProject],
+                retry: RetryClass::RetryAfterRepair,
+            },
             DiagnosticCode::WorkspaceLocked => ErrorExplanation {
                 code,
                 message: "workspace is locked by a Draftline operation".to_string(),
@@ -2388,6 +1934,7 @@ impl Workspace {
         policy: ContentPolicy,
     ) -> Result<AdoptionPreflightReport> {
         let inspection = self.inspect()?;
+        let policy = policy.scoped_to(self.scope())?;
         let candidate_policy_diagnostics = self.policy_git_diagnostics_for_policy(&policy)?;
         let blockers: Vec<WorkspaceDiagnostic> = inspection
             .diagnostics
@@ -2424,7 +1971,7 @@ impl Workspace {
              - Do not remove refs/draftline/ support refs except through purge or retention flows.\n\
              - Do not clear operation locks manually; use Draftline recovery tooling.\n\
              - Fetch before reasoning about shared remote state.\n\
-             - Use Draftline primitives for variation, cleanup, support-ref sync, recovery, and shared history replacement.\n"
+             - Use Draftline primitives for variations, shelves, incoming merges, support-ref sync, and recovery.\n"
                 .to_string(),
         )
     }
@@ -2437,7 +1984,7 @@ impl Workspace {
         }
 
         let text = fs::read_to_string(path)?;
-        let state: RecoveryState = serde_json::from_str(&text)?;
+        let state = serde_json::from_str::<RecoveryLedger>(&text)?.state;
 
         if state.completed {
             Ok(None)
@@ -2453,6 +2000,7 @@ impl Workspace {
 
     /// Clears an abandoned operation lock only when lock metadata marks it stale.
     pub fn clear_stale_lock(&self) -> Result<()> {
+        self.claim_checkout()?;
         let inspection = self.inspect_operation_lock()?;
         if inspection.state == OperationLockState::Unlocked {
             return Ok(());
@@ -2480,7 +2028,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<RecoveryRepairResult> {
         self.clear_stale_lock()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "repair_recovery")?;
+        let _lock = self.acquire_for_index("repair_recovery")?;
         let state = self.pending_recovery(operation_id.as_ref())?;
 
         match state.operation {
@@ -2488,12 +2036,12 @@ impl Workspace {
                 let Some(target) = state.target.as_deref() else {
                     return Ok(self.recovery_unavailable(state));
                 };
+                self.ensure_variation_switchable(target)?;
                 let changed_workspace =
-                    self.current_variation_unchecked().ok().as_deref() != Some(target);
-                self.checkout_variation_unchecked(target)?;
+                    self.finish_switch_at(state.original_variation.as_deref(), target)?;
                 self.complete_recovery(state, changed_workspace)
             }
-            RecoveryOperation::ApplyIncoming => {
+            RecoveryOperation::ApplyIncoming | RecoveryOperation::MergeIncoming => {
                 let (Some(variation), Some(target)) =
                     (state.original_variation.as_deref(), state.target.as_deref())
                 else {
@@ -2503,12 +2051,24 @@ impl Workspace {
                     .map_err(|_| DraftlineError::VersionNotFound(target.to_string()))?;
                 let commit = self.repo.find_commit(oid)?;
                 let branch_ref = format!("refs/heads/{}", validate_variation_name(variation)?);
-                self.repo
-                    .reference(&branch_ref, oid, true, "repair apply_incoming")?;
-                self.repo.checkout_tree(
-                    commit.tree()?.as_object(),
-                    Some(CheckoutBuilder::new().force()),
-                )?;
+                let current = self.repo.refname_to_id(&branch_ref).ok();
+                if current == Some(oid) {
+                    // The ref only moves after a finished checkout, so files are
+                    // already in place; anything different now is a newer edit.
+                    return self.complete_recovery(state, false);
+                } else if current.is_some_and(|current| {
+                    self.repo.graph_descendant_of(oid, current).unwrap_or(false)
+                }) {
+                    // Interrupted mid-checkout: safe checkout treats files already at
+                    // either side as clean, so rerunning it is idempotent and still
+                    // refuses to clobber local edits.
+                    self.checkout_tree_safely(&commit.tree()?)?;
+                    self.repo
+                        .reference(&branch_ref, oid, true, "repair incoming")?;
+                } else {
+                    // Someone else moved the branch since; don't guess.
+                    return Ok(self.recovery_unavailable(state));
+                }
                 self.repo.set_head(&branch_ref)?;
                 self.complete_recovery(state, true)
             }
@@ -2536,9 +2096,12 @@ impl Workspace {
                 self.complete_recovery(state, changed_workspace)
             }
             RecoveryOperation::DeleteVariation => {
-                if state.original_variation.is_none() || state.target.is_none() {
+                let (Some(variation), Some(_)) =
+                    (state.original_variation.as_deref(), state.target.as_deref())
+                else {
                     return Ok(self.recovery_unavailable(state));
-                }
+                };
+                self.ensure_variation_in_namespace(variation)?;
                 self.repair_delete_variation_recovery(&state)?;
                 self.complete_recovery(state, true)
             }
@@ -2553,10 +2116,7 @@ impl Workspace {
                     return Ok(self.recovery_unavailable(state));
                 };
                 let (_id, commit) = self.find_shelf_commit(target)?;
-                self.repo.checkout_tree(
-                    commit.tree()?.as_object(),
-                    Some(CheckoutBuilder::new().force()),
-                )?;
+                self.apply_shelf_paths(&commit)?;
                 self.complete_recovery(state, true)
             }
             RecoveryOperation::ExpireSupportRefs => {
@@ -2580,15 +2140,13 @@ impl Workspace {
                     Ok(self.recovery_unavailable(state))
                 }
             }
-            RecoveryOperation::SquashVersions | RecoveryOperation::HistoryCleanup => {
-                Ok(self.recovery_unavailable(state))
-            }
             RecoveryOperation::DeleteRemoteVariation => {
                 self.repair_delete_remote_variation_recovery(state, options)
             }
             RecoveryOperation::RestoreVersionAsNewSave
-            | RecoveryOperation::MergeIncoming
-            | RecoveryOperation::MilestoneMerge => Ok(self.recovery_unavailable(state)),
+            | RecoveryOperation::MilestoneMerge
+            | RecoveryOperation::SquashVersions
+            | RecoveryOperation::HistoryCleanup => Ok(self.recovery_unavailable(state)),
         }
     }
 
@@ -2596,17 +2154,18 @@ impl Workspace {
     /// prior state needed for a safe rollback.
     pub fn rollback_recovery(&self, operation_id: impl AsRef<str>) -> Result<RecoveryRepairResult> {
         self.clear_stale_lock()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "rollback_recovery")?;
+        let _lock = self.acquire_for_index("rollback_recovery")?;
         let state = self.pending_recovery(operation_id.as_ref())?;
 
         match state.operation {
             RecoveryOperation::SwitchVariation => {
-                let Some(original) = state.original_variation.as_deref() else {
+                // Going back to where the user was, like staying on the current branch.
+                let (Some(original), Some(target)) =
+                    (state.original_variation.as_deref(), state.target.as_deref())
+                else {
                     return Ok(self.recovery_unavailable(state));
                 };
-                let changed_workspace =
-                    self.current_variation_unchecked().ok().as_deref() != Some(original);
-                self.checkout_variation_unchecked(original)?;
+                let changed_workspace = self.finish_switch_at(Some(target), original)?;
                 self.complete_recovery(state, changed_workspace)
             }
             RecoveryOperation::DeleteVariation => {
@@ -2615,6 +2174,7 @@ impl Workspace {
                 else {
                     return Ok(self.recovery_unavailable(state));
                 };
+                self.ensure_variation_in_namespace(variation)?;
                 let oid = Oid::from_str(target)
                     .map_err(|_| DraftlineError::VersionNotFound(target.to_string()))?;
                 let branch_ref = format!("refs/heads/{}", validate_variation_name(variation)?);
@@ -2622,36 +2182,12 @@ impl Workspace {
                     .reference(&branch_ref, oid, true, "rollback recovery")?;
                 if self.current_variation_unchecked().ok().as_deref() == Some(variation) {
                     let commit = self.repo.find_commit(oid)?;
-                    self.repo.checkout_tree(
-                        commit.tree()?.as_object(),
-                        Some(CheckoutBuilder::new().force()),
-                    )?;
+                    self.checkout_scope_forced(&commit.tree()?)?;
                     self.repo.set_head(&branch_ref)?;
                 }
                 let archive_ref = archive_ref("deleted-variations", variation, &state.operation_id);
                 if let Ok(mut reference) = self.repo.find_reference(&archive_ref) {
                     reference.delete()?;
-                }
-                self.complete_recovery(state, true)
-            }
-            RecoveryOperation::SquashVersions | RecoveryOperation::HistoryCleanup => {
-                let (Some(variation), Some(target)) =
-                    (state.original_variation.as_deref(), state.target.as_deref())
-                else {
-                    return Ok(self.recovery_unavailable(state));
-                };
-                let oid = Oid::from_str(target)
-                    .map_err(|_| DraftlineError::VersionNotFound(target.to_string()))?;
-                let branch_ref = format!("refs/heads/{}", validate_variation_name(variation)?);
-                self.repo
-                    .reference(&branch_ref, oid, true, "rollback recovery")?;
-                if self.current_variation_unchecked().ok().as_deref() == Some(variation) {
-                    let commit = self.repo.find_commit(oid)?;
-                    self.repo.checkout_tree(
-                        commit.tree()?.as_object(),
-                        Some(CheckoutBuilder::new().force()),
-                    )?;
-                    self.repo.set_head(&branch_ref)?;
                 }
                 self.complete_recovery(state, true)
             }
@@ -2669,20 +2205,353 @@ impl Workspace {
                 }
                 self.complete_recovery(state, changed_workspace)
             }
-            RecoveryOperation::ShelveChanges
-            | RecoveryOperation::ApplyIncoming
-            | RecoveryOperation::RestoreVersionAsNewSave
-            | RecoveryOperation::DiscardChanges
-            | RecoveryOperation::DiscardFile
+            RecoveryOperation::DiscardChanges | RecoveryOperation::DiscardFile => {
+                // A discard only removes edits; stopping keeps whatever is on disk.
+                self.complete_recovery(state, false)
+            }
+            RecoveryOperation::ShelveChanges => {
+                let changed_workspace = self.rollback_shelve_recovery(&state)?;
+                self.complete_recovery(state, changed_workspace)
+            }
+            RecoveryOperation::RestoreVersionAsNewSave => {
+                match self.rollback_restore_recovery(&state)? {
+                    Some(changed_workspace) => self.complete_recovery(state, changed_workspace),
+                    None => Ok(self.recovery_unavailable(state)),
+                }
+            }
+            RecoveryOperation::ApplyIncoming
             | RecoveryOperation::DeleteRemoteVariation
             | RecoveryOperation::ExpireSupportRefs
             | RecoveryOperation::MergeIncoming
-            | RecoveryOperation::MilestoneMerge => Ok(self.recovery_unavailable(state)),
+            | RecoveryOperation::MilestoneMerge
+            | RecoveryOperation::SquashVersions
+            | RecoveryOperation::HistoryCleanup => Ok(self.recovery_unavailable(state)),
         }
+    }
+
+    /// Undoes an interrupted shelve. The shelf is deleted only while every
+    /// path it captured is still unchanged on disk; once the discard step has
+    /// touched a file, the shelf is the only copy of the edit and is kept.
+    fn rollback_shelve_recovery(&self, state: &RecoveryState) -> Result<bool> {
+        let Some(name) = state.target.as_deref() else {
+            return Ok(false);
+        };
+        let Ok((id, shelf)) = self.find_shelf_commit(name) else {
+            return Ok(false);
+        };
+        let parent_tree = match shelf.parent(0) {
+            Ok(parent) => Some(parent.tree()?),
+            Err(_) => None,
+        };
+        let shelf_tree = shelf.tree()?;
+        let captured = self.paths_changed_between(parent_tree.as_ref(), &shelf_tree)?;
+        if self.workdir_matches(&shelf_tree, &captured)?.len() == captured.len() {
+            self.repo
+                .find_reference(&format!("refs/draftline/shelves/{id}"))?
+                .delete()?;
+        }
+        Ok(false)
+    }
+
+    /// Undoes an interrupted restore: files still at the restored version go
+    /// back to the variation the user was on; files edited since the failure
+    /// are left alone. A targeted restore also points HEAD back at that
+    /// variation. `None` when the restore save already landed on the current
+    /// variation, which only a new restore undoes.
+    fn rollback_restore_recovery(&self, state: &RecoveryState) -> Result<Option<bool>> {
+        let Some(target) = state.target.as_deref() else {
+            return Ok(None);
+        };
+        // Targeted restores record "VERSION -> VARIATION".
+        let (version, variation) = match target.split_once(" -> ") {
+            Some((version, variation)) => (version, Some(variation)),
+            None => (target, None),
+        };
+        let Ok(version) = VersionId::from_canonical_string(version) else {
+            return Ok(None);
+        };
+        let original = match (variation, state.original_variation.as_deref()) {
+            (Some(_), Some(original)) => Some(validate_variation_name(original)?),
+            (Some(_), None) => return Ok(None),
+            (None, _) => None,
+        };
+        let home = match &original {
+            Some(name) => self.branch_tree(name)?,
+            None => self.repo.head()?.peel_to_tree()?,
+        };
+        let (before, restored) = match self.recorded_checkout() {
+            Some((before, restored)) => (Some(before), restored),
+            None => {
+                // Older records: the restore built on its target's tip,
+                // whether or not its save landed.
+                let source = self.find_version_commit(&version)?.tree()?;
+                let base = match variation.map(|name| self.branch_tree(name)) {
+                    Some(Ok(tree)) => tree,
+                    _ => self.repo.head()?.peel_to_tree()?,
+                };
+                let restored = self.compose_scoped_tree(&base, &source)?;
+                (None, self.repo.find_tree(restored)?)
+            }
+        };
+        // A targeted restore can legitimately match its original variation,
+        // and still has HEAD to point back.
+        if original.is_none() && restored.id() == home.id() {
+            return Ok(None);
+        }
+        Ok(Some(match original {
+            Some(original) => self.settle_onto_branch(&restored, before.as_ref(), &original)?,
+            None => self.settle_from(&restored, before.as_ref(), &home)?,
+        }))
+    }
+
+    /// Settles an interrupted switch onto the `to` variation's current tip,
+    /// then points HEAD at it. Files and index entries may sit at either
+    /// recorded tree; older records fall back to `from`'s tip (a variation,
+    /// or HEAD).
+    fn finish_switch_at(&self, from: Option<&str>, to: &str) -> Result<bool> {
+        let to = validate_variation_name(to)?;
+        match self.recorded_checkout() {
+            Some((before, after)) => self.settle_onto_branch(&after, Some(&before), &to),
+            None => {
+                let from_tree = match from {
+                    Some(name) => self.branch_tree(&validate_variation_name(name)?)?,
+                    None => self.repo.head()?.peel_to_tree()?,
+                };
+                self.settle_onto_branch(&from_tree, None, &to)
+            }
+        }
+    }
+
+    /// Settles an interrupted checkout onto `branch`'s tip and points
+    /// HEAD at it, following the branch if another Git process moves it
+    /// meanwhile, so HEAD never ends at a tip the files don't match.
+    fn settle_onto_branch(
+        &self,
+        written: &Tree<'_>,
+        before: Option<&Tree<'_>>,
+        branch: &str,
+    ) -> Result<bool> {
+        let mut tip = self.branch_tree(branch)?;
+        let mut changed = self.settle_from(written, before, &tip)?;
+        changed |= self.point_head_at(branch)?;
+        for _ in 0..5 {
+            let now = self.branch_tree(branch)?;
+            if now.id() == tip.id() {
+                return Ok(changed);
+            }
+            changed |= self.settle_paths(&tip, &now, &BTreeSet::new())?;
+            tip = now;
+        }
+        Err(DraftlineError::LocalStateChanged {
+            expected: tip.id().to_string(),
+            actual: self.branch_tree(branch)?.id().to_string(),
+        })
+    }
+
+    /// Settles an interrupted checkout from `before` to `written` onto `to`:
+    /// paths at `written` first, then paths the checkout never reached.
+    fn settle_from(
+        &self,
+        written: &Tree<'_>,
+        before: Option<&Tree<'_>>,
+        to: &Tree<'_>,
+    ) -> Result<bool> {
+        let before = before.filter(|before| ![written.id(), to.id()].contains(&before.id()));
+        // Git writes the index last, so an entry already at `written` proves
+        // the checkout wrote that file: one back at `before` is the
+        // developer's edit. Read before anything moves the index. A path the
+        // developer also staged back to `before` looks untouched and is
+        // finished; its content stays in `before`'s commit.
+        let mut proven = BTreeSet::new();
+        if let Some(before) = before {
+            self.while_git_busy(|| self.ensure_git_index_unlocked())?;
+            let mut index = self.repo.index()?;
+            index.read(true)?;
+            for path in self.paths_changed_between(Some(before), written)? {
+                let staged = index.get_path(&path, 0).map(|entry| (entry.id, entry.mode));
+                let in_written = written
+                    .get_path(&path)
+                    .ok()
+                    .map(|entry| (entry.id(), entry.filemode() as u32));
+                if staged == in_written {
+                    proven.insert(path);
+                }
+            }
+        }
+        let mut changed = false;
+        if written.id() != to.id() {
+            changed |= self.settle_paths(written, to, &BTreeSet::new())?;
+        }
+        if let Some(before) = before {
+            changed |= self.settle_paths(before, to, &proven)?;
+        }
+        Ok(changed)
+    }
+
+    /// HEAD's tree, or the empty tree while HEAD is unborn (a fresh clone).
+    fn head_tree_or_empty(&self) -> Result<Tree<'_>> {
+        match self.repo.head().and_then(|head| head.peel_to_tree()) {
+            Ok(tree) => Ok(tree),
+            Err(_) => Ok(self.repo.find_tree(self.repo.treebuilder(None)?.write()?)?),
+        }
+    }
+
+    fn branch_tree(&self, variation: &str) -> Result<Tree<'_>> {
+        Ok(self
+            .repo
+            .find_branch(variation, BranchType::Local)?
+            .into_reference()
+            .peel_to_tree()?)
+    }
+
+    /// Points HEAD at `variation`; `false` when it already is.
+    fn point_head_at(&self, variation: &str) -> Result<bool> {
+        if self.current_variation_unchecked().ok().as_deref() == Some(variation) {
+            return Ok(false);
+        }
+        let reference = format!("refs/heads/{variation}");
+        self.while_git_busy(|| Ok(self.repo.set_head(&reference)?))?;
+        Ok(true)
+    }
+
+    /// Moves an interrupted checkout from `from` the rest of the way to `to`,
+    /// in or out of scope: a working file still at `from` ends at `to`, and
+    /// an index entry still at `from` moves to `to`. Files edited since stay
+    /// as they are (showing as unsaved changes) and entries a developer
+    /// staged differently are left alone, so rerunning it is safe.
+    ///
+    /// Working files at `kept` are the developer's and stay as they are. Like
+    /// Git, this writes files first and the index last. Returns whether any
+    /// file was rewritten.
+    fn settle_paths(
+        &self,
+        from: &Tree<'_>,
+        to: &Tree<'_>,
+        kept: &BTreeSet<PathBuf>,
+    ) -> Result<bool> {
+        let paths = self.paths_changed_between(Some(from), to)?;
+        // Blob and mode, so a staged mode-only change counts as the developer's.
+        let entry_in = |tree: &Tree<'_>, path: &Path| {
+            tree.get_path(path)
+                .ok()
+                .map(|entry| (entry.id(), entry.filemode() as u32))
+        };
+        let staged = |index: &git2::Index, path: &Path| {
+            index.get_path(path, 0).map(|entry| (entry.id, entry.mode))
+        };
+        // Wait out Git first so nothing is written while it holds the index.
+        self.while_git_busy(|| self.ensure_git_index_unlocked())?;
+        test_hooks::fire("before_settle_files", self.repo.path());
+        // Read as late as possible so an edit made meanwhile is kept; what
+        // remains is the checkout's own window, as with `git switch`.
+        let at_from: Vec<PathBuf> = self
+            .workdir_matches(from, &paths)?
+            .into_iter()
+            .filter(|path| !kept.contains(path))
+            .collect();
+        let (in_to, gone): (Vec<_>, Vec<_>) = at_from
+            .iter()
+            .cloned()
+            .partition(|path| to.get_path(path).is_ok());
+        for path in &gone {
+            remove_workspace_path_if_exists(&self.root.join(path))?;
+        }
+        if !in_to.is_empty() {
+            // The index is written below, so the checkout never takes Git's lock.
+            let mut checkout = CheckoutBuilder::new();
+            checkout
+                .force()
+                .update_index(false)
+                .disable_pathspec_match(true);
+            for path in &in_to {
+                checkout.path(path.to_string_lossy().replace('\\', "/"));
+            }
+            let refused = RefCell::default();
+            self.checkout_refusing_filters(checkout, &refused, to, |checkout| {
+                self.repo.checkout_tree(to.as_object(), Some(checkout))
+            })?;
+        }
+        self.while_git_busy(|| {
+            let mut index = self.repo.index()?;
+            index.read(true)?;
+            let index_paths: Vec<PathBuf> = paths
+                .iter()
+                .filter(|path| staged(&index, path) == entry_in(from, path))
+                .cloned()
+                .collect();
+            drop(index);
+            if !index_paths.is_empty() {
+                self.write_index_from_tree(to, &index_paths, &[])?;
+            }
+            Ok(())
+        })?;
+        Ok(!at_from.is_empty())
+    }
+
+    /// Paths whose blobs differ between two trees.
+    fn paths_changed_between(
+        &self,
+        old: Option<&Tree<'_>>,
+        new: &Tree<'_>,
+    ) -> Result<Vec<PathBuf>> {
+        let diff = self.repo.diff_tree_to_tree(old, Some(new), None)?;
+        let mut paths = BTreeSet::new();
+        for delta in diff.deltas() {
+            for file in [delta.old_file(), delta.new_file()] {
+                if let Some(path) = file.path() {
+                    paths.insert(path.to_path_buf());
+                }
+            }
+        }
+        Ok(paths.into_iter().collect())
+    }
+
+    /// The subset of `paths` whose working files (after Git filters) are
+    /// exactly as in `tree`, including paths absent from both.
+    fn workdir_matches(&self, tree: &Tree<'_>, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut options = git2::DiffOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .disable_pathspec_match(true);
+        for path in paths {
+            options.pathspec(path.to_string_lossy().replace('\\', "/"));
+        }
+        // A scratch index of `tree` has no stat cache, so every file is hashed
+        // through Git's filters instead of trusting the real index's timestamps.
+        let mut expected = git2::Index::new()?;
+        expected.read_tree(tree)?;
+        let diff = self
+            .repo
+            .diff_index_to_workdir(Some(&expected), Some(&mut options))?;
+        let mut differing = BTreeSet::new();
+        for delta in diff.deltas() {
+            for file in [delta.old_file(), delta.new_file()] {
+                if let Some(path) = file.path() {
+                    differing.insert(path.to_path_buf());
+                }
+            }
+        }
+        Ok(paths
+            .iter()
+            .filter(|path| !differing.contains(*path))
+            .cloned()
+            .collect())
     }
 
     /// Acknowledges an incomplete recovery record and allows normal operations again.
     pub fn acknowledge_recovery(&self) -> Result<()> {
+        self.clear_stale_lock()?;
+        let _lock = self.acquire_operation_lock("acknowledge_recovery")?;
+        self.ensure_recovery_is_ours()?;
+        self.clear_recovery_records()
+    }
+
+    /// Deletes recovery records; the caller holds the operation lock.
+    fn clear_recovery_records(&self) -> Result<()> {
         if self.draftline_dir().exists() {
             for entry in fs::read_dir(self.draftline_dir())? {
                 let entry = entry?;
@@ -2707,6 +2576,7 @@ impl Workspace {
 
     /// Saves the current workspace content as a named version.
     pub fn save_version(&self, label: impl AsRef<str>) -> Result<Version> {
+        let _lock = self.acquire_for_index("save_version")?;
         self.ensure_no_pending_recovery()?;
         self.save_version_unchecked(label, None)
     }
@@ -2717,6 +2587,7 @@ impl Workspace {
         label: impl AsRef<str>,
         profile: &ContributorProfile,
     ) -> Result<Version> {
+        let _lock = self.acquire_for_index("save_version")?;
         self.ensure_no_pending_recovery()?;
         self.save_version_unchecked(label, Some(profile))
     }
@@ -2726,47 +2597,14 @@ impl Workspace {
         label: impl AsRef<str>,
         profile: Option<&ContributorProfile>,
     ) -> Result<Version> {
-        let mut index = self.repo.index()?;
-
-        for changed in self.changed_files_unchecked()? {
-            match changed.kind {
-                ChangeKind::Deleted => index.remove_path(&changed.path)?,
-                _ => index.add_path(&changed.path)?,
+        self.while_head_moves_forward(|retrying| {
+            let changed_files = self.changed_files_unchecked()?;
+            if retrying && changed_files.is_empty() {
+                return Ok(None);
             }
-        }
-
-        index.write()?;
-
-        let tree_id = index.write_tree()?;
-        let tree = self.repo.find_tree(tree_id)?;
-        let (author, committer) = self.workspace_signatures(profile)?;
-        let parent = self
-            .repo
-            .head()
-            .ok()
-            .and_then(|head| head.target())
-            .and_then(|oid| self.repo.find_commit(oid).ok());
-
-        let oid = match parent.as_ref() {
-            Some(parent) => self.repo.commit(
-                Some("HEAD"),
-                &author,
-                &committer,
-                label.as_ref(),
-                &tree,
-                &[parent],
-            )?,
-            None => self.repo.commit(
-                Some("HEAD"),
-                &author,
-                &committer,
-                label.as_ref(),
-                &tree,
-                &[],
-            )?,
-        };
-
-        Ok(version_from_commit(&self.repo.find_commit(oid)?))
+            self.commit_content_changes(&changed_files, "save_version", label.as_ref(), profile)
+                .map(Some)
+        })
     }
 
     /// Preflights saving only selected workspace-relative tracked content files.
@@ -2817,60 +2655,87 @@ impl Workspace {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        let _lock = self.acquire_for_index("save_files")?;
         self.ensure_no_pending_recovery()?;
-        let changed_files = self.selected_changed_files(paths)?;
-        if changed_files.is_empty() {
-            return Err(DraftlineError::PreflightFailed(Box::new(
-                selected_files_preflight_report("save_files", false, changed_files),
-            )));
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        self.while_head_moves_forward(|retrying| {
+            let changed_files = self.selected_changed_files(&paths)?;
+            if retrying && changed_files.is_empty() {
+                return Ok(None);
+            }
+            if changed_files.is_empty() {
+                return Err(DraftlineError::PreflightFailed(Box::new(
+                    selected_files_preflight_report("save_files", false, changed_files),
+                )));
+            }
+            self.commit_content_changes(&changed_files, "save_files", label.as_ref(), profile)
+                .map(Some)
+        })
+    }
+
+    /// Reruns a save whose branch a developer committed onto meanwhile, as
+    /// pressing Save again would. A switched, reset, or rewound branch still
+    /// refuses, since the save would then land somewhere the user didn't pick.
+    /// A rerun with nothing left to save (`Ok(None)`, say because the
+    /// developer's commit took the same edits) keeps the original refusal.
+    fn while_head_moves_forward<T>(
+        &self,
+        mut save: impl FnMut(bool) -> Result<Option<T>>,
+    ) -> Result<T> {
+        let deadline = std::time::Instant::now() + GIT_BUSY_WAIT;
+        let mut refusal = None;
+        loop {
+            let before = self.head_position();
+            match save(refusal.is_some()) {
+                Ok(Some(saved)) => return Ok(saved),
+                Ok(None) => {
+                    return Err(refusal.expect("only a rerun reports nothing left to save"));
+                }
+                Err(error @ DraftlineError::LocalStateChanged { .. })
+                    if std::time::Instant::now() < deadline && self.head_moved_forward(&before) =>
+                {
+                    refusal.get_or_insert(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
+    }
 
-        let tree_id = self.write_selected_changes_tree(&changed_files)?;
-        let tree = self.repo.find_tree(tree_id)?;
-        let (author, committer) = self.workspace_signatures(profile)?;
-        let parent = self
+    fn head_position(&self) -> (Option<String>, Option<Oid>) {
+        let name = self
             .repo
-            .head()
+            .find_reference("HEAD")
             .ok()
-            .and_then(|head| head.target())
-            .and_then(|oid| self.repo.find_commit(oid).ok());
+            .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string));
+        let tip = self.repo.head().ok().and_then(|head| head.target());
+        (name, tip)
+    }
 
-        let oid = match parent.as_ref() {
-            Some(parent) => self.repo.commit(
-                Some("HEAD"),
-                &author,
-                &committer,
-                label.as_ref(),
-                &tree,
-                &[parent],
-            )?,
-            None => self.repo.commit(
-                Some("HEAD"),
-                &author,
-                &committer,
-                label.as_ref(),
-                &tree,
-                &[],
-            )?,
-        };
-
-        Ok(version_from_commit(&self.repo.find_commit(oid)?))
+    fn head_moved_forward(&self, before: &(Option<String>, Option<Oid>)) -> bool {
+        let now = self.head_position();
+        if now.0 != before.0 {
+            return false;
+        }
+        match (before.1, now.1) {
+            (Some(old), Some(new)) => {
+                new != old && self.repo.graph_descendant_of(new, old).unwrap_or(false)
+            }
+            (None, Some(_)) => true,
+            _ => false,
+        }
     }
 
     /// Lists versions reachable from the current variation, newest first.
+    ///
+    /// In a project folder inside a larger repository, only commits that change
+    /// the folder are versions (like `git log -- <folder>`); developers' other
+    /// commits are skipped.
     pub fn versions(&self) -> Result<Vec<Version>> {
         self.ensure_no_pending_recovery()?;
-        let mut walk = self.repo.revwalk()?;
-        if walk.push_head().is_err() {
-            return Ok(Vec::new());
-        }
-
-        walk.map(|oid| {
-            let oid = oid?;
-            let commit = self.repo.find_commit(oid)?;
-            Ok(version_from_commit(&commit))
-        })
-        .collect()
+        self.versions_unchecked()
     }
 
     /// Returns true when the workspace has unsaved content changes.
@@ -2890,12 +2755,13 @@ impl Workspace {
             .include_untracked(true)
             .recurse_untracked_dirs(true)
             .renames_head_to_index(true);
+        limit_status_to_scope(&mut options, self.scope());
 
         let statuses = self.repo.statuses(Some(&mut options))?;
         let mut changed = Vec::new();
 
         for entry in statuses.iter() {
-            let Some(path) = entry.path() else {
+            let Ok(path) = entry.path() else {
                 continue;
             };
             if !self.content_policy.tracks(path)? {
@@ -2933,6 +2799,7 @@ impl Workspace {
             .include_ignored(true)
             .recurse_untracked_dirs(true)
             .recurse_ignored_dirs(true);
+        limit_status_to_scope(&mut options, policy.scope());
 
         let statuses = self.repo.statuses(Some(&mut options))?;
         let mut ignored_paths = Vec::new();
@@ -2942,7 +2809,7 @@ impl Workspace {
                 continue;
             }
 
-            let Some(path) = entry.path() else {
+            let Ok(path) = entry.path() else {
                 continue;
             };
 
@@ -2974,19 +2841,81 @@ impl Workspace {
             .recurse_untracked_dirs(true)
             .recurse_ignored_dirs(true);
 
+        // Only paths the target actually changes can be overwritten, so scan
+        // just those instead of walking the whole (possibly huge) repository.
+        let head_tree = self
+            .repo
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_tree().ok());
+        let diff = self
+            .repo
+            .diff_tree_to_tree(head_tree.as_ref(), Some(target_tree), None)?;
+        let mut target_paths = BTreeSet::new();
+        let mut written = Vec::new();
+        for delta in diff.deltas() {
+            for file in [delta.old_file(), delta.new_file()] {
+                if let Some(path) = file.path() {
+                    target_paths.insert(path.to_string_lossy().replace('\\', "/"));
+                }
+            }
+            if let Some(path) = delta
+                .new_file()
+                .path()
+                .filter(|_| delta.new_file().exists())
+            {
+                written.push(path.to_path_buf());
+            }
+        }
+        if target_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        options.disable_pathspec_match(true);
+        for path in &target_paths {
+            options.pathspec(path);
+        }
+
         let statuses = self.repo.statuses(Some(&mut options))?;
+        let local_change = Status::WT_MODIFIED
+            | Status::WT_DELETED
+            | Status::WT_TYPECHANGE
+            | Status::WT_RENAMED
+            | Status::INDEX_MODIFIED
+            | Status::INDEX_DELETED
+            | Status::INDEX_TYPECHANGE
+            | Status::INDEX_RENAMED;
         let mut hazards = Vec::new();
 
         for entry in statuses.iter() {
-            let Some(path) = entry.path() else {
+            let Ok(path) = entry.path() else {
                 continue;
             };
+            let path_ref = Path::new(path);
+            let status = entry.status();
 
-            if !tree_contains_path(target_tree, Path::new(path))? {
+            // Uncommitted edits outside the content policy (developer code) are
+            // never overwritten: flag them when the target changes that path.
+            if status.intersects(local_change) && !status.is_wt_new() && !status.is_index_new() {
+                if self.content_policy.tracks(path)? {
+                    continue;
+                }
+                let head_entry = match head_tree.as_ref() {
+                    Some(tree) => optional_tree_entry(tree, path_ref)?,
+                    None => None,
+                };
+                if head_entry != optional_tree_entry(target_tree, path_ref)? {
+                    hazards.push(FileHazard {
+                        path: PathBuf::from(path),
+                        kind: FileHazardKind::LocalChanges,
+                    });
+                }
                 continue;
             }
 
-            let status = entry.status();
+            if !tree_contains_path(target_tree, path_ref)? {
+                continue;
+            }
+
             let kind = if status.contains(Status::IGNORED) {
                 Some(FileHazardKind::Ignored)
             } else if status.is_wt_new() || status.is_index_new() {
@@ -3007,9 +2936,89 @@ impl Workspace {
             }
         }
 
+        // Safe checkout also refuses file/folder obstructions the status scan
+        // cannot see, so flag those up front instead of failing mid-operation.
+        for path in self.obstructed_paths(head_tree.as_ref(), target_tree, &target_paths)? {
+            if hazards.iter().any(|hazard| hazard.path == path)
+                || self.content_policy.tracks(&path)?
+            {
+                continue;
+            }
+            let kind = if self.repo.is_path_ignored(&path)? {
+                FileHazardKind::Ignored
+            } else {
+                FileHazardKind::PolicyExcluded
+            };
+            hazards.push(FileHazard { path, kind });
+        }
+        hazards.extend(self.filtered_hazards_toward(&written, Some(target_tree))?);
+
         hazards.sort_by(|left, right| left.path.cmp(&right.path));
         hazards.dedup_by(|left, right| left.path == right.path);
         Ok(hazards)
+    }
+
+    /// Untracked or ignored paths that block the target's files or folders: a
+    /// file where the target needs a folder, or files inside a folder the
+    /// target turns into a file.
+    fn obstructed_paths(
+        &self,
+        head_tree: Option<&Tree<'_>>,
+        target_tree: &Tree<'_>,
+        target_paths: &BTreeSet<String>,
+    ) -> Result<Vec<PathBuf>> {
+        let Some(workdir) = self.repo.workdir() else {
+            return Ok(Vec::new());
+        };
+        let in_head = |path: &Path| -> Result<bool> {
+            match head_tree {
+                Some(tree) => tree_contains_path(tree, path),
+                None => Ok(false),
+            }
+        };
+        let mut obstructed = BTreeSet::new();
+        for path in target_paths {
+            let path = Path::new(path);
+            if !tree_contains_path(target_tree, path)? {
+                continue;
+            }
+            for ancestor in path.ancestors().skip(1) {
+                if ancestor.as_os_str().is_empty() {
+                    break;
+                }
+                let on_disk = workdir.join(ancestor);
+                if fs::symlink_metadata(&on_disk).is_ok_and(|meta| !meta.is_dir())
+                    && !in_head(ancestor)?
+                {
+                    obstructed.insert(ancestor.to_path_buf());
+                }
+            }
+            let on_disk = workdir.join(path);
+            if fs::symlink_metadata(&on_disk).is_ok_and(|meta| meta.is_dir()) {
+                let mut pending = vec![on_disk];
+                while let Some(dir) = pending.pop() {
+                    for entry in fs::read_dir(&dir)? {
+                        let entry = entry?;
+                        if entry.file_type()?.is_dir() {
+                            pending.push(entry.path());
+                            continue;
+                        }
+                        let relative = entry
+                            .path()
+                            .strip_prefix(workdir)
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|_| entry.path());
+                        if !in_head(&relative)? {
+                            obstructed.insert(relative);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(obstructed
+            .into_iter()
+            .map(|path| PathBuf::from(path.to_string_lossy().replace('\\', "/")))
+            .collect())
     }
 
     /// Returns content changes and an optional textual diff of unsaved workspace changes.
@@ -3028,10 +3037,7 @@ impl Workspace {
     /// Preflights discarding all unsaved tracked content changes without mutating files.
     pub fn preflight_discard_changes(&self) -> Result<PreflightReport> {
         self.ensure_no_pending_recovery()?;
-        Ok(discard_preflight_report(
-            "discard_changes",
-            self.changed_files_unchecked()?,
-        ))
+        self.discard_preflight("discard_changes", self.changed_files_unchecked()?)
     }
 
     /// Discards all unsaved changes tracked by the active content policy.
@@ -3041,7 +3047,7 @@ impl Workspace {
     /// files are restored from the current `HEAD`.
     pub fn discard_changes(&self) -> Result<ChangeSet> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "discard_changes")?;
+        let _lock = self.acquire_for_index("discard_changes")?;
         let changed_files = self.changed_files_unchecked()?;
         if changed_files.is_empty() {
             return Ok(ChangeSet {
@@ -3050,6 +3056,7 @@ impl Workspace {
             });
         }
 
+        self.ensure_discard_unfiltered(&changed_files, "discard_changes")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -3085,7 +3092,7 @@ impl Workspace {
             .filter(|changed| changed.path == path)
             .collect();
 
-        Ok(discard_preflight_report("discard_file", changed_files))
+        self.discard_preflight("discard_file", changed_files)
     }
 
     /// Discards one changed tracked content file by workspace-relative path.
@@ -3096,7 +3103,7 @@ impl Workspace {
     pub fn discard_file(&self, path: impl AsRef<Path>) -> Result<Option<ChangedFile>> {
         self.ensure_no_pending_recovery()?;
         let path = self.normalize_tracked_content_path(path)?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "discard_file")?;
+        let _lock = self.acquire_for_index("discard_file")?;
         let changed_file = self
             .changed_files_unchecked()?
             .into_iter()
@@ -3105,6 +3112,7 @@ impl Workspace {
         let Some(changed_file) = changed_file else {
             return Ok(None);
         };
+        self.ensure_discard_unfiltered(std::slice::from_ref(&changed_file), "discard_file")?;
 
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
@@ -3135,10 +3143,7 @@ impl Workspace {
         P: AsRef<Path>,
     {
         self.ensure_no_pending_recovery()?;
-        Ok(discard_preflight_report(
-            "discard_files",
-            self.selected_changed_files(paths)?,
-        ))
+        self.discard_preflight("discard_files", self.selected_changed_files(paths)?)
     }
 
     /// Discards selected changed tracked content files.
@@ -3156,7 +3161,8 @@ impl Workspace {
             });
         }
 
-        let _lock = OperationLock::acquire(&self.lock_path(), "discard_files")?;
+        let _lock = self.acquire_for_index("discard_files")?;
+        self.ensure_discard_unfiltered(&changed_files, "discard_files")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -3198,6 +3204,7 @@ impl Workspace {
         &self,
         variation: &VariationId,
     ) -> Result<PreflightReport> {
+        self.ensure_variation_switchable(variation.as_str())?;
         let change_set = self.changes_unchecked()?;
         let target_commit = self
             .repo
@@ -3228,6 +3235,7 @@ impl Workspace {
     ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(name.as_ref())?;
+        self.ensure_variation_in_namespace(&name)?;
         let head = self.repo.head()?.peel_to_commit()?;
         self.repo.branch(&name, &head, false)?;
         self.write_variation_metadata(&name, &metadata)?;
@@ -3257,6 +3265,7 @@ impl Workspace {
     ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(name.as_ref())?;
+        self.ensure_variation_in_namespace(&name)?;
         let commit = self.find_version_commit(version)?;
         if !self.version_is_reachable_from_local_variation(commit.id())? {
             return Err(DraftlineError::VersionNotLocallyReachable(
@@ -3299,6 +3308,7 @@ impl Workspace {
     ) -> Result<VariationCreatePreflight> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(name.as_ref())?;
+        self.ensure_variation_in_namespace(&name)?;
         let commit = self.find_version_commit(version)?;
         if !self.version_is_reachable_from_local_variation(commit.id())? {
             return Err(DraftlineError::VersionNotLocallyReachable(
@@ -3327,7 +3337,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "create_variation_from_version")?;
+        let _lock = self.acquire_for_index("create_variation_from_version")?;
         if !is_safe_operation_id(&token.operation_id) {
             return Err(DraftlineError::LocalStateChanged {
                 expected: "create variation operation id issued by preflight".to_string(),
@@ -3336,6 +3346,7 @@ impl Workspace {
         }
 
         let name = validate_variation_name(token.variation.as_str())?;
+        self.ensure_variation_in_namespace(&name)?;
         let commit = self.find_version_commit(&token.from_version)?;
         if commit.id().to_string() != token.expected_source_oid {
             return Err(DraftlineError::LocalStateChanged {
@@ -3378,25 +3389,7 @@ impl Workspace {
     /// Lists local variations.
     pub fn variations(&self) -> Result<Vec<Variation>> {
         self.ensure_no_pending_recovery()?;
-        let current = self.current_variation().ok();
-        let mut paths = Vec::new();
-
-        for branch in self.repo.branches(Some(BranchType::Local))? {
-            let (branch, _) = branch?;
-            let Some(name) = branch.name()? else {
-                continue;
-            };
-
-            let metadata = self.read_variation_metadata(name)?;
-            paths.push(variation_from_name(
-                name.to_string(),
-                current.as_ref(),
-                metadata,
-            ));
-        }
-
-        paths.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(paths)
+        self.variations_unchecked()
     }
 
     /// Lists visible variations discovered on a remote-tracking namespace.
@@ -3576,6 +3569,7 @@ impl Workspace {
     ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(variation.as_str())?;
+        self.ensure_variation_in_namespace(&name)?;
         let remote_ref = format!("refs/remotes/{}/{}", remote.as_ref(), name);
         let commit = self.repo.find_reference(&remote_ref)?.peel_to_commit()?;
         self.repo.branch(&name, &commit, false)?;
@@ -3609,7 +3603,7 @@ impl Workspace {
     ) -> Result<Shelf> {
         self.ensure_no_pending_recovery()?;
         let safe_name = validate_variation_name(name.as_ref())?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "shelve_changes")?;
+        let _lock = self.acquire_for_index("shelve_changes")?;
         self.shelve_changes_unchecked(&safe_name, profile)?;
         self.shelf_by_id(&safe_name)
     }
@@ -3680,8 +3674,12 @@ impl Workspace {
             )));
         }
 
-        let _lock = OperationLock::acquire(&self.lock_path(), "shelve_files")?;
+        let _lock = self.acquire_for_index("shelve_files")?;
         let (author, committer) = self.rewrite_signatures(profile)?;
+        let parent = self.repo.head()?.peel_to_commit()?;
+        let (tree_id, _) =
+            self.content_changes_tree(Some(&parent), &changed_files, "shelve_files")?;
+        self.ensure_discard_unfiltered(&changed_files, "shelve_files")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -3691,9 +3689,7 @@ impl Workspace {
             completed: false,
         })?;
 
-        let tree_id = self.write_selected_changes_tree(&changed_files)?;
         let tree = self.repo.find_tree(tree_id)?;
-        let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             None,
             &author,
@@ -3730,7 +3726,7 @@ impl Workspace {
 
         for reference in references {
             let reference = reference?;
-            let Some(name) = reference.name() else {
+            let Ok(name) = reference.name() else {
                 continue;
             };
             let Some(id) = name.strip_prefix("refs/draftline/shelves/") else {
@@ -3774,7 +3770,8 @@ impl Workspace {
     pub fn preflight_apply_shelf(&self, id: impl AsRef<str>) -> Result<ShelfApplyReport> {
         self.ensure_no_pending_recovery()?;
         let (safe_name, commit) = self.find_shelf_commit(id.as_ref())?;
-        let tree = commit.tree()?;
+        let (tree_id, _paths) = self.shelf_target_tree(&commit)?;
+        let tree = self.repo.find_tree(tree_id)?;
         let dirty_files = self.changed_files_unchecked()?;
         let file_hazards = self.target_tree_hazards(&tree)?;
         let can_proceed = dirty_files.is_empty() && file_hazards.is_empty();
@@ -3794,7 +3791,7 @@ impl Workspace {
     pub fn apply_shelf(&self, id: impl AsRef<str>) -> Result<Shelf> {
         self.ensure_no_pending_recovery()?;
         let safe_name = validate_variation_name(id.as_ref())?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "apply_shelf")?;
+        let _lock = self.acquire_for_index("apply_shelf")?;
         let report = self.preflight_apply_shelf(&safe_name)?;
         if !report.can_proceed {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
@@ -3816,9 +3813,7 @@ impl Workspace {
         })?;
 
         let (_id, commit) = self.find_shelf_commit(&safe_name)?;
-        let tree = commit.tree()?;
-        self.repo
-            .checkout_tree(tree.as_object(), Some(CheckoutBuilder::new().force()))?;
+        self.clear_recovery_if_refused(self.apply_shelf_paths(&commit))?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -4016,129 +4011,6 @@ impl Workspace {
         Ok(())
     }
 
-    /// Plans replacing shared remote history with the current local variation tip.
-    pub fn preflight_replace_remote_history(
-        &self,
-        remote: impl AsRef<str>,
-    ) -> Result<RemoteHistoryReplacePreflight> {
-        let mut options = RemoteOptions::new();
-        self.preflight_replace_remote_history_with_options(remote, &mut options)
-    }
-
-    /// Plans shared history replacement with explicit remote options.
-    pub fn preflight_replace_remote_history_with_options(
-        &self,
-        remote: impl AsRef<str>,
-        options: &mut RemoteOptions<'_>,
-    ) -> Result<RemoteHistoryReplacePreflight> {
-        self.ensure_no_pending_recovery()?;
-        let remote = remote.as_ref().to_string();
-        self.repo.find_remote(&remote)?;
-        let variation = self.current_variation_unchecked()?;
-        let report = preflight_report(
-            "replace_remote_history",
-            false,
-            self.changed_files_unchecked()?,
-            Vec::new(),
-            None,
-        );
-        if !report.can_proceed {
-            return Err(DraftlineError::PreflightFailed(Box::new(report)));
-        }
-
-        self.fetch_remote_variation_ref(&remote, &variation, options)?;
-        let Some(expected_remote_oid) = remote_tracking_oid(&self.repo, &remote, &variation) else {
-            return Err(DraftlineError::VersionNotFound(variation));
-        };
-        let replacement_oid = self.repo.head()?.peel_to_commit()?.id().to_string();
-        let support_ref_preflight =
-            self.preflight_publish_support_refs_with_options(&remote, options)?;
-        let support_refs = self
-            .list_local_support_refs()?
-            .into_iter()
-            .filter(|support_ref| {
-                support_ref.kind == SupportRefKind::Rewrite
-                    && support_ref.source_variation.as_deref() == Some(variation.as_str())
-                    && support_ref.target_oid == expected_remote_oid
-            })
-            .collect::<Vec<_>>();
-        let can_replace = !support_refs.is_empty();
-        let token = can_replace.then(|| RemoteHistoryReplaceToken {
-            remote: remote.clone(),
-            variation: VariationId::from(variation.clone()),
-            expected_remote_oid: expected_remote_oid.clone(),
-            replacement_oid: replacement_oid.clone(),
-            support_ref_token: support_ref_preflight.token.clone(),
-            confirmed_rewrite: false,
-        });
-
-        Ok(RemoteHistoryReplacePreflight {
-            remote,
-            variation: VariationId::from(variation),
-            expected_remote_oid,
-            replacement_oid,
-            support_refs,
-            token,
-            can_replace,
-        })
-    }
-
-    /// Replaces shared remote history after publishing recovery support refs.
-    pub fn replace_remote_history(&self, token: RemoteHistoryReplaceToken) -> Result<()> {
-        let mut options = RemoteOptions::new();
-        self.replace_remote_history_with_options(token, &mut options)
-    }
-
-    /// Replaces shared remote history with explicit remote options.
-    pub fn replace_remote_history_with_options(
-        &self,
-        token: RemoteHistoryReplaceToken,
-        options: &mut RemoteOptions<'_>,
-    ) -> Result<()> {
-        self.ensure_no_pending_recovery()?;
-        if !token.confirmed_rewrite {
-            return Err(DraftlineError::ConsentRequired(
-                "replace_remote_history".to_string(),
-            ));
-        }
-        let variation = self.current_variation_unchecked()?;
-        let local_oid = self.repo.head()?.peel_to_commit()?.id().to_string();
-        if variation != token.variation.as_str() || local_oid != token.replacement_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{}@{}", token.variation.as_str(), token.replacement_oid),
-                actual: format!("{variation}@{local_oid}"),
-            });
-        }
-
-        self.publish_support_refs_with_options(token.support_ref_token, options)?;
-        self.fetch_remote_variation_ref(&token.remote, token.variation.as_str(), options)?;
-        let actual_remote_oid =
-            remote_tracking_oid(&self.repo, &token.remote, token.variation.as_str());
-        if actual_remote_oid.as_deref() != Some(token.expected_remote_oid.as_str()) {
-            return Err(DraftlineError::RemoteRace {
-                remote: token.remote,
-                variation: token.variation.as_str().to_string(),
-                expected: Some(token.expected_remote_oid),
-                actual: actual_remote_oid,
-            });
-        }
-
-        self.push_refspec(
-            &token.remote,
-            &format!(
-                "+refs/heads/{}:refs/heads/{}",
-                token.variation.as_str(),
-                token.variation.as_str()
-            ),
-            vec![PushRefExpectation {
-                dst_refname: format!("refs/heads/{}", token.variation.as_str()),
-                expected_old_oid: Some(token.expected_remote_oid),
-                expected_new_oid: Some(token.replacement_oid),
-            }],
-            options,
-        )
-    }
-
     /// Plans restoration of an archive support ref as a new visible variation.
     pub fn preflight_restore_support_ref(
         &self,
@@ -4148,6 +4020,7 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let id = id.as_ref();
         let name = validate_variation_name(name.as_ref())?;
+        self.ensure_variation_in_namespace(&name)?;
         if self.repo.find_branch(&name, BranchType::Local).is_ok() {
             return Err(DraftlineError::InvalidVariationName(name));
         }
@@ -4196,6 +4069,7 @@ impl Workspace {
     pub fn restore_support_ref(&self, token: SupportRefRestoreToken) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
         let name = validate_variation_name(token.target_variation.as_str())?;
+        self.ensure_variation_in_namespace(&name)?;
         let support_ref = self
             .list_local_support_refs()?
             .into_iter()
@@ -4245,6 +4119,7 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let remote = remote.as_ref().to_string();
         let variation_name = validate_variation_name(variation.as_str())?;
+        self.ensure_variation_in_namespace(&variation_name)?;
         let mut options = RemoteOptions::new();
         self.fetch_remote_variation_ref(&remote, &variation_name, &mut options)?;
         let Some(expected_remote_oid) = remote_tracking_oid(&self.repo, &remote, &variation_name)
@@ -4283,8 +4158,9 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<()> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "delete_remote_variation")?;
+        let _lock = self.acquire_operation_lock("delete_remote_variation")?;
         let variation_name = validate_variation_name(token.variation.as_str())?;
+        self.ensure_variation_in_namespace(&variation_name)?;
         self.fetch_remote_variation_ref(&token.remote, &variation_name, options)?;
         let actual_remote_oid = remote_tracking_oid(&self.repo, &token.remote, &variation_name);
         if actual_remote_oid.as_deref() != Some(token.expected_remote_oid.as_str()) {
@@ -4420,7 +4296,7 @@ impl Workspace {
     /// Expires selected local support refs as retention cleanup, not purge.
     pub fn expire_support_refs(&self, token: SupportRefExpirationToken) -> Result<()> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "expire_support_refs")?;
+        let _lock = self.acquire_operation_lock("expire_support_refs")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -4534,7 +4410,7 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "switch_variation")?;
+        let _lock = self.acquire_for_index("switch_variation")?;
         let mut report = self.preflight_switch_variation_unchecked(variation)?;
 
         if !report.file_hazards.is_empty() {
@@ -4564,24 +4440,22 @@ impl Workspace {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
 
+        let target = self.branch_tree(variation.as_str())?;
         let operation_id = new_operation_id();
-        self.write_recovery_state(&RecoveryState {
-            operation_id: operation_id.clone(),
-            operation: RecoveryOperation::SwitchVariation,
-            original_variation: self.current_variation().ok(),
-            target: Some(variation.as_str().to_string()),
-            completed: false,
-        })?;
+        self.write_recovery_state_for_checkout(
+            &RecoveryState {
+                operation_id: operation_id.clone(),
+                operation: RecoveryOperation::SwitchVariation,
+                original_variation: self.current_variation().ok(),
+                target: Some(variation.as_str().to_string()),
+                completed: false,
+            },
+            &self.head_tree_or_empty()?,
+            &target,
+        )?;
 
-        let branch = self
-            .repo
-            .find_branch(variation.as_str(), BranchType::Local)?;
-        let reference = branch.into_reference();
-        let target = reference.peel(ObjectType::Commit)?;
-
-        self.repo.checkout_tree(&target, None)?;
-        self.repo
-            .set_head(&format!("refs/heads/{}", variation.as_str()))?;
+        self.checkout_or_keep_recovery(&target)?;
+        self.point_head_at(variation.as_str())?;
 
         let metadata = self.read_variation_metadata(variation.as_str())?;
         let result =
@@ -4603,6 +4477,7 @@ impl Workspace {
         variation: &VariationId,
     ) -> Result<VariationDeletePreflight> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_variation_in_namespace(variation.as_str())?;
         if self.current_variation().ok().as_deref() == Some(variation.as_str()) {
             return Err(DraftlineError::CannotDeleteCurrentVariation(
                 variation.as_str().to_string(),
@@ -4635,7 +4510,8 @@ impl Workspace {
     /// Deletes a preflighted alternate variation.
     pub fn delete_variation_with_token(&self, token: VariationDeleteToken) -> Result<()> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "delete_variation")?;
+        let _lock = self.acquire_operation_lock("delete_variation")?;
+        self.ensure_variation_in_namespace(token.variation.as_str())?;
         if self.current_variation().ok().as_deref() == Some(token.variation.as_str()) {
             return Err(DraftlineError::CannotDeleteCurrentVariation(
                 token.variation.as_str().to_string(),
@@ -4693,6 +4569,8 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let source_name = validate_variation_name(source.as_str())?;
         let target_name = validate_variation_name(target.as_str())?;
+        self.ensure_variation_in_namespace(&source_name)?;
+        self.ensure_variation_in_namespace(&target_name)?;
         if source_name == target_name {
             return Err(DraftlineError::VariationAlreadyExists(target_name));
         }
@@ -4730,9 +4608,11 @@ impl Workspace {
     /// Renames a preflighted visible local variation while preserving its tip in a support ref.
     pub fn rename_variation_with_token(&self, token: VariationRenameToken) -> Result<Variation> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "rename_variation")?;
+        let _lock = self.acquire_operation_lock("rename_variation")?;
         let source_name = validate_variation_name(token.source_variation.as_str())?;
         let target_name = validate_variation_name(token.target_variation.as_str())?;
+        self.ensure_variation_in_namespace(&source_name)?;
+        self.ensure_variation_in_namespace(&target_name)?;
         if source_name == target_name {
             return Err(DraftlineError::VariationAlreadyExists(target_name));
         }
@@ -4833,15 +4713,18 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "restore_version_as_new_save")?;
+        let _lock = self.acquire_for_index("restore_version_as_new_save")?;
+        let head_commit = self.repo.head()?.peel_to_commit()?;
+        let restored_tree = {
+            let source = self.find_version_commit(version)?.tree()?;
+            let tree_id = self.compose_scoped_tree(&head_commit.tree()?, &source)?;
+            self.repo.find_tree(tree_id)?
+        };
         let report = preflight_report(
             "restore_version_as_new_save",
             true,
             self.changed_files_unchecked()?,
-            {
-                let commit = self.find_version_commit(version)?;
-                self.target_tree_hazards(&commit.tree()?)?
-            },
+            self.target_tree_hazards(&restored_tree)?,
             None,
         );
         if !report.can_proceed {
@@ -4850,28 +4733,27 @@ impl Workspace {
 
         let (author, committer) = self.rewrite_signatures(profile)?;
         let operation_id = new_operation_id();
-        self.write_recovery_state(&RecoveryState {
-            operation_id: operation_id.clone(),
-            operation: RecoveryOperation::RestoreVersionAsNewSave,
-            original_variation: self.current_variation().ok(),
-            target: Some(version.as_str().to_string()),
-            completed: false,
-        })?;
+        self.write_recovery_state_for_checkout(
+            &RecoveryState {
+                operation_id: operation_id.clone(),
+                operation: RecoveryOperation::RestoreVersionAsNewSave,
+                original_variation: self.current_variation().ok(),
+                target: Some(version.as_str().to_string()),
+                completed: false,
+            },
+            &head_commit.tree()?,
+            &restored_tree,
+        )?;
 
-        let commit = self.find_version_commit(version)?;
-        let tree = commit.tree()?;
-        let parent = self.repo.head()?.peel_to_commit()?;
+        self.checkout_or_keep_recovery(&restored_tree)?;
         let oid = self.repo.commit(
             Some("HEAD"),
             &author,
             &committer,
             label.as_ref(),
-            &tree,
-            &[&parent],
+            &restored_tree,
+            &[&head_commit],
         )?;
-
-        self.repo
-            .checkout_tree(tree.as_object(), Some(CheckoutBuilder::new().force()))?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -4926,22 +4808,24 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<TargetedRestoreVersionResult> {
         self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(
-            &self.lock_path(),
-            "restore_version_as_new_save_to_variation",
-        )?;
+        let _lock = self.acquire_for_index("restore_version_as_new_save_to_variation")?;
 
         let source_commit = self.find_version_commit(version)?;
         let source_tree = source_commit.tree()?;
         let current_variation = self.current_variation_unchecked()?;
         let (target_name, target_metadata, parent_oid) =
             self.resolve_restore_version_target(target, &current_variation)?;
+        let parent = self.repo.find_commit(parent_oid)?;
+        let restored_tree = {
+            let tree_id = self.compose_scoped_tree(&parent.tree()?, &source_tree)?;
+            self.repo.find_tree(tree_id)?
+        };
 
         let report = preflight_report(
             "restore_version_as_new_save_to_variation",
             true,
             self.changed_files_unchecked()?,
-            self.target_tree_hazards(&source_tree)?,
+            self.target_tree_hazards(&restored_tree)?,
             Some(format!("{current_variation} -> {target_name}")),
         );
         if !report.can_proceed {
@@ -4950,31 +4834,35 @@ impl Workspace {
 
         let (author, committer) = self.rewrite_signatures(profile)?;
         let operation_id = new_operation_id();
-        self.write_recovery_state(&RecoveryState {
-            operation_id: operation_id.clone(),
-            operation: RecoveryOperation::RestoreVersionAsNewSave,
-            original_variation: Some(current_variation),
-            target: Some(format!("{} -> {}", version.as_str(), target_name)),
-            completed: false,
-        })?;
+        self.write_recovery_state_for_checkout(
+            &RecoveryState {
+                operation_id: operation_id.clone(),
+                operation: RecoveryOperation::RestoreVersionAsNewSave,
+                original_variation: Some(current_variation),
+                target: Some(format!("{} -> {}", version.as_str(), target_name)),
+                completed: false,
+            },
+            &self.repo.head()?.peel_to_tree()?,
+            &restored_tree,
+        )?;
 
-        let parent = self.repo.find_commit(parent_oid)?;
+        // Move files before any ref so HEAD is still the checkout baseline.
+        self.checkout_or_keep_recovery(&restored_tree)?;
         let target_ref = format!("refs/heads/{target_name}");
-        let oid = self.repo.commit(
-            Some(&target_ref),
-            &author,
-            &committer,
-            label.as_ref(),
-            &source_tree,
-            &[&parent],
-        )?;
+        // The ref moves only if it is still at `parent`, so a retry after
+        // Git's lock clears can't land twice or over a developer's commit.
+        let oid = self.while_git_busy(|| {
+            Ok(self.repo.commit(
+                Some(&target_ref),
+                &author,
+                &committer,
+                label.as_ref(),
+                &restored_tree,
+                &[&parent],
+            )?)
+        })?;
         self.write_variation_metadata(&target_name, &target_metadata)?;
-
-        self.repo.checkout_tree(
-            source_tree.as_object(),
-            Some(CheckoutBuilder::new().force()),
-        )?;
-        self.repo.set_head(&target_ref)?;
+        self.point_head_at(&target_name)?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -5151,12 +5039,18 @@ impl Workspace {
             return Ok(Vec::new());
         }
 
-        walk.map(|oid| {
-            let oid = oid?;
-            let commit = self.repo.find_commit(oid)?;
-            history_entry_from_commit(&commit, &tips, head_oid)
-        })
-        .collect()
+        let mut history = self.scoped_history(&tips);
+        let mut entries = Vec::new();
+        for oid in walk {
+            let commit = self.repo.find_commit(oid?)?;
+            if history.shows(&commit)? {
+                let parents = history.parents(&commit)?;
+                entries.push(history_entry_from_commit(
+                    &commit, &parents, &tips, head_oid,
+                )?);
+            }
+        }
+        Ok(entries)
     }
 
     /// Returns the combined version history across **all** local variations.
@@ -5189,181 +5083,22 @@ impl Workspace {
         let mut walk = self.repo.revwalk()?;
         walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
 
-        for branch in self.repo.branches(Some(BranchType::Local))? {
-            let (branch, _) = branch?;
-            if let Ok(tip) = branch.get().peel_to_commit() {
-                walk.push(tip.id())?;
-            }
+        for (_, tip) in self.listed_variation_tip_oids()? {
+            walk.push(tip)?;
         }
 
-        walk.map(|oid| {
-            let oid = oid?;
-            let commit = self.repo.find_commit(oid)?;
-            history_entry_from_commit(&commit, &tips, head_oid)
-        })
-        .collect()
-    }
-
-    /// Returns viable second endpoints for compacting history around one version.
-    pub fn history_compaction_candidates(
-        &self,
-        request: HistoryCompactionCandidatesRequest,
-    ) -> Result<HistoryCompactionCandidates> {
-        self.ensure_no_pending_recovery()?;
-        let target_variation = match request.target_variation {
-            Some(variation) => VariationId::from(validate_variation_name(variation.as_str())?),
-            None => VariationId::from(self.current_variation_unchecked()?),
-        };
-        let target_branch = self.find_local_variation_branch(target_variation.as_str())?;
-        let target_head_oid = target_branch.get().peel_to_commit()?.id();
-        let selected_oid = oid_from_version(&request.selected_version)?;
-        let chain = self.first_parent_chain_to_root(target_head_oid)?;
-        let selected_index = chain
-            .iter()
-            .position(|oid| *oid == selected_oid)
-            .ok_or_else(|| {
-                DraftlineError::HistoryCleanupBlocked(Box::new(HistoryCleanupBlockReport {
-                    operation: "history_compaction_candidates".to_string(),
-                    diagnostics: vec![cleanup_warning(
-                        CleanupWarningCode::SelectedVersionNotOnTargetVariation,
-                        format!(
-                            "selected version `{selected_oid}` is not on the first-parent history of variation `{}`",
-                            target_variation.as_str()
-                        ),
-                        vec![VersionId::from(selected_oid), VersionId::from(target_head_oid)],
-                    )],
-                    can_proceed: false,
-                }))
-            })?;
-        let local_tips = self.local_variation_tip_oids()?;
-        let mut candidates = Vec::new();
-        let mut remote_options = RemoteOptions::new();
-        if let Some(remote) = request.remote.as_deref() {
-            self.fetch_remote_variation_ref(
-                remote,
-                target_variation.as_str(),
-                &mut remote_options,
-            )?;
+        let mut history = self.scoped_history(&tips);
+        let mut entries = Vec::new();
+        for oid in walk {
+            let commit = self.repo.find_commit(oid?)?;
+            if history.shows(&commit)? {
+                let parents = history.parents(&commit)?;
+                entries.push(history_entry_from_commit(
+                    &commit, &parents, &tips, head_oid,
+                )?);
+            }
         }
-
-        for (candidate_index, candidate_oid) in chain.iter().copied().enumerate() {
-            if candidate_oid == selected_oid {
-                continue;
-            }
-
-            let (start_index, end_index, selected_role) = if candidate_index > selected_index {
-                (
-                    candidate_index,
-                    selected_index,
-                    CompactionSelectionRole::RangeEnd,
-                )
-            } else {
-                (
-                    selected_index,
-                    candidate_index,
-                    CompactionSelectionRole::RangeStart,
-                )
-            };
-            let start_oid = chain[start_index];
-            let end_oid = chain[end_index];
-            let range_oids = chain[end_index..=start_index]
-                .iter()
-                .rev()
-                .copied()
-                .collect::<Vec<_>>();
-            let range_set = range_oids.iter().copied().collect::<BTreeSet<_>>();
-            let descendant_rewrite_count = end_index;
-            let descendant_set = chain[..end_index].iter().copied().collect::<BTreeSet<_>>();
-            let mut blockers = Vec::new();
-            let mut warnings = Vec::new();
-
-            if request.preserve_merge_boundaries {
-                for oid in &range_oids {
-                    let commit = self.repo.find_commit(*oid)?;
-                    if commit.parent_count() > 1 {
-                        blockers.push(cleanup_warning(
-                            CleanupWarningCode::MergeBoundaryRequiresUserChoice,
-                            format!("cleanup range crosses merge commit `{oid}`"),
-                            vec![VersionId::from(*oid)],
-                        ));
-                    }
-                }
-            }
-            for oid in chain[..end_index].iter().copied() {
-                let commit = self.repo.find_commit(oid)?;
-                for parent_index in 1..commit.parent_count() {
-                    let parent = commit.parent(parent_index)?;
-                    let parent_oid = parent.id();
-                    if range_set.contains(&parent_oid) {
-                        blockers.push(cleanup_warning(
-                            CleanupWarningCode::MergeBoundaryWouldBeRewritten,
-                            format!(
-                                "descendant merge commit `{oid}` has a secondary parent inside the compacted range"
-                            ),
-                            vec![VersionId::from(oid), VersionId::from(parent_oid)],
-                        ));
-                    }
-                }
-            }
-
-            for (variation, tip) in &local_tips {
-                if *variation == target_variation {
-                    continue;
-                }
-                if range_set.contains(tip) {
-                    let warning = cleanup_warning(
-                        CleanupWarningCode::NamedBranchInsideCompactedRange,
-                        format!(
-                            "variation `{}` points inside the compacted range",
-                            variation.as_str()
-                        ),
-                        vec![VersionId::from(*tip)],
-                    );
-                    blockers.push(warning);
-                } else if descendant_set.contains(tip) {
-                    warnings.push(cleanup_warning(
-                        CleanupWarningCode::NamedBranchWouldBeAffected,
-                        format!(
-                            "variation `{}` points to a descendant that cleanup would rewrite",
-                            variation.as_str()
-                        ),
-                        vec![VersionId::from(*tip)],
-                    ));
-                }
-            }
-
-            let candidate_commit = self.repo.find_commit(candidate_oid)?;
-            let remote_impact = self.cleanup_remote_impact_for_oids(
-                request.remote.as_deref(),
-                &target_variation,
-                target_head_oid,
-                None,
-                &range_oids,
-                &chain[..end_index],
-            )?;
-            candidates.push(HistoryCompactionCandidate {
-                version: version_from_commit(&candidate_commit),
-                include_range: CommitRange {
-                    start: VersionId::from(start_oid),
-                    end: VersionId::from(end_oid),
-                },
-                selected_role,
-                can_compact: blockers.is_empty(),
-                requires_descendant_replay: descendant_rewrite_count > 0,
-                selected_commit_count: range_oids.len(),
-                descendant_rewrite_count,
-                remote_impact,
-                blockers,
-                warnings,
-            });
-        }
-
-        Ok(HistoryCompactionCandidates {
-            target_variation: target_variation.clone(),
-            selected_version: request.selected_version,
-            target_head: VersionId::from(target_head_oid),
-            candidates,
-        })
+        Ok(entries)
     }
 
     /// Returns a graph-ready full-history snapshot over Draftline variations.
@@ -5400,9 +5135,9 @@ impl Workspace {
             files: dirty_files,
         };
         let local_tips = if state_may_be_inconsistent {
-            self.local_variation_tip_oids().unwrap_or_default()
+            self.listed_variation_tip_oids().unwrap_or_default()
         } else {
-            self.local_variation_tip_oids()?
+            self.listed_variation_tip_oids()?
         };
         let remote_variations = if options.include_remotes && state_may_be_inconsistent {
             self.graph_remote_variations(options.remote.as_deref())
@@ -5479,17 +5214,25 @@ impl Workspace {
         let walk_result = (|| -> Result<()> {
             let mut walk = self.repo.revwalk()?;
             walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+            let mut history = ScopedHistory::new(
+                &self.repo,
+                self.scope(),
+                push_oids.iter().copied().chain(head_oid),
+            );
             for oid in push_oids {
                 walk.push(oid)?;
             }
             for oid in walk {
                 let oid = oid?;
+                let commit = self.repo.find_commit(oid)?;
+                if !history.shows(&commit)? {
+                    continue;
+                }
                 if total >= start && total < end {
-                    let commit = self.repo.find_commit(oid)?;
+                    let parents = history.parents(&commit)?;
                     nodes.push(workspace_graph_node_from_commit(
                         &commit,
-                        &tips,
-                        head_oid,
+                        history_entry_from_commit(&commit, &parents, &tips, head_oid)?,
                         &local_reachable,
                         &remote_reachable,
                         &support_reachable,
@@ -5582,9 +5325,9 @@ impl Workspace {
             files: dirty_files,
         };
         let local_tips = if state_may_be_inconsistent {
-            self.local_variation_tip_oids().unwrap_or_default()
+            self.listed_variation_tip_oids().unwrap_or_default()
         } else {
-            self.local_variation_tip_oids()?
+            self.listed_variation_tip_oids()?
         };
         let remote_variations = if options.include_remotes && state_may_be_inconsistent {
             self.graph_remote_variations(options.remote.as_deref())
@@ -6007,9 +5750,10 @@ impl Workspace {
         if !by_id.contains_key(&to_id) {
             return Err(DraftlineError::VersionNotFound(to.to_string()));
         }
-        let ancestor = self
-            .workspace_graph_common_ancestor(from, to)?
-            .common_ancestor;
+        // Use the graph's own (possibly scope-simplified) parents so the
+        // ancestor is always a node the caller can see.
+        let ancestor = workspace_graph_nearest_common_ancestor(&by_id, &from_id, &to_id)
+            .and_then(|id| version_by_id.get(&id).cloned());
         let node_ids = if let Some(ancestor) = ancestor.as_ref() {
             let ancestor_id = workspace_graph_node_id_from_version(ancestor)?;
             let mut left = workspace_graph_path_to_ancestor(&by_id, &from_id, &ancestor_id)
@@ -6047,10 +5791,23 @@ impl Workspace {
             .map_err(|_| DraftlineError::VersionNotFound(left.to_string()))?;
         let right_oid = Oid::from_str(right.as_str())
             .map_err(|_| DraftlineError::VersionNotFound(right.to_string()))?;
-        let common_ancestor = match self.repo.merge_base(left_oid, right_oid) {
-            Ok(oid) => Some(VersionId::from(oid)),
+        let merge_base = match self.repo.merge_base(left_oid, right_oid) {
+            Ok(oid) => Some(oid),
             Err(error) if error.code() == git2::ErrorCode::NotFound => None,
             Err(error) => return Err(error.into()),
+        };
+        // In a scoped workspace the merge base may be a hidden developer-only
+        // commit; report the nearest version the graph actually shows.
+        let common_ancestor = match merge_base {
+            Some(oid) => {
+                let mut tips = self.variation_tips_map()?;
+                tips.entry(left_oid).or_default();
+                tips.entry(right_oid).or_default();
+                self.scoped_history(&tips)
+                    .nearest_shown(oid)?
+                    .map(VersionId::from)
+            }
+            None => None,
         };
         Ok(WorkspaceGraphCommonAncestor {
             left_version: left.clone(),
@@ -6150,6 +5907,9 @@ impl Workspace {
             let Some(name) = branch.name()? else {
                 continue;
             };
+            if !self.lists_variation(name, current.as_deref()) {
+                continue;
+            }
             let metadata = self.read_variation_metadata(name)?;
             let variation = variation_from_name(name.to_string(), current.as_ref(), metadata);
 
@@ -6158,7 +5918,13 @@ impl Workspace {
                     let head_version = Some(version_from_commit(&tip));
                     let mut walk = self.repo.revwalk()?;
                     walk.push(tip.id())?;
-                    let count = walk.count();
+                    let mut history = ScopedHistory::new(&self.repo, self.scope(), [tip.id()]);
+                    let mut count = 0;
+                    for oid in walk {
+                        if history.shows(&self.repo.find_commit(oid?)?)? {
+                            count += 1;
+                        }
+                    }
                     (head_version, count)
                 }
                 Err(_) => (None, 0),
@@ -6198,7 +5964,6 @@ impl Workspace {
     /// ```
     pub fn preflight_apply_incoming(&self, remote: impl AsRef<str>) -> Result<ApplyIncomingReport> {
         self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation("preflight_apply_incoming")?;
         let sync_status = self.sync_status(remote)?;
         let dirty_files = self.changed_files_unchecked()?;
 
@@ -6209,19 +5974,7 @@ impl Workspace {
                 sync_status.remote, sync_status.variation
             );
             let remote_oid = self.repo.refname_to_id(&remote_ref)?;
-            let local_oid = self
-                .repo
-                .refname_to_id(&format!("refs/heads/{}", sync_status.variation))?;
-            let hazard_oid = self
-                .incoming_remote_rewrite(
-                    &sync_status.remote,
-                    &sync_status.variation,
-                    local_oid,
-                    remote_oid,
-                )?
-                .and_then(|rewrite| rewrite.replay_oids.last().copied())
-                .unwrap_or(remote_oid);
-            let hazard_commit = self.repo.find_commit(hazard_oid)?;
+            let hazard_commit = self.repo.find_commit(remote_oid)?;
             self.target_tree_hazards(&hazard_commit.tree()?)?
         } else {
             Vec::new()
@@ -6237,194 +5990,105 @@ impl Workspace {
         })
     }
 
-    /// Preflights creating an additive milestone merge for local saves.
-    pub fn preflight_milestone_merge(
-        &self,
-        remote: impl AsRef<str>,
-    ) -> Result<MilestoneMergeReport> {
-        self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation("preflight_milestone_merge")?;
-        let sync_status = self.sync_status(remote)?;
-        let dirty_files = self.changed_files_unchecked()?;
-        let local_oid = self.repo.head()?.peel_to_commit()?.id();
-        let mut token = None;
-        let mut first_parent = None;
-        let unpublished_versions = sync_status.ahead;
-
-        if matches!(sync_status.state, SyncState::LocalAhead) {
-            let remote_ref = format!(
-                "refs/remotes/{}/{}",
-                sync_status.remote, sync_status.variation
-            );
-            let remote_oid = self.repo.refname_to_id(&remote_ref)?;
-            let merge_base_oid = self.repo.merge_base(local_oid, remote_oid)?;
-            first_parent = Some(VersionId::from(remote_oid));
-            if merge_base_oid == remote_oid && dirty_files.is_empty() {
-                token = Some(MilestoneMergeToken {
-                    remote: sync_status.remote.clone(),
-                    variation: sync_status.variation.clone(),
-                    local_oid: local_oid.to_string(),
-                    remote_oid: remote_oid.to_string(),
-                    merge_base_oid: merge_base_oid.to_string(),
-                });
-            }
-        }
-
-        Ok(MilestoneMergeReport {
-            sync_status,
-            dirty_files,
-            token: token.clone(),
-            can_create_milestone: token.is_some(),
-            unpublished_versions,
-            first_parent,
-            second_parent: VersionId::from(local_oid),
-            changed_workspace: false,
-        })
-    }
-
-    /// Creates a two-parent milestone merge whose first parent is the shared tip
-    /// and second parent is the preserved local save chain.
-    pub fn create_milestone_merge(
-        &self,
-        token: MilestoneMergeToken,
-        label: impl AsRef<str>,
-        options: &mut RemoteOptions<'_>,
-    ) -> Result<MilestoneMergeResult> {
-        self.create_milestone_merge_with_optional_profile(token, label, options, None)
-    }
-
-    /// Creates an additive milestone merge using host-supplied attribution.
-    pub fn create_milestone_merge_with_profile(
-        &self,
-        token: MilestoneMergeToken,
-        label: impl AsRef<str>,
-        options: &mut RemoteOptions<'_>,
-        profile: &ContributorProfile,
-    ) -> Result<MilestoneMergeResult> {
-        self.create_milestone_merge_with_optional_profile(token, label, options, Some(profile))
-    }
-
-    fn create_milestone_merge_with_optional_profile(
-        &self,
-        token: MilestoneMergeToken,
-        label: impl AsRef<str>,
-        options: &mut RemoteOptions<'_>,
-        profile: Option<&ContributorProfile>,
-    ) -> Result<MilestoneMergeResult> {
-        self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation("create_milestone_merge")?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "create_milestone_merge")?;
-        let dirty_files = self.changed_files_unchecked()?;
-        if !dirty_files.is_empty() {
-            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "create_milestone_merge",
-                true,
-                dirty_files,
-                Vec::new(),
-                None,
-            ))));
-        }
-
-        let variation = self.current_variation_unchecked()?;
-        let local_commit = self.repo.head()?.peel_to_commit()?;
-        if variation != token.variation || local_commit.id().to_string() != token.local_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{}@{}", token.variation, token.local_oid),
-                actual: format!("{variation}@{}", local_commit.id()),
-            });
-        }
-
-        self.fetch_remote_unchecked(&token.remote, options)?;
-        let status = self.sync_status(&token.remote)?;
-        if status.state != SyncState::LocalAhead {
-            return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
-        }
-        let actual_remote_oid = remote_tracking_oid(&self.repo, &token.remote, &token.variation);
-        if actual_remote_oid.as_deref() != Some(token.remote_oid.as_str()) {
-            return Err(DraftlineError::RemoteRace {
-                remote: token.remote,
-                variation: token.variation,
-                expected: Some(token.remote_oid),
-                actual: actual_remote_oid,
-            });
-        }
-
-        let remote_oid = Oid::from_str(&token.remote_oid)?;
-        let merge_base_oid = self.repo.merge_base(local_commit.id(), remote_oid)?;
-        if merge_base_oid.to_string() != token.merge_base_oid || merge_base_oid != remote_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: token.merge_base_oid,
-                actual: merge_base_oid.to_string(),
-            });
-        }
-
-        let remote_commit = self.repo.find_commit(remote_oid)?;
-        let tree = local_commit.tree()?;
-        let (author, committer) = self.workspace_signatures(profile)?;
-        let operation_id = new_operation_id();
-        self.write_recovery_state(&RecoveryState {
-            operation_id: operation_id.clone(),
-            operation: RecoveryOperation::MilestoneMerge,
-            original_variation: Some(variation),
-            target: Some(token.remote_oid.clone()),
-            completed: false,
-        })?;
-
-        let oid = self.repo.commit(
-            None,
-            &author,
-            &committer,
-            label.as_ref(),
-            &tree,
-            &[&remote_commit, &local_commit],
-        )?;
-        let branch_ref = format!("refs/heads/{}", token.variation);
-        self.repo
-            .reference(&branch_ref, oid, true, "create_milestone_merge")?;
-        self.repo.set_head(&branch_ref)?;
-
-        self.write_recovery_state(&RecoveryState {
-            operation_id,
-            operation: RecoveryOperation::MilestoneMerge,
-            original_variation: None,
-            target: Some(oid.to_string()),
-            completed: true,
-        })?;
-
-        Ok(MilestoneMergeResult {
-            version: version_from_commit(&self.repo.find_commit(oid)?),
-            first_parent: VersionId::from(remote_oid),
-            second_parent: VersionId::from(local_commit.id()),
-            preserved_versions: status.ahead,
-        })
-    }
-
     /// Preflights a diverged incoming merge without mutating workspace state.
     pub fn preflight_merge_incoming(&self, remote: impl AsRef<str>) -> Result<MergeIncomingReport> {
         self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation("preflight_merge_incoming")?;
         let sync_status = self.sync_status(remote)?;
+        self.preflight_merge_from(sync_status, None)
+    }
+
+    /// Compares the current variation with the base branch (usually `main`) as
+    /// last fetched; `variation` in the result names the base. Use it to show
+    /// "behind main by N" without changing anything.
+    pub fn base_status(&self, remote: impl AsRef<str>) -> Result<SyncStatus> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref();
+        let base = self
+            .default_branch_on(remote)
+            .ok_or(DraftlineError::SendBaseUnknown)?;
+        self.base_status_unchecked(remote, &base)
+    }
+
+    /// Preflights bringing the latest base branch into the current variation.
+    /// The token works with [`Self::merge_incoming`] and
+    /// [`Self::merge_incoming_with_resolutions`]. Developers' changes outside
+    /// the project come along as-is; conflicts there need a developer.
+    pub fn preflight_merge_base(&self, remote: impl AsRef<str>) -> Result<MergeIncomingReport> {
+        let status = self.base_status(remote)?;
+        // On the base itself this is an ordinary incoming merge; when only
+        // behind, use [`Self::apply_incoming`] to fast-forward instead.
+        let source = (status.variation != self.current_variation_unchecked()?)
+            .then(|| status.variation.clone());
+        self.preflight_merge_from(status, source)
+    }
+
+    fn base_status_unchecked(&self, remote: &str, base: &str) -> Result<SyncStatus> {
+        let local = self.repo.head()?.peel_to_commit()?.id();
+        let Ok(remote_oid) = self
+            .repo
+            .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
+        else {
+            return Ok(SyncStatus {
+                remote: remote.to_string(),
+                variation: base.to_string(),
+                ahead: 0,
+                behind: 0,
+                state: SyncState::NoRemoteVersion,
+                incoming: Vec::new(),
+            });
+        };
+        let (ahead, behind) = self.repo.graph_ahead_behind(local, remote_oid)?;
+        let state = match (ahead, behind) {
+            (0, 0) => SyncState::UpToDate,
+            (_, 0) => SyncState::LocalAhead,
+            (0, _) => SyncState::IncomingAvailable,
+            _ => SyncState::NeedsMerge,
+        };
+        Ok(SyncStatus {
+            remote: remote.to_string(),
+            variation: base.to_string(),
+            ahead,
+            behind,
+            state,
+            incoming: self.incoming_versions(local, remote_oid)?,
+        })
+    }
+
+    fn mergeable_state(state: &SyncState, from_base: bool) -> bool {
+        *state == SyncState::NeedsMerge || (from_base && *state == SyncState::IncomingAvailable)
+    }
+
+    fn preflight_merge_from(
+        &self,
+        sync_status: SyncStatus,
+        source: Option<String>,
+    ) -> Result<MergeIncomingReport> {
         let dirty_files = self.changed_files_unchecked()?;
         let mut file_hazards = Vec::new();
         let mut conflicts = Vec::new();
+        let mut developer_conflicts = Vec::new();
         let mut token = None;
 
-        if matches!(sync_status.state, SyncState::NeedsMerge) {
+        if Self::mergeable_state(&sync_status.state, source.is_some()) {
             let merge_input = self.merge_input_for_status(&sync_status)?;
-            file_hazards = self.target_tree_hazards(&merge_input.remote_commit.tree()?)?;
             let plan = self.plan_clean_merge(
                 &merge_input.base_commit.tree()?,
                 &merge_input.local_commit.tree()?,
                 &merge_input.remote_commit.tree()?,
             )?;
+            match self.merged_tree(&merge_input, &plan.files)? {
+                Ok(tree) => file_hazards = self.target_tree_hazards(&self.repo.find_tree(tree)?)?,
+                Err(paths) => developer_conflicts = paths,
+            }
             conflicts = plan.conflicts;
-            if dirty_files.is_empty() && file_hazards.is_empty() {
+            if dirty_files.is_empty() && file_hazards.is_empty() && developer_conflicts.is_empty() {
                 token = Some(MergeIncomingToken {
                     remote: sync_status.remote.clone(),
-                    variation: sync_status.variation.clone(),
+                    variation: self.current_variation_unchecked()?,
                     local_oid: merge_input.local_commit.id().to_string(),
                     remote_oid: merge_input.remote_commit.id().to_string(),
                     merge_base_oid: merge_input.base_commit.id().to_string(),
+                    source,
                 });
             }
         }
@@ -6435,6 +6099,7 @@ impl Workspace {
             dirty_files,
             file_hazards,
             conflicts,
+            developer_conflicts,
             token,
             can_merge_cleanly,
             changed_workspace: false,
@@ -6469,85 +6134,12 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
-        self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation("merge_incoming")?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "merge_incoming")?;
-        let dirty_files = self.changed_files_unchecked()?;
-        if !dirty_files.is_empty() {
-            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "merge_incoming",
-                true,
-                dirty_files,
-                Vec::new(),
-                None,
-            ))));
-        }
-
-        let variation = self.current_variation_unchecked()?;
-        let local_oid = self.repo.head()?.peel_to_commit()?.id().to_string();
-        if variation != token.variation || local_oid != token.local_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{}@{}", token.variation, token.local_oid),
-                actual: format!("{variation}@{local_oid}"),
-            });
-        }
-
-        self.fetch_remote_unchecked(&token.remote, options)?;
-        let status = self.sync_status(&token.remote)?;
-        if status.state != SyncState::NeedsMerge {
-            return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
-        }
-        let remote_oid = remote_tracking_oid(&self.repo, &token.remote, &token.variation);
-        if remote_oid.as_deref() != Some(token.remote_oid.as_str()) {
-            return Err(DraftlineError::RemoteRace {
-                remote: token.remote,
-                variation: token.variation,
-                expected: Some(token.remote_oid),
-                actual: remote_oid,
-            });
-        }
-
-        let merge_input = self.merge_input_for_status(&status)?;
-        if merge_input.base_commit.id().to_string() != token.merge_base_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: token.merge_base_oid,
-                actual: merge_input.base_commit.id().to_string(),
-            });
-        }
-
-        let remote_tree = merge_input.remote_commit.tree()?;
-        let file_hazards = self.target_tree_hazards(&remote_tree)?;
-        if !file_hazards.is_empty() {
-            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "merge_incoming",
-                true,
-                Vec::new(),
-                file_hazards,
-                None,
-            ))));
-        }
-
-        let plan = self.plan_clean_merge(
-            &merge_input.base_commit.tree()?,
-            &merge_input.local_commit.tree()?,
-            &remote_tree,
-        )?;
-        if !plan.conflicts.is_empty() {
-            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "merge_incoming",
-                true,
-                Vec::new(),
-                Vec::new(),
-                Some(plan.conflicts[0].label.clone()),
-            ))));
-        }
-
-        self.write_incoming_merge_version(
-            variation,
-            token.remote_oid,
-            &merge_input,
+        self.merge_incoming_core(
+            "merge_incoming",
+            token,
             label.as_ref(),
-            plan.files,
+            None,
+            options,
             profile,
         )
     }
@@ -6595,15 +6187,31 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
-        self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation(
+        self.merge_incoming_core(
             "merge_incoming_with_resolutions",
-        )?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "merge_incoming_with_resolutions")?;
+            token,
+            label.as_ref(),
+            Some(resolutions.into_iter().collect()),
+            options,
+            profile,
+        )
+    }
+
+    fn merge_incoming_core(
+        &self,
+        operation: &str,
+        token: MergeIncomingToken,
+        label: &str,
+        resolutions: Option<Vec<MergeConflictResolution>>,
+        options: &mut RemoteOptions<'_>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<MergeIncomingResult> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = self.acquire_for_index(operation)?;
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "merge_incoming_with_resolutions",
+                operation,
                 true,
                 dirty_files,
                 Vec::new(),
@@ -6620,16 +6228,29 @@ impl Workspace {
             });
         }
 
-        self.fetch_remote_unchecked(&token.remote, options)?;
-        let status = self.sync_status(&token.remote)?;
-        if status.state != SyncState::NeedsMerge {
+        let from_base = token
+            .source
+            .as_ref()
+            .is_some_and(|source| *source != token.variation);
+        let source = token
+            .source
+            .clone()
+            .unwrap_or_else(|| token.variation.clone());
+        let status = if from_base {
+            self.fetch_remote_variation_ref(&token.remote, &source, options)?;
+            self.base_status_unchecked(&token.remote, &source)?
+        } else {
+            self.fetch_remote_unchecked(&token.remote, options)?;
+            self.sync_status(&token.remote)?
+        };
+        if !Self::mergeable_state(&status.state, from_base) {
             return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
         }
-        let remote_oid = remote_tracking_oid(&self.repo, &token.remote, &token.variation);
+        let remote_oid = remote_tracking_oid(&self.repo, &token.remote, &source);
         if remote_oid.as_deref() != Some(token.remote_oid.as_str()) {
             return Err(DraftlineError::RemoteRace {
                 remote: token.remote,
-                variation: token.variation,
+                variation: source,
                 expected: Some(token.remote_oid),
                 actual: remote_oid,
             });
@@ -6643,11 +6264,32 @@ impl Workspace {
             });
         }
 
-        let remote_tree = merge_input.remote_commit.tree()?;
-        let file_hazards = self.target_tree_hazards(&remote_tree)?;
+        let plan = self.plan_clean_merge(
+            &merge_input.base_commit.tree()?,
+            &merge_input.local_commit.tree()?,
+            &merge_input.remote_commit.tree()?,
+        )?;
+        let files = match resolutions {
+            Some(resolutions) => self.resolve_merge_plan(plan, resolutions)?,
+            None if !plan.conflicts.is_empty() => {
+                return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                    operation,
+                    true,
+                    Vec::new(),
+                    Vec::new(),
+                    Some(plan.conflicts[0].label.clone()),
+                ))));
+            }
+            None => plan.files,
+        };
+        let tree = match self.merged_tree(&merge_input, &files)? {
+            Ok(tree) => self.repo.find_tree(tree)?,
+            Err(paths) => return Err(DraftlineError::MergeNeedsDeveloper(paths)),
+        };
+        let file_hazards = self.target_tree_hazards(&tree)?;
         if !file_hazards.is_empty() {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "merge_incoming_with_resolutions",
+                operation,
                 true,
                 Vec::new(),
                 file_hazards,
@@ -6655,21 +6297,7 @@ impl Workspace {
             ))));
         }
 
-        let plan = self.plan_clean_merge(
-            &merge_input.base_commit.tree()?,
-            &merge_input.local_commit.tree()?,
-            &remote_tree,
-        )?;
-        let files = self.resolve_merge_plan(plan, resolutions)?;
-
-        self.write_incoming_merge_version(
-            variation,
-            token.remote_oid,
-            &merge_input,
-            label.as_ref(),
-            files,
-            profile,
-        )
+        self.write_incoming_merge_version(variation, &merge_input, label, &tree, files, profile)
     }
 
     /// Applies incoming changes from a remote using a fast-forward when possible.
@@ -6699,8 +6327,7 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<ApplyIncomingResult> {
         self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation("apply_incoming")?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "apply_incoming")?;
+        let _lock = self.acquire_for_index("apply_incoming")?;
 
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
@@ -6732,16 +6359,7 @@ impl Workspace {
         let variation = self.current_variation_unchecked()?;
         let remote_ref = format!("refs/remotes/{remote_name}/{variation}");
         let remote_oid = self.repo.refname_to_id(&remote_ref)?;
-        let local_oid = self
-            .repo
-            .refname_to_id(&format!("refs/heads/{variation}"))?;
-        let incoming_rewrite =
-            self.incoming_remote_rewrite(&remote_name, &variation, local_oid, remote_oid)?;
-        let hazard_oid = incoming_rewrite
-            .as_ref()
-            .and_then(|rewrite| rewrite.replay_oids.last().copied())
-            .unwrap_or(remote_oid);
-        let hazard_commit = self.repo.find_commit(hazard_oid)?;
+        let hazard_commit = self.repo.find_commit(remote_oid)?;
         let file_hazards = self.target_tree_hazards(&hazard_commit.tree()?)?;
         if !file_hazards.is_empty() {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
@@ -6754,20 +6372,9 @@ impl Workspace {
         }
         let branch_ref = format!("refs/heads/{variation}");
 
-        // Save the original OID so we can roll back if checkout fails.
-        let original_oid = self.repo.refname_to_id(&branch_ref).ok();
-
         let operation_id = new_operation_id();
-        let remote_rewrite_application = if let Some(rewrite) = incoming_rewrite.as_ref() {
-            Some(self.prepare_incoming_remote_rewrite(&variation, local_oid, rewrite)?)
-        } else {
-            None
-        };
-        let target_oid = remote_rewrite_application
-            .as_ref()
-            .map(|application| application.target_oid)
-            .unwrap_or(remote_oid);
-        let checkout_commit = self.repo.find_commit(target_oid)?;
+        let target_oid = remote_oid;
+        let checkout_commit = hazard_commit;
 
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -6777,29 +6384,14 @@ impl Workspace {
             completed: false,
         })?;
 
-        // Fast-forward or rewrite the local branch ref to the incoming target.
+        // Bring files up to the incoming tree like `git merge --ff-only`: local
+        // edits are never overwritten. This runs before the ref moves so HEAD
+        // is still the checkout baseline.
+        self.checkout_or_keep_recovery(&checkout_commit.tree()?)?;
         self.repo
             .reference(&branch_ref, target_oid, true, "apply_incoming")?;
 
-        // Bring the working directory up to the new tree.  Roll back the ref if
-        // checkout fails so the repo is not left with a moved branch and stale tree.
-        if let Err(checkout_err) = self.repo.checkout_tree(
-            checkout_commit.tree()?.as_object(),
-            Some(CheckoutBuilder::new().force()),
-        ) {
-            if let Some(orig) = original_oid {
-                let _ = self
-                    .repo
-                    .reference(&branch_ref, orig, true, "apply_incoming rollback");
-            }
-            let _ = self.acknowledge_recovery();
-            return Err(checkout_err.into());
-        }
-
         self.repo.set_head(&branch_ref)?;
-        if let Some(application) = remote_rewrite_application {
-            self.write_history_cleanup_ledger(&application.ledger)?;
-        }
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -6810,1132 +6402,6 @@ impl Workspace {
         })?;
 
         Ok(ApplyIncomingResult { applied_count })
-    }
-
-    /// Squashes the last `count` versions into a single new version.
-    ///
-    /// The new version has the same tree as the current `HEAD` but is parented
-    /// directly on the commit that preceded the squashed range, collapsing
-    /// `count` intermediate commits into one.
-    ///
-    /// Requires:
-    /// - `count >= 2`
-    /// - The workspace must be clean (no unsaved changes).
-    /// - The current variation must have at least `count + 1` versions (so
-    ///   there is a parent commit outside the squash range to attach to).
-    ///
-    /// ```no_run
-    /// use draftline::Workspace;
-    ///
-    /// let workspace = Workspace::open("my-content")?;
-    /// let squashed = workspace.squash_versions(3, "Squashed three drafts")?;
-    /// println!("squashed → {}", squashed.label);
-    /// # Ok::<(), draftline::DraftlineError>(())
-    /// ```
-    pub fn preflight_squash_versions(&self, count: usize) -> Result<SquashVersionsPreflight> {
-        self.ensure_no_pending_recovery()?;
-
-        if count < 2 {
-            return Err(DraftlineError::InvalidSquashCount(count));
-        }
-
-        let dirty_files = self.changed_files_unchecked()?;
-        if !dirty_files.is_empty() {
-            let variation = VariationId::from(self.current_variation_unchecked()?);
-            return Ok(SquashVersionsPreflight {
-                variation,
-                count,
-                head_oid: String::new(),
-                squash_parent_oid: String::new(),
-                support_ref: String::new(),
-                dirty_files,
-                token: None,
-                can_squash: false,
-            });
-        }
-
-        let mut walk = self.repo.revwalk()?;
-        walk.push_head()?;
-        let commit_oids: Vec<Oid> = walk
-            .take(count)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        if commit_oids.len() < count {
-            return Err(DraftlineError::NotEnoughVersionsToSquash {
-                needed: count,
-                available: commit_oids.len(),
-            });
-        }
-
-        let head_commit = self.repo.find_commit(commit_oids[0])?;
-        let oldest_commit = self.repo.find_commit(commit_oids[count - 1])?;
-
-        // The squash commit's parent is the commit that precedes the squash range.
-        let squash_parent =
-            oldest_commit
-                .parent(0)
-                .map_err(|_| DraftlineError::NotEnoughVersionsToSquash {
-                    needed: count + 1,
-                    available: count,
-                })?;
-
-        let variation = VariationId::from(self.current_variation_unchecked()?);
-        let operation_id = new_operation_id();
-        let support_ref = archive_ref("rewrites/squash", variation.as_str(), &operation_id);
-        let token = SquashVersionsToken {
-            operation_id,
-            variation: variation.clone(),
-            count,
-            head_oid: head_commit.id().to_string(),
-            squash_parent_oid: squash_parent.id().to_string(),
-            support_ref: support_ref.clone(),
-        };
-
-        Ok(SquashVersionsPreflight {
-            variation,
-            count,
-            head_oid: head_commit.id().to_string(),
-            squash_parent_oid: squash_parent.id().to_string(),
-            support_ref,
-            dirty_files: Vec::new(),
-            token: Some(token),
-            can_squash: true,
-        })
-    }
-
-    /// Squashes the last `count` preflighted versions into a single new version.
-    pub fn squash_versions_with_token(
-        &self,
-        token: SquashVersionsToken,
-        label: impl AsRef<str>,
-    ) -> Result<Version> {
-        self.squash_versions_with_token_and_optional_profile(token, label, None)
-    }
-
-    /// Squashes preflighted versions into a single new version using host-supplied attribution.
-    pub fn squash_versions_with_token_and_profile(
-        &self,
-        token: SquashVersionsToken,
-        label: impl AsRef<str>,
-        profile: &ContributorProfile,
-    ) -> Result<Version> {
-        self.squash_versions_with_token_and_optional_profile(token, label, Some(profile))
-    }
-
-    fn squash_versions_with_token_and_optional_profile(
-        &self,
-        token: SquashVersionsToken,
-        label: impl AsRef<str>,
-        profile: Option<&ContributorProfile>,
-    ) -> Result<Version> {
-        self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "squash_versions")?;
-        let variation = self.current_variation_unchecked()?;
-        if variation != token.variation.as_str() {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: token.variation.as_str().to_string(),
-                actual: variation,
-            });
-        }
-
-        let head_commit = self.repo.head()?.peel_to_commit()?;
-        if head_commit.id().to_string() != token.head_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{}@{}", token.variation.as_str(), token.head_oid),
-                actual: format!("{}@{}", token.variation.as_str(), head_commit.id()),
-            });
-        }
-        let squash_parent_oid = Oid::from_str(&token.squash_parent_oid)?;
-        let squash_parent = self.repo.find_commit(squash_parent_oid)?;
-        let tree = head_commit.tree()?;
-        let (author, committer) = self.rewrite_signatures(profile)?;
-
-        // Create the squash commit without touching any ref yet — git2 would
-        // reject Some("HEAD") here because squash_parent is not the current tip.
-        let oid = self.repo.commit(
-            None,
-            &author,
-            &committer,
-            label.as_ref(),
-            &tree,
-            &[&squash_parent],
-        )?;
-
-        // Force the current branch to point at the new squash commit.
-        let branch_ref = format!("refs/heads/{variation}");
-        self.write_recovery_state(&RecoveryState {
-            operation_id: token.operation_id.clone(),
-            operation: RecoveryOperation::SquashVersions,
-            original_variation: Some(variation.clone()),
-            target: Some(token.head_oid.clone()),
-            completed: false,
-        })?;
-        self.repo.reference(
-            &token.support_ref,
-            head_commit.id(),
-            false,
-            "archive pre-squash tip",
-        )?;
-        self.repo
-            .reference(&branch_ref, oid, true, "squash_versions")?;
-        self.write_recovery_state(&RecoveryState {
-            operation_id: token.operation_id,
-            operation: RecoveryOperation::SquashVersions,
-            original_variation: None,
-            target: Some(oid.to_string()),
-            completed: true,
-        })?;
-
-        Ok(version_from_commit(&self.repo.find_commit(oid)?))
-    }
-
-    pub fn squash_versions(&self, count: usize, label: impl AsRef<str>) -> Result<Version> {
-        self.squash_versions_with_optional_profile(count, label, None)
-    }
-
-    /// Squashes the last `count` versions into a single new version using host-supplied
-    /// attribution.
-    pub fn squash_versions_with_profile(
-        &self,
-        count: usize,
-        label: impl AsRef<str>,
-        profile: &ContributorProfile,
-    ) -> Result<Version> {
-        self.squash_versions_with_optional_profile(count, label, Some(profile))
-    }
-
-    fn squash_versions_with_optional_profile(
-        &self,
-        count: usize,
-        label: impl AsRef<str>,
-        profile: Option<&ContributorProfile>,
-    ) -> Result<Version> {
-        let preflight = self.preflight_squash_versions(count)?;
-        let Some(token) = preflight.token else {
-            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                "squash_versions",
-                false,
-                preflight.dirty_files,
-                Vec::new(),
-                None,
-            ))));
-        };
-        self.squash_versions_with_token_and_optional_profile(token, label, profile)
-    }
-
-    /// Prepares a durable local timeline cleanup plan without moving visible refs.
-    pub fn preview_history_cleanup(
-        &self,
-        request: HistoryCleanupRequest,
-    ) -> Result<HistoryCleanupPreview> {
-        let mut options = RemoteOptions::new();
-        self.preview_history_cleanup_with_options(request, &mut options)
-    }
-
-    /// Prepares a durable local cleanup plan whose milestone commits use host-supplied
-    /// attribution. Replayed descendants keep their original author and committer.
-    pub fn preview_history_cleanup_with_profile(
-        &self,
-        request: HistoryCleanupRequest,
-        profile: &ContributorProfile,
-    ) -> Result<HistoryCleanupPreview> {
-        let mut options = RemoteOptions::new();
-        self.preview_history_cleanup_with_optional_profile(request, &mut options, Some(profile))
-    }
-
-    /// Prepares a durable timeline cleanup plan with explicit remote options.
-    pub fn preview_history_cleanup_with_options(
-        &self,
-        request: HistoryCleanupRequest,
-        options: &mut RemoteOptions<'_>,
-    ) -> Result<HistoryCleanupPreview> {
-        self.preview_history_cleanup_with_optional_profile(request, options, None)
-    }
-
-    /// Prepares a durable timeline cleanup plan with explicit remote options and
-    /// host-supplied attribution for milestone commits.
-    pub fn preview_history_cleanup_with_options_and_profile(
-        &self,
-        request: HistoryCleanupRequest,
-        options: &mut RemoteOptions<'_>,
-        profile: &ContributorProfile,
-    ) -> Result<HistoryCleanupPreview> {
-        self.preview_history_cleanup_with_optional_profile(request, options, Some(profile))
-    }
-
-    fn preview_history_cleanup_with_optional_profile(
-        &self,
-        request: HistoryCleanupRequest,
-        options: &mut RemoteOptions<'_>,
-        profile: Option<&ContributorProfile>,
-    ) -> Result<HistoryCleanupPreview> {
-        self.ensure_no_pending_recovery()?;
-        let target_variation = match request.target_variation.clone() {
-            Some(variation) => VariationId::from(validate_variation_name(variation.as_str())?),
-            None => VariationId::from(self.current_variation_unchecked()?),
-        };
-        let target_name = target_variation.as_str();
-        let target_branch = self.find_local_variation_branch(target_name)?;
-        let old_head_oid = target_branch.get().peel_to_commit()?.id();
-
-        if request.safety.require_clean_worktree {
-            let dirty_files = self.changed_files_unchecked()?;
-            if !dirty_files.is_empty() {
-                return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                    "history_cleanup",
-                    false,
-                    dirty_files,
-                    Vec::new(),
-                    None,
-                ))));
-            }
-        }
-
-        let plan_id = CleanupPlanId::from_string(new_operation_id())?;
-        let planned_backup_ref = if request.safety.create_backup_ref {
-            Some(request.safety.backup_ref_name.clone().unwrap_or_else(|| {
-                RefName::from(archive_ref(
-                    "backups/history-cleanup",
-                    target_name,
-                    plan_id.as_str(),
-                ))
-            }))
-        } else {
-            None
-        };
-
-        let (milestones, preserve_named_branches, preserve_merge_boundaries) = match &request.mode {
-            CleanupMode::CompactMilestones {
-                milestones,
-                preserve_named_branches,
-                preserve_merge_boundaries,
-            } => (
-                milestones.as_slice(),
-                *preserve_named_branches,
-                *preserve_merge_boundaries,
-            ),
-        };
-
-        let mut warnings = cleanup_remote_warnings(&request.remote_policy);
-        let planned = self.plan_compact_milestones(CompactCleanupPlanInput {
-            target_variation: &target_variation,
-            old_head_oid,
-            base: &request.base,
-            milestones,
-            preserve_named_branches,
-            preserve_merge_boundaries,
-            profile,
-        })?;
-        let remote_impact_remote =
-            if let RemoteRewritePolicy::PushWithLease { remote, branch } = &request.remote_policy {
-                self.fetch_remote_variation_ref(remote, branch, options)?;
-                Some(remote.as_str())
-            } else {
-                None
-            };
-        warnings.extend(planned.warnings);
-
-        let preview_ref = RefName::from(format!(
-            "refs/draftline/previews/history-cleanup/{target_name}/{}",
-            plan_id.as_str()
-        ));
-        self.repo.reference(
-            preview_ref.as_str(),
-            planned.new_head_oid,
-            false,
-            "prepare history cleanup preview",
-        )?;
-
-        let preview = HistoryCleanupPreview {
-            plan_id,
-            target_variation: target_variation.clone(),
-            old_head: VersionId::from(old_head_oid),
-            new_head: VersionId::from(planned.new_head_oid),
-            preview_ref,
-            planned_backup_ref,
-            selected_commit_count: planned.selected_commit_count,
-            descendant_rewrite_count: planned.descendant_rewrite_count,
-            affected_refs: planned.affected_refs,
-            planned_ref_updates: planned.planned_ref_updates,
-            operations: planned.operations,
-            graph_diff: CleanupGraphDiff {
-                old_head: VersionId::from(old_head_oid),
-                new_head: VersionId::from(planned.new_head_oid),
-                old_commit_count: planned.old_commit_count,
-                new_commit_count: planned.new_commit_count,
-                squashed_commit_count: planned
-                    .old_commit_count
-                    .saturating_sub(planned.new_commit_count),
-            },
-            commit_map: planned.commit_map.clone(),
-            snapshot_map: planned.snapshot_map.clone(),
-            remote_impact: self.cleanup_remote_impact_for_oids(
-                remote_impact_remote,
-                &target_variation,
-                old_head_oid,
-                Some(planned.new_head_oid),
-                &planned
-                    .commit_map
-                    .iter()
-                    .filter_map(|entry| {
-                        matches!(entry.disposition, RewriteDisposition::SquashedInto { .. })
-                            .then(|| oid_from_version(&entry.old).ok())
-                            .flatten()
-                    })
-                    .collect::<Vec<_>>(),
-                &planned
-                    .commit_map
-                    .iter()
-                    .filter_map(|entry| {
-                        matches!(entry.disposition, RewriteDisposition::Preserved { .. })
-                            .then(|| oid_from_version(&entry.old).ok())
-                            .flatten()
-                    })
-                    .collect::<Vec<_>>(),
-            )?,
-            warnings,
-        };
-
-        self.write_history_cleanup_plan(&HistoryCleanupStoredPlan {
-            request,
-            preview: preview.clone(),
-        })?;
-
-        Ok(preview)
-    }
-
-    /// Applies a durable cleanup preview after confirming the target state is unchanged.
-    pub fn apply_history_cleanup(
-        &self,
-        plan_id: CleanupPlanId,
-        confirmation: RewriteConfirmation,
-    ) -> Result<TimelineCleanupResult> {
-        self.apply_history_cleanup_with_optional_profile(plan_id, confirmation, None)
-    }
-
-    /// Applies a durable cleanup preview so its milestone commits record host-supplied
-    /// attribution.
-    ///
-    /// When the preview's milestone commits already carry this profile, the preview is
-    /// applied as-is. Otherwise the milestones are re-created with the profile before any
-    /// visible ref moves; the re-created plan must match the preview's rewrite map and
-    /// ref updates, or the apply fails and asks for a new preview. Replayed descendants
-    /// keep their original author and committer.
-    pub fn apply_history_cleanup_with_profile(
-        &self,
-        plan_id: CleanupPlanId,
-        confirmation: RewriteConfirmation,
-        profile: &ContributorProfile,
-    ) -> Result<TimelineCleanupResult> {
-        self.apply_history_cleanup_with_optional_profile(plan_id, confirmation, Some(profile))
-    }
-
-    fn apply_history_cleanup_with_optional_profile(
-        &self,
-        plan_id: CleanupPlanId,
-        _confirmation: RewriteConfirmation,
-        profile: Option<&ContributorProfile>,
-    ) -> Result<TimelineCleanupResult> {
-        self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "history_cleanup")?;
-        let mut stored = self.read_history_cleanup_plan(&plan_id)?;
-        self.ensure_no_pending_history_cleanup(
-            "history_cleanup",
-            Some(stored.preview.target_variation.as_str()),
-        )?;
-        if stored.request.safety.require_clean_worktree {
-            let dirty_files = self.changed_files_unchecked()?;
-            if !dirty_files.is_empty() {
-                return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
-                    "history_cleanup",
-                    false,
-                    dirty_files,
-                    Vec::new(),
-                    None,
-                ))));
-            }
-        }
-
-        let variation = stored.preview.target_variation.as_str().to_owned();
-        let variation = variation.as_str();
-        let branch_ref = format!("refs/heads/{variation}");
-        let old_head_oid = oid_from_version(&stored.preview.old_head)?;
-        let new_head_oid = oid_from_version(&stored.preview.new_head)?;
-        for update in &stored.preview.planned_ref_updates {
-            let Some(expected_old) = update.old.as_ref() else {
-                continue;
-            };
-            let expected_old_oid = oid_from_version(expected_old)?;
-            let actual = self.repo.refname_to_id(update.name.as_str())?;
-            if actual != expected_old_oid {
-                return Err(DraftlineError::LocalStateChanged {
-                    expected: format!("{}@{expected_old_oid}", update.name.as_str()),
-                    actual: format!("{}@{actual}", update.name.as_str()),
-                });
-            }
-        }
-
-        let remint_profile = match profile {
-            Some(profile)
-                if !self.history_cleanup_milestones_match_profile(&stored.preview, profile)? =>
-            {
-                Some(profile)
-            }
-            _ => None,
-        };
-        // A re-mint regenerates the preview from the verified refs and overwrites the
-        // preview ref, so the preview-ref check is skipped. This keeps a retry safe if
-        // a previous re-mint was interrupted between the ref move and the plan write.
-        if let Some(profile) = remint_profile {
-            stored.preview = self.reattribute_history_cleanup_preview(&stored, profile)?;
-            self.write_history_cleanup_plan(&stored)?;
-        } else {
-            let actual_preview = self
-                .repo
-                .refname_to_id(stored.preview.preview_ref.as_str())?;
-            if actual_preview != new_head_oid {
-                return Err(DraftlineError::LocalStateChanged {
-                    expected: format!("{}@{new_head_oid}", stored.preview.preview_ref.as_str()),
-                    actual: format!("{}@{actual_preview}", stored.preview.preview_ref.as_str()),
-                });
-            }
-        }
-
-        let mut backup_refs = Vec::new();
-        if let Some(backup_ref) = stored.preview.planned_backup_ref.as_ref() {
-            self.ensure_archive_ref(
-                backup_ref.as_str(),
-                old_head_oid,
-                "backup before history cleanup",
-            )?;
-            backup_refs.push(backup_ref.clone());
-        }
-
-        self.write_recovery_state(&RecoveryState {
-            operation_id: plan_id.as_str().to_string(),
-            operation: RecoveryOperation::HistoryCleanup,
-            original_variation: Some(variation.to_string()),
-            target: Some(stored.preview.old_head.to_string()),
-            completed: false,
-        })?;
-
-        for update in &stored.preview.planned_ref_updates {
-            let Some(new) = update.new.as_ref() else {
-                continue;
-            };
-            self.repo.reference(
-                update.name.as_str(),
-                oid_from_version(new)?,
-                true,
-                "history_cleanup",
-            )?;
-        }
-        if self.head_symbolic_variation().as_deref() == Some(variation) {
-            self.repo.set_head(&branch_ref)?;
-            self.repo
-                .checkout_head(Some(CheckoutBuilder::new().force()))?;
-        }
-
-        let result = TimelineCleanupResult {
-            plan_id: plan_id.clone(),
-            old_head: stored.preview.old_head.clone(),
-            new_head: stored.preview.new_head.clone(),
-            backup_refs,
-            ref_updates: stored.preview.planned_ref_updates.clone(),
-            commit_map: stored.preview.commit_map.clone(),
-            snapshot_map: stored.preview.snapshot_map.clone(),
-            warnings: stored.preview.warnings.clone(),
-        };
-        self.write_history_cleanup_ledger(&result)?;
-        if stored
-            .preview
-            .remote_impact
-            .as_ref()
-            .is_some_and(history_cleanup_needs_pending_resolution)
-        {
-            self.upsert_pending_history_cleanup(PendingHistoryCleanup {
-                plan_id: plan_id.clone(),
-                target_variation: stored.preview.target_variation.clone(),
-                expected_local_head: stored.preview.old_head.clone(),
-                replacement_head: stored.preview.new_head.clone(),
-                backup_refs: result.backup_refs.clone(),
-                ref_updates: result.ref_updates.clone(),
-                remote_impact: stored.preview.remote_impact.clone(),
-                publish_status: stored
-                    .preview
-                    .remote_impact
-                    .as_ref()
-                    .map(|impact| impact.publish_status.clone()),
-                expected_remote_oid: stored
-                    .preview
-                    .remote_impact
-                    .as_ref()
-                    .and_then(|impact| impact.upstream_head.clone()),
-            })?;
-        }
-        self.write_recovery_state(&RecoveryState {
-            operation_id: plan_id.as_str().to_string(),
-            operation: RecoveryOperation::HistoryCleanup,
-            original_variation: None,
-            target: Some(stored.preview.new_head.to_string()),
-            completed: true,
-        })?;
-        Ok(result)
-    }
-
-    /// Reports origin-aware publish impact for a prepared cleanup plan.
-    pub fn preflight_history_cleanup_remote_impact(
-        &self,
-        plan_id: CleanupPlanId,
-        remote: impl AsRef<str>,
-    ) -> Result<HistoryCleanupRemoteImpact> {
-        let mut options = RemoteOptions::new();
-        self.preflight_history_cleanup_remote_impact_with_options(plan_id, remote, &mut options)
-    }
-
-    /// Reports origin-aware publish impact with explicit remote options.
-    pub fn preflight_history_cleanup_remote_impact_with_options(
-        &self,
-        plan_id: CleanupPlanId,
-        remote: impl AsRef<str>,
-        options: &mut RemoteOptions<'_>,
-    ) -> Result<HistoryCleanupRemoteImpact> {
-        self.ensure_no_pending_recovery()?;
-        let stored = self.read_history_cleanup_plan(&plan_id)?;
-        let remote = remote.as_ref().to_string();
-        self.fetch_remote_variation_ref(
-            &remote,
-            stored.preview.target_variation.as_str(),
-            options,
-        )?;
-        self.cleanup_remote_impact_from_preview(&stored.preview, Some(remote.as_str()))
-    }
-
-    /// Preflights explicitly publishing an applied cleanup rewrite to a shared remote.
-    pub fn preflight_publish_history_cleanup(
-        &self,
-        plan_id: CleanupPlanId,
-        remote: impl AsRef<str>,
-    ) -> Result<HistoryCleanupPublishPreflight> {
-        let mut options = RemoteOptions::new();
-        self.preflight_publish_history_cleanup_with_options(plan_id, remote, &mut options)
-    }
-
-    /// Preflights cleanup publish with explicit remote options.
-    pub fn preflight_publish_history_cleanup_with_options(
-        &self,
-        plan_id: CleanupPlanId,
-        remote: impl AsRef<str>,
-        options: &mut RemoteOptions<'_>,
-    ) -> Result<HistoryCleanupPublishPreflight> {
-        self.ensure_no_pending_recovery()?;
-        let remote = remote.as_ref().to_string();
-        self.repo.find_remote(&remote)?;
-        let stored = self.read_history_cleanup_plan(&plan_id)?;
-        let ledger = self.read_history_cleanup_ledger(&plan_id)?;
-        let variation = stored.preview.target_variation.clone();
-        let branch_ref = format!("refs/heads/{}", variation.as_str());
-        let actual_local_oid = self.repo.refname_to_id(&branch_ref)?.to_string();
-        if actual_local_oid != ledger.new_head.as_str() {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{branch_ref}@{}", ledger.new_head),
-                actual: format!("{branch_ref}@{actual_local_oid}"),
-            });
-        }
-
-        self.fetch_remote_variation_ref(&remote, variation.as_str(), options)?;
-        let expected_remote_oid = remote_tracking_oid(&self.repo, &remote, variation.as_str())
-            .ok_or_else(|| DraftlineError::VersionNotFound(variation.as_str().to_string()))?;
-        let remote_impact =
-            self.cleanup_remote_impact_from_preview(&stored.preview, Some(&remote))?;
-        if remote_impact.publish_status == CleanupPublishStatus::RemoteHasIncoming {
-            return Err(DraftlineError::RemoteRace {
-                remote,
-                variation: variation.as_str().to_string(),
-                expected: Some(ledger.old_head.to_string()),
-                actual: Some(expected_remote_oid),
-            });
-        }
-
-        let support_ref = archive_ref("rewrites/squash", variation.as_str(), plan_id.as_str());
-        self.ensure_archive_ref(
-            &support_ref,
-            Oid::from_str(&expected_remote_oid)?,
-            "backup before publishing history cleanup rewrite",
-        )?;
-        let support_ref_preflight =
-            self.preflight_publish_support_refs_with_options(&remote, options)?;
-        let support_refs = self
-            .list_local_support_refs()?
-            .into_iter()
-            .filter(|support_ref| {
-                support_ref.kind == SupportRefKind::Rewrite
-                    && support_ref.source_variation.as_deref() == Some(variation.as_str())
-                    && support_ref.target_oid == expected_remote_oid
-            })
-            .collect::<Vec<_>>();
-        let can_publish = !support_refs.is_empty()
-            && remote_impact.publish_status == CleanupPublishStatus::SharedHistoryRewriteRequired;
-        let token = can_publish.then(|| HistoryCleanupPublishToken {
-            plan_id: plan_id.clone(),
-            remote: remote.clone(),
-            variation: variation.clone(),
-            expected_remote_oid: expected_remote_oid.clone(),
-            replacement_oid: ledger.new_head.to_string(),
-            support_ref_token: support_ref_preflight.token,
-        });
-        self.update_pending_history_cleanup_publish_state(
-            &plan_id,
-            remote_impact.clone(),
-            VersionId::from_canonical_string(expected_remote_oid.clone()).ok(),
-        )?;
-
-        Ok(HistoryCleanupPublishPreflight {
-            plan_id,
-            remote,
-            variation,
-            expected_remote_oid,
-            replacement_oid: ledger.new_head.to_string(),
-            remote_impact,
-            support_refs,
-            token,
-            can_publish,
-        })
-    }
-
-    /// Publishes an applied cleanup rewrite after explicit shared-history confirmation.
-    pub fn publish_history_cleanup(
-        &self,
-        token: HistoryCleanupPublishToken,
-        confirmation: RewriteConfirmation,
-    ) -> Result<HistoryCleanupPublishResult> {
-        let mut options = RemoteOptions::new();
-        self.publish_history_cleanup_with_options(token, confirmation, &mut options)
-    }
-
-    /// Publishes an applied cleanup rewrite with explicit remote options.
-    pub fn publish_history_cleanup_with_options(
-        &self,
-        token: HistoryCleanupPublishToken,
-        _confirmation: RewriteConfirmation,
-        options: &mut RemoteOptions<'_>,
-    ) -> Result<HistoryCleanupPublishResult> {
-        self.ensure_no_pending_recovery()?;
-        let ledger = self.read_history_cleanup_ledger(&token.plan_id)?;
-        let branch_ref = format!("refs/heads/{}", token.variation.as_str());
-        let local_oid = self.repo.refname_to_id(&branch_ref)?.to_string();
-        if local_oid != token.replacement_oid || ledger.new_head.as_str() != token.replacement_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{branch_ref}@{}", token.replacement_oid),
-                actual: format!("{branch_ref}@{local_oid}"),
-            });
-        }
-
-        self.publish_support_refs_with_options(token.support_ref_token.clone(), options)?;
-        self.fetch_remote_variation_ref(&token.remote, token.variation.as_str(), options)?;
-        let actual_remote_oid =
-            remote_tracking_oid(&self.repo, &token.remote, token.variation.as_str());
-        if actual_remote_oid.as_deref() != Some(token.expected_remote_oid.as_str()) {
-            return Err(DraftlineError::RemoteRace {
-                remote: token.remote,
-                variation: token.variation.as_str().to_string(),
-                expected: Some(token.expected_remote_oid),
-                actual: actual_remote_oid,
-            });
-        }
-
-        self.push_refspec(
-            &token.remote,
-            &format!(
-                "+refs/heads/{}:refs/heads/{}",
-                token.variation.as_str(),
-                token.variation.as_str()
-            ),
-            vec![PushRefExpectation {
-                dst_refname: format!("refs/heads/{}", token.variation.as_str()),
-                expected_old_oid: Some(token.expected_remote_oid.clone()),
-                expected_new_oid: Some(token.replacement_oid.clone()),
-            }],
-            options,
-        )?;
-        self.fetch_remote_variation_ref(&token.remote, token.variation.as_str(), options)?;
-        let published_remote_oid =
-            remote_tracking_oid(&self.repo, &token.remote, token.variation.as_str());
-        if published_remote_oid.as_deref() != Some(token.replacement_oid.as_str()) {
-            return Err(DraftlineError::RemoteRace {
-                remote: token.remote,
-                variation: token.variation.as_str().to_string(),
-                expected: Some(token.replacement_oid),
-                actual: published_remote_oid,
-            });
-        }
-
-        self.clear_pending_history_cleanup(&token.plan_id)?;
-        let support_refs = token
-            .support_ref_token
-            .refs
-            .into_iter()
-            .map(|item| SupportRef {
-                id: item.ref_name.clone(),
-                ref_name: item.ref_name,
-                kind: SupportRefKind::Rewrite,
-                source_variation: Some(token.variation.as_str().to_string()),
-                target_oid: item.target_oid,
-                scope: SupportRefScope::Local,
-            })
-            .collect::<Vec<_>>();
-
-        Ok(HistoryCleanupPublishResult {
-            plan_id: token.plan_id,
-            remote: token.remote,
-            variation: token.variation,
-            expected_remote_oid: token.expected_remote_oid.clone(),
-            replacement_oid: token.replacement_oid.clone(),
-            support_refs,
-            ref_updates: vec![RefUpdate {
-                name: RefName::from(branch_ref),
-                old: Some(VersionId::from_canonical_string(token.expected_remote_oid)?),
-                new: Some(VersionId::from_canonical_string(token.replacement_oid)?),
-            }],
-        })
-    }
-
-    /// Resolves an old version ID through applied cleanup ledgers and support refs.
-    pub fn resolve_rewritten_version(
-        &self,
-        request: StaleVersionResolutionRequest,
-    ) -> Result<StaleVersionResolution> {
-        let requested_oid = oid_from_version(&request.version)?;
-        if self.version_is_reachable_from_local_variation(requested_oid)? {
-            return Ok(StaleVersionResolution {
-                requested: request.version.clone(),
-                disposition: StaleVersionDisposition::Live {
-                    version: request.version,
-                },
-            });
-        }
-
-        for ledger in self.read_history_cleanup_ledgers()? {
-            if let Some(entry) = ledger
-                .commit_map
-                .iter()
-                .find(|entry| entry.old == request.version)
-            {
-                let disposition = match &entry.disposition {
-                    RewriteDisposition::Preserved { new_id } => StaleVersionDisposition::Live {
-                        version: new_id.clone(),
-                    },
-                    RewriteDisposition::SquashedInto { new_id } => {
-                        StaleVersionDisposition::SquashedInto {
-                            version: new_id.clone(),
-                        }
-                    }
-                    RewriteDisposition::DroppedAsNoise => StaleVersionDisposition::DroppedAsNoise,
-                    RewriteDisposition::OrphanedButBackedUp { backup_ref } => {
-                        StaleVersionDisposition::BackedUp {
-                            backup_ref: backup_ref.clone(),
-                        }
-                    }
-                    RewriteDisposition::ConflictRequiresUserChoice => {
-                        StaleVersionDisposition::Unknown
-                    }
-                };
-                return Ok(StaleVersionResolution {
-                    requested: request.version,
-                    disposition,
-                });
-            }
-        }
-
-        let support_refs: Vec<_> = self
-            .list_local_support_refs()?
-            .into_iter()
-            .chain(self.list_remote_tracking_support_refs()?)
-            .collect();
-
-        for support_ref in &support_refs {
-            let support_oid = Oid::from_str(&support_ref.target_oid)
-                .map_err(|_| DraftlineError::VersionNotFound(support_ref.target_oid.clone()))?;
-            if support_oid == requested_oid {
-                return Ok(StaleVersionResolution {
-                    requested: request.version.clone(),
-                    disposition: StaleVersionDisposition::BackedUp {
-                        backup_ref: RefName::from(support_ref.ref_name.clone()),
-                    },
-                });
-            }
-        }
-
-        let mut closest_backup_ref: Option<(usize, RefName)> = None;
-        for support_ref in support_refs {
-            let support_oid = Oid::from_str(&support_ref.target_oid)
-                .map_err(|_| DraftlineError::VersionNotFound(support_ref.target_oid.clone()))?;
-            if self.repo.graph_descendant_of(support_oid, requested_oid)? {
-                let distance = self.support_ref_distance_from(support_oid, requested_oid)?;
-                if closest_backup_ref
-                    .as_ref()
-                    .is_none_or(|(best_distance, _)| distance < *best_distance)
-                {
-                    closest_backup_ref = Some((distance, RefName::from(support_ref.ref_name)));
-                }
-            }
-        }
-        if let Some((_, backup_ref)) = closest_backup_ref {
-            return Ok(StaleVersionResolution {
-                requested: request.version,
-                disposition: StaleVersionDisposition::BackedUp { backup_ref },
-            });
-        }
-
-        Ok(StaleVersionResolution {
-            requested: request.version,
-            disposition: StaleVersionDisposition::Unknown,
-        })
-    }
-
-    fn support_ref_distance_from(&self, descendant_oid: Oid, ancestor_oid: Oid) -> Result<usize> {
-        let mut walk = self.repo.revwalk()?;
-        walk.push(descendant_oid)?;
-        walk.hide(ancestor_oid)?;
-        let mut distance = 0;
-        for oid in walk {
-            oid?;
-            distance += 1;
-        }
-        Ok(distance)
-    }
-
-    /// Plans undoing an applied cleanup by restoring its generated backup ref.
-    pub fn preflight_undo_history_cleanup(
-        &self,
-        plan_id: CleanupPlanId,
-    ) -> Result<HistoryCleanupUndoPreflight> {
-        self.ensure_no_pending_recovery()?;
-        let stored = self.read_history_cleanup_plan(&plan_id)?;
-        let ledger = self.read_history_cleanup_ledger(&plan_id)?;
-        let backup_ref = ledger.backup_refs.first().cloned().ok_or_else(|| {
-            DraftlineError::InvalidHistoryCleanup(format!(
-                "cleanup plan `{plan_id}` did not create a backup ref"
-            ))
-        })?;
-        let restore_oid = self.repo.refname_to_id(backup_ref.as_str())?;
-        let restore_head = VersionId::from(restore_oid);
-        if restore_head != ledger.old_head {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{}@{}", backup_ref.as_str(), ledger.old_head),
-                actual: format!("{}@{restore_head}", backup_ref.as_str()),
-            });
-        }
-        let branch_ref = format!("refs/heads/{}", stored.preview.target_variation.as_str());
-        let current_oid = self.repo.refname_to_id(&branch_ref)?;
-        let expected_current_head = VersionId::from(current_oid);
-        if expected_current_head != ledger.new_head {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{branch_ref}@{}", ledger.new_head),
-                actual: format!("{branch_ref}@{expected_current_head}"),
-            });
-        }
-        let token = HistoryCleanupUndoToken {
-            plan_id: plan_id.clone(),
-            target_variation: stored.preview.target_variation.clone(),
-            backup_ref: backup_ref.clone(),
-            expected_current_head: expected_current_head.clone(),
-            restore_head: restore_head.clone(),
-        };
-        Ok(HistoryCleanupUndoPreflight {
-            plan_id,
-            target_variation: stored.preview.target_variation,
-            backup_ref,
-            expected_current_head,
-            restore_head,
-            ref_updates: ledger.ref_updates.clone(),
-            token,
-            can_undo: true,
-        })
-    }
-
-    /// Restores a cleanup backup ref after a successful undo preflight.
-    pub fn undo_history_cleanup(
-        &self,
-        token: HistoryCleanupUndoToken,
-    ) -> Result<TimelineCleanupResult> {
-        self.ensure_no_pending_recovery()?;
-        let _lock = OperationLock::acquire(&self.lock_path(), "undo_history_cleanup")?;
-        let ledger = self.read_history_cleanup_ledger(&token.plan_id)?;
-        let branch_ref = format!("refs/heads/{}", token.target_variation.as_str());
-        let current_oid = oid_from_version(&token.expected_current_head)?;
-        for update in &ledger.ref_updates {
-            let Some(expected_new) = update.new.as_ref() else {
-                continue;
-            };
-            let expected_new_oid = oid_from_version(expected_new)?;
-            let actual = self.repo.refname_to_id(update.name.as_str())?;
-            if actual != expected_new_oid {
-                return Err(DraftlineError::LocalStateChanged {
-                    expected: format!("{}@{expected_new_oid}", update.name.as_str()),
-                    actual: format!("{}@{actual}", update.name.as_str()),
-                });
-            }
-        }
-        let restore_oid = self.repo.refname_to_id(token.backup_ref.as_str())?;
-        let expected_restore_oid = oid_from_version(&token.restore_head)?;
-        if restore_oid != expected_restore_oid {
-            return Err(DraftlineError::LocalStateChanged {
-                expected: format!("{}@{expected_restore_oid}", token.backup_ref.as_str()),
-                actual: format!("{}@{restore_oid}", token.backup_ref.as_str()),
-            });
-        }
-
-        let undo_operation_id = new_operation_id();
-        let undo_backup_ref = RefName::from(archive_ref(
-            "backups/history-cleanup-undo",
-            token.target_variation.as_str(),
-            &undo_operation_id,
-        ));
-        self.ensure_archive_ref(
-            undo_backup_ref.as_str(),
-            current_oid,
-            "backup before undoing history cleanup",
-        )?;
-        self.write_recovery_state(&RecoveryState {
-            operation_id: undo_operation_id.clone(),
-            operation: RecoveryOperation::HistoryCleanup,
-            original_variation: Some(token.target_variation.to_string()),
-            target: Some(token.expected_current_head.to_string()),
-            completed: false,
-        })?;
-        for update in &ledger.ref_updates {
-            let Some(old) = update.old.as_ref() else {
-                continue;
-            };
-            self.repo.reference(
-                update.name.as_str(),
-                oid_from_version(old)?,
-                true,
-                "undo_history_cleanup",
-            )?;
-        }
-        if self.head_symbolic_variation().as_deref() == Some(token.target_variation.as_str()) {
-            self.repo.set_head(&branch_ref)?;
-            self.repo
-                .checkout_head(Some(CheckoutBuilder::new().force()))?;
-        }
-        let ref_updates = ledger
-            .ref_updates
-            .iter()
-            .map(|update| RefUpdate {
-                name: update.name.clone(),
-                old: update.new.clone(),
-                new: update.old.clone(),
-            })
-            .collect();
-
-        let result = TimelineCleanupResult {
-            plan_id: token.plan_id.clone(),
-            old_head: token.expected_current_head.clone(),
-            new_head: token.restore_head.clone(),
-            backup_refs: vec![token.backup_ref, undo_backup_ref],
-            ref_updates,
-            commit_map: ledger.commit_map,
-            snapshot_map: ledger.snapshot_map,
-            warnings: ledger.warnings,
-        };
-        self.write_recovery_state(&RecoveryState {
-            operation_id: undo_operation_id,
-            operation: RecoveryOperation::HistoryCleanup,
-            original_variation: None,
-            target: Some(result.new_head.to_string()),
-            completed: true,
-        })?;
-        self.clear_pending_history_cleanup(&token.plan_id)?;
-        Ok(result)
-    }
-
-    /// Lists durable pending history cleanups, optionally scoped to a target variation.
-    pub fn pending_history_cleanups(
-        &self,
-        target_variation: Option<&VariationId>,
-    ) -> Result<Vec<PendingHistoryCleanup>> {
-        let mut pending = self.read_pending_history_cleanups()?;
-        if let Some(target_variation) = target_variation {
-            pending.retain(|cleanup| &cleanup.target_variation == target_variation);
-        }
-        Ok(pending)
-    }
-
-    /// Publishes a pending cleanup by preflighting the current remote state first.
-    pub fn publish_pending_history_cleanup(
-        &self,
-        plan_id: CleanupPlanId,
-        remote: impl AsRef<str>,
-        confirmation: RewriteConfirmation,
-    ) -> Result<HistoryCleanupPublishResult> {
-        let mut options = RemoteOptions::new();
-        self.publish_pending_history_cleanup_with_options(
-            plan_id,
-            remote,
-            confirmation,
-            &mut options,
-        )
-    }
-
-    /// Publishes a pending cleanup with explicit remote options.
-    pub fn publish_pending_history_cleanup_with_options(
-        &self,
-        plan_id: CleanupPlanId,
-        remote: impl AsRef<str>,
-        confirmation: RewriteConfirmation,
-        options: &mut RemoteOptions<'_>,
-    ) -> Result<HistoryCleanupPublishResult> {
-        let preflight =
-            self.preflight_publish_history_cleanup_with_options(plan_id, remote, options)?;
-        let Some(token) = preflight.token else {
-            return Err(DraftlineError::HistoryCleanupBlocked(Box::new(
-                HistoryCleanupBlockReport {
-                    operation: "publish_pending_history_cleanup".to_string(),
-                    diagnostics: vec![CleanupWarning {
-                        code: CleanupWarningCode::PendingHistoryCleanup,
-                        message: "pending history cleanup cannot be published in the current remote state"
-                            .to_string(),
-                        related_versions: vec![preflight.remote_impact.local_head],
-                        safe_next_actions: vec![
-                            SafeNextAction::UndoHistoryCleanup,
-                            SafeNextAction::AbandonHistoryCleanup,
-                        ],
-                    }],
-                    can_proceed: false,
-                },
-            )));
-        };
-        self.publish_history_cleanup_with_options(token, confirmation, options)
-    }
-
-    /// Undoes a pending cleanup by preflighting the current local state first.
-    pub fn undo_pending_history_cleanup(
-        &self,
-        plan_id: CleanupPlanId,
-    ) -> Result<TimelineCleanupResult> {
-        let preflight = self.preflight_undo_history_cleanup(plan_id)?;
-        self.undo_history_cleanup(preflight.token)
-    }
-
-    /// Explicitly clears a pending cleanup marker without changing Git refs.
-    pub fn abandon_pending_history_cleanup(
-        &self,
-        plan_id: CleanupPlanId,
-    ) -> Result<PendingHistoryCleanup> {
-        let mut pending = self.read_pending_history_cleanups()?;
-        let Some(index) = pending
-            .iter()
-            .position(|cleanup| cleanup.plan_id == plan_id)
-        else {
-            return Err(DraftlineError::InvalidHistoryCleanup(format!(
-                "pending cleanup `{plan_id}` was not found"
-            )));
-        };
-        let abandoned = pending.remove(index);
-        self.write_pending_history_cleanups(&pending)?;
-        Ok(abandoned)
     }
 
     /// Returns a diff between two specific versions.
@@ -7962,6 +6428,7 @@ impl Workspace {
         let to_tree = to_commit.tree()?;
 
         let mut opts = DiffOptions::new();
+        limit_diff_to_scope(&mut opts, self.scope());
         let diff =
             self.repo
                 .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))?;
@@ -8001,6 +6468,7 @@ impl Workspace {
 
         let mut opts = DiffOptions::new();
         opts.include_untracked(true).recurse_untracked_dirs(true);
+        limit_diff_to_scope(&mut opts, self.scope());
         let diff = self
             .repo
             .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts))?;
@@ -8029,6 +6497,7 @@ impl Workspace {
         let mut opts = DiffOptions::new();
         opts.include_untracked(true)
             .recurse_untracked_dirs(true)
+            .disable_pathspec_match(true)
             .pathspec(&path);
         let diff = self
             .repo
@@ -8061,7 +6530,7 @@ impl Workspace {
                 if !head.is_branch() {
                     return Err(DraftlineError::NoCurrentVariation);
                 }
-                let Some(name) = head.shorthand() else {
+                let Ok(name) = head.shorthand() else {
                     return Err(DraftlineError::NoCurrentVariation);
                 };
                 Ok(name.to_string())
@@ -8072,7 +6541,7 @@ impl Workspace {
                 self.repo
                     .find_reference("HEAD")
                     .ok()
-                    .and_then(|r| r.symbolic_target().map(str::to_string))
+                    .and_then(|r| r.symbolic_target().ok().flatten().map(str::to_string))
                     .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_string))
                     .ok_or(DraftlineError::NoCurrentVariation)
             }
@@ -8084,7 +6553,13 @@ impl Workspace {
         self.repo
             .find_reference("HEAD")
             .ok()
-            .and_then(|reference| reference.symbolic_target().map(str::to_string))
+            .and_then(|reference| {
+                reference
+                    .symbolic_target()
+                    .ok()
+                    .flatten()
+                    .map(str::to_string)
+            })
             .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_string))
     }
 
@@ -8100,6 +6575,9 @@ impl Workspace {
                 Ok((current_variation.to_string(), metadata, parent_oid))
             }
             RestoreVersionTarget::Existing { variation } => {
+                if variation.as_str() != current_variation {
+                    self.ensure_variation_in_namespace(variation.as_str())?;
+                }
                 let branch = self
                     .repo
                     .find_branch(variation.as_str(), BranchType::Local)
@@ -8115,6 +6593,7 @@ impl Workspace {
             }
             RestoreVersionTarget::New { name, metadata } => {
                 let name = validate_variation_name(&name)?;
+                self.ensure_variation_in_namespace(&name)?;
                 match self.repo.find_branch(&name, BranchType::Local) {
                     Ok(_) => Err(DraftlineError::VariationAlreadyExists(name)),
                     Err(error) if error.code() == git2::ErrorCode::NotFound => {
@@ -8160,7 +6639,7 @@ impl Workspace {
         let names = self.repo.remotes()?;
         let mut remotes = Vec::new();
 
-        for name in names.iter().flatten() {
+        for name in names.iter().filter_map(|name| name.ok().flatten()) {
             let remote = self.repo.find_remote(name)?;
             remotes.push(RemoteEndpoint {
                 name: name.to_string(),
@@ -8173,6 +6652,7 @@ impl Workspace {
     }
 
     fn pending_recovery(&self, operation_id: &str) -> Result<RecoveryState> {
+        self.ensure_recovery_is_ours()?;
         let Some(state) = self.recovery_state()? else {
             return Err(DraftlineError::RecoveryNotFound(operation_id.to_string()));
         };
@@ -8227,18 +6707,6 @@ impl Workspace {
             changed_workspace: false,
             safe_next_actions: vec![SafeNextAction::RepairRecovery],
         }
-    }
-
-    fn checkout_variation_unchecked(&self, variation: &str) -> Result<()> {
-        let safe_variation = validate_variation_name(variation)?;
-        let branch = self.repo.find_branch(&safe_variation, BranchType::Local)?;
-        let reference = branch.into_reference();
-        let target = reference.peel(ObjectType::Commit)?;
-        self.repo
-            .checkout_tree(&target, Some(CheckoutBuilder::new().force()))?;
-        self.repo
-            .set_head(&format!("refs/heads/{safe_variation}"))?;
-        Ok(())
     }
 
     fn repair_delete_variation_recovery(&self, state: &RecoveryState) -> Result<()> {
@@ -8369,10 +6837,13 @@ impl Workspace {
         else {
             return Ok(None);
         };
-        Ok(Some((
+        let (source, target) = (
             validate_variation_name(source)?,
             validate_variation_name(target)?,
-        )))
+        );
+        self.ensure_variation_in_namespace(&source)?;
+        self.ensure_variation_in_namespace(&target)?;
+        Ok(Some((source, target)))
     }
 
     fn rename_recovery_oid(&self, source: &str, state: &RecoveryState) -> Result<Option<Oid>> {
@@ -8457,6 +6928,7 @@ impl Workspace {
         let Some(metadata) = self.read_remote_delete_recovery_metadata(&state.operation_id)? else {
             return Ok(self.recovery_unavailable(state));
         };
+        self.ensure_variation_in_namespace(&metadata.variation)?;
         let expected_remote_oid = Oid::from_str(&metadata.expected_remote_oid)
             .map_err(|_| DraftlineError::VersionNotFound(metadata.expected_remote_oid.clone()))?;
         if state.target.as_deref() != Some(metadata.expected_remote_oid.as_str())
@@ -8712,7 +7184,7 @@ impl Workspace {
     ) -> Result<()> {
         for reference in self.repo.references_glob(glob)? {
             let reference = reference?;
-            let Some(ref_name) = reference.name() else {
+            let Ok(ref_name) = reference.name() else {
                 continue;
             };
             let Some(target_oid) = reference.target() else {
@@ -8749,7 +7221,7 @@ impl Workspace {
                 if reference.kind() != Some(git2::ReferenceType::Direct) {
                     continue;
                 }
-                if let Some(name) = reference.name() {
+                if let Ok(name) = reference.name() {
                     refs.push(name.to_string());
                 }
             }
@@ -8766,6 +7238,7 @@ impl Workspace {
         let mut options = RemoteOptions::new();
         let remote = remote.as_ref().to_string();
         self.fetch_remote_unchecked(&remote, &mut options)?;
+        self.fetch_base_unchecked(&remote, &mut options)?;
         self.fetch_support_refs_with_options(&remote, &mut options)
     }
 
@@ -8778,7 +7251,18 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let remote = remote.as_ref().to_string();
         self.fetch_remote_unchecked(&remote, options)?;
+        self.fetch_base_unchecked(&remote, options)?;
         self.fetch_support_refs_with_options(&remote, options)
+    }
+
+    /// Fetches the base branch too, so [`Self::base_status`] is current.
+    fn fetch_base_unchecked(&self, remote: &str, options: &mut RemoteOptions<'_>) -> Result<()> {
+        match self.default_branch_on(remote) {
+            Some(base) if base != self.current_variation_unchecked()? => {
+                self.fetch_remote_variation_ref(remote, &base, options)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn fetch_remote_unchecked(
@@ -8825,19 +7309,12 @@ impl Workspace {
         };
 
         let (ahead, behind) = self.repo.graph_ahead_behind(local, remote_oid)?;
-        let mut state = match (ahead, behind) {
+        let state = match (ahead, behind) {
             (0, 0) => SyncState::UpToDate,
             (_, 0) => SyncState::LocalAhead,
             (0, _) => SyncState::IncomingAvailable,
             _ => SyncState::NeedsMerge,
         };
-        if state == SyncState::NeedsMerge
-            && self
-                .incoming_remote_rewrite(&remote, &variation, local, remote_oid)?
-                .is_some()
-        {
-            state = SyncState::IncomingAvailable;
-        }
 
         Ok(SyncStatus {
             remote,
@@ -8847,6 +7324,406 @@ impl Workspace {
             state,
             incoming: self.incoming_versions(local, remote_oid)?,
         })
+    }
+
+    /// Shares saved work the way the Copilot app does: push the current branch
+    /// (never forced) and open a pull request, or reuse the one already open.
+    ///
+    /// On the base branch, Send first moves the work onto a new branch named
+    /// from the variation namespace and title, then hands the local base back
+    /// to its upstream so it never diverges. Retrying after a failure is safe:
+    /// the push becomes a no-op and the open pull request is found.
+    pub fn send(
+        &self,
+        remote: impl AsRef<str>,
+        request: &SendRequest,
+        provider: &mut dyn PullRequestProvider,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<SendResult> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref();
+        let explicit = match &request.base {
+            Some(base) => Some(validate_variation_name(base)?),
+            None => None,
+        };
+        let advertised = self.remote_advertised_branches(remote, options)?;
+        let base = match explicit {
+            Some(base) => base,
+            None => match self.default_branch_on(remote) {
+                Some(base) if advertised.contains(&base) => base,
+                inferred => self
+                    .default_branch_candidates()
+                    .into_iter()
+                    .find(|name| advertised.contains(name))
+                    .or(inferred)
+                    .ok_or(DraftlineError::SendBaseUnknown)?,
+            },
+        };
+        if !advertised.contains(&base) {
+            return Err(DraftlineError::SendBaseNotOnRemote(base));
+        }
+        let current = self.current_variation_unchecked()?;
+        if let Some(namespace) = &self.variation_namespace {
+            if current != base && !current.starts_with(namespace.as_str()) {
+                return Err(DraftlineError::SendOutsideNamespace(current));
+            }
+        }
+        self.fetch_remote_variation_ref(remote, &base, options)?;
+
+        let mut created_variation = false;
+        let variation = if current == base {
+            let report = preflight_report(
+                "send",
+                false,
+                self.changed_files_unchecked()?,
+                Vec::new(),
+                None,
+            );
+            if !report.can_proceed {
+                return Err(DraftlineError::PreflightFailed(Box::new(report)));
+            }
+            let taken = |name: &str| {
+                self.repo.find_branch(name, BranchType::Local).is_ok() || advertised.contains(name)
+            };
+            let name = match &request.branch {
+                Some(name) => validate_variation_name(name)?,
+                None => self.unused_send_branch_name(&request.title, taken)?,
+            };
+            if let Some(namespace) = &self.variation_namespace {
+                if !name.starts_with(namespace.as_str()) {
+                    return Err(DraftlineError::SendOutsideNamespace(name));
+                }
+            }
+            if taken(&name) {
+                return Err(DraftlineError::VariationAlreadyExists(name));
+            }
+            let head = self.repo.head()?.peel_to_commit()?;
+            let mut branch = self.repo.branch(&name, &head, false)?;
+            let switched = (|| -> Result<()> {
+                if !request.title.trim().is_empty() {
+                    self.write_variation_metadata(
+                        &name,
+                        &VariationMetadata::default().with_label(request.title.trim()),
+                    )?;
+                }
+                self.repo.set_head(&format!("refs/heads/{name}"))?;
+                Ok(())
+            })();
+            if let Err(error) = switched {
+                let _ = branch.delete();
+                return Err(error);
+            }
+            created_variation = true;
+            name
+        } else {
+            current
+        };
+        self.hand_base_back_to_upstream(&base, remote)?;
+
+        let base_ahead = match (
+            advertised.contains(&variation),
+            self.repo
+                .refname_to_id(&format!("refs/remotes/{remote}/{base}")),
+        ) {
+            (false, Ok(base_oid)) => {
+                let head = self.repo.head()?.peel_to_commit()?.id();
+                Some(self.repo.graph_ahead_behind(head, base_oid)?.0)
+            }
+            _ => None,
+        };
+        let published = self.publish_changes_with_options(remote, options)?;
+        let published_versions = base_ahead.unwrap_or(published.published_versions);
+        if self
+            .repo
+            .find_reference(&format!("refs/remotes/{remote}/{variation}"))
+            .is_ok()
+        {
+            self.repo
+                .find_branch(&variation, BranchType::Local)?
+                .set_upstream(Some(&format!("{remote}/{variation}")))?;
+        }
+
+        let pull_request_request = PullRequestRequest {
+            remote: remote.to_string(),
+            head: variation.clone(),
+            base: base.clone(),
+            title: request.title.clone(),
+            body: request.body.clone(),
+        };
+        let (pull_request, created_pull_request) =
+            match provider.find_open(&pull_request_request)? {
+                Some(open) => (open, false),
+                None => (provider.create(&pull_request_request)?, true),
+            };
+
+        Ok(SendResult {
+            remote: remote.to_string(),
+            variation,
+            base,
+            created_variation,
+            published_versions,
+            pull_request,
+            created_pull_request,
+        })
+    }
+
+    /// Creates a separate checkout under `worktrees_dir` on a new branch named
+    /// after `title` (inside the variation namespace), like the Copilot app's
+    /// per-task worktrees. This checkout, its index, and its branch are left
+    /// alone. Fetch first to start from the latest base, then open the
+    /// returned `project_path` as usual.
+    pub fn create_owned_worktree(
+        &self,
+        worktrees_dir: impl AsRef<Path>,
+        title: impl AsRef<str>,
+        remote: impl AsRef<str>,
+        start: WorktreeStart,
+    ) -> Result<OwnedWorktree> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref();
+        let start_commit = match start {
+            WorktreeStart::CurrentVersion => self.repo.head()?.peel_to_commit()?,
+            WorktreeStart::LatestBase => {
+                let base = self
+                    .default_branch_on(remote)
+                    .ok_or(DraftlineError::SendBaseUnknown)?;
+                let oid = self
+                    .repo
+                    .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
+                    .or_else(|_| self.repo.refname_to_id(&format!("refs/heads/{base}")))?;
+                self.repo.find_commit(oid)?
+            }
+        };
+        let worktrees_dir = worktrees_dir.as_ref();
+        let worktree_name =
+            |branch: &str| format!("{OWNED_WORKTREE_PREFIX}{}", branch.replace('/', "-"));
+        let variation = self.unused_send_branch_name(title.as_ref(), |name| {
+            self.repo.find_branch(name, BranchType::Local).is_ok()
+                || self
+                    .repo
+                    .find_reference(&format!("refs/remotes/{remote}/{name}"))
+                    .is_ok()
+                || self.repo.find_worktree(&worktree_name(name)).is_ok()
+                || worktrees_dir.join(worktree_name(name)).exists()
+        })?;
+        let name = worktree_name(&variation);
+        let path = worktrees_dir.join(&name);
+        fs::create_dir_all(worktrees_dir)?;
+
+        let reference = self
+            .repo
+            .branch(&variation, &start_commit, false)?
+            .into_reference();
+        let mut options = git2::WorktreeAddOptions::new();
+        options.reference(Some(&reference));
+        // The project may not exist yet where the branch starts.
+        let project_path = path.join(self.scope());
+        let added = self
+            .repo
+            .worktree(&name, &path, Some(&options))
+            .map_err(DraftlineError::from)
+            .and_then(|_| fs::create_dir_all(&project_path).map_err(DraftlineError::from));
+        if let Err(error) = added {
+            drop(reference);
+            self.roll_back_owned_worktree(&name, &path, &variation)?;
+            return Err(error);
+        }
+        // Report the path the way Git recorded it (symlinks and 8.3 names
+        // resolved), so it matches what owned_worktrees lists.
+        let path = self
+            .repo
+            .find_worktree(&name)
+            .map(|worktree| worktree.path().components().collect::<PathBuf>())
+            .unwrap_or(path);
+        Ok(OwnedWorktree {
+            name,
+            project_path: path.join(self.scope()),
+            path,
+            variation: Some(variation),
+        })
+    }
+
+    /// Lists the checkouts [`Self::create_owned_worktree`] made in this
+    /// repository. Other tools' worktrees are never included.
+    pub fn owned_worktrees(&self) -> Result<Vec<OwnedWorktree>> {
+        let mut owned = Vec::new();
+        for name in self
+            .repo
+            .worktrees()?
+            .iter()
+            .filter_map(|name| name.ok().flatten())
+        {
+            if !name.starts_with(OWNED_WORKTREE_PREFIX) {
+                continue;
+            }
+            let worktree = self.repo.find_worktree(name)?;
+            let path = worktree.path().components().collect::<PathBuf>();
+            let variation = Repository::open_from_worktree(&worktree)
+                .ok()
+                .and_then(|repo| {
+                    repo.head()
+                        .ok()
+                        .and_then(|head| head.shorthand().ok().map(str::to_string))
+                });
+            owned.push(OwnedWorktree {
+                name: name.to_string(),
+                project_path: path.join(self.scope()),
+                path,
+                variation,
+            });
+        }
+        Ok(owned)
+    }
+
+    /// Deletes an owned checkout's folder; its branch and versions stay, like
+    /// `git worktree remove`. Refuses while it has unsaved or untracked files
+    /// unless `discard_changes`, and refuses the checkout this workspace is in.
+    pub fn remove_owned_worktree(
+        &self,
+        name: impl AsRef<str>,
+        discard_changes: bool,
+    ) -> Result<()> {
+        let name = name.as_ref();
+        if !name.starts_with(OWNED_WORKTREE_PREFIX) {
+            return Err(DraftlineError::NotOwnedWorktree(name.to_string()));
+        }
+        let worktree = self.repo.find_worktree(name)?;
+        let path = worktree.path().to_path_buf();
+        let in_use = match (fs::canonicalize(&path), fs::canonicalize(&self.root)) {
+            (Ok(path), Ok(root)) => path == root,
+            _ => false,
+        };
+        if in_use {
+            return Err(DraftlineError::OwnedWorktreeInUse(name.to_string()));
+        }
+        if !discard_changes && path.exists() {
+            // Damaged metadata means its changes can't be checked; keep it.
+            if worktree.validate().is_err() {
+                return Err(DraftlineError::OwnedWorktreeHasChanges(vec![path]));
+            }
+            let repo = Repository::open_from_worktree(&worktree)?;
+            let mut options = StatusOptions::new();
+            options.include_untracked(true).recurse_untracked_dirs(true);
+            let statuses = repo.statuses(Some(&mut options))?;
+            if !statuses.is_empty() {
+                let changed = statuses
+                    .iter()
+                    .map(|entry| {
+                        PathBuf::from(String::from_utf8_lossy(entry.path_bytes()).as_ref())
+                    })
+                    .collect();
+                return Err(DraftlineError::OwnedWorktreeHasChanges(changed));
+            }
+        }
+        let mut prune = git2::WorktreePruneOptions::new();
+        prune.valid(true).working_tree(true);
+        worktree.prune(Some(&mut prune))?;
+        Ok(())
+    }
+
+    /// Undoes a half-made owned worktree: its folder, admin data, then the
+    /// new branch. Errors if anything is left so it isn't silently orphaned.
+    fn roll_back_owned_worktree(&self, name: &str, path: &Path, branch: &str) -> Result<()> {
+        if let Ok(worktree) = self.repo.find_worktree(name) {
+            let mut prune = git2::WorktreePruneOptions::new();
+            prune.valid(true).working_tree(true).locked(true);
+            worktree.prune(Some(&mut prune))?;
+        }
+        if path.exists() {
+            fs::remove_dir_all(path)?;
+        }
+        let admin = self.repo.commondir().join("worktrees").join(name);
+        if admin.exists() {
+            fs::remove_dir_all(admin)?;
+        }
+        if let Ok(mut created) = self.repo.find_branch(branch, BranchType::Local) {
+            created.delete()?;
+        }
+        Ok(())
+    }
+
+    fn unused_send_branch_name(&self, title: &str, taken: impl Fn(&str) -> bool) -> Result<String> {
+        let mut slug = String::new();
+        for character in title.trim().to_lowercase().chars() {
+            if character.is_ascii_alphanumeric() {
+                slug.push(character);
+            } else if !slug.is_empty() && !slug.ends_with('-') {
+                slug.push('-');
+            }
+            if slug.len() >= 48 {
+                break;
+            }
+        }
+        let slug = slug.trim_end_matches('-');
+        let stem = format!(
+            "{}{}",
+            self.variation_namespace.as_deref().unwrap_or_default(),
+            if slug.is_empty() { "send" } else { slug }
+        );
+        let name = (1..)
+            .map(|n| {
+                if n == 1 {
+                    stem.clone()
+                } else {
+                    format!("{stem}-{n}")
+                }
+            })
+            .find(|name| !taken(name))
+            .expect("an unused suffix exists");
+        validate_variation_name(&name)
+    }
+
+    /// Moves the local base to its freshly fetched remote-tracking ref when the
+    /// current branch carries every local base commit, so nothing is lost and
+    /// the base never diverges from upstream. The worktree is untouched. Runs on every send, which also repairs a send
+    /// that failed after switching branches.
+    fn hand_base_back_to_upstream(&self, base: &str, remote: &str) -> Result<()> {
+        let Ok(upstream) = self
+            .repo
+            .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
+        else {
+            return Ok(());
+        };
+        let Ok(mut local) = self.repo.find_branch(base, BranchType::Local) else {
+            return Ok(());
+        };
+        let Some(local_oid) = local.get().target() else {
+            return Ok(());
+        };
+        let head = self.repo.head()?.peel_to_commit()?.id();
+        let carried = head == local_oid || self.repo.graph_descendant_of(head, local_oid)?;
+        if local_oid != upstream && carried {
+            local.get_mut().set_target(
+                upstream,
+                &format!("draftline: send moved local work off {base}"),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn remote_advertised_branches(
+        &self,
+        remote_name: &str,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<HashSet<String>> {
+        let mut remote = self.repo.find_remote(remote_name)?;
+        ensure_remote_transport_supported(&remote)?;
+        let _timeout_guard = options.server_timeout_guard()?;
+        let branches = |heads: &[git2::RemoteHead<'_>]| {
+            heads
+                .iter()
+                .filter_map(|head| head.name().strip_prefix("refs/heads/"))
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        };
+        if options.has_network_callbacks() {
+            let callbacks = options.remote_callbacks("remote_advertised_branches");
+            let connection = remote.connect_auth(Direction::Fetch, Some(callbacks), None)?;
+            Ok(branches(connection.list()?))
+        } else {
+            remote.connect(Direction::Fetch)?;
+            Ok(branches(remote.list()?))
+        }
     }
 
     /// Publishes local versions for the current variation when doing so will not overwrite remote work.
@@ -8868,7 +7745,6 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishPreflight> {
         self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation("publish_changes")?;
         let report = preflight_report(
             "publish_changes",
             false,
@@ -8876,6 +7752,7 @@ impl Workspace {
             Vec::new(),
             None,
         );
+        self.ensure_variation_in_namespace(&self.current_variation_unchecked()?)?;
         if !report.can_proceed {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
@@ -8924,7 +7801,6 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishResult> {
         self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation("publish_changes")?;
         let report = preflight_report(
             "publish_changes",
             false,
@@ -8932,6 +7808,7 @@ impl Workspace {
             Vec::new(),
             None,
         );
+        self.ensure_variation_in_namespace(&self.current_variation_unchecked()?)?;
         if !report.can_proceed {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
@@ -8987,7 +7864,6 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishResult> {
         self.ensure_no_pending_recovery()?;
-        self.ensure_no_pending_history_cleanup_for_current_variation("publish_changes")?;
         let report = preflight_report(
             "publish_changes",
             false,
@@ -8995,6 +7871,7 @@ impl Workspace {
             Vec::new(),
             None,
         );
+        self.ensure_variation_in_namespace(&self.current_variation_unchecked()?)?;
         if !report.can_proceed {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
@@ -9130,819 +8007,6 @@ impl Workspace {
             .map_err(|_| DraftlineError::VersionNotFound(version.to_string()))
     }
 
-    fn history_cleanup_milestones_match_profile(
-        &self,
-        preview: &HistoryCleanupPreview,
-        profile: &ContributorProfile,
-    ) -> Result<bool> {
-        let (author, committer) = self.workspace_signatures(Some(profile))?;
-        for operation in &preview.operations {
-            let commit = self
-                .repo
-                .find_commit(oid_from_version(&operation.new_version)?)?;
-            let commit_author = commit.author();
-            let commit_committer = commit.committer();
-            if commit_author.name_bytes() != author.name_bytes()
-                || commit_author.email_bytes() != author.email_bytes()
-                || commit_committer.name_bytes() != committer.name_bytes()
-                || commit_committer.email_bytes() != committer.email_bytes()
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Re-creates a stored cleanup preview's milestone commits with `profile` and returns the
-    /// updated preview. The caller must already have verified the stored plan against the
-    /// live refs; any structural drift from the stored preview is rejected.
-    fn reattribute_history_cleanup_preview(
-        &self,
-        stored: &HistoryCleanupStoredPlan,
-        profile: &ContributorProfile,
-    ) -> Result<HistoryCleanupPreview> {
-        let preview = &stored.preview;
-        let CleanupMode::CompactMilestones {
-            milestones,
-            preserve_named_branches,
-            preserve_merge_boundaries,
-        } = &stored.request.mode;
-        let planned = self.plan_compact_milestones(CompactCleanupPlanInput {
-            target_variation: &preview.target_variation,
-            old_head_oid: oid_from_version(&preview.old_head)?,
-            base: &stored.request.base,
-            milestones,
-            preserve_named_branches: *preserve_named_branches,
-            preserve_merge_boundaries: *preserve_merge_boundaries,
-            profile: Some(profile),
-        })?;
-
-        let same_commit_map =
-            planned.commit_map.len() == preview.commit_map.len()
-                && planned.commit_map.iter().zip(&preview.commit_map).all(
-                    |(planned, previewed)| {
-                        planned.old == previewed.old
-                            && std::mem::discriminant(&planned.disposition)
-                                == std::mem::discriminant(&previewed.disposition)
-                    },
-                );
-        let same_ref_updates = planned.planned_ref_updates.len()
-            == preview.planned_ref_updates.len()
-            && planned
-                .planned_ref_updates
-                .iter()
-                .zip(&preview.planned_ref_updates)
-                .all(|(planned, previewed)| {
-                    planned.name == previewed.name && planned.old == previewed.old
-                });
-        if !same_commit_map || !same_ref_updates {
-            return Err(DraftlineError::InvalidHistoryCleanup(
-                "history cleanup plan no longer matches the workspace; preview the cleanup again"
-                    .to_string(),
-            ));
-        }
-
-        let new_head = VersionId::from(planned.new_head_oid);
-        self.repo.reference(
-            preview.preview_ref.as_str(),
-            planned.new_head_oid,
-            true,
-            "reattribute history cleanup preview",
-        )?;
-
-        let mut updated = preview.clone();
-        updated.new_head = new_head.clone();
-        updated.graph_diff.new_head = new_head.clone();
-        updated.affected_refs = planned.affected_refs;
-        updated.planned_ref_updates = planned.planned_ref_updates;
-        updated.operations = planned.operations;
-        updated.commit_map = planned.commit_map;
-        updated.snapshot_map = planned.snapshot_map;
-        if let Some(impact) = updated.remote_impact.as_mut() {
-            impact.replacement_head = Some(new_head);
-        }
-        Ok(updated)
-    }
-
-    fn plan_compact_milestones(
-        &self,
-        input: CompactCleanupPlanInput<'_>,
-    ) -> Result<PlannedCompactCleanup> {
-        let CompactCleanupPlanInput {
-            target_variation,
-            old_head_oid,
-            base,
-            milestones,
-            preserve_named_branches: _preserve_named_branches,
-            preserve_merge_boundaries,
-            profile,
-        } = input;
-
-        if milestones.is_empty() {
-            return Err(DraftlineError::InvalidHistoryCleanup(
-                "compact cleanup requires at least one milestone".to_string(),
-            ));
-        }
-
-        let first_start_oid = oid_from_version(&milestones[0].include_range.start)?;
-        let first_start = self.repo.find_commit(first_start_oid)?;
-        let base_parent_oid = match base {
-            CleanupBase::Auto => first_start.parent(0).ok().map(|parent| parent.id()),
-            CleanupBase::Version { version } => Some(oid_from_version(version)?),
-        };
-        if let (CleanupBase::Version { version }, Some(parent)) =
-            (base, first_start.parent(0).ok().map(|parent| parent.id()))
-        {
-            let requested = oid_from_version(version)?;
-            if requested != parent {
-                return Err(DraftlineError::InvalidHistoryCleanup(format!(
-                    "explicit cleanup base `{requested}` is not the first milestone parent `{parent}`"
-                )));
-            }
-        }
-
-        let last_end = oid_from_version(&milestones[milestones.len() - 1].include_range.end)?;
-        let descendant_old_oids = self.first_parent_descendants_after(last_end, old_head_oid)?;
-
-        let mut all_old_oids = Vec::new();
-        let mut seen_old_oids = BTreeSet::new();
-        let mut operations = Vec::new();
-        let mut commit_map = Vec::new();
-        let mut oid_rewrites = HashMap::new();
-        let mut previous_new_oid = base_parent_oid;
-        let mut previous_old_end = base_parent_oid;
-        let (author, committer) = self.rewrite_signatures(profile)?;
-
-        for milestone in milestones {
-            let title = milestone.title.trim();
-            if title.is_empty() {
-                return Err(DraftlineError::InvalidHistoryCleanup(
-                    "milestone title is required".to_string(),
-                ));
-            }
-            let old_oids = self.first_parent_range(&milestone.include_range)?;
-            if let Some(expected_parent) = previous_old_end {
-                let start_commit = self.repo.find_commit(old_oids[0])?;
-                let actual_parent = start_commit.parent(0).ok().map(|parent| parent.id());
-                if actual_parent != Some(expected_parent) {
-                    return Err(DraftlineError::InvalidHistoryCleanup(format!(
-                        "milestone `{title}` is not contiguous with the previous cleanup range"
-                    )));
-                }
-            }
-            for oid in &old_oids {
-                if !seen_old_oids.insert(*oid) {
-                    return Err(DraftlineError::InvalidHistoryCleanup(format!(
-                        "cleanup range includes version `{oid}` more than once"
-                    )));
-                }
-                let commit = self.repo.find_commit(*oid)?;
-                if preserve_merge_boundaries && commit.parent_count() > 1 {
-                    return Err(DraftlineError::InvalidHistoryCleanup(format!(
-                        "cleanup milestone `{title}` crosses merge commit `{oid}`"
-                    )));
-                }
-            }
-
-            let end_oid = *old_oids.last().ok_or_else(|| {
-                DraftlineError::InvalidHistoryCleanup("milestone range is empty".to_string())
-            })?;
-            let end_commit = self.repo.find_commit(end_oid)?;
-            let tree = end_commit.tree()?;
-            let parent_commit = previous_new_oid
-                .map(|oid| self.repo.find_commit(oid))
-                .transpose()?;
-            let parents = parent_commit.iter().collect::<Vec<_>>();
-            let message = cleanup_commit_message(title, milestone.description.as_deref());
-            let new_oid = self.repo.commit(
-                None,
-                &author,
-                &committer,
-                &message,
-                &tree,
-                parents.as_slice(),
-            )?;
-            let new_version = VersionId::from(new_oid);
-            let old_versions = old_oids
-                .iter()
-                .copied()
-                .map(VersionId::from)
-                .collect::<Vec<_>>();
-            operations.push(CleanupOperation {
-                title: title.to_string(),
-                description: milestone
-                    .description
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|description| !description.is_empty())
-                    .map(ToString::to_string),
-                old_versions: old_versions.clone(),
-                new_version: new_version.clone(),
-            });
-            for old_oid in &old_oids {
-                commit_map.push(CommitRewriteMap {
-                    old: VersionId::from(*old_oid),
-                    new: Some(new_version.clone()),
-                    disposition: RewriteDisposition::SquashedInto {
-                        new_id: new_version.clone(),
-                    },
-                });
-                oid_rewrites.insert(*old_oid, new_oid);
-            }
-            all_old_oids.extend(old_oids);
-            previous_new_oid = Some(new_oid);
-            previous_old_end = Some(end_oid);
-        }
-
-        let selected_commit_count = all_old_oids.len();
-        let selected_oid_set = all_old_oids.iter().copied().collect::<BTreeSet<_>>();
-        let descendant_oid_set = descendant_old_oids.iter().copied().collect::<BTreeSet<_>>();
-
-        for old_oid in &descendant_old_oids {
-            let old_commit = self.repo.find_commit(*old_oid)?;
-            let first_parent = old_commit.parent(0).map_err(|_| {
-                DraftlineError::InvalidHistoryCleanup(format!(
-                    "descendant `{old_oid}` has no first parent to replay"
-                ))
-            })?;
-            let first_parent_oid =
-                oid_rewrites
-                    .get(&first_parent.id())
-                    .copied()
-                    .ok_or_else(|| {
-                        DraftlineError::InvalidHistoryCleanup(format!(
-                    "descendant `{old_oid}` is not contiguous with the rewritten cleanup range"
-                ))
-                    })?;
-            let mut parent_oids = vec![first_parent_oid];
-            for index in 1..old_commit.parent_count() {
-                let parent = old_commit.parent(index)?;
-                let parent_oid = parent.id();
-                if selected_oid_set.contains(&parent_oid) {
-                    return Err(cleanup_blocked(
-                        CleanupWarningCode::MergeBoundaryWouldBeRewritten,
-                        format!(
-                            "merge commit `{old_oid}` has a secondary parent inside the compacted range"
-                        ),
-                        vec![VersionId::from(*old_oid), VersionId::from(parent_oid)],
-                    ));
-                }
-                parent_oids.push(oid_rewrites.get(&parent_oid).copied().unwrap_or(parent_oid));
-            }
-
-            let parent_commits = parent_oids
-                .iter()
-                .map(|oid| self.repo.find_commit(*oid).map_err(DraftlineError::from))
-                .collect::<Result<Vec<_>>>()?;
-            let parents = parent_commits.iter().collect::<Vec<_>>();
-            let tree = old_commit.tree()?;
-            let author = old_commit.author();
-            let committer = old_commit.committer();
-            let message = old_commit.message().unwrap_or_default();
-            let new_oid = self.repo.commit(
-                None,
-                &author,
-                &committer,
-                message,
-                &tree,
-                parents.as_slice(),
-            )?;
-            let new_version = VersionId::from(new_oid);
-            commit_map.push(CommitRewriteMap {
-                old: VersionId::from(*old_oid),
-                new: Some(new_version.clone()),
-                disposition: RewriteDisposition::Preserved {
-                    new_id: new_version,
-                },
-            });
-            oid_rewrites.insert(*old_oid, new_oid);
-            previous_new_oid = Some(new_oid);
-        }
-
-        let new_head_oid = previous_new_oid.ok_or_else(|| {
-            DraftlineError::InvalidHistoryCleanup("cleanup did not produce a new head".to_string())
-        })?;
-        let old_tree = self.repo.find_commit(old_head_oid)?.tree_id();
-        let new_tree = self.repo.find_commit(new_head_oid)?.tree_id();
-        if old_tree != new_tree {
-            return Err(DraftlineError::InvalidHistoryCleanup(
-                "compact cleanup must preserve final workspace file content".to_string(),
-            ));
-        }
-
-        let warnings = Vec::new();
-        let mut affected_refs = Vec::new();
-        let mut planned_ref_updates = Vec::new();
-        let target_ref_update = RefUpdate {
-            name: RefName::from(format!("refs/heads/{}", target_variation.as_str())),
-            old: Some(VersionId::from(old_head_oid)),
-            new: Some(VersionId::from(new_head_oid)),
-        };
-        affected_refs.push(CleanupAffectedRef {
-            name: RefName::from(format!("refs/heads/{}", target_variation.as_str())),
-            old: Some(VersionId::from(old_head_oid)),
-            new: Some(VersionId::from(new_head_oid)),
-            impact: CleanupRefImpact::TargetVariationMoved,
-        });
-
-        for (variation, tip) in self.local_variation_tip_oids()? {
-            if variation == *target_variation {
-                continue;
-            }
-            let ref_name = RefName::from(format!("refs/heads/{}", variation.as_str()));
-            if selected_oid_set.contains(&tip) {
-                let warning = cleanup_warning(
-                    CleanupWarningCode::NamedBranchInsideCompactedRange,
-                    format!(
-                        "variation `{}` points inside the compacted range",
-                        variation.as_str()
-                    ),
-                    vec![VersionId::from(tip)],
-                );
-                return Err(DraftlineError::HistoryCleanupBlocked(Box::new(
-                    HistoryCleanupBlockReport {
-                        operation: "history_cleanup".to_string(),
-                        diagnostics: vec![warning],
-                        can_proceed: false,
-                    },
-                )));
-            } else if descendant_oid_set.contains(&tip) {
-                let new_tip = oid_rewrites.get(&tip).copied().ok_or_else(|| {
-                    DraftlineError::InvalidHistoryCleanup(format!(
-                        "rewritten descendant `{tip}` is missing from cleanup map"
-                    ))
-                })?;
-                planned_ref_updates.push(RefUpdate {
-                    name: ref_name.clone(),
-                    old: Some(VersionId::from(tip)),
-                    new: Some(VersionId::from(new_tip)),
-                });
-                affected_refs.push(CleanupAffectedRef {
-                    name: ref_name,
-                    old: Some(VersionId::from(tip)),
-                    new: Some(VersionId::from(new_tip)),
-                    impact: CleanupRefImpact::DescendantVariationRewritten,
-                });
-            }
-        }
-        planned_ref_updates.push(target_ref_update);
-
-        let snapshot_map = commit_map
-            .iter()
-            .map(|entry| SnapshotRewriteMap {
-                old: entry.old.clone(),
-                new: entry.new.clone(),
-                disposition: entry.disposition.clone(),
-            })
-            .collect();
-
-        Ok(PlannedCompactCleanup {
-            new_head_oid,
-            operations,
-            commit_map,
-            snapshot_map,
-            warnings,
-            affected_refs,
-            planned_ref_updates,
-            old_commit_count: selected_commit_count + descendant_old_oids.len(),
-            new_commit_count: milestones.len() + descendant_old_oids.len(),
-            selected_commit_count,
-            descendant_rewrite_count: descendant_old_oids.len(),
-        })
-    }
-
-    fn first_parent_descendants_after(&self, ancestor_oid: Oid, head_oid: Oid) -> Result<Vec<Oid>> {
-        let range = CommitRange {
-            start: VersionId::from(ancestor_oid),
-            end: VersionId::from(head_oid),
-        };
-        let mut oids = match self.first_parent_range(&range) {
-            Ok(oids) => oids,
-            Err(DraftlineError::InvalidHistoryCleanup(_)) => {
-                return Err(DraftlineError::HistoryCleanupBlocked(Box::new(
-                    HistoryCleanupBlockReport {
-                        operation: "history_cleanup".to_string(),
-                        diagnostics: vec![cleanup_warning(
-                            CleanupWarningCode::RangeEndNotAncestorOfTargetHead,
-                            format!(
-                                "cleanup range end `{ancestor_oid}` is not a first-parent ancestor of target head `{head_oid}`"
-                            ),
-                            vec![VersionId::from(ancestor_oid), VersionId::from(head_oid)],
-                        )],
-                        can_proceed: false,
-                    },
-                )));
-            }
-            Err(error) => return Err(error),
-        };
-        if !oids.is_empty() {
-            oids.remove(0);
-        }
-        Ok(oids)
-    }
-
-    fn first_parent_chain_to_root(&self, head_oid: Oid) -> Result<Vec<Oid>> {
-        let mut commit = self.repo.find_commit(head_oid)?;
-        let mut oids = Vec::new();
-
-        loop {
-            oids.push(commit.id());
-            let Ok(parent) = commit.parent(0) else {
-                break;
-            };
-            commit = parent;
-        }
-
-        Ok(oids)
-    }
-
-    fn first_parent_range(&self, range: &CommitRange) -> Result<Vec<Oid>> {
-        let start_oid = oid_from_version(&range.start)?;
-        let mut commit = self.repo.find_commit(oid_from_version(&range.end)?)?;
-        let mut oids = Vec::new();
-
-        loop {
-            let oid = commit.id();
-            oids.push(oid);
-            if oid == start_oid {
-                break;
-            }
-            commit = commit.parent(0).map_err(|_| {
-                DraftlineError::InvalidHistoryCleanup(format!(
-                    "range end `{}` is not descended from start `{}`",
-                    range.end, range.start
-                ))
-            })?;
-        }
-
-        oids.reverse();
-        Ok(oids)
-    }
-
-    fn cleanup_remote_impact_from_preview(
-        &self,
-        preview: &HistoryCleanupPreview,
-        remote: Option<&str>,
-    ) -> Result<HistoryCleanupRemoteImpact> {
-        let selected = preview
-            .commit_map
-            .iter()
-            .filter_map(|entry| {
-                matches!(entry.disposition, RewriteDisposition::SquashedInto { .. })
-                    .then(|| oid_from_version(&entry.old).ok())
-                    .flatten()
-            })
-            .collect::<Vec<_>>();
-        let descendants = preview
-            .commit_map
-            .iter()
-            .filter_map(|entry| {
-                matches!(entry.disposition, RewriteDisposition::Preserved { .. })
-                    .then(|| oid_from_version(&entry.old).ok())
-                    .flatten()
-            })
-            .collect::<Vec<_>>();
-        self.cleanup_remote_impact_for_oids(
-            remote,
-            &preview.target_variation,
-            oid_from_version(&preview.old_head)?,
-            Some(oid_from_version(&preview.new_head)?),
-            &selected,
-            &descendants,
-        )
-        .and_then(|impact| {
-            impact.ok_or_else(|| {
-                DraftlineError::InvalidHistoryCleanup(
-                    "cleanup remote impact requires a remote".to_string(),
-                )
-            })
-        })
-    }
-
-    fn cleanup_remote_impact_for_oids(
-        &self,
-        remote: Option<&str>,
-        variation: &VariationId,
-        local_head_oid: Oid,
-        replacement_head_oid: Option<Oid>,
-        selected_oids: &[Oid],
-        descendant_oids: &[Oid],
-    ) -> Result<Option<HistoryCleanupRemoteImpact>> {
-        let Some(remote) = remote else {
-            return Ok(None);
-        };
-        let tracking_ref = RefName::from(format!("refs/remotes/{remote}/{}", variation.as_str()));
-        let upstream_head = remote_tracking_oid(&self.repo, remote, variation.as_str())
-            .map(VersionId::from_canonical_string)
-            .transpose()?;
-        let upstream_oid = upstream_head.as_ref().map(oid_from_version).transpose()?;
-        let selected = self.cleanup_publication_summary(upstream_oid, selected_oids)?;
-        let descendants = self.cleanup_publication_summary(upstream_oid, descendant_oids)?;
-        let publish_status = if let Some(upstream_oid) = upstream_oid {
-            if local_head_oid != upstream_oid
-                && !self
-                    .repo
-                    .graph_descendant_of(local_head_oid, upstream_oid)?
-            {
-                CleanupPublishStatus::RemoteHasIncoming
-            } else if selected.published_count > 0 || descendants.published_count > 0 {
-                CleanupPublishStatus::SharedHistoryRewriteRequired
-            } else {
-                CleanupPublishStatus::NormalPublish
-            }
-        } else {
-            CleanupPublishStatus::NoUpstream
-        };
-        let mut warnings = Vec::new();
-        match publish_status {
-            CleanupPublishStatus::NoUpstream => warnings.push(cleanup_warning(
-                CleanupWarningCode::LocalOnlyRewrite,
-                format!(
-                    "remote `{remote}` has no upstream variation `{}`",
-                    variation.as_str()
-                ),
-                Vec::new(),
-            )),
-            CleanupPublishStatus::NormalPublish => {}
-            CleanupPublishStatus::SharedHistoryRewriteRequired => warnings.push(cleanup_warning(
-                CleanupWarningCode::RemoteRewriteRequiresSeparatePublish,
-                "cleanup rewrites commits that are already reachable from the upstream remote"
-                    .to_string(),
-                selected
-                    .published_versions
-                    .iter()
-                    .chain(descendants.published_versions.iter())
-                    .cloned()
-                    .collect(),
-            )),
-            CleanupPublishStatus::RemoteHasIncoming => warnings.push(cleanup_warning(
-                CleanupWarningCode::TargetRefChangedSincePreview,
-                "upstream contains commits that are not in the local cleanup base".to_string(),
-                upstream_head.iter().cloned().collect(),
-            )),
-            CleanupPublishStatus::LocalOnly => {}
-        }
-
-        Ok(Some(HistoryCleanupRemoteImpact {
-            remote: Some(remote.to_string()),
-            variation: variation.clone(),
-            tracking_ref: Some(tracking_ref),
-            upstream_head,
-            local_head: VersionId::from(local_head_oid),
-            replacement_head: replacement_head_oid.map(VersionId::from),
-            selected,
-            descendants,
-            publish_status,
-            warnings,
-        }))
-    }
-
-    fn cleanup_publication_summary(
-        &self,
-        upstream_oid: Option<Oid>,
-        oids: &[Oid],
-    ) -> Result<CleanupPublicationSummary> {
-        let mut published_versions = Vec::new();
-        let mut private_versions = Vec::new();
-        for oid in oids {
-            let version = VersionId::from(*oid);
-            let published = upstream_oid
-                .map(|upstream| {
-                    if upstream == *oid {
-                        Ok(true)
-                    } else {
-                        self.repo.graph_descendant_of(upstream, *oid)
-                    }
-                })
-                .transpose()?
-                .unwrap_or(false);
-            if published {
-                published_versions.push(version);
-            } else {
-                private_versions.push(version);
-            }
-        }
-        Ok(CleanupPublicationSummary {
-            published_count: published_versions.len(),
-            private_count: private_versions.len(),
-            published_versions,
-            private_versions,
-        })
-    }
-
-    fn history_cleanup_dir(&self) -> PathBuf {
-        self.draftline_dir().join("history-cleanup")
-    }
-
-    fn history_cleanup_plans_dir(&self) -> PathBuf {
-        self.history_cleanup_dir().join("plans")
-    }
-
-    fn history_cleanup_ledgers_dir(&self) -> PathBuf {
-        self.history_cleanup_dir().join("ledgers")
-    }
-
-    fn pending_history_cleanup_path(&self) -> PathBuf {
-        self.history_cleanup_dir().join("pending.json")
-    }
-
-    fn history_cleanup_plan_path(&self, plan_id: &CleanupPlanId) -> PathBuf {
-        self.history_cleanup_plans_dir()
-            .join(format!("{}.json", plan_id.as_str()))
-    }
-
-    fn history_cleanup_ledger_path(&self, plan_id: &CleanupPlanId) -> PathBuf {
-        self.history_cleanup_ledgers_dir()
-            .join(format!("{}.json", plan_id.as_str()))
-    }
-
-    fn write_history_cleanup_plan(&self, plan: &HistoryCleanupStoredPlan) -> Result<()> {
-        fs::create_dir_all(self.history_cleanup_plans_dir())?;
-        let path = self.history_cleanup_plan_path(&plan.preview.plan_id);
-        let temp = path.with_extension("json.tmp");
-        fs::write(&temp, serde_json::to_vec_pretty(plan)?)?;
-        fs::rename(&temp, &path)?;
-        Ok(())
-    }
-
-    fn read_history_cleanup_plan(
-        &self,
-        plan_id: &CleanupPlanId,
-    ) -> Result<HistoryCleanupStoredPlan> {
-        let path = self.history_cleanup_plan_path(plan_id);
-        match fs::read(&path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(DraftlineError::InvalidHistoryCleanup(format!(
-                    "cleanup plan `{plan_id}` was not found"
-                )))
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn write_history_cleanup_ledger(&self, result: &TimelineCleanupResult) -> Result<()> {
-        fs::create_dir_all(self.history_cleanup_ledgers_dir())?;
-        fs::write(
-            self.history_cleanup_ledger_path(&result.plan_id),
-            serde_json::to_vec_pretty(result)?,
-        )?;
-        Ok(())
-    }
-
-    fn read_history_cleanup_ledger(
-        &self,
-        plan_id: &CleanupPlanId,
-    ) -> Result<TimelineCleanupResult> {
-        let path = self.history_cleanup_ledger_path(plan_id);
-        match fs::read(&path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(DraftlineError::InvalidHistoryCleanup(format!(
-                    "cleanup ledger `{plan_id}` was not found"
-                )))
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn read_history_cleanup_ledgers(&self) -> Result<Vec<TimelineCleanupResult>> {
-        let dir = self.history_cleanup_ledgers_dir();
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
-        let mut ledgers = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            if entry
-                .path()
-                .extension()
-                .and_then(|extension| extension.to_str())
-                != Some("json")
-            {
-                continue;
-            }
-            let bytes = fs::read(entry.path())?;
-            ledgers.push(serde_json::from_slice(&bytes)?);
-        }
-        Ok(ledgers)
-    }
-
-    fn read_pending_history_cleanups(&self) -> Result<Vec<PendingHistoryCleanup>> {
-        let path = self.pending_history_cleanup_path();
-        match fs::read(&path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn write_pending_history_cleanups(&self, pending: &[PendingHistoryCleanup]) -> Result<()> {
-        fs::create_dir_all(self.history_cleanup_dir())?;
-        fs::write(
-            self.pending_history_cleanup_path(),
-            serde_json::to_vec_pretty(pending)?,
-        )?;
-        Ok(())
-    }
-
-    fn upsert_pending_history_cleanup(&self, cleanup: PendingHistoryCleanup) -> Result<()> {
-        let mut pending = self.read_pending_history_cleanups()?;
-        pending.retain(|existing| existing.plan_id != cleanup.plan_id);
-        pending.push(cleanup);
-        self.write_pending_history_cleanups(&pending)
-    }
-
-    fn update_pending_history_cleanup_publish_state(
-        &self,
-        plan_id: &CleanupPlanId,
-        remote_impact: HistoryCleanupRemoteImpact,
-        expected_remote_oid: Option<VersionId>,
-    ) -> Result<()> {
-        let mut pending = self.read_pending_history_cleanups()?;
-        if let Some(cleanup) = pending
-            .iter_mut()
-            .find(|cleanup| &cleanup.plan_id == plan_id)
-        {
-            cleanup.publish_status = Some(remote_impact.publish_status.clone());
-            cleanup.remote_impact = Some(remote_impact);
-            cleanup.expected_remote_oid = expected_remote_oid;
-            self.write_pending_history_cleanups(&pending)?;
-        }
-        Ok(())
-    }
-
-    fn clear_pending_history_cleanup(&self, plan_id: &CleanupPlanId) -> Result<()> {
-        let mut pending = self.read_pending_history_cleanups()?;
-        let original_len = pending.len();
-        pending.retain(|cleanup| &cleanup.plan_id != plan_id);
-        if pending.len() != original_len {
-            self.write_pending_history_cleanups(&pending)?;
-        }
-        Ok(())
-    }
-
-    fn ensure_no_pending_history_cleanup_for_current_variation(
-        &self,
-        operation: &str,
-    ) -> Result<()> {
-        let variation = self.current_variation_unchecked().ok();
-        self.ensure_no_pending_history_cleanup(operation, variation.as_deref())
-    }
-
-    fn ensure_no_pending_history_cleanup(
-        &self,
-        operation: &str,
-        target_variation: Option<&str>,
-    ) -> Result<()> {
-        let pending = self.read_pending_history_cleanups()?;
-        let blockers = pending
-            .into_iter()
-            .filter(|cleanup| {
-                target_variation
-                    .is_none_or(|variation| cleanup.target_variation.as_str() == variation)
-            })
-            .collect::<Vec<_>>();
-        if blockers.is_empty() {
-            return Ok(());
-        }
-
-        let diagnostics = blockers
-            .into_iter()
-            .map(|cleanup| {
-                let mut safe_next_actions = Vec::new();
-                if cleanup.publish_status == Some(CleanupPublishStatus::SharedHistoryRewriteRequired) {
-                    safe_next_actions.push(SafeNextAction::PublishHistoryCleanup);
-                }
-                safe_next_actions.push(SafeNextAction::UndoHistoryCleanup);
-                safe_next_actions.push(SafeNextAction::AbandonHistoryCleanup);
-
-                CleanupWarning {
-                    code: CleanupWarningCode::PendingHistoryCleanup,
-                    message: format!(
-                        "history cleanup `{}` is pending for variation `{}`; publish, undo, or explicitly abandon it before running `{operation}`",
-                        cleanup.plan_id,
-                        cleanup.target_variation.as_str()
-                    ),
-                    related_versions: vec![
-                        cleanup.expected_local_head.clone(),
-                        cleanup.replacement_head.clone(),
-                    ],
-                    safe_next_actions,
-                }
-            })
-            .collect();
-        Err(DraftlineError::HistoryCleanupBlocked(Box::new(
-            HistoryCleanupBlockReport {
-                operation: operation.to_string(),
-                diagnostics,
-                can_proceed: false,
-            },
-        )))
-    }
-
     fn draftline_dir(&self) -> PathBuf {
         self.repo.path().join("draftline")
     }
@@ -9956,13 +8020,104 @@ impl Workspace {
             .join(format!("recovery-delete-remote-{operation_id}.json"))
     }
 
+    /// Takes the Draftline lock for an operation that writes Git's index, and
+    /// refuses up front while another Git process holds that index.
+    fn acquire_for_index(&self, operation: &str) -> Result<OperationLock> {
+        let lock = self.acquire_operation_lock(operation)?;
+        self.while_git_busy(|| self.ensure_git_index_unlocked())?;
+        Ok(lock)
+    }
+
+    /// Git holds `index.lock` only while it stages, commits, or checks out, so
+    /// a step that finds it taken is retried briefly before reporting
+    /// [`DraftlineError::GitIndexLocked`]. Every wrapped step is idempotent.
+    fn while_git_busy<T>(&self, mut step: impl FnMut() -> Result<T>) -> Result<T> {
+        let deadline = std::time::Instant::now() + GIT_BUSY_WAIT;
+        loop {
+            match step() {
+                Err(DraftlineError::GitIndexLocked) if std::time::Instant::now() < deadline => {
+                    test_hooks::fire("git_busy_retry", self.repo.path());
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(DraftlineError::GitIndexLocked) => {
+                    // A failed write leaves libgit2's shared index ahead of disk.
+                    if let Ok(mut index) = self.repo.index() {
+                        let _ = index.read(true);
+                    }
+                    return Err(DraftlineError::GitIndexLocked);
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn ensure_git_index_unlocked(&self) -> Result<()> {
+        if self.repo.path().join("index.lock").exists() {
+            return Err(DraftlineError::GitIndexLocked);
+        }
+        test_hooks::fire("after_index_precheck", self.repo.path());
+        Ok(())
+    }
+
+    /// Takes the Draftline lock, then confirms this workspace still holds the
+    /// checkout, so a handle opened before a relocate can't keep writing.
+    fn acquire_operation_lock(&self, operation: &str) -> Result<OperationLock> {
+        let lock = OperationLock::acquire(&self.lock_path(), operation)?;
+        self.claim_checkout()?;
+        Ok(lock)
+    }
+
     fn lock_path(&self) -> PathBuf {
         self.draftline_dir().join("operation.lock")
     }
 
     fn write_recovery_state(&self, state: &RecoveryState) -> Result<()> {
+        self.write_recovery_ledger(state, None)
+    }
+
+    /// Records an operation that is about to move the checkout from `from`
+    /// to `to`.
+    fn write_recovery_state_for_checkout(
+        &self,
+        state: &RecoveryState,
+        from: &Tree<'_>,
+        to: &Tree<'_>,
+    ) -> Result<()> {
+        self.write_recovery_ledger(
+            state,
+            Some(RecordedCheckout {
+                from_tree: from.id().to_string(),
+                to_tree: to.id().to_string(),
+            }),
+        )
+    }
+
+    /// The trees recorded for the pending checkout, when the record has them.
+    fn recorded_checkout(&self) -> Option<(Tree<'_>, Tree<'_>)> {
+        let bytes = fs::read(self.ledger_path()).ok()?;
+        let checkout = serde_json::from_slice::<RecoveryLedger>(&bytes)
+            .ok()?
+            .checkout?;
+        let tree = |id: &str| {
+            Oid::from_str(id)
+                .ok()
+                .and_then(|oid| self.repo.find_tree(oid).ok())
+        };
+        Some((tree(&checkout.from_tree)?, tree(&checkout.to_tree)?))
+    }
+
+    fn write_recovery_ledger(
+        &self,
+        state: &RecoveryState,
+        checkout: Option<RecordedCheckout>,
+    ) -> Result<()> {
         fs::create_dir_all(self.draftline_dir())?;
-        fs::write(self.ledger_path(), serde_json::to_vec_pretty(state)?)?;
+        let ledger = RecoveryLedger {
+            state: state.clone(),
+            project: Some(self.project_key()),
+            checkout,
+        };
+        fs::write(self.ledger_path(), serde_json::to_vec_pretty(&ledger)?)?;
         if state.completed && matches!(&state.operation, RecoveryOperation::DeleteRemoteVariation) {
             match fs::remove_file(self.remote_delete_recovery_metadata_path(&state.operation_id)) {
                 Ok(()) => {}
@@ -10002,12 +8157,138 @@ impl Workspace {
         self
     }
 
+    fn claim_path(&self) -> PathBuf {
+        self.draftline_dir().join("workspace.json")
+    }
+
+    /// A checkout has one current branch, and variations, sends, merges, the
+    /// operation lock and recovery all act on it, so it holds one Draftline
+    /// workspace. The first workspace opened in a checkout claims it; any other
+    /// folder is refused until [`Workspace::relocate`] moves the claim.
+    fn claim_checkout(&self) -> Result<()> {
+        let path = self.claim_path();
+        if !path.exists() {
+            match self.publish_new_claim(&path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let claimed = self.read_claim(&path)?;
+        if claimed.project == self.project_key() {
+            Ok(())
+        } else {
+            Err(DraftlineError::WorkspaceAlreadyInCheckout(PathBuf::from(
+                claimed.project,
+            )))
+        }
+    }
+
+    /// Publishes a complete claim only if none exists, so a crash never leaves
+    /// a partial one: the claim is written and synced to a temporary file,
+    /// then hard-linked into place, which fails if another opener won. File
+    /// systems without hard links fall back to an exclusive create.
+    fn publish_new_claim(&self, path: &Path) -> std::io::Result<()> {
+        use std::io::Write as _;
+        fs::create_dir_all(self.draftline_dir())?;
+        let bytes = self.claim_bytes().map_err(std::io::Error::other)?;
+        let temp = unique_claim_temp(path);
+        let written = fs::File::create(&temp).and_then(|mut file| {
+            file.write_all(&bytes)?;
+            file.sync_all()
+        });
+        let linked = written.and_then(|()| fs::hard_link(&temp, path));
+        let _ = fs::remove_file(&temp);
+        match linked {
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists && !path.exists() => {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?;
+                file.write_all(&bytes)?;
+                file.sync_all()
+            }
+            result => result,
+        }
+    }
+
+    /// Reads the claim, waiting briefly for a racing opener that created the
+    /// file but has not written it yet.
+    fn read_claim(&self, path: &Path) -> Result<WorkspaceClaim> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let bytes = fs::read(path)?;
+            if !bytes.is_empty() || std::time::Instant::now() >= deadline {
+                return serde_json::from_slice(&bytes).map_err(|error| {
+                    DraftlineError::InvalidWorkspaceClaim(format!(
+                        "{}: {error}; use Workspace::relocate to reset it",
+                        path.display()
+                    ))
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn write_claim(&self) -> Result<()> {
+        fs::create_dir_all(self.draftline_dir())?;
+        let path = self.claim_path();
+        let temp = unique_claim_temp(&path);
+        fs::write(&temp, self.claim_bytes()?)?;
+        if let Err(error) = fs::rename(&temp, &path) {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn claim_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec_pretty(&WorkspaceClaim {
+            project: self.project_key(),
+        })?)
+    }
+
+    /// Every operation that reads or writes the checkout passes here, so a
+    /// handle whose folder no longer holds the checkout's claim is refused.
     fn ensure_no_pending_recovery(&self) -> Result<()> {
+        self.claim_checkout()?;
+        self.ensure_no_pending_recovery_in_checkout()
+    }
+
+    fn ensure_no_pending_recovery_in_checkout(&self) -> Result<()> {
+        self.ensure_recovery_is_ours()?;
         if let Some(state) = self.recovery_state()? {
             return Err(DraftlineError::RecoveryRequired(Box::new(state)));
         }
 
         Ok(())
+    }
+
+    /// Projects in one checkout share its branch, so one project's unfinished
+    /// operation blocks the others, but only that project may finish it.
+    fn ensure_recovery_is_ours(&self) -> Result<()> {
+        match self.recovery_owner_elsewhere() {
+            Some(project) => Err(DraftlineError::RecoveryInOtherProject(project)),
+            None => Ok(()),
+        }
+    }
+
+    /// The other project that owns the incomplete recovery record, if any. An
+    /// unreadable record is reported by `recovery_state` and stays clearable.
+    fn recovery_owner_elsewhere(&self) -> Option<PathBuf> {
+        let bytes = fs::read(self.ledger_path()).ok()?;
+        let ledger = serde_json::from_slice::<RecoveryLedger>(&bytes).ok()?;
+        let project = ledger.project?;
+        (!ledger.state.completed && project != self.project_key()).then(|| PathBuf::from(project))
+    }
+
+    fn project_key(&self) -> String {
+        self.scope()
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     fn normalize_tracked_content_path(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -10035,148 +8316,632 @@ impl Workspace {
             .collect())
     }
 
-    fn write_selected_changes_tree(&self, changed_files: &[ChangedFile]) -> Result<Oid> {
-        let all_changed_files = self.changed_files_unchecked()?;
-        let selected_paths: BTreeSet<_> = changed_files
-            .iter()
-            .map(|changed| changed.path.as_path())
-            .collect();
-        let mut rename_targets = HashMap::new();
-        let mut paths_to_reset = BTreeSet::new();
-        let mut paths_to_restore = BTreeSet::new();
-        for changed in &all_changed_files {
-            let mut affected_paths = vec![changed.path.clone()];
-            if changed.kind == ChangeKind::Renamed {
-                if let Some(target) = self.staged_rename_target_for_path(&changed.path)? {
-                    affected_paths.push(target.clone());
-                    rename_targets.insert(changed.path.clone(), target);
-                }
-            }
-            paths_to_reset.extend(affected_paths.iter().cloned());
-            if !selected_paths.contains(changed.path.as_path()) {
-                paths_to_restore.extend(affected_paths);
-            }
-        }
-
-        let original_index_entries = {
-            let index = self.repo.index()?;
-            paths_to_restore
-                .iter()
-                .map(|path| (path.clone(), index.get_path(path, 0)))
-                .collect::<Vec<_>>()
-        };
-
-        if let Ok(head) = self
-            .repo
-            .head()
-            .and_then(|head| head.peel(ObjectType::Commit))
-        {
-            self.repo
-                .reset_default(Some(&head), paths_to_reset.iter().map(PathBuf::as_path))?;
-        }
-
-        let mut index = self.repo.index()?;
-        if self.repo.head().is_err() {
-            for path in &paths_to_reset {
-                if let Err(error) = index.remove_path(path) {
-                    if error.code() != git2::ErrorCode::NotFound {
-                        return Err(error.into());
-                    }
-                }
-            }
-        }
-
+    /// Builds the tree for `changed_files` on top of HEAD in a private
+    /// in-memory index so the developer's staged changes are never consumed.
+    /// Returns the tree and every path whose real index entry should follow it.
+    fn content_changes_tree(
+        &self,
+        base: Option<&Commit<'_>>,
+        changed_files: &[ChangedFile],
+        operation: &str,
+    ) -> Result<(Oid, Vec<PathBuf>)> {
+        // Resolve every path first so filter checks see what will really be added.
+        let mut additions = Vec::new();
+        let mut removals = Vec::new();
         for changed in changed_files {
             match changed.kind {
                 ChangeKind::Renamed => {
-                    let target = rename_targets.get(&changed.path).ok_or_else(|| {
-                        DraftlineError::LocalStateChanged {
+                    let target = self
+                        .staged_rename_target_for_path(&changed.path)?
+                        .ok_or_else(|| DraftlineError::LocalStateChanged {
                             expected: format!(
                                 "staged rename target for {}",
                                 changed.path.display()
                             ),
                             actual: "missing rename target".to_string(),
-                        }
-                    })?;
-                    index.add_path(target)?;
-                    if let Err(error) = index.remove_path(&changed.path) {
-                        if error.code() != git2::ErrorCode::NotFound {
-                            return Err(error.into());
-                        }
+                        })?;
+                    removals.push(changed.path.clone());
+                    // A rename out of the project leaves the target to whoever made it.
+                    if self.content_policy.tracks(&target)? {
+                        additions.push(target);
                     }
                 }
-                ChangeKind::Deleted => {
-                    if let Err(error) = index.remove_path(&changed.path) {
-                        if error.code() != git2::ErrorCode::NotFound {
-                            return Err(error.into());
-                        }
-                    }
-                }
-                _ => index.add_path(&changed.path)?,
+                ChangeKind::Deleted => removals.push(changed.path.clone()),
+                _ => additions.push(changed.path.clone()),
             }
         }
+        self.ensure_no_filtered_content(&additions, operation)?;
 
-        index.write()?;
-        let selected_tree_id = index.write_tree()?;
+        // A second handle owns its own index object; it is never written to disk.
+        let scratch = Repository::open(&self.root)?;
+        let mut index = scratch.index()?;
+        index.clear()?;
+        // Built from the exact parent the commit will get, so a developer
+        // commit landing meanwhile can never be reverted by this tree.
+        if let Some(base) = base {
+            index.read_tree(&base.tree()?)?;
+        }
+        for path in &removals {
+            remove_index_path(&mut index, path)?;
+        }
+        for path in &additions {
+            index.add_path(path)?;
+        }
+        let affected_paths = removals.into_iter().chain(additions).collect::<Vec<_>>();
 
-        for (path, entry) in original_index_entries {
-            if let Some(entry) = entry {
-                index.add(&entry)?;
-            } else if let Err(error) = index.remove_path(&path) {
+        Ok((index.write_tree()?, affected_paths))
+    }
+
+    /// Commits `changed_files` on top of HEAD, then syncs only the saved paths
+    /// in the real index so `git status` stays clean for them.
+    fn commit_content_changes(
+        &self,
+        changed_files: &[ChangedFile],
+        operation: &str,
+        label: &str,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Version> {
+        let parent = self
+            .repo
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok());
+        test_hooks::fire("after_parent_read", self.repo.path());
+        let (tree_id, affected_paths) =
+            self.content_changes_tree(parent.as_ref(), changed_files, operation)?;
+        let tree = self.repo.find_tree(tree_id)?;
+        let (author, committer) = self.workspace_signatures(profile)?;
+        let parents = parent.iter().collect::<Vec<_>>();
+        self.while_git_busy(|| self.ensure_git_index_unlocked())?;
+        // Like `git commit`: the index is updated before the branch moves, so a
+        // busy index fails the save cleanly instead of leaving a commit the
+        // index would silently revert on the developer's next commit.
+        let oid = self
+            .repo
+            .commit(None, &author, &committer, label, &tree, &parents)?;
+        let commit = self.repo.find_commit(oid)?;
+        let previous = self.while_git_busy(|| self.stage_from(&commit, &affected_paths))?;
+        if let Err(error) =
+            self.while_git_busy(|| self.advance_head(&commit, parent.as_ref(), &committer))
+        {
+            self.restore_index_entries(&affected_paths, previous)?;
+            return Err(error);
+        }
+        Ok(version_from_commit(&commit))
+    }
+
+    /// Sets the index entries for `paths` to `commit`'s, returning every entry
+    /// (all stages) they replace. libgit2 cannot hold Git's index lock across
+    /// a read and a write, so the index is reread just before the write.
+    fn stage_from(&self, commit: &Commit<'_>, paths: &[PathBuf]) -> Result<Vec<git2::IndexEntry>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        let wanted = paths
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/").into_bytes())
+            .collect::<HashSet<_>>();
+        let previous = index
+            .iter()
+            .filter(|entry| wanted.contains(&entry.path))
+            .collect();
+        drop(index);
+        self.write_index_from_tree(&commit.tree()?, paths, &[])?;
+        Ok(previous)
+    }
+
+    /// Puts back the entries [`Self::stage_from`] replaced.
+    fn restore_index_entries(
+        &self,
+        paths: &[PathBuf],
+        entries: Vec<git2::IndexEntry>,
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.while_git_busy(|| self.write_index_entries(paths, &entries))
+    }
+
+    fn write_index_entries(&self, paths: &[PathBuf], entries: &[git2::IndexEntry]) -> Result<()> {
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        for path in paths {
+            if let Err(error) = index.remove_path(path) {
                 if error.code() != git2::ErrorCode::NotFound {
                     return Err(error.into());
                 }
             }
         }
-        index.write()?;
+        for entry in entries {
+            index.add(entry)?;
+        }
+        write_index_or_reload(&mut index)
+    }
 
-        Ok(selected_tree_id)
+    /// Moves HEAD's branch (or a detached HEAD) to `commit` only if it still
+    /// points at `parent`, holding the ref's lock as `git commit` does.
+    fn advance_head(
+        &self,
+        commit: &Commit<'_>,
+        parent: Option<&Commit<'_>>,
+        committer: &Signature<'_>,
+    ) -> Result<()> {
+        let head = self.repo.find_reference("HEAD")?;
+        let name = head
+            .symbolic_target()
+            .ok()
+            .flatten()
+            .unwrap_or("HEAD")
+            .to_string();
+        let mut transaction = self.repo.transaction()?;
+        transaction.lock_ref(&name)?;
+        let current = self.repo.refname_to_id(&name).ok();
+        let expected = parent.map(Commit::id);
+        if current != expected {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{name} at {expected:?}"),
+                actual: format!("{current:?}"),
+            });
+        }
+        let summary = commit.summary().ok().flatten().unwrap_or_default();
+        let message = match parent {
+            Some(_) => format!("commit: {summary}"),
+            None => format!("commit (initial): {summary}"),
+        };
+        transaction.set_target(&name, commit.id(), Some(committer), &message)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Refuses content that needs a Git filter driver (for example Git LFS),
+    /// which libgit2 cannot run; committing it raw would corrupt the repository.
+    fn ensure_no_filtered_content(&self, paths: &[PathBuf], operation: &str) -> Result<()> {
+        let hazards = self.filtered_hazards(paths)?;
+        if hazards.is_empty() {
+            Ok(())
+        } else {
+            Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                operation,
+                false,
+                Vec::new(),
+                hazards,
+                None,
+            ))))
+        }
+    }
+
+    /// A discard rewrites paths from `HEAD`, so `HEAD`'s rules count too.
+    fn discard_filtered_hazards(&self, changed_files: &[ChangedFile]) -> Result<Vec<FileHazard>> {
+        let paths = Self::discard_write_paths(changed_files);
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let head = self.repo.head()?.peel_to_tree()?;
+        self.filtered_hazards_toward(&paths, Some(&head))
+    }
+
+    fn ensure_discard_unfiltered(
+        &self,
+        changed_files: &[ChangedFile],
+        operation: &str,
+    ) -> Result<()> {
+        let hazards = self.discard_filtered_hazards(changed_files)?;
+        if hazards.is_empty() {
+            return Ok(());
+        }
+        Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+            operation,
+            false,
+            Vec::new(),
+            hazards,
+            None,
+        ))))
+    }
+
+    fn filtered_hazards(&self, paths: &[PathBuf]) -> Result<Vec<FileHazard>> {
+        self.filtered_hazards_toward(paths, None)
+    }
+
+    /// Like [`Self::filtered_hazards`], but a path also counts when `target`'s
+    /// own `.gitattributes` would filter it, since a checkout installs those
+    /// rules only after it has written the file.
+    fn filtered_hazards_toward(
+        &self,
+        paths: &[PathBuf],
+        target: Option<&Tree<'_>>,
+    ) -> Result<Vec<FileHazard>> {
+        let attributes = target.map(|tree| self.attributes_of(tree)).transpose()?;
+        let mut hazards = Vec::new();
+        for path in paths {
+            if self.needs_filter(attributes.as_ref(), path)? {
+                hazards.push(FileHazard {
+                    path: path.clone(),
+                    kind: FileHazardKind::GitFilter,
+                });
+            }
+        }
+        Ok(hazards)
+    }
+
+    /// A second handle whose index is `tree`, so attribute lookups see the
+    /// `.gitattributes` rules `tree` carries rather than the checkout's.
+    fn attributes_of(&self, tree: &Tree<'_>) -> Result<Repository> {
+        let repo = Repository::open(self.repo.path())?;
+        let mut index = git2::Index::new()?;
+        index.read_tree(tree)?;
+        repo.set_index(&mut index)?;
+        Ok(repo)
+    }
+
+    fn needs_filter(&self, target: Option<&Repository>, path: &Path) -> Result<bool> {
+        if needs_git_filter(&self.repo, path, git2::AttrCheckFlags::FILE_THEN_INDEX)? {
+            return Ok(true);
+        }
+        match target {
+            Some(repo) => needs_git_filter(repo, path, git2::AttrCheckFlags::INDEX_ONLY),
+            None => Ok(false),
+        }
+    }
+
+    /// libgit2 cannot run filter drivers such as Git LFS, so it would write the
+    /// stored pointer text over the real file. Every checkout here aborts while
+    /// planning, before any file is written, if it would update such a path
+    /// under either the current rules or `target`'s.
+    fn checkout_refusing_filters<'cb>(
+        &'cb self,
+        mut checkout: CheckoutBuilder<'cb>,
+        refused: &'cb RefCell<Vec<PathBuf>>,
+        target: &Tree<'_>,
+        run: impl FnOnce(&mut CheckoutBuilder<'cb>) -> std::result::Result<(), git2::Error>,
+    ) -> Result<()> {
+        let attributes = self.attributes_of(target)?;
+        checkout
+            .notify_on(git2::CheckoutNotificationType::UPDATED)
+            .notify(move |_, path, _, file, _| {
+                let Some(path) = path.filter(|_| file.is_some_and(|file| file.exists())) else {
+                    return true;
+                };
+                if self.needs_filter(Some(&attributes), path).unwrap_or(true) {
+                    refused.borrow_mut().push(path.to_path_buf());
+                    return false;
+                }
+                true
+            });
+        let result = run(&mut checkout);
+        let refused = refused.take();
+        if refused.is_empty() {
+            return Ok(result?);
+        }
+        Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+            "checkout",
+            true,
+            Vec::new(),
+            refused
+                .into_iter()
+                .map(|path| FileHazard {
+                    path,
+                    kind: FileHazardKind::GitFilter,
+                })
+                .collect(),
+            None,
+        ))))
+    }
+
+    /// Moves working files from the current HEAD tree to `target` the way
+    /// `git checkout` does: files with local edits are never overwritten.
+    /// Must run before HEAD or its branch moves, since HEAD is the baseline.
+    fn checkout_tree_safely(&self, target: &Tree<'_>) -> Result<()> {
+        let baseline = self.repo.head().and_then(|head| head.peel_to_tree()).ok();
+        let position = self.head_position();
+        let mut checkout = CheckoutBuilder::new();
+        checkout.safe().overwrite_ignored(false);
+        let refused = RefCell::default();
+        let result = self.checkout_refusing_filters(checkout, &refused, target, |checkout| {
+            self.repo.checkout_tree(target.as_object(), Some(checkout))
+        });
+        if !matches!(result, Err(DraftlineError::GitIndexLocked)) {
+            return result;
+        }
+        // libgit2 writes the index last, so every file is already at `target`.
+        // Rerunning a safe checkout would see files it just added as untracked
+        // and refuse; writing the moved paths' index entries from `target`
+        // finishes the job instead. If HEAD (its branch or tip) or any of those files changed while
+        // Git held the index, the lock error stands and recovery takes over.
+        let paths = self.paths_changed_between(baseline.as_ref(), target)?;
+        self.while_git_busy(|| {
+            if self.head_position() != position
+                || self.workdir_matches(target, &paths)?.len() != paths.len()
+            {
+                return Err(DraftlineError::GitIndexLocked);
+            }
+            self.write_index_from_tree(target, &paths, &[])
+        })
+    }
+
+    /// Sets the index entries for `paths` to `tree`'s (removing those `tree`
+    /// lacks) and drops `remove`, in a single index write. Entries carry no
+    /// stat data, so Git rehashes those files on the next status.
+    fn write_index_from_tree(
+        &self,
+        tree: &Tree<'_>,
+        paths: &[PathBuf],
+        remove: &[PathBuf],
+    ) -> Result<()> {
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        for path in paths.iter().chain(remove) {
+            if let Err(error) = index.remove_path(path) {
+                if error.code() != git2::ErrorCode::NotFound {
+                    return Err(error.into());
+                }
+            }
+        }
+        for path in paths {
+            let entry = match tree.get_path(path) {
+                Ok(entry) if entry.kind() != Some(ObjectType::Tree) => entry,
+                Ok(_) => continue,
+                Err(error) if error.code() == git2::ErrorCode::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let key = path.to_string_lossy().replace('\\', "/").into_bytes();
+            index.add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: entry.filemode() as u32,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: entry.id(),
+                flags: key.len().min(0xfff) as u16,
+                flags_extended: 0,
+                path: key,
+            })?;
+        }
+        write_index_or_reload(&mut index)
+    }
+
+    /// Safe checkout for an operation with a pending recovery record. A refused
+    /// checkout (local edits in the way) writes nothing, so the record is
+    /// dropped; any other failure may have written some files, so the record
+    /// stays for [`Self::repair_recovery`].
+    fn checkout_or_keep_recovery(&self, target: &Tree<'_>) -> Result<()> {
+        match self.checkout_tree_safely(target) {
+            Err(DraftlineError::Git(error)) if error.code() == git2::ErrorCode::Conflict => {
+                let _ = self.clear_recovery_records();
+                Err(DraftlineError::Git(error))
+            }
+            result => self.clear_recovery_if_refused(result),
+        }
+    }
+
+    /// A filter refusal aborts a checkout before it writes anything, so the
+    /// pending record has nothing to recover.
+    fn clear_recovery_if_refused(&self, result: Result<()>) -> Result<()> {
+        if matches!(result, Err(DraftlineError::PreflightFailed(_))) {
+            let _ = self.clear_recovery_records();
+        }
+        result
+    }
+
+    /// Forces only the project folder to `target`; paths outside it are untouched.
+    fn checkout_scope_forced(&self, target: &Tree<'_>) -> Result<()> {
+        let mut checkout = CheckoutBuilder::new();
+        checkout.force();
+        if let Some(pathspec) = scope_pathspec(self.scope()) {
+            checkout.disable_pathspec_match(true).path(pathspec);
+        }
+        let refused = RefCell::default();
+        let result = self.checkout_refusing_filters(checkout, &refused, target, |checkout| {
+            self.repo.checkout_tree(target.as_object(), Some(checkout))
+        });
+        if !matches!(result, Err(DraftlineError::GitIndexLocked)) {
+            return result;
+        }
+        // libgit2 writes the index last, so the folder's files are already at
+        // `target`. Forcing them again could overwrite an edit made while Git
+        // held the index; finishing only the index leaves such an edit visible
+        // as a change instead.
+        self.while_git_busy(|| {
+            let paths = self.scope_index_paths(target)?;
+            self.write_index_from_tree(target, &paths, &[])
+        })
+    }
+
+    /// Every path in the project folder that `target` or the index has.
+    fn scope_index_paths(&self, target: &Tree<'_>) -> Result<Vec<PathBuf>> {
+        let scope = scope_pathspec(self.scope());
+        let in_scope = |path: &str| {
+            scope.as_deref().is_none_or(|scope| {
+                path == scope
+                    || path
+                        .strip_prefix(scope)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        };
+        let mut paths = BTreeSet::new();
+        target.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            if entry.kind() != Some(ObjectType::Tree) {
+                let path = format!("{dir}{}", String::from_utf8_lossy(entry.name_bytes()));
+                if in_scope(&path) {
+                    paths.insert(path);
+                }
+            }
+            git2::TreeWalkResult::Ok
+        })?;
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        for entry in index.iter() {
+            let path = String::from_utf8_lossy(&entry.path).into_owned();
+            if in_scope(&path) {
+                paths.insert(path);
+            }
+        }
+        Ok(paths.into_iter().map(PathBuf::from).collect())
+    }
+
+    /// `base` with its project folder replaced by `source`'s project folder.
+    /// Unscoped workspaces use `source` as-is.
+    fn compose_scoped_tree(&self, base: &Tree<'_>, source: &Tree<'_>) -> Result<Oid> {
+        let Some(pathspec) = scope_pathspec(self.scope()) else {
+            return Ok(source.id());
+        };
+        let source_entry = optional_tree_entry(source, self.scope())?;
+        let base_entry = optional_tree_entry(base, self.scope())?;
+        let mut update = git2::build::TreeUpdateBuilder::new();
+        match (source_entry, base_entry) {
+            (Some(entry), _) => {
+                update.upsert(pathspec.as_str(), entry, git2::FileMode::Tree);
+            }
+            (None, Some(_)) => {
+                update.remove(pathspec.as_str());
+            }
+            (None, None) => return Ok(base.id()),
+        }
+        Ok(update.create_updated(&self.repo, base)?)
+    }
+
+    /// HEAD with only the content paths the shelf changed replaced by the
+    /// shelf's versions, plus those paths. Everything else stays at HEAD, so
+    /// applying a shelf never reverts commits made since it was created.
+    fn shelf_target_tree(&self, shelf: &Commit<'_>) -> Result<(Oid, Vec<PathBuf>)> {
+        let shelf_tree = shelf.tree()?;
+        let parent_tree = match shelf.parent(0) {
+            Ok(parent) => Some(parent.tree()?),
+            Err(_) => None,
+        };
+        let head_tree = self.repo.head()?.peel_to_tree()?;
+        let diff = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&shelf_tree), None)?;
+        let mut paths = BTreeSet::new();
+        for delta in diff.deltas() {
+            for file in [delta.old_file(), delta.new_file()] {
+                if let Some(path) = file.path() {
+                    if self.content_policy.tracks(path)? {
+                        paths.insert(path.to_path_buf());
+                    }
+                }
+            }
+        }
+
+        let mut update = git2::build::TreeUpdateBuilder::new();
+        for path in &paths {
+            let key = path.to_string_lossy().replace('\\', "/");
+            match shelf_tree.get_path(path) {
+                Ok(entry) => {
+                    update.upsert(key.as_str(), entry.id(), blob_file_mode(entry.filemode()));
+                }
+                Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                    update.remove(key.as_str());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let tree = update.create_updated(&self.repo, &head_tree)?;
+        Ok((tree, paths.into_iter().collect()))
+    }
+
+    /// Writes the shelf's content paths into the working tree without staging
+    /// them, leaving every other path and the index alone.
+    fn apply_shelf_paths(&self, shelf: &Commit<'_>) -> Result<()> {
+        let (tree_id, paths) = self.shelf_target_tree(shelf)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let tree = self.repo.find_tree(tree_id)?;
+        let mut checkout = CheckoutBuilder::new();
+        checkout
+            .force()
+            .update_index(false)
+            .disable_pathspec_match(true);
+        for path in &paths {
+            checkout.path(path.to_string_lossy().replace('\\', "/"));
+        }
+        let refused = RefCell::default();
+        self.checkout_refusing_filters(checkout, &refused, &tree, |checkout| {
+            self.repo.checkout_tree(tree.as_object(), Some(checkout))
+        })
+    }
+
+    fn discard_preflight(
+        &self,
+        operation: &str,
+        changed_files: Vec<ChangedFile>,
+    ) -> Result<PreflightReport> {
+        let hazards = self.discard_filtered_hazards(&changed_files)?;
+        let mut report = discard_preflight_report(operation, changed_files);
+        if !hazards.is_empty() {
+            report.file_hazards.extend(hazards);
+            report.can_proceed = false;
+        }
+        Ok(report)
+    }
+
+    /// Paths a discard would rewrite from `HEAD`.
+    fn discard_write_paths(changed_files: &[ChangedFile]) -> Vec<PathBuf> {
+        changed_files
+            .iter()
+            .filter(|changed| changed.kind != ChangeKind::Added)
+            .map(|changed| changed.path.clone())
+            .collect()
     }
 
     fn discard_changed_files(&self, changed_files: &[ChangedFile]) -> Result<()> {
-        let mut index = self.repo.index()?;
-        let mut checkout = CheckoutBuilder::new();
-        checkout.force();
+        self.ensure_discard_unfiltered(changed_files, "discard")?;
+        let mut paths_to_unstage = Vec::new();
         let mut paths_to_reset = Vec::new();
         let mut paths_to_remove_after_checkout = Vec::new();
 
         for changed in changed_files {
             match changed.kind {
-                ChangeKind::Added => {
-                    if let Err(error) = index.remove_path(&changed.path) {
-                        if error.code() != git2::ErrorCode::NotFound {
-                            return Err(error.into());
-                        }
-                    }
-                    remove_workspace_path_if_exists(&self.root.join(&changed.path))?;
-                }
+                ChangeKind::Added => paths_to_unstage.push(changed.path.clone()),
                 ChangeKind::Renamed => {
-                    if let Some(target) = self.staged_rename_target_for_path(&changed.path)? {
-                        checkout.path(&target);
+                    let target = match self.staged_rename_target_for_path(&changed.path)? {
+                        Some(target) if self.content_policy.tracks(&target)? => Some(target),
+                        _ => None,
+                    };
+                    // A target outside the content policy belongs to the developer.
+                    if let Some(target) = target {
                         paths_to_reset.push(target.clone());
                         paths_to_remove_after_checkout.push(target);
                     }
-                    checkout.path(&changed.path);
                     paths_to_reset.push(changed.path.clone());
                 }
                 ChangeKind::Modified
                 | ChangeKind::Deleted
                 | ChangeKind::Conflicted
-                | ChangeKind::TypeChanged => {
-                    checkout.path(&changed.path);
-                    paths_to_reset.push(changed.path.clone());
-                }
+                | ChangeKind::TypeChanged => paths_to_reset.push(changed.path.clone()),
             }
         }
 
-        index.write()?;
-        drop(index);
+        // The whole index change is one write made before any file is touched,
+        // and the file steps never write the index, so a busy index leaves the
+        // workspace exactly as it was.
+        let head_tree = self.repo.head()?.peel_to_tree()?;
+        if !paths_to_unstage.is_empty() || !paths_to_reset.is_empty() {
+            self.while_git_busy(|| {
+                self.write_index_from_tree(&head_tree, &paths_to_reset, &paths_to_unstage)
+            })?;
+        }
+        for path in &paths_to_unstage {
+            remove_workspace_path_if_exists(&self.root.join(path))?;
+        }
 
         if !paths_to_reset.is_empty() {
-            let head = self.repo.head()?.peel(ObjectType::Commit)?;
-            self.repo
-                .reset_default(Some(&head), paths_to_reset.iter().map(PathBuf::as_path))?;
-            self.repo.checkout_head(Some(&mut checkout))?;
+            let mut checkout = CheckoutBuilder::new();
+            checkout.force().update_index(false);
+            for path in &paths_to_reset {
+                checkout.path(path);
+            }
+            let refused = RefCell::default();
+            self.checkout_refusing_filters(checkout, &refused, &head_tree, |checkout| {
+                self.repo
+                    .checkout_tree(head_tree.as_object(), Some(checkout))
+            })?;
         }
 
         for path in paths_to_remove_after_checkout {
@@ -10195,7 +8960,8 @@ impl Workspace {
 
         let statuses = self.repo.statuses(Some(&mut options))?;
         for entry in statuses.iter() {
-            if !entry.status().is_index_renamed() || entry.path().map(Path::new) != Some(path) {
+            if !entry.status().is_index_renamed() || entry.path().ok().map(Path::new) != Some(path)
+            {
                 continue;
             }
 
@@ -10221,6 +8987,11 @@ impl Workspace {
     ) -> Result<()> {
         let safe_name = validate_variation_name(name)?;
         let (author, committer) = self.rewrite_signatures(profile)?;
+        let changed_files = self.changed_files_unchecked()?;
+        let parent = self.repo.head()?.peel_to_commit()?;
+        let (tree_id, _) =
+            self.content_changes_tree(Some(&parent), &changed_files, "shelve_changes")?;
+        self.ensure_discard_unfiltered(&changed_files, "shelve_changes")?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
@@ -10230,25 +9001,7 @@ impl Workspace {
             completed: false,
         })?;
 
-        let changed_files = self.changed_files_unchecked()?;
-        let untracked_content: Vec<PathBuf> = changed_files
-            .iter()
-            .filter(|changed| changed.kind == ChangeKind::Added)
-            .map(|changed| changed.path.clone())
-            .collect();
-
-        let mut index = self.repo.index()?;
-        for changed in changed_files {
-            match changed.kind {
-                ChangeKind::Deleted => index.remove_path(&changed.path)?,
-                _ => index.add_path(&changed.path)?,
-            }
-        }
-        index.write()?;
-
-        let tree_id = index.write_tree()?;
         let tree = self.repo.find_tree(tree_id)?;
-        let parent = self.repo.head()?.peel_to_commit()?;
         let oid = self.repo.commit(
             None,
             &author,
@@ -10264,15 +9017,7 @@ impl Workspace {
             "shelve changes",
         )?;
 
-        self.repo
-            .checkout_head(Some(CheckoutBuilder::new().force()))?;
-
-        for path in untracked_content {
-            let full_path = self.root.join(path);
-            if full_path.is_file() {
-                fs::remove_file(full_path)?;
-            }
-        }
+        self.discard_changed_files(&changed_files)?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -10283,142 +9028,6 @@ impl Workspace {
         })?;
 
         Ok(())
-    }
-
-    fn incoming_remote_rewrite(
-        &self,
-        remote: &str,
-        variation: &str,
-        local_oid: Oid,
-        replacement_oid: Oid,
-    ) -> Result<Option<RemoteRewriteIncoming>> {
-        let remote_prefix = format!("refs/remotes/{remote}/draftline/rewrites/squash/{variation}/");
-        'support_refs: for support_ref in self.list_remote_tracking_support_refs()? {
-            if support_ref.kind != SupportRefKind::Rewrite
-                || support_ref.source_variation.as_deref() != Some(variation)
-                || !support_ref.ref_name.starts_with(&remote_prefix)
-            {
-                continue;
-            }
-            let old_remote_oid = Oid::from_str(&support_ref.target_oid)
-                .map_err(|_| DraftlineError::VersionNotFound(support_ref.target_oid.clone()))?;
-            let Ok(old_remote_commit) = self.repo.find_commit(old_remote_oid) else {
-                continue;
-            };
-            let Ok(replacement_commit) = self.repo.find_commit(replacement_oid) else {
-                continue;
-            };
-            if old_remote_commit.tree_id() != replacement_commit.tree_id() {
-                continue;
-            }
-            let replay_oids = if old_remote_oid == local_oid {
-                Vec::new()
-            } else {
-                match self.first_parent_descendants_after(old_remote_oid, local_oid) {
-                    Ok(replay_oids) => replay_oids,
-                    Err(
-                        DraftlineError::HistoryCleanupBlocked(_)
-                        | DraftlineError::InvalidHistoryCleanup(_),
-                    ) => continue,
-                    Err(error) => return Err(error),
-                }
-            };
-            for old_oid in &replay_oids {
-                let old_commit = self.repo.find_commit(*old_oid)?;
-                if old_commit.parent_count() > 1 {
-                    continue 'support_refs;
-                }
-            }
-            return Ok(Some(RemoteRewriteIncoming {
-                support_ref: RefName::from(support_ref.ref_name),
-                old_remote_oid,
-                replacement_oid,
-                replay_oids,
-            }));
-        }
-        Ok(None)
-    }
-
-    fn prepare_incoming_remote_rewrite(
-        &self,
-        variation: &str,
-        local_oid: Oid,
-        rewrite: &RemoteRewriteIncoming,
-    ) -> Result<RemoteRewriteApplication> {
-        let plan_id = CleanupPlanId::from_string(
-            rewrite
-                .support_ref
-                .as_str()
-                .rsplit('/')
-                .next()
-                .filter(|segment| !segment.is_empty())
-                .map(ToString::to_string)
-                .unwrap_or_else(new_operation_id),
-        )?;
-        let mut commit_map = vec![CommitRewriteMap {
-            old: VersionId::from(rewrite.old_remote_oid),
-            new: Some(VersionId::from(rewrite.replacement_oid)),
-            disposition: RewriteDisposition::Preserved {
-                new_id: VersionId::from(rewrite.replacement_oid),
-            },
-        }];
-        let mut parent_oid = rewrite.replacement_oid;
-
-        if !rewrite.replay_oids.is_empty() {
-            for old_oid in &rewrite.replay_oids {
-                let old_commit = self.repo.find_commit(*old_oid)?;
-                let parent_commit = self.repo.find_commit(parent_oid)?;
-                let tree = old_commit.tree()?;
-                let author = old_commit.author();
-                let committer = old_commit.committer();
-                let message = old_commit.message().unwrap_or_default();
-                let new_oid = self.repo.commit(
-                    None,
-                    &author,
-                    &committer,
-                    message,
-                    &tree,
-                    &[&parent_commit],
-                )?;
-                commit_map.push(CommitRewriteMap {
-                    old: VersionId::from(*old_oid),
-                    new: Some(VersionId::from(new_oid)),
-                    disposition: RewriteDisposition::Preserved {
-                        new_id: VersionId::from(new_oid),
-                    },
-                });
-                parent_oid = new_oid;
-            }
-        }
-
-        let ref_updates = vec![RefUpdate {
-            name: RefName::from(format!("refs/heads/{variation}")),
-            old: Some(VersionId::from(local_oid)),
-            new: Some(VersionId::from(parent_oid)),
-        }];
-        let snapshot_map = commit_map
-            .iter()
-            .map(|entry| SnapshotRewriteMap {
-                old: entry.old.clone(),
-                new: entry.new.clone(),
-                disposition: entry.disposition.clone(),
-            })
-            .collect();
-        let ledger = TimelineCleanupResult {
-            plan_id,
-            old_head: VersionId::from(local_oid),
-            new_head: VersionId::from(parent_oid),
-            backup_refs: vec![rewrite.support_ref.clone()],
-            ref_updates,
-            commit_map,
-            snapshot_map,
-            warnings: Vec::new(),
-        };
-
-        Ok(RemoteRewriteApplication {
-            target_oid: parent_oid,
-            ledger,
-        })
     }
 
     fn incoming_versions(&self, local: Oid, remote: Oid) -> Result<Vec<RemoteVersionSummary>> {
@@ -10543,56 +9152,142 @@ impl Workspace {
             .collect())
     }
 
+    /// The whole-repository merge of `input` with every content path set to
+    /// the planned (resolver-aware) result, built in memory so the real index
+    /// is never touched. Conflicts outside the content policy are returned
+    /// instead: they belong to a developer.
+    fn merged_tree(
+        &self,
+        input: &IncomingMergeInput<'_>,
+        files: &[MergeFileChange],
+    ) -> Result<std::result::Result<Oid, Vec<PathBuf>>> {
+        let base_tree = input.base_commit.tree()?;
+        let local_tree = input.local_commit.tree()?;
+        let remote_tree = input.remote_commit.tree()?;
+        let mut index = self
+            .repo
+            .merge_trees(&base_tree, &local_tree, &remote_tree, None)?;
+
+        let mut developer_conflicts = BTreeSet::new();
+        let mut content_conflicts = BTreeSet::new();
+        for conflict in index.conflicts()? {
+            let conflict = conflict?;
+            for entry in [&conflict.ancestor, &conflict.our, &conflict.their]
+                .into_iter()
+                .flatten()
+            {
+                let path = PathBuf::from(String::from_utf8_lossy(&entry.path).into_owned());
+                if self.content_policy.tracks(&path)? {
+                    content_conflicts.insert(path);
+                } else {
+                    developer_conflicts.insert(path);
+                }
+            }
+        }
+        if !developer_conflicts.is_empty() {
+            return Ok(Err(developer_conflicts.into_iter().collect()));
+        }
+        for path in &content_conflicts {
+            index.conflict_remove(path)?;
+        }
+        let merged = self.repo.find_tree(index.write_tree_to(&self.repo)?)?;
+
+        let mut paths = BTreeSet::new();
+        for tree in [&base_tree, &local_tree, &remote_tree, &merged] {
+            self.collect_tracked_tree_paths(tree, Path::new(""), &mut paths)?;
+        }
+        let planned = files
+            .iter()
+            .map(|file| (file.path.as_path(), file.content.as_deref()))
+            .collect::<BTreeMap<_, _>>();
+        let mut update = git2::build::TreeUpdateBuilder::new();
+        for path in &paths {
+            let desired = match planned.get(path.as_path()) {
+                Some(Some(content)) => Some(self.repo.blob(content)?),
+                Some(None) => None,
+                None => local_tree.get_path(path).ok().map(|entry| entry.id()),
+            };
+            let current = merged
+                .get_path(path)
+                .ok()
+                .map(|entry| (entry.id(), entry.filemode()));
+            let Some(oid) = desired else {
+                if current.is_some() {
+                    update.remove(path);
+                }
+                continue;
+            };
+            // Git's own mode merge when it settled one; otherwise keep a side's.
+            let mode = current
+                .map(|(_, mode)| mode)
+                .or_else(|| local_tree.get_path(path).ok().map(|entry| entry.filemode()))
+                .or_else(|| {
+                    remote_tree
+                        .get_path(path)
+                        .ok()
+                        .map(|entry| entry.filemode())
+                })
+                .unwrap_or(i32::from(git2::FileMode::Blob));
+            let file_mode = [
+                git2::FileMode::Blob,
+                git2::FileMode::BlobExecutable,
+                git2::FileMode::Link,
+            ]
+            .into_iter()
+            .find(|candidate| i32::from(*candidate) == mode);
+            match file_mode {
+                Some(file_mode) if current != Some((oid, mode)) => {
+                    update.upsert(path, oid, file_mode);
+                }
+                Some(_) => {}
+                // A folder, submodule, or other non-file entry: not ours to merge.
+                None => {
+                    developer_conflicts.insert(path.clone());
+                }
+            }
+        }
+        if !developer_conflicts.is_empty() {
+            return Ok(Err(developer_conflicts.into_iter().collect()));
+        }
+        Ok(Ok(update.create_updated(&self.repo, &merged)?))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn write_incoming_merge_version(
         &self,
         variation: String,
-        remote_oid: String,
         merge_input: &IncomingMergeInput<'_>,
         label: &str,
+        tree: &Tree<'_>,
         files: Vec<MergeFileChange>,
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
+        let (author, committer) = self.workspace_signatures(profile)?;
+        let oid = self.repo.commit(
+            None,
+            &author,
+            &committer,
+            label,
+            tree,
+            &[&merge_input.local_commit, &merge_input.remote_commit],
+        )?;
         let operation_id = new_operation_id();
         self.write_recovery_state(&RecoveryState {
             operation_id: operation_id.clone(),
             operation: RecoveryOperation::MergeIncoming,
-            original_variation: Some(variation),
-            target: Some(remote_oid),
+            original_variation: Some(variation.clone()),
+            target: Some(oid.to_string()),
             completed: false,
         })?;
 
-        let mut index = self.repo.index()?;
-        for change in &files {
-            let full_path = self.root.join(&change.path);
-            match &change.content {
-                Some(content) => {
-                    if let Some(parent) = full_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&full_path, content)?;
-                    index.add_path(&change.path)?;
-                }
-                None => {
-                    remove_workspace_path_if_exists(&full_path)?;
-                    if let Err(error) = index.remove_path(&change.path) {
-                        if error.code() != git2::ErrorCode::NotFound {
-                            return Err(error.into());
-                        }
-                    }
-                }
-            }
-        }
-        index.write()?;
-        let tree_id = index.write_tree()?;
-        let tree = self.repo.find_tree(tree_id)?;
-        let (author, committer) = self.workspace_signatures(profile)?;
-        let oid = self.repo.commit(
-            Some("HEAD"),
-            &author,
-            &committer,
-            label,
-            &tree,
-            &[&merge_input.local_commit, &merge_input.remote_commit],
+        // Like `git merge`: files move from HEAD to the merged tree without
+        // overwriting local edits, before the branch moves.
+        self.checkout_or_keep_recovery(tree)?;
+        self.repo.reference(
+            &format!("refs/heads/{variation}"),
+            oid,
+            true,
+            "merge_incoming",
         )?;
 
         self.write_recovery_state(&RecoveryState {
@@ -10616,7 +9311,7 @@ impl Workspace {
         paths: &mut BTreeSet<PathBuf>,
     ) -> Result<()> {
         for entry in tree.iter() {
-            let Some(name) = entry.name() else {
+            let Ok(name) = entry.name() else {
                 continue;
             };
             let path = prefix.join(name);
@@ -10696,12 +9391,93 @@ impl Workspace {
         if walk.push_head().is_err() {
             return Ok(Vec::new());
         }
-        walk.map(|oid| {
-            let oid = oid?;
-            let commit = self.repo.find_commit(oid)?;
-            Ok(version_from_commit(&commit))
-        })
-        .collect()
+        let mut history = ScopedHistory::new(&self.repo, self.scope(), []);
+        let mut versions = Vec::new();
+        for oid in walk {
+            let commit = self.repo.find_commit(oid?)?;
+            if history.shows(&commit)? {
+                versions.push(version_from_commit(&commit));
+            }
+        }
+        Ok(versions)
+    }
+
+    /// Path-limited history pinned to HEAD and every listed tip so labels stay
+    /// anchored even when a tip is a developer-only commit.
+    fn scoped_history(&self, tips: &HashMap<Oid, Vec<VariationId>>) -> ScopedHistory<'_> {
+        let head = self.repo.head().ok().and_then(|head| head.target());
+        ScopedHistory::new(&self.repo, self.scope(), tips.keys().copied().chain(head))
+    }
+
+    fn lists_variation(&self, name: &str, current: Option<&str>) -> bool {
+        match self.variation_namespace.as_deref() {
+            Some(namespace) => {
+                name.starts_with(namespace)
+                    || Some(name) == current
+                    || self.default_branch().as_deref() == Some(name)
+            }
+            None => true,
+        }
+    }
+
+    /// The branch new work starts from: `origin/HEAD`'s target, else the first
+    /// of `init.defaultBranch`, `main`, `master` and `trunk` that exists on
+    /// `origin` (as last fetched), else the first that exists locally.
+    fn default_branch(&self) -> Option<String> {
+        self.default_branch_on("origin")
+    }
+
+    fn default_branch_on(&self, remote: &str) -> Option<String> {
+        let prefix = format!("refs/remotes/{remote}/");
+        if let Ok(reference) = self.repo.find_reference(&format!("{prefix}HEAD")) {
+            if let Some(name) = reference
+                .symbolic_target()
+                .ok()
+                .flatten()
+                .and_then(|target| target.strip_prefix(prefix.as_str()))
+            {
+                return Some(name.to_string());
+            }
+        }
+        let candidates = self.default_branch_candidates();
+        candidates
+            .iter()
+            .find(|name| self.repo.find_reference(&format!("{prefix}{name}")).is_ok())
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|name| self.repo.find_branch(name, BranchType::Local).is_ok())
+            })
+            .cloned()
+    }
+
+    fn default_branch_candidates(&self) -> Vec<String> {
+        let configured = self
+            .repo
+            .config()
+            .and_then(|config| config.get_string("init.defaultBranch"))
+            .ok()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
+        let mut names = Vec::new();
+        for name in configured
+            .into_iter()
+            .chain(["main", "master", "trunk"].map(str::to_string))
+        {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    fn listed_variation_tip_oids(&self) -> Result<Vec<(VariationId, Oid)>> {
+        let current = self.current_variation_unchecked().ok();
+        Ok(self
+            .local_variation_tip_oids()?
+            .into_iter()
+            .filter(|(variation, _)| self.lists_variation(variation.as_str(), current.as_deref()))
+            .collect())
     }
 
     fn variations_unchecked(&self) -> Result<Vec<Variation>> {
@@ -10712,6 +9488,9 @@ impl Workspace {
             let Some(name) = branch.name()? else {
                 continue;
             };
+            if !self.lists_variation(name, current.as_deref()) {
+                continue;
+            }
             let metadata = self.read_variation_metadata(name)?;
             paths.push(variation_from_name(
                 name.to_string(),
@@ -10754,6 +9533,7 @@ impl Workspace {
     fn remote_variations_unchecked(&self, remote: impl AsRef<str>) -> Result<Vec<RemoteVariation>> {
         let remote = remote.as_ref().to_string();
         let prefix = format!("refs/remotes/{remote}/");
+        let current = self.current_variation_unchecked().ok();
         let mut variations = Vec::new();
 
         for reference in self.repo.references_glob(&format!("{prefix}*"))? {
@@ -10762,7 +9542,7 @@ impl Workspace {
                 continue;
             }
 
-            let Some(ref_name) = reference.name() else {
+            let Ok(ref_name) = reference.name() else {
                 continue;
             };
             let Some(name) = ref_name.strip_prefix(&prefix) else {
@@ -10772,6 +9552,7 @@ impl Workspace {
                 || name.ends_with("/HEAD")
                 || name == "draftline"
                 || name.starts_with("draftline/")
+                || !self.lists_variation(name, current.as_deref())
             {
                 continue;
             }
@@ -10941,16 +9722,8 @@ impl Workspace {
 
     fn variation_tips_map(&self) -> Result<HashMap<Oid, Vec<VariationId>>> {
         let mut map: HashMap<Oid, Vec<VariationId>> = HashMap::new();
-        for branch in self.repo.branches(Some(BranchType::Local))? {
-            let (branch, _) = branch?;
-            let Some(name) = branch.name()? else {
-                continue;
-            };
-            if let Ok(tip) = branch.get().peel_to_commit() {
-                map.entry(tip.id())
-                    .or_default()
-                    .push(VariationId::from(name));
-            }
+        for (variation, tip) in self.listed_variation_tip_oids()? {
+            map.entry(tip).or_default().push(variation);
         }
         Ok(map)
     }
@@ -10958,6 +9731,16 @@ impl Workspace {
 
 fn default_initial_variation_name() -> String {
     "main".to_string()
+}
+
+pub(crate) fn validate_variation_namespace(namespace: &str) -> Result<()> {
+    let probe = format!("{namespace}x");
+    if !namespace.ends_with('/') || !git2::Reference::is_valid_name(&format!("refs/heads/{probe}"))
+    {
+        return Err(DraftlineError::InvalidVariationName(namespace.to_string()));
+    }
+    validate_variation_name(&probe)?;
+    Ok(())
 }
 
 fn validate_variation_name(name: &str) -> Result<String> {
@@ -11129,6 +9912,15 @@ fn preflight_report(
     }
 }
 
+/// Whether Git would run a filter driver (for example Git LFS) for `path`.
+fn needs_git_filter(repo: &Repository, path: &Path, flags: git2::AttrCheckFlags) -> Result<bool> {
+    let filter = repo.get_attr(path, "filter", flags)?;
+    Ok(matches!(
+        git2::AttrValue::from_string(filter),
+        git2::AttrValue::True | git2::AttrValue::String(_)
+    ))
+}
+
 fn discard_preflight_report(
     operation: impl Into<String>,
     dirty_files: Vec<ChangedFile>,
@@ -11186,6 +9978,16 @@ fn file_is_binary(path: &Path) -> Result<bool> {
     Ok(bytes.contains(&0) || std::str::from_utf8(&bytes).is_err())
 }
 
+/// libgit2 shares one in-memory index per repository, so a failed write
+/// would leave later reads seeing changes that never reached disk.
+fn write_index_or_reload(index: &mut git2::Index) -> Result<()> {
+    if let Err(error) = index.write() {
+        let _ = index.read(true);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 fn remove_workspace_path_if_exists(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -11222,7 +10024,7 @@ fn collect_preview_files(
     content_policy: &ContentPolicy,
 ) -> Result<()> {
     for entry in tree.iter() {
-        let Some(name) = entry.name() else {
+        let Ok(name) = entry.name() else {
             continue;
         };
         let path = prefix.join(name);
@@ -11258,7 +10060,7 @@ fn collect_preview_files(
 fn contributor_from_signature(signature: &git2::Signature<'_>) -> Contributor {
     Contributor {
         name: signature.name().unwrap_or("Unknown").to_string(),
-        email: signature.email().map(ToString::to_string),
+        email: signature.email().ok().map(ToString::to_string),
     }
 }
 
@@ -11280,83 +10082,127 @@ fn signature_from_contributor(contributor: &Contributor) -> Result<Signature<'st
     Ok(Signature::now(name, email)?)
 }
 
+/// Path-limited history like `git log --parents -- <scope>`: in a scoped
+/// workspace only commits that change the project folder are shown (plus
+/// pinned ref tips), and parents are rewritten to the nearest shown ancestor,
+/// following the parent whose project folder is unchanged through merges.
+/// Unscoped workspaces show every commit with its real parents.
+struct ScopedHistory<'r> {
+    repo: &'r Repository,
+    scope: Option<PathBuf>,
+    pinned: HashSet<Oid>,
+    scope_trees: HashMap<Oid, Option<Oid>>,
+    nearest: HashMap<Oid, Option<Oid>>,
+}
+
+impl<'r> ScopedHistory<'r> {
+    fn new(repo: &'r Repository, scope: &Path, pinned: impl IntoIterator<Item = Oid>) -> Self {
+        Self {
+            repo,
+            scope: (!scope.as_os_str().is_empty()).then(|| scope.to_path_buf()),
+            pinned: pinned.into_iter().collect(),
+            scope_trees: HashMap::new(),
+            nearest: HashMap::new(),
+        }
+    }
+
+    fn scope_tree(&mut self, scope: &Path, oid: Oid) -> Result<Option<Oid>> {
+        if let Some(cached) = self.scope_trees.get(&oid) {
+            return Ok(*cached);
+        }
+        let tree = self.repo.find_commit(oid)?.tree()?;
+        let id = match tree.get_path(scope) {
+            Ok(entry) => Some(entry.id()),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        self.scope_trees.insert(oid, id);
+        Ok(id)
+    }
+
+    /// The first parent whose project folder is identical to `commit`'s.
+    fn unchanged_parent(&mut self, scope: &Path, commit: &Commit<'_>) -> Result<Option<Oid>> {
+        let own = self.scope_tree(scope, commit.id())?;
+        for parent in commit.parent_ids() {
+            if self.scope_tree(scope, parent)? == own {
+                return Ok(Some(parent));
+            }
+        }
+        Ok(None)
+    }
+
+    fn shows(&mut self, commit: &Commit<'_>) -> Result<bool> {
+        let Some(scope) = self.scope.clone() else {
+            return Ok(true);
+        };
+        if self.pinned.contains(&commit.id()) {
+            return Ok(true);
+        }
+        if commit.parent_count() == 0 {
+            return Ok(self.scope_tree(&scope, commit.id())?.is_some());
+        }
+        Ok(self.unchanged_parent(&scope, commit)?.is_none())
+    }
+
+    /// The nearest shown commit at or below `oid`, iteratively so long runs of
+    /// developer-only commits cannot overflow the stack.
+    fn nearest_shown(&mut self, oid: Oid) -> Result<Option<Oid>> {
+        let Some(scope) = self.scope.clone() else {
+            return Ok(Some(oid));
+        };
+        let mut hidden = Vec::new();
+        let mut current = Some(oid);
+        let found = loop {
+            let Some(oid) = current else {
+                break None;
+            };
+            if let Some(cached) = self.nearest.get(&oid) {
+                break *cached;
+            }
+            let commit = self.repo.find_commit(oid)?;
+            if self.shows(&commit)? {
+                break Some(oid);
+            }
+            hidden.push(oid);
+            current = self.unchanged_parent(&scope, &commit)?;
+        };
+        for oid in hidden {
+            self.nearest.insert(oid, found);
+        }
+        Ok(found)
+    }
+
+    fn parents(&mut self, commit: &Commit<'_>) -> Result<Vec<Oid>> {
+        let mut parents = Vec::new();
+        for parent in commit.parent_ids() {
+            if let Some(shown) = self.nearest_shown(parent)? {
+                if !parents.contains(&shown) {
+                    parents.push(shown);
+                }
+            }
+        }
+        Ok(parents)
+    }
+}
+
 fn version_from_commit(commit: &Commit<'_>) -> Version {
     Version {
         id: VersionId::from(commit.id()),
-        label: commit.summary().unwrap_or_default().to_string(),
+        label: commit
+            .summary()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .to_string(),
         author: contributor_from_signature(&commit.author()),
         saved_by: contributor_from_signature(&commit.committer()),
         time_seconds: commit.time().seconds(),
     }
 }
 
-fn oid_from_version(version: &VersionId) -> Result<Oid> {
-    Oid::from_str(version.as_str())
-        .map_err(|_| DraftlineError::VersionNotFound(version.to_string()))
-}
-
-fn cleanup_commit_message(title: &str, description: Option<&str>) -> String {
-    match description
-        .map(str::trim)
-        .filter(|description| !description.is_empty())
-    {
-        Some(description) => format!("{title}\n\n{description}"),
-        None => title.to_string(),
-    }
-}
-
-fn cleanup_warning(
-    code: CleanupWarningCode,
-    message: impl Into<String>,
-    related_versions: Vec<VersionId>,
-) -> CleanupWarning {
-    CleanupWarning {
-        code,
-        message: message.into(),
-        related_versions,
-        safe_next_actions: Vec::new(),
-    }
-}
-
-fn cleanup_blocked(
-    code: CleanupWarningCode,
-    message: impl Into<String>,
-    related_versions: Vec<VersionId>,
-) -> DraftlineError {
-    DraftlineError::HistoryCleanupBlocked(Box::new(HistoryCleanupBlockReport {
-        operation: "history_cleanup".to_string(),
-        diagnostics: vec![cleanup_warning(code, message, related_versions)],
-        can_proceed: false,
-    }))
-}
-
-fn cleanup_remote_warnings(policy: &RemoteRewritePolicy) -> Vec<CleanupWarning> {
-    match policy {
-        RemoteRewritePolicy::LocalOnly => vec![cleanup_warning(
-            CleanupWarningCode::LocalOnlyRewrite,
-            "history cleanup will update only local Draftline refs",
-            Vec::new(),
-        )],
-        RemoteRewritePolicy::PushWithLease { remote, branch } => vec![cleanup_warning(
-            CleanupWarningCode::RemoteRewriteRequiresSeparatePublish,
-            format!(
-                "apply_history_cleanup is local-first; publish `{branch}` to `{remote}` with preflight_replace_remote_history after apply"
-            ),
-            Vec::new(),
-        )],
-    }
-}
-
-fn history_cleanup_needs_pending_resolution(impact: &HistoryCleanupRemoteImpact) -> bool {
-    matches!(
-        impact.publish_status,
-        CleanupPublishStatus::SharedHistoryRewriteRequired
-            | CleanupPublishStatus::RemoteHasIncoming
-    )
-}
-
 fn history_entry_from_commit(
     commit: &Commit<'_>,
+    parents: &[Oid],
     tips: &HashMap<Oid, Vec<VariationId>>,
     head_oid: Option<Oid>,
 ) -> Result<HistoryEntry> {
@@ -11365,9 +10211,7 @@ fn history_entry_from_commit(
     let mut variation_tips = tips.get(&oid).cloned().unwrap_or_default();
     variation_tips.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     let is_head = head_oid == Some(oid);
-    let parent_ids = (0..commit.parent_count())
-        .map(|i| commit.parent_id(i).map(VersionId::from))
-        .collect::<std::result::Result<Vec<_>, git2::Error>>()?;
+    let parent_ids = parents.iter().copied().map(VersionId::from).collect();
     Ok(HistoryEntry {
         version,
         variation_tips,
@@ -11376,17 +10220,40 @@ fn history_entry_from_commit(
     })
 }
 
+/// The common ancestor of `left` and `right` nearest to `right`, walking the
+/// graph's parent links breadth-first.
+fn workspace_graph_nearest_common_ancestor(
+    parents: &HashMap<WorkspaceGraphNodeId, Vec<WorkspaceGraphNodeId>>,
+    left: &WorkspaceGraphNodeId,
+    right: &WorkspaceGraphNodeId,
+) -> Option<WorkspaceGraphNodeId> {
+    let ancestors = |start: &WorkspaceGraphNodeId| {
+        let mut seen = HashSet::new();
+        let mut order = Vec::new();
+        let mut queue = VecDeque::from([start.clone()]);
+        while let Some(id) = queue.pop_front() {
+            if seen.insert(id.clone()) {
+                queue.extend(parents.get(&id).into_iter().flatten().cloned());
+                order.push(id);
+            }
+        }
+        order
+    };
+    let left_ancestors = ancestors(left).into_iter().collect::<HashSet<_>>();
+    ancestors(right)
+        .into_iter()
+        .find(|id| left_ancestors.contains(id))
+}
+
 fn workspace_graph_node_from_commit(
     commit: &Commit<'_>,
-    tips: &HashMap<Oid, Vec<VariationId>>,
-    head_oid: Option<Oid>,
+    history_entry: HistoryEntry,
     local_reachable: &BTreeSet<Oid>,
     remote_reachable: &BTreeSet<Oid>,
     support_reachable: &BTreeSet<Oid>,
     topo_index: usize,
 ) -> Result<WorkspaceGraphNode> {
     let oid = commit.id();
-    let history_entry = history_entry_from_commit(commit, tips, head_oid)?;
     let reachable_from_local_variation = local_reachable.contains(&oid);
     let reachable_from_remote_variation = remote_reachable.contains(&oid);
     let reachable_from_support_ref = support_reachable.contains(&oid);
@@ -11933,7 +10800,12 @@ fn remote_from_remote_tracking_ref(ref_name: &str) -> Option<String> {
 fn remote_summary_from_commit(commit: &Commit<'_>) -> RemoteVersionSummary {
     RemoteVersionSummary {
         id: commit.id().to_string(),
-        label: commit.summary().unwrap_or_default().to_string(),
+        label: commit
+            .summary()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .to_string(),
         author: contributor_from_signature(&commit.author()),
         time_seconds: commit.time().seconds(),
     }
@@ -11972,6 +10844,12 @@ fn safe_next_actions_for_inspection(
     dirty: &DirtySummary,
     diagnostics: &[WorkspaceDiagnostic],
 ) -> Vec<SafeNextAction> {
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == DiagnosticCode::RecoveryInOtherProject)
+    {
+        return vec![SafeNextAction::FinishInOtherProject];
+    }
     if recovery.is_some()
         || operation_lock.state == OperationLockState::Locked
         || diagnostics
@@ -12067,7 +10945,7 @@ fn tree_contains_path(tree: &Tree<'_>, path: &Path) -> Result<bool> {
 }
 
 fn ensure_remote_transport_supported(remote: &git2::Remote<'_>) -> Result<()> {
-    if let Some(url) = remote.url() {
+    if let Ok(url) = remote.url() {
         ensure_supported_remote_url(url)?;
     }
     Ok(())
@@ -12267,6 +11145,63 @@ fn diff_deltas_to_changed_files(diff: &git2::Diff<'_>) -> Vec<ChangedFile> {
     files
 }
 
+fn remove_index_path(index: &mut git2::Index, path: &Path) -> Result<()> {
+    match index.remove_path(path) {
+        Err(error) if error.code() != git2::ErrorCode::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+fn blob_file_mode(mode: i32) -> git2::FileMode {
+    match mode {
+        0o100755 => git2::FileMode::BlobExecutable,
+        0o120000 => git2::FileMode::Link,
+        _ => git2::FileMode::Blob,
+    }
+}
+
+fn optional_tree_entry(tree: &Tree<'_>, path: &Path) -> Result<Option<Oid>> {
+    match tree.get_path(path) {
+        Ok(entry) => Ok(Some(entry.id())),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Literal (non-glob) pathspec for the project folder, or `None` when unscoped.
+fn scope_pathspec(scope: &Path) -> Option<String> {
+    if scope.as_os_str().is_empty() {
+        return None;
+    }
+    Some(scope.to_string_lossy().replace('\\', "/"))
+}
+
+/// Restricts a status scan to the project folder so large code repositories
+/// are not walked in full.
+fn limit_status_to_scope(options: &mut StatusOptions, scope: &Path) {
+    if let Some(pathspec) = scope_pathspec(scope) {
+        options.disable_pathspec_match(true).pathspec(pathspec);
+    }
+}
+
+/// Restricts a diff to the project folder.
+fn limit_diff_to_scope(options: &mut DiffOptions, scope: &Path) {
+    if let Some(pathspec) = scope_pathspec(scope) {
+        options.disable_pathspec_match(true).pathspec(pathspec);
+    }
+}
+
+/// Computes the repository-relative project folder for `project_path`.
+fn project_scope(workdir: &Path, project_path: &Path) -> Result<PathBuf> {
+    let workdir = fs::canonicalize(workdir)?;
+    let project = fs::canonicalize(project_path)?;
+    match project.strip_prefix(&workdir) {
+        Ok(relative) => normalize_workspace_relative(relative),
+        // e.g. a symlinked project folder that resolves outside the repository.
+        Err(_) => Err(DraftlineError::PathEscapesWorkspace(project)),
+    }
+}
+
 /// Collects [`ChangedFile`] entries from a tree-to-workdir diff, filtered by
 /// `content_policy`.  `is_large` and `is_binary` are derived from the actual
 /// workspace file, matching the behaviour of [`Workspace::changed_files`].
@@ -12338,6 +11273,31 @@ fn redact_remote_url(url: &str) -> String {
     )
 }
 
+/// Creates `path` and any missing parents, returning only the folders this
+/// call created, outermost first.
+fn create_missing_dirs(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut missing: Vec<&Path> = path
+        .ancestors()
+        .take_while(|ancestor| !ancestor.as_os_str().is_empty() && !ancestor.is_dir())
+        .collect();
+    missing.reverse();
+    let mut created = Vec::new();
+    for dir in missing {
+        match fs::create_dir(dir) {
+            Ok(()) => created.push(dir.to_path_buf()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(created)
+}
+
+fn unique_claim_temp(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("json.{}.{next}.tmp", std::process::id()))
+}
+
 struct OperationLock {
     path: PathBuf,
 }
@@ -12376,6 +11336,44 @@ impl Drop for OperationLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// Lets unit tests run Git between two steps of an operation, to force
+/// interleavings that real timing only hits by chance.
+/// How long an operation waits for another Git process to release the index.
+const GIT_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(test)]
+mod test_hooks {
+    use std::{cell::RefCell, path::Path};
+
+    type Hook = Box<dyn FnMut(&Path)>;
+
+    thread_local! {
+        static HOOKS: RefCell<Vec<(&'static str, Hook)>> = RefCell::new(Vec::new());
+    }
+
+    /// Runs `hook` once, the next time `point` is reached on this thread.
+    pub fn once(point: &'static str, hook: impl FnMut(&Path) + 'static) {
+        HOOKS.with(|hooks| hooks.borrow_mut().push((point, Box::new(hook))));
+    }
+
+    pub fn fire(point: &str, git_dir: &Path) {
+        let hook = HOOKS.with(|hooks| {
+            let mut hooks = hooks.borrow_mut();
+            let index = hooks.iter().position(|(name, _)| *name == point)?;
+            Some(hooks.remove(index).1)
+        });
+        if let Some(mut hook) = hook {
+            hook(git_dir);
+        }
+    }
+}
+
+#[cfg(not(test))]
+mod test_hooks {
+    #[inline(always)]
+    pub fn fire(_point: &str, _git_dir: &std::path::Path) {}
 }
 
 #[cfg(test)]
@@ -12501,6 +11499,1158 @@ mod tests {
         peer.fetch_remote("origin").unwrap();
 
         (remote, author_dir, peer_dir, peer)
+    }
+
+    /// Git grabs `index.lock` right after Draftline's precheck passed.
+    fn lock_index_after_precheck() {
+        test_hooks::once("after_index_precheck", |git_dir| {
+            fs::write(git_dir.join("index.lock"), b"").unwrap();
+        });
+    }
+
+    /// After a late lock is released, the operation has either not happened
+    /// or can be rolled back, and nothing outside it changed.
+    fn settle_after_late_lock(workspace: &Workspace) {
+        fs::remove_file(workspace.repo.path().join("index.lock")).unwrap();
+        if let Some(state) = workspace.recovery_state().unwrap() {
+            workspace.rollback_recovery(&state.operation_id).unwrap();
+        }
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    fn content(workspace: &Workspace, path: &str) -> String {
+        fs::read_to_string(workspace.root().join(path)).unwrap()
+    }
+
+    fn head_summary(workspace: &Workspace) -> String {
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        head.summary().unwrap().unwrap().to_string()
+    }
+
+    fn assert_clean(workspace: &Workspace) {
+        let statuses = workspace.repo.statuses(None).unwrap();
+        let dirty = statuses
+            .iter()
+            .filter(|entry| entry.status() != git2::Status::IGNORED)
+            .map(|entry| entry.path().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(dirty.is_empty(), "unexpected changes: {dirty:?}");
+    }
+
+    fn two_saves() -> (tempfile::TempDir, Workspace, Version) {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        let first = workspace.save_version("First").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        workspace.save_version("Second").unwrap();
+        (temp, workspace, first)
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_save_keeps_the_edit_unsaved() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_after_precheck();
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        settle_after_late_lock(&workspace);
+        assert_eq!(head_summary(&workspace), "Second");
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+        workspace.save_version("Third").unwrap();
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_restore_is_retryable() {
+        let (_temp, workspace, first) = two_saves();
+        lock_index_after_precheck();
+
+        let error = workspace
+            .restore_version_as_new_save(first.id(), "Restore first")
+            .unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        settle_after_late_lock(&workspace);
+        assert_eq!(head_summary(&workspace), "Second");
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert_clean(&workspace);
+        workspace
+            .restore_version_as_new_save(first.id(), "Restore first")
+            .unwrap();
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_switch_is_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        workspace.save_version("Second").unwrap();
+        lock_index_after_precheck();
+
+        let error = workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        settle_after_late_lock(&workspace);
+        assert_eq!(head_summary(&workspace), "Second");
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert_clean(&workspace);
+        workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_discard_keeps_the_edit() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_after_precheck();
+
+        let error = workspace.discard_changes().unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        settle_after_late_lock(&workspace);
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+        workspace.discard_changes().unwrap();
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_shelve_keeps_the_edit() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_after_precheck();
+
+        let error = workspace.shelve_changes("later").unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        settle_after_late_lock(&workspace);
+        assert_eq!(head_summary(&workspace), "Second");
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+        assert!(workspace.list_shelves().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_shelve_rollback_keeps_the_shelf_once_an_edit_was_discarded() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_after_precheck();
+        workspace.shelve_changes("later").unwrap_err();
+        // As if the discard step had reverted the file before failing.
+        write_file(workspace.root(), "plan.sk", b"v2");
+
+        settle_after_late_lock(&workspace);
+
+        let shelves = workspace.list_shelves().unwrap();
+        assert_eq!(shelves.len(), 1);
+        workspace.apply_shelf(&shelves[0].id).unwrap();
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+    }
+
+    #[test]
+    fn a_restore_rollback_keeps_files_edited_after_the_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        write_file(workspace.root(), "notes.md", b"v1");
+        let first = workspace.save_version("First").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        write_file(workspace.root(), "notes.md", b"v2");
+        fs::remove_file(workspace.root().join("plan.sk")).unwrap();
+        write_file(workspace.root(), "added.md", b"v2");
+        workspace.save_version("Second").unwrap();
+        lock_index_after_precheck();
+        workspace
+            .restore_version_as_new_save(first.id(), "Restore first")
+            .unwrap_err();
+        assert_eq!(content(&workspace, "notes.md"), "v1");
+        write_file(workspace.root(), "notes.md", b"mine");
+
+        settle_after_late_lock(&workspace);
+
+        assert_eq!(head_summary(&workspace), "Second");
+        assert_eq!(content(&workspace, "notes.md"), "mine");
+        assert!(!workspace.root().join("plan.sk").exists());
+        assert_eq!(content(&workspace, "added.md"), "v2");
+        let changed = workspace.changed_files().unwrap();
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0].path, Path::new("notes.md"));
+    }
+
+    /// Git grabs `index.lock` after the precheck and lets go shortly after.
+    fn lock_index_briefly_after_precheck() {
+        test_hooks::once("after_index_precheck", |git_dir| {
+            let lock = git_dir.join("index.lock");
+            fs::write(&lock, b"").unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                fs::remove_file(lock).unwrap();
+            });
+        });
+    }
+
+    #[test]
+    fn a_save_waits_out_a_brief_index_lock() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_briefly_after_precheck();
+
+        workspace.save_version("Third").unwrap();
+
+        assert_eq!(head_summary(&workspace), "Third");
+        assert!(workspace
+            .recovery_state()
+            .unwrap()
+            .is_none_or(|state| state.completed));
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_restore_waits_out_a_brief_index_lock() {
+        let (_temp, workspace, first) = two_saves();
+        lock_index_briefly_after_precheck();
+
+        workspace
+            .restore_version_as_new_save(first.id(), "Restore first")
+            .unwrap();
+
+        assert_eq!(head_summary(&workspace), "Restore first");
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_waits_out_a_brief_index_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        let main = workspace.current_variation().unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        fs::remove_file(workspace.root().join("plan.sk")).unwrap();
+        write_file(workspace.root(), "other.sk", b"alt");
+        workspace.save_version("Alternate").unwrap();
+        lock_index_briefly_after_precheck();
+
+        let main_id = VariationId::from(main);
+        workspace
+            .switch_variation(&main_id, SwitchPolicy::AbortIfDirty)
+            .unwrap();
+
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
+        assert!(!workspace.root().join("other.sk").exists());
+        assert!(workspace
+            .recovery_state()
+            .unwrap()
+            .is_none_or(|state| state.completed));
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_late_index_lock_during_a_mixed_discard_changes_nothing() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        write_file(workspace.root(), "new.sk", b"new");
+        let mut index = workspace.repo.index().unwrap();
+        index.add_path(Path::new("new.sk")).unwrap();
+        index.write().unwrap();
+        lock_index_after_precheck();
+
+        let error = workspace.discard_changes().unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+        assert_eq!(content(&workspace, "new.sk"), "new");
+        settle_after_late_lock(&workspace);
+        assert_eq!(content(&workspace, "new.sk"), "new");
+        let status = workspace.repo.status_file(Path::new("new.sk")).unwrap();
+        assert!(status.contains(git2::Status::INDEX_NEW), "{status:?}");
+    }
+
+    #[test]
+    fn a_switch_never_stages_a_file_edited_while_it_waits_for_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        workspace.save_version("Second").unwrap();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_index_precheck", |git_dir| {
+            fs::write(git_dir.join("index.lock"), b"").unwrap();
+        });
+        // The developer edits while Draftline waits for Git's lock.
+        test_hooks::once("git_busy_retry", move |git_dir| {
+            fs::write(root.join("plan.sk"), b"theirs").unwrap();
+            fs::remove_file(git_dir.join("index.lock")).unwrap();
+        });
+
+        let error = workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        assert_eq!(content(&workspace, "plan.sk"), "theirs");
+        assert!(workspace.recovery_state().unwrap().is_some());
+        let entry = workspace
+            .repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("plan.sk"), 0)
+            .unwrap();
+        let head = workspace.repo.head().unwrap().peel_to_tree().unwrap();
+        assert_eq!(entry.id, head.get_path(Path::new("plan.sk")).unwrap().id());
+    }
+
+    /// Git holds the branch's ref lock while it moves the branch.
+    fn lock_branch_after_precheck(workspace: &Workspace, release_after_ms: Option<u64>) {
+        let branch = workspace.repo.head().unwrap().name().unwrap().to_string();
+        test_hooks::once("after_index_precheck", move |git_dir| {
+            let lock = git_dir.join(format!("{branch}.lock"));
+            fs::write(&lock, b"").unwrap();
+            if let Some(ms) = release_after_ms {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    fs::remove_file(lock).unwrap();
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn a_save_waits_out_a_brief_branch_ref_lock() {
+        let (_temp, workspace, _first) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"third");
+        lock_branch_after_precheck(&workspace, Some(300));
+
+        workspace.save_version("Third").unwrap();
+
+        assert_eq!(head_summary(&workspace), "Third");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_lingering_branch_ref_lock_fails_the_save_cleanly() {
+        let (_temp, workspace, _first) = two_saves();
+        let before = workspace.repo.head().unwrap().target().unwrap();
+        write_file(workspace.root(), "plan.sk", b"third");
+        lock_branch_after_precheck(&workspace, None);
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        assert_eq!(workspace.repo.head().unwrap().target().unwrap(), before);
+        let status = workspace.repo.status_file(Path::new("plan.sk")).unwrap();
+        assert_eq!(status, git2::Status::WT_MODIFIED);
+        let branch = workspace.repo.head().unwrap().name().unwrap().to_string();
+        fs::remove_file(workspace.repo.path().join(format!("{branch}.lock"))).unwrap();
+        workspace.save_version("Third").unwrap();
+        assert_eq!(head_summary(&workspace), "Third");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_stops_when_a_developer_commits_while_it_waits_for_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        workspace.save_version("Second").unwrap();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_index_precheck", |git_dir| {
+            fs::write(git_dir.join("index.lock"), b"").unwrap();
+        });
+        // The developer commits while Draftline waits for Git's lock.
+        test_hooks::once("git_busy_retry", move |git_dir| {
+            let repo = Repository::open(&root).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            let blob = repo.blob(b"fn main() {}").unwrap();
+            let mut builder = repo.treebuilder(Some(&head.tree().unwrap())).unwrap();
+            builder.insert("code.rs", blob, 0o100644).unwrap();
+            let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+            let signature = git2::Signature::now("Dev", "dev@example.com").unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, "dev", &tree, &[&head])
+                .unwrap();
+            fs::remove_file(git_dir.join("index.lock")).unwrap();
+        });
+
+        let error = workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        assert!(workspace.recovery_state().unwrap().is_some());
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().ok(), Some("dev"));
+    }
+
+    /// A developer commit of `code.rs` on the current branch, outside Draftline.
+    fn dev_commit(workspace: &Workspace, code: &[u8]) {
+        let repo = &workspace.repo;
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let blob = repo.blob(code).unwrap();
+        let mut builder = repo.treebuilder(Some(&head.tree().unwrap())).unwrap();
+        builder.insert("code.rs", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("Dev", "dev@example.com").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "dev", &tree, &[&head])
+            .unwrap();
+        let mut checkout = CheckoutBuilder::new();
+        repo.checkout_head(Some(checkout.force())).unwrap();
+    }
+
+    /// `alt` has code.rs "v1"; the current branch has the developer's "v2".
+    fn branches_with_different_code() -> (tempfile::TempDir, Workspace, String, Version) {
+        let (temp, workspace, first) = two_saves();
+        dev_commit(&workspace, b"v1");
+        {
+            let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+            workspace.repo.branch("alt", &head, false).unwrap();
+        }
+        dev_commit(&workspace, b"v2");
+        let original = workspace.current_variation_unchecked().unwrap();
+        (temp, workspace, original, first)
+    }
+
+    fn interrupted_switch(workspace: &Workspace, original: &str) {
+        workspace
+            .write_recovery_state_for_checkout(
+                &RecoveryState {
+                    operation_id: "interrupted".to_string(),
+                    operation: RecoveryOperation::SwitchVariation,
+                    original_variation: Some(original.to_string()),
+                    target: Some("alt".to_string()),
+                    completed: false,
+                },
+                &workspace.branch_tree(original).unwrap(),
+                &workspace.branch_tree("alt").unwrap(),
+            )
+            .unwrap();
+    }
+
+    /// Commits `code.rs` = `text` on `branch` without touching the checkout,
+    /// as another worktree or `git branch -f` would.
+    fn move_branch(workspace: &Workspace, branch: &str, text: &str) {
+        let repo = &workspace.repo;
+        let tip = repo
+            .find_branch(branch, BranchType::Local)
+            .unwrap()
+            .into_reference()
+            .peel_to_commit()
+            .unwrap();
+        let blob = repo.blob(text.as_bytes()).unwrap();
+        let mut builder = repo.treebuilder(Some(&tip.tree().unwrap())).unwrap();
+        builder.insert("code.rs", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("Dev", "dev@example.com").unwrap();
+        repo.commit(
+            Some(&format!("refs/heads/{branch}")),
+            &signature,
+            &signature,
+            "dev moves branch",
+            &tree,
+            &[&tip],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_switch_repair_follows_a_target_that_moved_since() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        workspace.repo.checkout_tree(alt.as_object(), None).unwrap();
+        interrupted_switch(&workspace, &original);
+        move_branch(&workspace, "alt", "v3");
+
+        workspace.repair_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert_eq!(content(&workspace, "code.rs"), "v3");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_repair_finishes_a_checkout_that_never_started() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        interrupted_switch(&workspace, &original);
+
+        workspace.repair_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert_eq!(content(&workspace, "code.rs"), "v1");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_repair_keeps_a_file_the_developer_reverted() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        workspace.repo.checkout_tree(alt.as_object(), None).unwrap();
+        interrupted_switch(&workspace, &original);
+        // The checkout finished; the developer then put the old code back.
+        std::fs::write(workspace.root().join("code.rs"), "v2").unwrap();
+
+        workspace.repair_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert_eq!(content(&workspace, "code.rs"), "v2");
+    }
+
+    #[test]
+    fn a_switch_repair_keeps_a_reverted_file_when_the_target_moved_too() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        workspace.repo.checkout_tree(alt.as_object(), None).unwrap();
+        interrupted_switch(&workspace, &original);
+        std::fs::write(workspace.root().join("code.rs"), "v2").unwrap();
+        move_branch(&workspace, "alt", "v3");
+
+        workspace.repair_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert_eq!(content(&workspace, "code.rs"), "v2");
+    }
+
+    #[test]
+    fn a_switch_rollback_follows_a_branch_that_moves_while_it_settles() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        workspace.repo.checkout_tree(alt.as_object(), None).unwrap();
+        interrupted_switch(&workspace, &original);
+        let branch = original.clone();
+        test_hooks::once("before_settle_files", move |git_dir| {
+            let workspace_repo = Repository::open(git_dir).unwrap();
+            let tip = workspace_repo
+                .find_branch(&branch, BranchType::Local)
+                .unwrap()
+                .into_reference()
+                .peel_to_commit()
+                .unwrap();
+            let blob = workspace_repo.blob(b"v4").unwrap();
+            let mut builder = workspace_repo
+                .treebuilder(Some(&tip.tree().unwrap()))
+                .unwrap();
+            builder.insert("code.rs", blob, 0o100644).unwrap();
+            let tree = workspace_repo.find_tree(builder.write().unwrap()).unwrap();
+            let signature = git2::Signature::now("Dev", "dev@example.com").unwrap();
+            workspace_repo
+                .commit(
+                    Some(&format!("refs/heads/{branch}")),
+                    &signature,
+                    &signature,
+                    "dev moves branch",
+                    &tree,
+                    &[&tip],
+                )
+                .unwrap();
+        });
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "code.rs"), "v4");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_rollback_ignores_a_target_that_moved_since() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        workspace.repo.checkout_tree(alt.as_object(), None).unwrap();
+        interrupted_switch(&workspace, &original);
+        move_branch(&workspace, "alt", "v3");
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "code.rs"), "v2");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_rollback_keeps_a_mode_change_the_developer_staged() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        workspace.repo.checkout_tree(alt.as_object(), None).unwrap();
+        interrupted_switch(&workspace, &original);
+        let mut index = workspace.repo.index().unwrap();
+        let mut entry = index.get_path(Path::new("code.rs"), 0).unwrap();
+        entry.mode = 0o100755;
+        index.add(&entry).unwrap();
+        index.write().unwrap();
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        let mut index = workspace.repo.index().unwrap();
+        index.read(true).unwrap();
+        let entry = index.get_path(Path::new("code.rs"), 0).unwrap();
+        assert_eq!(entry.mode, 0o100755);
+        assert_eq!(entry.id, alt.get_path(Path::new("code.rs")).unwrap().id());
+    }
+
+    #[test]
+    fn a_switch_rollback_keeps_an_edit_made_after_the_index_moved() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        workspace.repo.checkout_tree(alt.as_object(), None).unwrap();
+        interrupted_switch(&workspace, &original);
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("before_settle_files", move |_| {
+            std::fs::write(root.join("code.rs"), "mine").unwrap();
+        });
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "code.rs"), "mine");
+    }
+
+    #[test]
+    fn a_switch_rollback_puts_developer_code_back_when_head_never_moved() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        // The switch wrote every file and the index, then failed to move HEAD.
+        let alt = workspace.branch_tree("alt").unwrap();
+        workspace.repo.checkout_tree(alt.as_object(), None).unwrap();
+        assert_eq!(content(&workspace, "code.rs"), "v1");
+        interrupted_switch(&workspace, &original);
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "code.rs"), "v2");
+        assert_clean(&workspace);
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_switch_rollback_keeps_what_the_developer_staged_meanwhile() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        workspace.repo.checkout_tree(alt.as_object(), None).unwrap();
+        interrupted_switch(&workspace, &original);
+        std::fs::write(workspace.root().join("code.rs"), "mine").unwrap();
+        let mut index = workspace.repo.index().unwrap();
+        index.add_path(Path::new("code.rs")).unwrap();
+        index.write().unwrap();
+        let staged = index.get_path(Path::new("code.rs"), 0).unwrap().id;
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "code.rs"), "mine");
+        let mut index = workspace.repo.index().unwrap();
+        index.read(true).unwrap();
+        assert_eq!(index.get_path(Path::new("code.rs"), 0).unwrap().id, staged);
+    }
+
+    #[test]
+    fn a_switch_repair_finishes_a_partly_written_checkout() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        // Only code.rs reached the disk; the index and HEAD never moved.
+        let alt = workspace.branch_tree("alt").unwrap();
+        let mut checkout = CheckoutBuilder::new();
+        checkout.force().update_index(false).path("code.rs");
+        workspace
+            .repo
+            .checkout_tree(alt.as_object(), Some(&mut checkout))
+            .unwrap();
+        interrupted_switch(&workspace, &original);
+
+        workspace.repair_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert_eq!(content(&workspace, "code.rs"), "v1");
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_rollback_after_head_moved_returns_to_the_original_branch() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        workspace.repo.set_head("refs/heads/alt").unwrap();
+        let mut checkout = CheckoutBuilder::new();
+        workspace
+            .repo
+            .checkout_head(Some(checkout.force()))
+            .unwrap();
+        interrupted_switch(&workspace, &original);
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "code.rs"), "v2");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_targeted_restore_rollback_puts_the_checkout_back() {
+        let (_temp, workspace, original, first) = branches_with_different_code();
+        // Restoring "First" onto alt wrote the files and index, then the
+        // commit hit Git's lock: alt and HEAD never moved.
+        let source = workspace
+            .find_version_commit(first.id())
+            .unwrap()
+            .tree()
+            .unwrap();
+        let alt = workspace.branch_tree("alt").unwrap();
+        let restored = workspace
+            .repo
+            .find_tree(workspace.compose_scoped_tree(&alt, &source).unwrap())
+            .unwrap();
+        workspace
+            .repo
+            .checkout_tree(restored.as_object(), None)
+            .unwrap();
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::RestoreVersionAsNewSave,
+                original_variation: Some(original.clone()),
+                target: Some(format!("{} -> alt", first.id().as_str())),
+                completed: false,
+            })
+            .unwrap();
+
+        let rollback = workspace.rollback_recovery("interrupted").unwrap();
+
+        assert!(rollback.completed);
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "code.rs"), "v2");
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_targeted_restore_rollback_after_its_save_landed_returns_to_the_original_branch() {
+        let (_temp, workspace, original, first) = branches_with_different_code();
+        workspace
+            .restore_version_as_new_save_to_variation(
+                first.id(),
+                "Restore onto alt",
+                RestoreVersionTarget::Existing {
+                    variation: VariationId::from("alt".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        // As if the final record write failed after the save landed.
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::RestoreVersionAsNewSave,
+                original_variation: Some(original.clone()),
+                target: Some(format!("{} -> alt", first.id().as_str())),
+                completed: false,
+            })
+            .unwrap();
+
+        let rollback = workspace.rollback_recovery("interrupted").unwrap();
+
+        assert!(rollback.completed);
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "code.rs"), "v2");
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_targeted_restore_rollback_returns_home_even_when_the_trees_match() {
+        let (_temp, workspace, first) = two_saves();
+        let original = workspace.current_variation_unchecked().unwrap();
+        let second = workspace.versions().unwrap()[0].id().clone();
+        {
+            let first_commit = workspace.find_version_commit(first.id()).unwrap();
+            workspace.repo.branch("alt", &first_commit, false).unwrap();
+        }
+        // Restoring the current version onto alt yields the original's tree.
+        workspace
+            .restore_version_as_new_save_to_variation(
+                &second,
+                "Restore onto alt",
+                RestoreVersionTarget::Existing {
+                    variation: VariationId::from("alt".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert_eq!(
+            workspace.branch_tree("alt").unwrap().id(),
+            workspace.branch_tree(&original).unwrap().id()
+        );
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::RestoreVersionAsNewSave,
+                original_variation: Some(original.clone()),
+                target: Some(format!("{} -> alt", second.as_str())),
+                completed: false,
+            })
+            .unwrap();
+
+        let rollback = workspace.rollback_recovery("interrupted").unwrap();
+
+        assert!(rollback.completed);
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn the_default_branch_can_be_trunk_or_configured() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = init_workspace_with_initial_branch(temp.path(), "trunk");
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        assert_eq!(workspace.default_branch().as_deref(), Some("trunk"));
+
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        workspace.repo.branch("develop", &head, false).unwrap();
+        workspace
+            .repo
+            .config()
+            .unwrap()
+            .set_str("init.defaultBranch", "develop")
+            .unwrap();
+        assert_eq!(workspace.default_branch().as_deref(), Some("develop"));
+
+        workspace
+            .repo
+            .config()
+            .unwrap()
+            .set_str("init.defaultBranch", "release")
+            .unwrap();
+        workspace
+            .repo
+            .reference("refs/remotes/origin/release", head.id(), false, "test")
+            .unwrap();
+        assert_eq!(
+            workspace.default_branch().as_deref(),
+            Some("release"),
+            "a configured default that exists only on origin still counts"
+        );
+
+        workspace
+            .repo
+            .config()
+            .unwrap()
+            .set_str("init.defaultBranch", "develop")
+            .unwrap();
+        workspace
+            .repo
+            .reference("refs/remotes/origin/main", head.id(), false, "test")
+            .unwrap();
+        assert_eq!(
+            workspace.default_branch().as_deref(),
+            Some("main"),
+            "a branch origin has beats a local-only configured default"
+        );
+    }
+
+    #[test]
+    fn a_discard_waits_out_a_brief_index_lock() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        lock_index_briefly_after_precheck();
+
+        workspace.discard_changes().unwrap();
+
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_developer_commit_that_lands_mid_save_is_never_reverted() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_parent_read", move |_| {
+            let repo = Repository::open(&root).unwrap();
+            fs::write(root.join("code.rs"), b"dev").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("code.rs")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let signature = repo.signature().unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "dev",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        });
+
+        workspace.save_version("Third").unwrap();
+
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().unwrap(), Some("Third"));
+        assert_eq!(head.parent(0).unwrap().summary().unwrap(), Some("dev"));
+        let tree = head.tree().unwrap();
+        assert!(tree.get_name("code.rs").is_some(), "keeps the dev commit");
+        let plan = workspace
+            .repo
+            .find_blob(tree.get_name("plan.sk").unwrap().id());
+        assert_eq!(plan.unwrap().content(), b"edit");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_save_refuses_when_a_developer_rewinds_the_branch_mid_save() {
+        let (_temp, workspace, first) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let root = workspace.root().to_path_buf();
+        let first = first.id().as_str().to_string();
+        test_hooks::once("after_parent_read", move |_| {
+            let repo = Repository::open(&root).unwrap();
+            let target = Oid::from_str(&first).unwrap();
+            repo.head()
+                .unwrap()
+                .set_target(target, "reset: moving to First")
+                .unwrap();
+        });
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(head_summary(&workspace), "First");
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+    }
+
+    #[test]
+    fn a_save_refuses_when_a_developer_switches_branch_mid_save() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_parent_read", move |_| {
+            let repo = Repository::open(&root).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let signature = repo.signature().unwrap();
+            let tree = parent.tree().unwrap();
+            let oid = repo
+                .commit(None, &signature, &signature, "dev", &tree, &[&parent])
+                .unwrap();
+            repo.branch("feature", &repo.find_commit(oid).unwrap(), false)
+                .unwrap();
+            repo.set_head("refs/heads/feature").unwrap();
+        });
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(head_summary(&workspace), "dev");
+        assert_eq!(content(&workspace, "plan.sk"), "edit");
+    }
+
+    #[test]
+    fn a_save_whose_edit_a_developer_already_committed_refuses_instead_of_saving_nothing() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_parent_read", move |_| {
+            let repo = Repository::open(&root).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("plan.sk")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let signature = repo.signature().unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "dev",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        });
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(head_summary(&workspace), "dev");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_stops_when_a_developer_switches_to_an_identical_branch_while_it_waits() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        write_file(workspace.root(), "plan.sk", b"v2");
+        workspace.save_version("Second").unwrap();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_index_precheck", |git_dir| {
+            fs::write(git_dir.join("index.lock"), b"").unwrap();
+        });
+        // The developer switches while Draftline waits for Git's lock.
+        test_hooks::once("git_busy_retry", move |git_dir| {
+            let repo = Repository::open(&root).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("twin", &head, false).unwrap();
+            repo.set_head("refs/heads/twin").unwrap();
+            fs::remove_file(git_dir.join("index.lock")).unwrap();
+        });
+
+        let error = workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap_err();
+
+        assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
+        assert!(workspace.recovery_state().unwrap().is_some());
+        let head = workspace.repo.head().unwrap();
+        assert_eq!(head.name().ok(), Some("refs/heads/twin"));
+    }
+
+    #[test]
+    fn a_switch_rollback_keeps_an_edit_made_while_it_waits_for_git() {
+        let (_temp, workspace, first) = two_saves();
+        let original = workspace.current_variation_unchecked().unwrap();
+        let commit = workspace
+            .repo
+            .find_commit(first.id().as_str().parse().unwrap());
+        workspace
+            .repo
+            .branch("alt", &commit.unwrap(), false)
+            .unwrap();
+        workspace.repo.set_head("refs/heads/alt").unwrap();
+        let mut checkout = CheckoutBuilder::new();
+        workspace
+            .repo
+            .checkout_head(Some(checkout.force()))
+            .unwrap();
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::SwitchVariation,
+                original_variation: Some(original.clone()),
+                target: Some("alt".to_string()),
+                completed: false,
+            })
+            .unwrap();
+        let plan = workspace.root().join("plan.sk");
+        test_hooks::once("after_index_precheck", move |git_dir| {
+            let lock = git_dir.join("index.lock");
+            fs::write(&lock, b"").unwrap();
+            let plan = plan.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                fs::write(plan, b"theirs").unwrap();
+                fs::remove_file(lock).unwrap();
+            });
+        });
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "plan.sk"), "theirs");
+        let status = workspace.repo.status_file(Path::new("plan.sk")).unwrap();
+        assert_eq!(status, git2::Status::WT_MODIFIED);
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_save_never_reverts_a_commit_that_lands_while_it_is_built() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        let base = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+
+        // A developer commit lands after the save read HEAD.
+        write_file(workspace.root(), "code.rs", b"dev");
+        stage_file(&workspace, "code.rs");
+        let signature = workspace.repo.signature().unwrap();
+        let dev_tree = workspace
+            .repo
+            .find_tree(workspace.repo.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        workspace
+            .repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "dev",
+                &dev_tree,
+                &[&base],
+            )
+            .unwrap();
+
+        write_file(workspace.root(), "plan.sk", b"edited");
+        let changed = vec![ChangedFile {
+            path: PathBuf::from("plan.sk"),
+            kind: ChangeKind::Modified,
+            is_binary: false,
+            is_large: false,
+        }];
+        let (tree_id, _) = workspace
+            .content_changes_tree(Some(&base), &changed, "save")
+            .unwrap();
+        let tree = workspace.repo.find_tree(tree_id).unwrap();
+        assert!(
+            tree.get_name("code.rs").is_none(),
+            "tree must come from the save's parent"
+        );
+        let saved = workspace
+            .repo
+            .find_commit(
+                workspace
+                    .repo
+                    .commit(None, &signature, &signature, "save", &tree, &[&base])
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let moved = workspace.advance_head(&saved, Some(&base), &signature);
+        assert!(matches!(
+            moved,
+            Err(DraftlineError::LocalStateChanged { .. })
+        ));
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().unwrap(), Some("dev"));
     }
 
     #[test]
@@ -14153,6 +14303,48 @@ mod tests {
     }
 
     #[test]
+    fn repair_recovery_leaves_apply_incoming_alone_when_branch_moved_elsewhere() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"incoming");
+        let incoming = workspace.save_version("Incoming").unwrap();
+        let base_oid = Oid::from_str(base.id().as_str()).unwrap();
+        workspace
+            .repo
+            .reference("refs/heads/main", base_oid, true, "rewind")
+            .unwrap();
+        workspace
+            .repo
+            .checkout_head(Some(CheckoutBuilder::new().force()))
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"developer");
+        let developer = workspace.save_version("Developer commit").unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "interrupted".to_string(),
+                operation: RecoveryOperation::ApplyIncoming,
+                original_variation: Some("main".to_string()),
+                target: Some(incoming.id().as_str().to_string()),
+                completed: false,
+            })
+            .unwrap();
+
+        let repair = workspace.repair_recovery("interrupted").unwrap();
+
+        assert!(!repair.completed);
+        assert_eq!(
+            workspace.repo.head().unwrap().target().unwrap().to_string(),
+            developer.id().as_str()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "developer"
+        );
+    }
+
+    #[test]
     fn rollback_recovery_restores_deleted_variation() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
@@ -14225,7 +14417,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_restore_recovery_reports_unavailable_without_original_oid() {
+    fn rollback_restore_recovery_leaves_later_saves_and_edits_alone() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
         write_file(workspace.root(), "post.md", b"base");
@@ -14244,58 +14436,37 @@ mod tests {
 
         let rollback = workspace.rollback_recovery("interrupted").unwrap();
 
-        assert!(!rollback.completed);
+        assert!(rollback.completed);
         assert!(!rollback.changed_workspace);
-        assert_eq!(
-            rollback.safe_next_actions,
-            vec![SafeNextAction::RepairRecovery]
-        );
         assert_eq!(
             workspace.repo.head().unwrap().target().unwrap().to_string(),
             advanced.id().as_str()
         );
+        assert_eq!(content(&workspace, "post.md"), "restored");
+        assert!(workspace.recovery_state().unwrap().is_none());
     }
 
     #[test]
-    fn repair_squash_recovery_reports_unavailable_even_when_archive_exists() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        write_file(workspace.root(), "post.md", b"one");
-        workspace.save_version("One").unwrap();
-        write_file(workspace.root(), "post.md", b"two");
-        let original_tip = workspace.save_version("Two").unwrap();
-        let archive_ref = archive_ref("rewrites/squash", "main", "interrupted");
+    fn rollback_restore_recovery_is_unavailable_once_the_restore_save_landed() {
+        let (_temp, workspace, first) = two_saves();
         workspace
-            .repo
-            .reference(
-                &archive_ref,
-                Oid::from_str(original_tip.id().as_str()).unwrap(),
-                false,
-                "simulate interrupted squash archive",
-            )
+            .restore_version_as_new_save(first.id(), "Restore first")
             .unwrap();
         workspace
             .write_recovery_state(&RecoveryState {
                 operation_id: "interrupted".to_string(),
-                operation: RecoveryOperation::SquashVersions,
-                original_variation: Some("main".to_string()),
-                target: Some(original_tip.id().as_str().to_string()),
+                operation: RecoveryOperation::RestoreVersionAsNewSave,
+                original_variation: None,
+                target: Some(first.id().as_str().to_string()),
                 completed: false,
             })
             .unwrap();
 
-        let repair = workspace.repair_recovery("interrupted").unwrap();
+        let rollback = workspace.rollback_recovery("interrupted").unwrap();
 
-        assert!(!repair.completed);
-        assert!(!repair.changed_workspace);
-        assert_eq!(
-            repair.safe_next_actions,
-            vec![SafeNextAction::RepairRecovery]
-        );
-        assert_eq!(
-            workspace.repo.head().unwrap().target().unwrap().to_string(),
-            original_tip.id().as_str()
-        );
+        assert!(!rollback.completed);
+        assert_eq!(head_summary(&workspace), "Restore first");
+        assert_eq!(content(&workspace, "plan.sk"), "v1");
     }
 
     #[test]
@@ -14961,185 +15132,6 @@ mod tests {
         assert!(diagnostics
             .remote_only_variations
             .contains(&VariationId::from("teammate")));
-    }
-
-    #[test]
-    fn replace_remote_history_publishes_support_ref_before_force_with_lease() {
-        let remote = tempfile::tempdir().unwrap();
-        init_bare_remote(remote.path());
-
-        let local = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(local.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        workspace
-            .add_remote("origin", remote.path().to_str().unwrap())
-            .unwrap();
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let original_remote_tip = workspace.save_version("v3").unwrap();
-        workspace.publish_changes("origin").unwrap();
-
-        let squashed = workspace.squash_versions(2, "Squashed v2+v3").unwrap();
-        let preflight = workspace
-            .preflight_replace_remote_history("origin")
-            .unwrap();
-        assert!(preflight.can_replace);
-        assert_eq!(
-            preflight.expected_remote_oid,
-            original_remote_tip.id().as_str()
-        );
-        assert_eq!(preflight.replacement_oid, squashed.id().as_str());
-        assert_eq!(preflight.support_refs.len(), 1);
-
-        workspace
-            .replace_remote_history(preflight.token.unwrap().confirm_shared_history_rewrite())
-            .unwrap();
-
-        let bare = Repository::open_bare(remote.path()).unwrap();
-        assert_eq!(
-            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
-            squashed.id().as_str()
-        );
-        assert!(bare
-            .references_glob("refs/draftline/rewrites/squash/main/*")
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .any(|reference| reference.target().map(|oid| oid.to_string())
-                == Some(original_remote_tip.id().as_str().to_string())));
-    }
-
-    #[test]
-    fn replace_remote_history_refuses_remote_race_after_preflight() {
-        let remote = tempfile::tempdir().unwrap();
-        init_bare_remote(remote.path());
-
-        let local = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(local.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        workspace
-            .add_remote("origin", remote.path().to_str().unwrap())
-            .unwrap();
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        workspace.save_version("v3").unwrap();
-        workspace.publish_changes("origin").unwrap();
-
-        workspace.squash_versions(2, "Squashed v2+v3").unwrap();
-        let preflight = workspace
-            .preflight_replace_remote_history("origin")
-            .unwrap();
-
-        let other = tempfile::tempdir().unwrap();
-        let other_workspace =
-            Workspace::clone_workspace(remote.path().to_str().unwrap(), other.path()).unwrap();
-        configure_identity(&other_workspace, "Maria", "maria@example.com");
-        write_file(other_workspace.root(), "post.md", b"remote race");
-        let raced_tip = other_workspace.save_version("Remote race").unwrap();
-        other_workspace.publish_changes("origin").unwrap();
-
-        let err = workspace
-            .replace_remote_history(preflight.token.unwrap().confirm_shared_history_rewrite())
-            .unwrap_err();
-
-        assert!(matches!(err, DraftlineError::RemoteRace { .. }));
-        let bare = Repository::open_bare(remote.path()).unwrap();
-        assert_eq!(
-            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
-            raced_tip.id().as_str()
-        );
-    }
-
-    #[test]
-    fn replace_remote_history_requires_explicit_confirmation() {
-        let remote = tempfile::tempdir().unwrap();
-        init_bare_remote(remote.path());
-
-        let local = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(local.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        workspace
-            .add_remote("origin", remote.path().to_str().unwrap())
-            .unwrap();
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let original_remote_tip = workspace.save_version("v3").unwrap();
-        workspace.publish_changes("origin").unwrap();
-
-        workspace.squash_versions(2, "Squashed v2+v3").unwrap();
-        let preflight = workspace
-            .preflight_replace_remote_history("origin")
-            .unwrap();
-        assert!(!preflight.token.as_ref().unwrap().confirmed_rewrite);
-
-        let err = workspace
-            .replace_remote_history(preflight.token.unwrap())
-            .unwrap_err();
-
-        assert!(matches!(err, DraftlineError::ConsentRequired(_)));
-        let bare = Repository::open_bare(remote.path()).unwrap();
-        assert_eq!(
-            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
-            original_remote_tip.id().as_str()
-        );
-    }
-
-    #[test]
-    fn replace_remote_history_can_retry_after_support_ref_was_already_published() {
-        let remote = tempfile::tempdir().unwrap();
-        init_bare_remote(remote.path());
-
-        let local = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(local.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        workspace
-            .add_remote("origin", remote.path().to_str().unwrap())
-            .unwrap();
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        workspace.save_version("v3").unwrap();
-        workspace.publish_changes("origin").unwrap();
-
-        let squashed = workspace.squash_versions(2, "Squashed v2+v3").unwrap();
-        let first_preflight = workspace
-            .preflight_replace_remote_history("origin")
-            .unwrap();
-        workspace
-            .publish_support_refs(first_preflight.token.unwrap().support_ref_token)
-            .unwrap();
-
-        let retry_preflight = workspace
-            .preflight_replace_remote_history("origin")
-            .unwrap();
-        assert!(retry_preflight.can_replace);
-        assert!(retry_preflight.token.is_some());
-        assert_eq!(retry_preflight.support_refs.len(), 1);
-
-        workspace
-            .replace_remote_history(
-                retry_preflight
-                    .token
-                    .unwrap()
-                    .confirm_shared_history_rewrite(),
-            )
-            .unwrap();
-
-        let bare = Repository::open_bare(remote.path()).unwrap();
-        assert_eq!(
-            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
-            squashed.id().as_str()
-        );
     }
 
     #[test]
@@ -16267,6 +16259,43 @@ mod tests {
     }
 
     #[test]
+    fn recovery_records_name_the_project_that_wrote_them() {
+        let temp = tempfile::tempdir().unwrap();
+        Repository::init(temp.path()).unwrap();
+        let workspace = Workspace::init(temp.path().join("decks").join("pitch")).unwrap();
+        let state = RecoveryState {
+            operation_id: "op".to_string(),
+            operation: RecoveryOperation::ShelveChanges,
+            original_variation: None,
+            target: None,
+            completed: false,
+        };
+        workspace.write_recovery_state(&state).unwrap();
+
+        let text = fs::read_to_string(workspace.ledger_path()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["project"], "decks/pitch");
+        assert_eq!(workspace.recovery_state().unwrap(), Some(state));
+        workspace.acknowledge_recovery().unwrap();
+        assert!(!workspace.ledger_path().exists());
+    }
+
+    #[test]
+    fn a_corrupt_recovery_record_can_still_be_cleared() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        fs::write(workspace.ledger_path(), b"{not-json").unwrap();
+        assert!(workspace.save_version("Blocked").is_err());
+        workspace.acknowledge_recovery().unwrap();
+        assert!(!workspace.ledger_path().exists());
+
+        // A record cut off mid-character isn't valid UTF-8.
+        fs::write(workspace.ledger_path(), b"{\"project\": \"caf\xc3").unwrap();
+        workspace.acknowledge_recovery().unwrap();
+        assert!(!workspace.ledger_path().exists());
+    }
+
+    #[test]
     fn agent_json_facade_reports_corrupt_recovery_ledger() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
@@ -17299,1245 +17328,6 @@ mod tests {
         assert_eq!(result.applied_count, 0);
     }
 
-    // ── history_cleanup ───────────────────────────────────────────────────────
-
-    fn compact_cleanup_request(start: &Version, end: &Version) -> HistoryCleanupRequest {
-        HistoryCleanupRequest {
-            target_variation: None,
-            base: CleanupBase::Auto,
-            mode: CleanupMode::CompactMilestones {
-                milestones: vec![MilestoneSpec {
-                    title: "Clean milestone".to_string(),
-                    description: Some("Compacted noisy saves".to_string()),
-                    include_range: CommitRange {
-                        start: start.id().clone(),
-                        end: end.id().clone(),
-                    },
-                }],
-                preserve_named_branches: true,
-                preserve_merge_boundaries: true,
-            },
-            safety: CleanupSafety::default_user_facing(),
-            remote_policy: RemoteRewritePolicy::LocalOnly,
-        }
-    }
-
-    #[test]
-    fn history_cleanup_compacts_milestones_maps_old_versions_and_undoes() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("noisy autosave").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("another noisy autosave").unwrap();
-
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-        assert_eq!(preview.target_variation, VariationId::from("main"));
-        assert_eq!(preview.old_head, v3.id().clone());
-        assert_ne!(preview.new_head, preview.old_head);
-        assert_eq!(preview.operations.len(), 1);
-        assert_eq!(
-            preview.operations[0].old_versions,
-            vec![v2.id().clone(), v3.id().clone()]
-        );
-        assert_eq!(preview.graph_diff.old_commit_count, 2);
-        assert_eq!(preview.graph_diff.new_commit_count, 1);
-        assert_eq!(preview.graph_diff.squashed_commit_count, 1);
-        assert!(preview
-            .commit_map
-            .iter()
-            .all(|entry| matches!(entry.disposition, RewriteDisposition::SquashedInto { .. })));
-
-        let result = workspace
-            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-        assert_eq!(result.old_head, v3.id().clone());
-        assert_eq!(result.new_head, preview.new_head);
-        assert_eq!(
-            workspace
-                .repo
-                .head()
-                .unwrap()
-                .peel_to_commit()
-                .unwrap()
-                .id()
-                .to_string(),
-            result.new_head.as_str()
-        );
-        assert_eq!(
-            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
-            "v3"
-        );
-        assert_eq!(result.backup_refs.len(), 1);
-        assert_eq!(
-            workspace
-                .repo
-                .refname_to_id(result.backup_refs[0].as_str())
-                .unwrap()
-                .to_string(),
-            v3.id().as_str()
-        );
-
-        let resolution = workspace
-            .resolve_rewritten_version(StaleVersionResolutionRequest {
-                version: v2.id().clone(),
-            })
-            .unwrap();
-        assert!(matches!(
-            resolution.disposition,
-            StaleVersionDisposition::SquashedInto { ref version } if version == &result.new_head
-        ));
-
-        let undo = workspace
-            .preflight_undo_history_cleanup(result.plan_id.clone())
-            .unwrap();
-        assert!(undo.can_undo);
-        let undo_result = workspace.undo_history_cleanup(undo.token).unwrap();
-        assert_eq!(undo_result.new_head, v3.id().clone());
-        assert_eq!(
-            workspace
-                .repo
-                .head()
-                .unwrap()
-                .peel_to_commit()
-                .unwrap()
-                .id()
-                .to_string(),
-            v3.id().as_str()
-        );
-    }
-
-    #[test]
-    fn history_cleanup_compacts_middle_range_and_replays_descendants() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("noisy autosave").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("another noisy autosave").unwrap();
-        write_file(workspace.root(), "post.md", b"v4");
-        let v4 = workspace.save_version("keep v4").unwrap();
-        write_file(workspace.root(), "post.md", b"v5");
-        let v5 = workspace.save_version("keep v5").unwrap();
-
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-
-        assert_eq!(preview.old_head, v5.id().clone());
-        assert_eq!(preview.selected_commit_count, 2);
-        assert_eq!(preview.descendant_rewrite_count, 2);
-        assert_eq!(preview.graph_diff.old_commit_count, 4);
-        assert_eq!(preview.graph_diff.new_commit_count, 3);
-        assert_eq!(preview.graph_diff.squashed_commit_count, 1);
-        assert_eq!(preview.planned_ref_updates.len(), 1);
-        assert!(preview.commit_map.iter().any(|entry| {
-            entry.old == *v4.id()
-                && matches!(entry.disposition, RewriteDisposition::Preserved { .. })
-        }));
-
-        let result = workspace
-            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-        assert_eq!(result.old_head, v5.id().clone());
-        assert_eq!(result.new_head, preview.new_head);
-        assert_eq!(
-            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
-            "v5"
-        );
-
-        let squashed = workspace
-            .resolve_rewritten_version(StaleVersionResolutionRequest {
-                version: v2.id().clone(),
-            })
-            .unwrap();
-        assert!(matches!(
-            squashed.disposition,
-            StaleVersionDisposition::SquashedInto { .. }
-        ));
-        let preserved = workspace
-            .resolve_rewritten_version(StaleVersionResolutionRequest {
-                version: v4.id().clone(),
-            })
-            .unwrap();
-        assert!(matches!(
-            preserved.disposition,
-            StaleVersionDisposition::Live { ref version } if version != v4.id()
-        ));
-    }
-
-    #[test]
-    fn history_compaction_candidates_reports_viable_partner_nodes() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        write_file(workspace.root(), "post.md", b"v4");
-        let v4 = workspace.save_version("v4").unwrap();
-
-        let candidates = workspace
-            .history_compaction_candidates(HistoryCompactionCandidatesRequest {
-                target_variation: None,
-                selected_version: v2.id().clone(),
-                remote: None,
-                preserve_named_branches: true,
-                preserve_merge_boundaries: true,
-            })
-            .unwrap();
-
-        assert_eq!(candidates.target_variation, VariationId::from("main"));
-        assert_eq!(candidates.target_head, v4.id().clone());
-        let v3_candidate = candidates
-            .candidates
-            .iter()
-            .find(|candidate| candidate.version.id() == v3.id())
-            .unwrap();
-        assert_eq!(v3_candidate.version.id(), v3.id());
-        assert!(v3_candidate.can_compact);
-        assert_eq!(
-            v3_candidate.selected_role,
-            CompactionSelectionRole::RangeStart
-        );
-        assert_eq!(v3_candidate.include_range.start, v2.id().clone());
-        assert_eq!(v3_candidate.include_range.end, v3.id().clone());
-        assert_eq!(v3_candidate.selected_commit_count, 2);
-        assert_eq!(v3_candidate.descendant_rewrite_count, 1);
-        assert!(v3_candidate.requires_descendant_replay);
-        let candidate_json = serde_json::to_value(v3_candidate).unwrap();
-        assert_eq!(candidate_json["version"]["id"], v3.id().as_str());
-    }
-
-    #[test]
-    fn history_compaction_candidates_blocks_selected_version_outside_target_first_parent_chain() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        let v1 = workspace.save_version("v1").unwrap();
-        let v1_commit = workspace.find_version_commit(v1.id()).unwrap();
-        workspace.repo.branch("side", &v1_commit, false).unwrap();
-        drop(v1_commit);
-
-        workspace
-            .switch_variation(&VariationId::from("side"), SwitchPolicy::AbortIfDirty)
-            .unwrap();
-        write_file(workspace.root(), "post.md", b"side");
-        let side = workspace.save_version("side").unwrap();
-        workspace
-            .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
-            .unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        workspace.save_version("v3").unwrap();
-
-        let err = workspace
-            .history_compaction_candidates(HistoryCompactionCandidatesRequest {
-                target_variation: Some(VariationId::from("main")),
-                selected_version: side.id().clone(),
-                remote: None,
-                preserve_named_branches: true,
-                preserve_merge_boundaries: true,
-            })
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            DraftlineError::HistoryCleanupBlocked(report)
-                if report.operation == "history_compaction_candidates"
-                    && report.diagnostics.iter().any(|diagnostic| diagnostic.code == CleanupWarningCode::SelectedVersionNotOnTargetVariation)
-        ));
-    }
-
-    #[test]
-    fn history_compaction_candidates_blocks_variation_tip_inside_range_even_when_branches_can_move()
-    {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        let v2_commit = workspace.find_version_commit(v2.id()).unwrap();
-        workspace.repo.branch("side", &v2_commit, false).unwrap();
-        drop(v2_commit);
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        write_file(workspace.root(), "post.md", b"v4");
-        workspace.save_version("v4").unwrap();
-
-        let candidates = workspace
-            .history_compaction_candidates(HistoryCompactionCandidatesRequest {
-                target_variation: None,
-                selected_version: v2.id().clone(),
-                remote: None,
-                preserve_named_branches: false,
-                preserve_merge_boundaries: true,
-            })
-            .unwrap();
-        let v3_candidate = candidates
-            .candidates
-            .iter()
-            .find(|candidate| candidate.version.id() == v3.id())
-            .unwrap();
-
-        assert!(!v3_candidate.can_compact);
-        assert!(v3_candidate.blockers.iter().any(|diagnostic| {
-            diagnostic.code == CleanupWarningCode::NamedBranchInsideCompactedRange
-        }));
-    }
-
-    #[test]
-    fn history_compaction_candidates_supports_selected_range_end() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        workspace.save_version("v3").unwrap();
-        write_file(workspace.root(), "post.md", b"v4");
-        let v4 = workspace.save_version("v4").unwrap();
-        write_file(workspace.root(), "post.md", b"v5");
-        let v5 = workspace.save_version("v5").unwrap();
-
-        let candidates = workspace
-            .history_compaction_candidates(HistoryCompactionCandidatesRequest {
-                target_variation: None,
-                selected_version: v4.id().clone(),
-                remote: None,
-                preserve_named_branches: true,
-                preserve_merge_boundaries: true,
-            })
-            .unwrap();
-
-        let v2_candidate = candidates
-            .candidates
-            .iter()
-            .find(|candidate| candidate.version.id() == v2.id())
-            .unwrap();
-        assert_eq!(
-            v2_candidate.selected_role,
-            CompactionSelectionRole::RangeEnd
-        );
-        assert_eq!(v2_candidate.include_range.start, v2.id().clone());
-        assert_eq!(v2_candidate.include_range.end, v4.id().clone());
-        assert_eq!(v2_candidate.selected_commit_count, 3);
-        assert_eq!(v2_candidate.descendant_rewrite_count, 1);
-        assert!(v2_candidate.requires_descendant_replay);
-        assert!(v2_candidate.can_compact);
-        assert_eq!(candidates.target_head, v5.id().clone());
-    }
-
-    #[test]
-    fn history_compaction_candidates_reports_remote_impact_for_published_range() {
-        let remote = tempfile::tempdir().unwrap();
-        init_bare_remote(remote.path());
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        workspace
-            .add_remote("origin", remote.path().to_str().unwrap())
-            .unwrap();
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        write_file(workspace.root(), "post.md", b"v4");
-        let v4 = workspace.save_version("v4").unwrap();
-        workspace.publish_changes("origin").unwrap();
-
-        let candidates = workspace
-            .history_compaction_candidates(HistoryCompactionCandidatesRequest {
-                target_variation: None,
-                selected_version: v2.id().clone(),
-                remote: Some("origin".to_string()),
-                preserve_named_branches: true,
-                preserve_merge_boundaries: true,
-            })
-            .unwrap();
-
-        let v3_candidate = candidates
-            .candidates
-            .iter()
-            .find(|candidate| candidate.version.id() == v3.id())
-            .unwrap();
-        let impact = v3_candidate.remote_impact.as_ref().unwrap();
-        assert_eq!(
-            impact.publish_status,
-            CleanupPublishStatus::SharedHistoryRewriteRequired
-        );
-        assert_eq!(impact.selected.published_count, 2);
-        assert_eq!(impact.descendants.published_count, 1);
-        assert_eq!(impact.upstream_head, Some(v4.id().clone()));
-    }
-
-    #[test]
-    fn history_cleanup_publish_replaces_remote_with_support_ref_and_lease() {
-        let remote = tempfile::tempdir().unwrap();
-        init_bare_remote(remote.path());
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        workspace
-            .add_remote("origin", remote.path().to_str().unwrap())
-            .unwrap();
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        write_file(workspace.root(), "post.md", b"v4");
-        let original_remote_tip = workspace.save_version("v4").unwrap();
-        workspace.publish_changes("origin").unwrap();
-
-        let mut request = compact_cleanup_request(&v2, &v3);
-        request.remote_policy = RemoteRewritePolicy::PushWithLease {
-            remote: "origin".to_string(),
-            branch: "main".to_string(),
-        };
-        let preview = workspace.preview_history_cleanup(request).unwrap();
-        assert_eq!(
-            preview.remote_impact.as_ref().unwrap().publish_status,
-            CleanupPublishStatus::SharedHistoryRewriteRequired
-        );
-        let result = workspace
-            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-        let preflight = workspace
-            .preflight_publish_history_cleanup(result.plan_id.clone(), "origin")
-            .unwrap();
-        assert!(preflight.can_publish);
-        assert_eq!(
-            preflight.expected_remote_oid,
-            original_remote_tip.id().as_str()
-        );
-        assert_eq!(preflight.replacement_oid, result.new_head.as_str());
-        assert_eq!(preflight.support_refs.len(), 1);
-
-        let publish = workspace
-            .publish_history_cleanup(preflight.token.unwrap(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-        assert_eq!(publish.replacement_oid, result.new_head.as_str());
-
-        let bare = Repository::open_bare(remote.path()).unwrap();
-        assert_eq!(
-            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
-            result.new_head.as_str()
-        );
-        assert_eq!(
-            workspace
-                .repo
-                .refname_to_id("refs/remotes/origin/main")
-                .unwrap()
-                .to_string(),
-            result.new_head.as_str()
-        );
-        assert!(bare
-            .references_glob("refs/draftline/rewrites/squash/main/*")
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .any(|reference| reference.target().map(|oid| oid.to_string())
-                == Some(original_remote_tip.id().as_str().to_string())));
-    }
-
-    #[test]
-    fn history_cleanup_publish_support_ref_targets_remote_tip_when_local_was_ahead() {
-        let remote = tempfile::tempdir().unwrap();
-        init_bare_remote(remote.path());
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        workspace
-            .add_remote("origin", remote.path().to_str().unwrap())
-            .unwrap();
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        workspace.publish_changes("origin").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        write_file(workspace.root(), "post.md", b"v4");
-        let v4 = workspace.save_version("v4").unwrap();
-
-        let mut request = compact_cleanup_request(&v2, &v3);
-        request.remote_policy = RemoteRewritePolicy::PushWithLease {
-            remote: "origin".to_string(),
-            branch: "main".to_string(),
-        };
-        let preview = workspace.preview_history_cleanup(request).unwrap();
-        let result = workspace
-            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-
-        let preflight = workspace
-            .preflight_publish_history_cleanup(result.plan_id.clone(), "origin")
-            .unwrap();
-        assert!(preflight.can_publish);
-        assert_eq!(preflight.expected_remote_oid, v2.id().as_str());
-        assert_eq!(preflight.replacement_oid, result.new_head.as_str());
-        assert_eq!(preflight.support_refs[0].target_oid, v2.id().as_str());
-
-        workspace
-            .publish_history_cleanup(preflight.token.unwrap(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-        let bare = Repository::open_bare(remote.path()).unwrap();
-        assert_eq!(
-            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
-            result.new_head.as_str()
-        );
-        assert_ne!(result.new_head, v4.id().clone());
-    }
-
-    #[test]
-    fn history_cleanup_publish_refuses_remote_race_after_preflight() {
-        let remote = tempfile::tempdir().unwrap();
-        init_bare_remote(remote.path());
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        workspace
-            .add_remote("origin", remote.path().to_str().unwrap())
-            .unwrap();
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        workspace.publish_changes("origin").unwrap();
-
-        let mut request = compact_cleanup_request(&v2, &v3);
-        request.remote_policy = RemoteRewritePolicy::PushWithLease {
-            remote: "origin".to_string(),
-            branch: "main".to_string(),
-        };
-        let preview = workspace.preview_history_cleanup(request).unwrap();
-        let result = workspace
-            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-        let preflight = workspace
-            .preflight_publish_history_cleanup(result.plan_id.clone(), "origin")
-            .unwrap();
-
-        let other = tempfile::tempdir().unwrap();
-        let other_workspace =
-            Workspace::clone_workspace(remote.path().to_str().unwrap(), other.path()).unwrap();
-        configure_identity(&other_workspace, "Maria", "maria@example.com");
-        write_file(other_workspace.root(), "post.md", b"remote race");
-        let raced_tip = other_workspace.save_version("Remote race").unwrap();
-        other_workspace.publish_changes("origin").unwrap();
-
-        let err = workspace
-            .publish_history_cleanup(preflight.token.unwrap(), RewriteConfirmation::UserConfirmed)
-            .unwrap_err();
-        assert!(matches!(err, DraftlineError::RemoteRace { .. }));
-        let bare = Repository::open_bare(remote.path()).unwrap();
-        assert_eq!(
-            bare.refname_to_id("refs/heads/main").unwrap().to_string(),
-            raced_tip.id().as_str()
-        );
-    }
-
-    #[test]
-    fn apply_incoming_accepts_published_remote_compaction_when_clean() {
-        let remote = tempfile::tempdir().unwrap();
-        init_bare_remote(remote.path());
-        let author_dir = tempfile::tempdir().unwrap();
-        let author = Workspace::init(author_dir.path()).unwrap();
-        configure_identity(&author, "Seth", "seth@example.com");
-        author
-            .add_remote("origin", remote.path().to_str().unwrap())
-            .unwrap();
-        write_file(author.root(), "post.md", b"v1");
-        author.save_version("v1").unwrap();
-        write_file(author.root(), "post.md", b"v2");
-        let v2 = author.save_version("v2").unwrap();
-        write_file(author.root(), "post.md", b"v3");
-        let old_remote_tip = author.save_version("v3").unwrap();
-        author.publish_changes("origin").unwrap();
-
-        let peer_dir = tempfile::tempdir().unwrap();
-        let peer =
-            Workspace::clone_workspace(remote.path().to_str().unwrap(), peer_dir.path()).unwrap();
-        configure_identity(&peer, "Maria", "maria@example.com");
-
-        let mut request = compact_cleanup_request(&v2, &old_remote_tip);
-        request.remote_policy = RemoteRewritePolicy::PushWithLease {
-            remote: "origin".to_string(),
-            branch: "main".to_string(),
-        };
-        let preview = author.preview_history_cleanup(request).unwrap();
-        let cleanup = author
-            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-        let publish = author
-            .preflight_publish_history_cleanup(cleanup.plan_id.clone(), "origin")
-            .unwrap();
-        author
-            .publish_history_cleanup(publish.token.unwrap(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-
-        peer.fetch_remote("origin").unwrap();
-        let status = peer.sync_status("origin").unwrap();
-        assert_eq!(status.state, SyncState::IncomingAvailable);
-        let report = peer.preflight_apply_incoming("origin").unwrap();
-        assert!(report.can_proceed);
-
-        let mut options = RemoteOptions::new();
-        peer.apply_incoming("origin", &mut options).unwrap();
-        let peer_head = peer.repo.head().unwrap().peel_to_commit().unwrap().id();
-        assert_eq!(peer_head.to_string(), cleanup.new_head.as_str());
-        let resolution = peer
-            .resolve_rewritten_version(StaleVersionResolutionRequest {
-                version: v2.id().clone(),
-            })
-            .unwrap();
-        assert!(matches!(
-            resolution.disposition,
-            StaleVersionDisposition::BackedUp { .. }
-        ));
-    }
-
-    #[test]
-    fn apply_incoming_replays_local_snapshots_after_published_remote_compaction() {
-        let remote = tempfile::tempdir().unwrap();
-        init_bare_remote(remote.path());
-        let author_dir = tempfile::tempdir().unwrap();
-        let author = Workspace::init(author_dir.path()).unwrap();
-        configure_identity(&author, "Seth", "seth@example.com");
-        author
-            .add_remote("origin", remote.path().to_str().unwrap())
-            .unwrap();
-        write_file(author.root(), "post.md", b"v1");
-        author.save_version("v1").unwrap();
-        write_file(author.root(), "post.md", b"v2");
-        let v2 = author.save_version("v2").unwrap();
-        write_file(author.root(), "post.md", b"v3");
-        let old_remote_tip = author.save_version("v3").unwrap();
-        author.publish_changes("origin").unwrap();
-
-        let peer_dir = tempfile::tempdir().unwrap();
-        let peer =
-            Workspace::clone_workspace(remote.path().to_str().unwrap(), peer_dir.path()).unwrap();
-        configure_identity(&peer, "Maria", "maria@example.com");
-        write_file(peer.root(), "post.md", b"v4 local");
-        let local_tip = peer.save_version("v4 local").unwrap();
-
-        let mut request = compact_cleanup_request(&v2, &old_remote_tip);
-        request.remote_policy = RemoteRewritePolicy::PushWithLease {
-            remote: "origin".to_string(),
-            branch: "main".to_string(),
-        };
-        let preview = author.preview_history_cleanup(request).unwrap();
-        let cleanup = author
-            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-        let publish = author
-            .preflight_publish_history_cleanup(cleanup.plan_id.clone(), "origin")
-            .unwrap();
-        author
-            .publish_history_cleanup(publish.token.unwrap(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-
-        let mut options = RemoteOptions::new();
-        let result = peer.apply_incoming("origin", &mut options).unwrap();
-        assert!(result.applied_count > 0);
-        let peer_head = peer.repo.head().unwrap().peel_to_commit().unwrap();
-        assert_ne!(peer_head.id().to_string(), local_tip.id().as_str());
-        assert_eq!(
-            peer_head.parent(0).unwrap().id().to_string(),
-            cleanup.new_head.as_str()
-        );
-        assert_eq!(
-            std::fs::read_to_string(peer.root().join("post.md")).unwrap(),
-            "v4 local"
-        );
-        assert_eq!(
-            peer.sync_status("origin").unwrap().state,
-            SyncState::LocalAhead
-        );
-    }
-
-    #[test]
-    fn remote_compaction_with_non_first_parent_local_work_stays_needs_merge() {
-        let remote = tempfile::tempdir().unwrap();
-        init_bare_remote(remote.path());
-        let author_dir = tempfile::tempdir().unwrap();
-        let author = Workspace::init(author_dir.path()).unwrap();
-        configure_identity(&author, "Seth", "seth@example.com");
-        author
-            .add_remote("origin", remote.path().to_str().unwrap())
-            .unwrap();
-        write_file(author.root(), "post.md", b"v1");
-        let v1 = author.save_version("v1").unwrap();
-        write_file(author.root(), "post.md", b"v2");
-        let v2 = author.save_version("v2").unwrap();
-        write_file(author.root(), "post.md", b"v3");
-        let old_remote_tip = author.save_version("v3").unwrap();
-        author.publish_changes("origin").unwrap();
-
-        let peer_dir = tempfile::tempdir().unwrap();
-        let peer =
-            Workspace::clone_workspace(remote.path().to_str().unwrap(), peer_dir.path()).unwrap();
-        configure_identity(&peer, "Maria", "maria@example.com");
-        let signature = peer.workspace_signature().unwrap();
-        let v1_commit = peer.find_version_commit(v1.id()).unwrap();
-        let side_tree = v1_commit.tree().unwrap();
-        let side_oid = peer
-            .repo
-            .commit(
-                None,
-                &signature,
-                &signature,
-                "side local",
-                &side_tree,
-                &[&v1_commit],
-            )
-            .unwrap();
-        let side_commit = peer.repo.find_commit(side_oid).unwrap();
-        let old_remote_commit = peer.find_version_commit(old_remote_tip.id()).unwrap();
-        let merge_tree = side_commit.tree().unwrap();
-        let merge_oid = peer
-            .repo
-            .commit(
-                None,
-                &signature,
-                &signature,
-                "local merge",
-                &merge_tree,
-                &[&side_commit, &old_remote_commit],
-            )
-            .unwrap();
-        peer.repo
-            .reference("refs/heads/main", merge_oid, true, "test local merge")
-            .unwrap();
-        peer.repo.set_head("refs/heads/main").unwrap();
-        peer.repo
-            .checkout_head(Some(CheckoutBuilder::new().force()))
-            .unwrap();
-
-        let mut request = compact_cleanup_request(&v2, &old_remote_tip);
-        request.remote_policy = RemoteRewritePolicy::PushWithLease {
-            remote: "origin".to_string(),
-            branch: "main".to_string(),
-        };
-        let preview = author.preview_history_cleanup(request).unwrap();
-        let cleanup = author
-            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-        let publish = author
-            .preflight_publish_history_cleanup(cleanup.plan_id.clone(), "origin")
-            .unwrap();
-        author
-            .publish_history_cleanup(publish.token.unwrap(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-
-        peer.fetch_remote("origin").unwrap();
-        let status = peer.sync_status("origin").unwrap();
-        assert_eq!(status.state, SyncState::NeedsMerge);
-        let report = peer.preflight_apply_incoming("origin").unwrap();
-        assert!(!report.can_proceed);
-    }
-
-    #[test]
-    fn history_cleanup_rewrites_descendant_variation_refs_and_undo_restores_them() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        write_file(workspace.root(), "post.md", b"v4");
-        let v4 = workspace.save_version("v4").unwrap();
-        let v4_commit = workspace.find_version_commit(v4.id()).unwrap();
-        workspace.repo.branch("side", &v4_commit, false).unwrap();
-        drop(v4_commit);
-        write_file(workspace.root(), "post.md", b"v5");
-        let v5 = workspace.save_version("v5").unwrap();
-
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-        assert_eq!(preview.planned_ref_updates.len(), 2);
-        assert!(preview.affected_refs.iter().any(|affected| {
-            affected.name.as_str() == "refs/heads/side"
-                && affected.impact == CleanupRefImpact::DescendantVariationRewritten
-        }));
-        let side_new = preview
-            .planned_ref_updates
-            .iter()
-            .find(|update| update.name.as_str() == "refs/heads/side")
-            .and_then(|update| update.new.clone())
-            .unwrap();
-
-        let result = workspace
-            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-        assert_eq!(
-            workspace.repo.refname_to_id("refs/heads/side").unwrap(),
-            oid_from_version(&side_new).unwrap()
-        );
-
-        let undo = workspace
-            .preflight_undo_history_cleanup(result.plan_id.clone())
-            .unwrap();
-        assert_eq!(undo.ref_updates.len(), 2);
-        let undo_result = workspace.undo_history_cleanup(undo.token).unwrap();
-        assert_eq!(undo_result.new_head, v5.id().clone());
-        assert_eq!(
-            workspace.repo.refname_to_id("refs/heads/side").unwrap(),
-            oid_from_version(v4.id()).unwrap()
-        );
-    }
-
-    #[test]
-    fn history_cleanup_blocks_preserved_variation_inside_compacted_range() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        let v2_commit = workspace.find_version_commit(v2.id()).unwrap();
-        workspace.repo.branch("side", &v2_commit, false).unwrap();
-        drop(v2_commit);
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        write_file(workspace.root(), "post.md", b"v4");
-        workspace.save_version("v4").unwrap();
-
-        let err = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            DraftlineError::HistoryCleanupBlocked(report)
-                if report.diagnostics.iter().any(|diagnostic| diagnostic.code == CleanupWarningCode::NamedBranchInsideCompactedRange)
-        ));
-    }
-
-    #[test]
-    fn history_cleanup_blocks_variation_inside_compacted_range_even_when_named_branches_can_move() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        let v2_commit = workspace.find_version_commit(v2.id()).unwrap();
-        workspace.repo.branch("side", &v2_commit, false).unwrap();
-        drop(v2_commit);
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-
-        let mut request = compact_cleanup_request(&v2, &v3);
-        let CleanupMode::CompactMilestones {
-            preserve_named_branches,
-            ..
-        } = &mut request.mode;
-        *preserve_named_branches = false;
-        let err = workspace.preview_history_cleanup(request).unwrap_err();
-
-        assert!(matches!(
-            err,
-            DraftlineError::HistoryCleanupBlocked(report)
-                if report.diagnostics.iter().any(|diagnostic| diagnostic.code == CleanupWarningCode::NamedBranchInsideCompactedRange)
-        ));
-        let graph = workspace
-            .workspace_graph(WorkspaceGraphOptions::default())
-            .unwrap();
-        let side_node = graph
-            .nodes
-            .iter()
-            .find(|node| node.version.id() == v2.id())
-            .unwrap();
-        assert!(side_node.reachable_from_local_variation);
-        assert_eq!(side_node.kind, WorkspaceGraphNodeKind::Normal);
-    }
-
-    #[test]
-    fn history_cleanup_rejects_dirty_worktree_by_default() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        write_file(workspace.root(), "scratch.md", b"dirty");
-
-        let err = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap_err();
-
-        assert!(
-            matches!(err, DraftlineError::PreflightFailed(report) if report.operation == "history_cleanup")
-        );
-    }
-
-    #[test]
-    fn history_cleanup_apply_rejects_changed_target_ref_after_preview() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-
-        write_file(workspace.root(), "post.md", b"v4");
-        workspace.save_version("v4").unwrap();
-        let err = workspace
-            .apply_history_cleanup(preview.plan_id, RewriteConfirmation::UserConfirmed)
-            .unwrap_err();
-
-        assert!(matches!(err, DraftlineError::LocalStateChanged { .. }));
-    }
-
-    #[test]
-    fn history_cleanup_apply_rejects_changed_preview_ref_after_preview() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        let v1 = workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-
-        workspace
-            .repo
-            .reference(
-                preview.preview_ref.as_str(),
-                oid_from_version(v1.id()).unwrap(),
-                true,
-                "tamper cleanup preview",
-            )
-            .unwrap();
-        let err = workspace
-            .apply_history_cleanup(preview.plan_id, RewriteConfirmation::UserConfirmed)
-            .unwrap_err();
-
-        assert!(matches!(err, DraftlineError::LocalStateChanged { .. }));
-    }
-
-    #[test]
-    fn history_cleanup_undo_rejects_work_added_after_cleanup() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-        let result = workspace
-            .apply_history_cleanup(preview.plan_id, RewriteConfirmation::UserConfirmed)
-            .unwrap();
-
-        write_file(workspace.root(), "post.md", b"v4");
-        workspace.save_version("v4").unwrap();
-        let err = workspace
-            .preflight_undo_history_cleanup(result.plan_id)
-            .unwrap_err();
-
-        assert!(matches!(err, DraftlineError::LocalStateChanged { .. }));
-    }
-
-    #[test]
-    fn history_cleanup_recovery_rolls_back_interrupted_branch_move() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-        let branch_ref = "refs/heads/main";
-        let new_head = oid_from_version(&preview.new_head).unwrap();
-        workspace
-            .repo
-            .reference(branch_ref, new_head, true, "simulate interrupted cleanup")
-            .unwrap();
-        workspace.repo.set_head(branch_ref).unwrap();
-        let commit = workspace.repo.find_commit(new_head).unwrap();
-        workspace
-            .repo
-            .checkout_tree(
-                commit.tree().unwrap().as_object(),
-                Some(CheckoutBuilder::new().force()),
-            )
-            .unwrap();
-        workspace
-            .write_recovery_state(&RecoveryState {
-                operation_id: preview.plan_id.to_string(),
-                operation: RecoveryOperation::HistoryCleanup,
-                original_variation: Some("main".to_string()),
-                target: Some(v3.id().to_string()),
-                completed: false,
-            })
-            .unwrap();
-
-        let rollback = workspace
-            .rollback_recovery(preview.plan_id.as_str())
-            .unwrap();
-
-        assert!(rollback.completed);
-        assert_eq!(
-            workspace
-                .repo
-                .head()
-                .unwrap()
-                .peel_to_commit()
-                .unwrap()
-                .id()
-                .to_string(),
-            v3.id().as_str()
-        );
-        assert_eq!(
-            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
-            "v3"
-        );
-        assert!(workspace.recovery_state().unwrap().is_none());
-    }
-
-    // ── squash_versions ───────────────────────────────────────────────────────
-
-    #[test]
-    fn squash_versions_collapses_commits_and_produces_single_version() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        workspace.save_version("v3").unwrap();
-
-        let squashed = workspace.squash_versions(2, "Squashed v2+v3").unwrap();
-
-        assert_eq!(squashed.label, "Squashed v2+v3");
-        // after squash: 2 commits — v1 (base) + squash commit
-        let versions = workspace.versions().unwrap();
-        assert_eq!(versions.len(), 2);
-        assert_eq!(versions[0].label, "Squashed v2+v3");
-        assert_eq!(versions[1].label, "v1");
-        // workspace files must still reflect v3 content
-        let content = std::fs::read_to_string(workspace.root().join("post.md")).unwrap();
-        assert_eq!(content, "v3");
-        assert!(workspace.recovery_state().unwrap().is_none());
-    }
-
-    #[test]
-    fn history_cleanup_undo_recovery_rolls_back_interrupted_branch_move() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("v3").unwrap();
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-        let result = workspace
-            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-        let undo = workspace
-            .preflight_undo_history_cleanup(result.plan_id.clone())
-            .unwrap();
-        let branch_ref = "refs/heads/main";
-        let restore_head = oid_from_version(&undo.restore_head).unwrap();
-        workspace
-            .repo
-            .reference(
-                branch_ref,
-                restore_head,
-                true,
-                "simulate interrupted cleanup undo",
-            )
-            .unwrap();
-        workspace.repo.set_head(branch_ref).unwrap();
-        let commit = workspace.repo.find_commit(restore_head).unwrap();
-        workspace
-            .repo
-            .checkout_tree(
-                commit.tree().unwrap().as_object(),
-                Some(CheckoutBuilder::new().force()),
-            )
-            .unwrap();
-        let undo_operation_id = new_operation_id();
-        workspace
-            .write_recovery_state(&RecoveryState {
-                operation_id: undo_operation_id.clone(),
-                operation: RecoveryOperation::HistoryCleanup,
-                original_variation: Some("main".to_string()),
-                target: Some(result.new_head.to_string()),
-                completed: false,
-            })
-            .unwrap();
-
-        let rollback = workspace.rollback_recovery(undo_operation_id).unwrap();
-
-        assert!(rollback.completed);
-        assert_eq!(
-            workspace
-                .repo
-                .head()
-                .unwrap()
-                .peel_to_commit()
-                .unwrap()
-                .id()
-                .to_string(),
-            result.new_head.as_str()
-        );
-        assert_eq!(
-            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
-            "v3"
-        );
-        assert!(workspace.recovery_state().unwrap().is_none());
-    }
-
-    #[test]
-    fn squash_versions_archives_original_tip_before_rewriting_branch() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        workspace.save_version("v2").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let original_tip = workspace.save_version("v3").unwrap();
-
-        let preflight = workspace.preflight_squash_versions(2).unwrap();
-        assert!(preflight.can_squash);
-        assert_eq!(preflight.variation, VariationId::from("main"));
-        assert_eq!(preflight.head_oid, original_tip.id().as_str());
-        assert!(preflight
-            .support_ref
-            .starts_with("refs/draftline/rewrites/squash/main/"));
-        workspace
-            .squash_versions_with_token(preflight.token.unwrap(), "Squashed v2+v3")
-            .unwrap();
-
-        assert!(workspace
-            .repo
-            .references()
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .any(|reference| {
-                reference
-                    .name()
-                    .map(|name| name.starts_with("refs/draftline/rewrites/squash/main/"))
-                    .unwrap_or(false)
-                    && reference.target() == Some(original_tip.id().as_str().parse().unwrap())
-            }));
-    }
-
-    #[test]
-    fn squash_versions_rejects_count_less_than_two() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-
-        let err = workspace.squash_versions(1, "Single").unwrap_err();
-        assert!(matches!(err, DraftlineError::InvalidSquashCount(1)));
-    }
-
-    #[test]
-    fn squash_versions_rejects_dirty_workspace() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        workspace.save_version("v2").unwrap();
-        // leave v3 unsaved
-        write_file(workspace.root(), "post.md", b"unsaved");
-
-        let err = workspace.squash_versions(2, "Squashed").unwrap_err();
-        assert!(matches!(err, DraftlineError::PreflightFailed(_)));
-    }
-
-    #[test]
-    fn squash_versions_rejects_when_not_enough_commits() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = Workspace::init(temp.path()).unwrap();
-        configure_identity(&workspace, "Seth", "seth@example.com");
-
-        // Only 2 commits, trying to squash 2 requires a parent outside the range
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        workspace.save_version("v2").unwrap();
-
-        let err = workspace
-            .squash_versions(2, "Squash everything")
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            DraftlineError::NotEnoughVersionsToSquash { .. }
-        ));
-    }
-
     // ── contributor profile attribution ─────────────────────────────────────
 
     fn attribution_profile() -> ContributorProfile {
@@ -18590,7 +17380,7 @@ mod tests {
         let names = |version: &Version| {
             let commit = workspace
                 .repo
-                .find_commit(oid_from_version(version.id()).unwrap())
+                .find_commit(Oid::from_str(version.id().as_str()).unwrap())
                 .unwrap();
             let author = commit.author().name_bytes().to_vec();
             let committer = commit.committer().name_bytes().to_vec();
@@ -18604,7 +17394,7 @@ mod tests {
 
         write_file(workspace.root(), "post.md", b"shelved");
         let shelf = workspace.shelve_changes("wip").unwrap();
-        // Shelve, restore, squash and cleanup have always used the raw config signature.
+        // Shelve and restore have always used the raw config signature.
         assert_eq!(
             names(&shelf.version),
             (b"Jos\xe9".to_vec(), b"Jos\xe9".to_vec())
@@ -18867,341 +17657,5 @@ mod tests {
             .unwrap();
 
         assert_git_config_attribution(&restored.version);
-    }
-
-    fn squash_fixture(workspace: &Workspace) {
-        for (index, content) in ["one", "two", "three"].into_iter().enumerate() {
-            write_file(workspace.root(), "post.md", content.as_bytes());
-            workspace.save_version(format!("v{}", index + 1)).unwrap();
-        }
-    }
-
-    #[test]
-    fn squash_versions_with_profile_records_profile_attribution() {
-        let (_temp, workspace) = attribution_workspace();
-        squash_fixture(&workspace);
-
-        let squashed = workspace
-            .squash_versions_with_profile(2, "Squashed", &attribution_profile())
-            .unwrap();
-
-        assert_eq!(squashed.label, "Squashed");
-        assert_profile_attribution(&squashed);
-    }
-
-    #[test]
-    fn squash_versions_with_token_and_profile_records_profile_attribution() {
-        let (_temp, workspace) = attribution_workspace();
-        squash_fixture(&workspace);
-        let token = workspace
-            .preflight_squash_versions(2)
-            .unwrap()
-            .token
-            .unwrap();
-
-        let squashed = workspace
-            .squash_versions_with_token_and_profile(token, "Squashed", &attribution_profile())
-            .unwrap();
-
-        assert_profile_attribution(&squashed);
-    }
-
-    #[test]
-    fn squash_versions_without_profile_keeps_git_config_attribution() {
-        let (_temp, workspace) = attribution_workspace();
-        squash_fixture(&workspace);
-
-        let squashed = workspace.squash_versions(2, "Squashed").unwrap();
-
-        assert_git_config_attribution(&squashed);
-    }
-
-    #[test]
-    fn squash_with_invalid_profile_fails_without_pending_recovery() {
-        let (_temp, workspace) = attribution_workspace();
-        squash_fixture(&workspace);
-        let head = workspace.repo.head().unwrap().target().unwrap();
-
-        let err = workspace
-            .squash_versions_with_profile(2, "Bad", &invalid_profile())
-            .unwrap_err();
-
-        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
-        workspace.ensure_no_pending_recovery().unwrap();
-        assert_eq!(workspace.repo.head().unwrap().target().unwrap(), head);
-    }
-
-    fn descendant_profile() -> ContributorProfile {
-        ContributorProfile::new(
-            Contributor {
-                name: "Descendant Author".to_string(),
-                email: Some("descendant@profile.invalid".to_string()),
-            },
-            Contributor {
-                name: "Descendant Saver".to_string(),
-                email: Some("descendant-saver@profile.invalid".to_string()),
-            },
-        )
-    }
-
-    /// v1 → v2 → v3 → v4, where v4 is a descendant saved under a distinct identity.
-    fn cleanup_fixture(workspace: &Workspace) -> (Version, Version, Version) {
-        write_file(workspace.root(), "post.md", b"v1");
-        workspace.save_version("v1").unwrap();
-        write_file(workspace.root(), "post.md", b"v2");
-        let v2 = workspace.save_version("noisy autosave").unwrap();
-        write_file(workspace.root(), "post.md", b"v3");
-        let v3 = workspace.save_version("another noisy autosave").unwrap();
-        write_file(workspace.root(), "post.md", b"v4");
-        let v4 = workspace
-            .save_version_with_profile("descendant", &descendant_profile())
-            .unwrap();
-        (v2, v3, v4)
-    }
-
-    fn cleanup_versions(
-        workspace: &Workspace,
-        result: &TimelineCleanupResult,
-    ) -> (Version, Version) {
-        let milestone = result
-            .commit_map
-            .iter()
-            .find_map(|entry| match &entry.disposition {
-                RewriteDisposition::SquashedInto { new_id } => Some(new_id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let descendant = result
-            .commit_map
-            .iter()
-            .find_map(|entry| match &entry.disposition {
-                RewriteDisposition::Preserved { new_id } => Some(new_id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let load = |id: &VersionId| {
-            version_from_commit(
-                &workspace
-                    .repo
-                    .find_commit(oid_from_version(id).unwrap())
-                    .unwrap(),
-            )
-        };
-        (load(&milestone), load(&descendant))
-    }
-
-    fn assert_descendant_attribution(version: &Version) {
-        assert_eq!(version.label, "descendant");
-        assert_eq!(version.author.name, "Descendant Author");
-        assert_eq!(version.saved_by.name, "Descendant Saver");
-    }
-
-    #[test]
-    fn history_cleanup_with_profile_attributes_milestones_and_keeps_descendants() {
-        let (_temp, workspace) = attribution_workspace();
-        let (v2, v3, _v4) = cleanup_fixture(&workspace);
-
-        let preview = workspace
-            .preview_history_cleanup_with_profile(
-                compact_cleanup_request(&v2, &v3),
-                &attribution_profile(),
-            )
-            .unwrap();
-        let result = workspace
-            .apply_history_cleanup_with_profile(
-                preview.plan_id.clone(),
-                RewriteConfirmation::UserConfirmed,
-                &attribution_profile(),
-            )
-            .unwrap();
-
-        assert_eq!(result.new_head, preview.new_head);
-        let (milestone, descendant) = cleanup_versions(&workspace, &result);
-        assert_profile_attribution(&milestone);
-        assert_descendant_attribution(&descendant);
-    }
-
-    #[test]
-    fn history_cleanup_apply_with_profile_reattributes_unprofiled_preview() {
-        let (_temp, workspace) = attribution_workspace();
-        let (v2, v3, v4) = cleanup_fixture(&workspace);
-
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-        let previewed = version_from_commit(
-            &workspace
-                .repo
-                .find_commit(oid_from_version(&preview.operations[0].new_version).unwrap())
-                .unwrap(),
-        );
-        assert_git_config_attribution(&previewed);
-
-        let result = workspace
-            .apply_history_cleanup_with_profile(
-                preview.plan_id.clone(),
-                RewriteConfirmation::UserConfirmed,
-                &attribution_profile(),
-            )
-            .unwrap();
-
-        assert_ne!(result.new_head, preview.new_head);
-        assert_eq!(result.old_head, v4.id().clone());
-        let (milestone, descendant) = cleanup_versions(&workspace, &result);
-        assert_profile_attribution(&milestone);
-        assert_descendant_attribution(&descendant);
-        let head = workspace
-            .repo
-            .head()
-            .unwrap()
-            .peel_to_commit()
-            .unwrap()
-            .id();
-        assert_eq!(head.to_string(), result.new_head.as_str());
-        assert_eq!(
-            workspace
-                .repo
-                .refname_to_id(preview.preview_ref.as_str())
-                .unwrap(),
-            head
-        );
-        let stored = workspace
-            .read_history_cleanup_plan(&preview.plan_id)
-            .unwrap();
-        assert_eq!(stored.preview.new_head, result.new_head);
-        assert_eq!(stored.preview.commit_map, result.commit_map);
-        assert_eq!(
-            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
-            "v4"
-        );
-
-        let resolution = workspace
-            .resolve_rewritten_version(StaleVersionResolutionRequest {
-                version: v2.id().clone(),
-            })
-            .unwrap();
-        assert!(matches!(
-            resolution.disposition,
-            StaleVersionDisposition::SquashedInto { ref version } if version == milestone.id()
-        ));
-
-        let undo = workspace
-            .preflight_undo_history_cleanup(result.plan_id.clone())
-            .unwrap();
-        assert!(undo.can_undo);
-        let undone = workspace.undo_history_cleanup(undo.token).unwrap();
-        assert_eq!(undone.new_head, v4.id().clone());
-    }
-
-    #[test]
-    fn history_cleanup_without_profile_keeps_git_config_attribution() {
-        let (_temp, workspace) = attribution_workspace();
-        let (v2, v3, _v4) = cleanup_fixture(&workspace);
-
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-        let result = workspace
-            .apply_history_cleanup(preview.plan_id.clone(), RewriteConfirmation::UserConfirmed)
-            .unwrap();
-
-        assert_eq!(result.new_head, preview.new_head);
-        let (milestone, descendant) = cleanup_versions(&workspace, &result);
-        assert_git_config_attribution(&milestone);
-        assert_descendant_attribution(&descendant);
-    }
-
-    #[test]
-    fn history_cleanup_with_invalid_profile_fails_without_moving_refs() {
-        let (_temp, workspace) = attribution_workspace();
-        let (v2, v3, v4) = cleanup_fixture(&workspace);
-
-        let err = workspace
-            .preview_history_cleanup_with_profile(
-                compact_cleanup_request(&v2, &v3),
-                &invalid_profile(),
-            )
-            .unwrap_err();
-        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
-
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-        let err = workspace
-            .apply_history_cleanup_with_profile(
-                preview.plan_id.clone(),
-                RewriteConfirmation::UserConfirmed,
-                &invalid_profile(),
-            )
-            .unwrap_err();
-        assert!(matches!(err, DraftlineError::InvalidContributorIdentity(_)));
-        workspace.ensure_no_pending_recovery().unwrap();
-        let head = workspace.repo.head().unwrap().target().unwrap();
-        assert_eq!(head.to_string(), v4.id().as_str());
-    }
-
-    #[test]
-    fn history_cleanup_apply_with_profile_recovers_interrupted_remint() {
-        let (_temp, workspace) = attribution_workspace();
-        let (v2, v3, _v4) = cleanup_fixture(&workspace);
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-        let stored = workspace
-            .read_history_cleanup_plan(&preview.plan_id)
-            .unwrap();
-        // Simulate a crash after the preview ref moved but before the plan was rewritten.
-        workspace
-            .reattribute_history_cleanup_preview(&stored, &attribution_profile())
-            .unwrap();
-
-        let result = workspace
-            .apply_history_cleanup_with_profile(
-                preview.plan_id.clone(),
-                RewriteConfirmation::UserConfirmed,
-                &attribution_profile(),
-            )
-            .unwrap();
-        let (milestone, descendant) = cleanup_versions(&workspace, &result);
-        assert_profile_attribution(&milestone);
-        assert_descendant_attribution(&descendant);
-    }
-
-    #[test]
-    fn history_cleanup_apply_with_profile_rejects_plan_drift_before_moving_refs() {
-        let (_temp, workspace) = attribution_workspace();
-        let (v2, v3, v4) = cleanup_fixture(&workspace);
-
-        let preview = workspace
-            .preview_history_cleanup(compact_cleanup_request(&v2, &v3))
-            .unwrap();
-        workspace
-            .create_variation_from(v4.id(), "late-branch")
-            .unwrap();
-
-        let err = workspace
-            .apply_history_cleanup_with_profile(
-                preview.plan_id.clone(),
-                RewriteConfirmation::UserConfirmed,
-                &attribution_profile(),
-            )
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            DraftlineError::InvalidHistoryCleanup(ref message)
-                if message.contains("no longer matches the workspace")
-        ));
-        workspace.ensure_no_pending_recovery().unwrap();
-        let head = workspace.repo.head().unwrap().target().unwrap();
-        assert_eq!(head.to_string(), v4.id().as_str());
-        assert_eq!(
-            workspace
-                .repo
-                .refname_to_id(preview.preview_ref.as_str())
-                .unwrap()
-                .to_string(),
-            preview.new_head.as_str()
-        );
     }
 }
