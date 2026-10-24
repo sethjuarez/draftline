@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use draftline::{
     ContentPolicy, DiagnosticCode, DiagnosticSeverity, DraftlineError, FileHazardKind,
-    RemoteOptions, Workspace,
+    OutgoingFileKind, RemoteOptions, Workspace,
 };
 
 fn write_file(root: &Path, relative: &str, content: &str) {
@@ -2506,6 +2506,93 @@ fn send_refuses_a_variation_started_on_unpushed_developer_work() {
         "{error:?}"
     );
     assert_eq!(remote_branch(bare.path(), "cutready/x"), None);
+}
+
+#[test]
+fn send_and_publish_preflights_report_large_files_and_lfs_pointers_going_out() {
+    let (temp, repo) = code_repo();
+    let (_bare, _other_dir, _other) = with_remote(&repo);
+    write_file(
+        temp.path(),
+        "cutready/.gitattributes",
+        "hero.md filter=lfs -text\n",
+    );
+    write_file(temp.path(), "cutready/hero.md", LFS_POINTER);
+    commit_all(&repo, "Dev: hero image in LFS");
+    let workspace = Workspace::init_with_policy(
+        temp.path().join("cutready"),
+        cutready_policy().with_large_file_threshold(64),
+    )
+    .unwrap()
+    .with_variation_namespace("cutready/")
+    .unwrap();
+    write_file(temp.path(), "cutready/big.md", &"x".repeat(100));
+    workspace.save_version("Big").unwrap();
+    let kinds = |files: &[draftline::OutgoingFile]| {
+        let mut kinds = files
+            .iter()
+            .map(|file| (file.path.clone(), file.kind))
+            .collect::<Vec<_>>();
+        kinds.sort_by(|a, b| a.0.cmp(&b.0));
+        kinds
+    };
+    let expected = vec![
+        (PathBuf::from("cutready/big.md"), OutgoingFileKind::Large),
+        (
+            PathBuf::from("cutready/hero.md"),
+            OutgoingFileKind::LfsPointer,
+        ),
+    ];
+
+    let preflight = workspace
+        .preflight_send("origin", &send_request("Big"), &mut RemoteOptions::new())
+        .unwrap();
+    assert_eq!(kinds(&preflight.outgoing_files), expected);
+    assert!(!preflight.outgoing_files_truncated);
+    assert!(
+        preflight.can_proceed,
+        "reported, not refused: {preflight:?}"
+    );
+
+    // A stale tracking ref the remote no longer advertises hides nothing.
+    let head = repo.head().unwrap().target().unwrap();
+    repo.reference("refs/remotes/origin/gone", head, true, "stale")
+        .unwrap();
+    let approved = workspace
+        .preflight_send("origin", &send_request("Big"), &mut RemoteOptions::new())
+        .unwrap();
+    assert_eq!(kinds(&approved.outgoing_files), expected);
+    assert_eq!(approved.head, Some(head.to_string()));
+
+    // Send refuses a head the host never checked.
+    write_file(temp.path(), "cutready/later.md", "later\n");
+    workspace.save_version("Later").unwrap();
+    let error = workspace
+        .send(
+            "origin",
+            &draftline::SendRequest {
+                expected_head: approved.head.clone(),
+                ..send_request("Big")
+            },
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, draftline::DraftlineError::LocalStateChanged { .. }),
+        "{error:?}"
+    );
+
+    workspace.start_variation_here("cutready/big").unwrap();
+    let preflight = workspace.preflight_publish("origin").unwrap();
+    assert_eq!(kinds(&preflight.outgoing_files), expected);
+    assert!(preflight.can_publish);
+    assert_eq!(
+        serde_json::to_value(&preflight.outgoing_files[0]).unwrap()["kind"]
+            .as_str()
+            .map(|kind| ["large", "lfs_pointer"].contains(&kind)),
+        Some(true)
+    );
 }
 
 #[test]

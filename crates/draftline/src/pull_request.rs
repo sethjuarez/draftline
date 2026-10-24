@@ -46,6 +46,10 @@ pub struct SendRequest {
     /// the variation namespace plus a slug of the title.
     #[serde(default)]
     pub branch: Option<String>,
+    /// [SendPreflight::head] the host approved. Send refuses with
+    /// local_state_changed if the branch has moved since.
+    #[serde(default)]
+    pub expected_head: Option<String>,
 }
 
 /// What [`crate::Workspace::send`] did.
@@ -82,11 +86,20 @@ pub struct SendPreflight {
     /// The branch Send would push: the current one, or the one it would create.
     pub variation: String,
     pub creates_variation: bool,
+    /// The commit checked; pass it as [SendRequest::expected_head].
+    #[serde(default)]
+    pub head: Option<String>,
     /// Commits the base on the remote doesn't have yet.
     pub outgoing_versions: usize,
     /// Unsaved project changes; Send refuses them on the base branch.
     pub has_unsaved_changes: bool,
     /// Developer commits Send would carry; Send refuses while any are listed.
     pub developer_commits: Vec<DeveloperCommit>,
+    /// Large files and LFS pointers in the commits Send would push.
+    #[serde(default)]
+    pub outgoing_files: Vec<crate::OutgoingFile>,
+    /// The scan stopped early; treat `outgoing_files` as incomplete.
+    #[serde(default)]
+    pub outgoing_files_truncated: bool,
     pub can_proceed: bool,
 }

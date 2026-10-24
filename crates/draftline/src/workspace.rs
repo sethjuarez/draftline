@@ -21,8 +21,9 @@ use crate::remote::{ensure_supported_remote_url, PushRefExpectation};
 use crate::worktree::{OwnedWorktree, WorktreeStart, OWNED_WORKTREE_PREFIX};
 use crate::{
     path::normalize_workspace_relative, ContentPolicy, Contributor, ContributorProfile,
-    DraftlineError, PublishPreflight, PublishResult, PublishToken, RecoveryState, RemoteEndpoint,
-    RemoteOptions, RemoteVersionSummary, Result, SyncState, SyncStatus,
+    DraftlineError, OutgoingFile, OutgoingFileKind, PublishPreflight, PublishResult, PublishToken,
+    RecoveryState, RemoteEndpoint, RemoteOptions, RemoteVersionSummary, Result, SyncState,
+    SyncStatus,
 };
 
 /// A folder-backed content workspace.
@@ -1313,6 +1314,8 @@ struct CleanMergePlan {
 struct SendTarget {
     base: String,
     advertised: HashSet<String>,
+    /// Commits the remote advertised just now: what a push won't upload.
+    advertised_oids: Vec<git2::Oid>,
     current: String,
 }
 
@@ -7762,10 +7765,20 @@ impl Workspace {
             base,
             advertised,
             current,
+            ..
         } = target;
         // Every later step works on this exact commit, so a developer commit
         // landing mid-send is never carried unscanned.
         let scanned = self.repo.head().ok().and_then(|head| head.target());
+        if let Some(expected) = &request.expected_head {
+            let actual = scanned.map(|oid| oid.to_string()).unwrap_or_default();
+            if *expected != actual {
+                return Err(DraftlineError::LocalStateChanged {
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
         let developer_commits = self.developer_commits_to_send(remote, &base, &current, scanned)?;
         if !developer_commits.is_empty() {
             return Err(DraftlineError::SendCarriesDeveloperCommits(
@@ -7889,6 +7902,7 @@ impl Workspace {
         let SendTarget {
             base,
             advertised,
+            advertised_oids,
             current,
         } = self.resolve_send_target(remote, request, options)?;
         let creates_variation = current == base;
@@ -7910,15 +7924,20 @@ impl Workspace {
             },
             Err(_) => 0,
         };
+        let (outgoing_files, outgoing_files_truncated) =
+            self.outgoing_files(head, &advertised_oids)?;
         let can_proceed = developer_commits.is_empty() && !has_unsaved_changes;
         Ok(SendPreflight {
             remote: remote.to_string(),
             base,
             variation,
             creates_variation,
+            head: head.map(|oid| oid.to_string()),
             outgoing_versions,
             has_unsaved_changes,
             developer_commits,
+            outgoing_files,
+            outgoing_files_truncated,
             can_proceed,
         })
     }
@@ -7935,7 +7954,9 @@ impl Workspace {
             Some(base) => Some(validate_variation_name(base)?),
             None => None,
         };
-        let advertised = self.remote_advertised_branches(remote, options)?;
+        let advertised_heads = self.remote_advertised_heads(remote, options)?;
+        let advertised_oids = advertised_heads.values().copied().collect::<Vec<_>>();
+        let advertised = advertised_heads.into_keys().collect::<HashSet<_>>();
         let base = match explicit {
             Some(base) => base,
             None => match self.default_branch_on(remote) {
@@ -7964,6 +7985,7 @@ impl Workspace {
         Ok(SendTarget {
             base,
             advertised,
+            advertised_oids,
             current,
         })
     }
@@ -7990,6 +8012,80 @@ impl Workspace {
             return Err(DraftlineError::VariationAlreadyExists(name));
         }
         Ok(name)
+    }
+
+    /// Large files and Git LFS pointers in commits reachable from `head`
+    /// that the remote doesn't advertise: what a push would upload. Reports a
+    /// path once, at its newest outgoing version. `true` when it stopped at
+    /// 2000 commits or 100 files, so the list may be incomplete.
+    fn outgoing_files(
+        &self,
+        head: Option<git2::Oid>,
+        advertised: &[git2::Oid],
+    ) -> Result<(Vec<OutgoingFile>, bool)> {
+        const MAX_COMMITS: usize = 2000;
+        const MAX_FILES: usize = 100;
+        const MAX_POINTER: usize = 1024;
+        let Some(head) = head else {
+            return Ok((Vec::new(), false));
+        };
+        let threshold = self.content_policy.large_file_threshold_bytes();
+        let odb = self.repo.odb()?;
+        let mut walk = self.repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+        walk.push(head)?;
+        for oid in advertised {
+            if self.repo.find_commit(*oid).is_ok() {
+                walk.hide(*oid)?;
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let mut files = Vec::new();
+        for (scanned, oid) in walk.enumerate() {
+            if scanned == MAX_COMMITS {
+                return Ok((files, true));
+            }
+            let commit = self.repo.find_commit(oid?)?;
+            let parent = commit
+                .parents()
+                .next()
+                .map(|parent| parent.tree())
+                .transpose()?;
+            let diff = self
+                .repo
+                .diff_tree_to_tree(parent.as_ref(), Some(&commit.tree()?), None)?;
+            for delta in diff.deltas() {
+                let new = delta.new_file();
+                let (Some(path), true) = (new.path(), new.exists()) else {
+                    continue;
+                };
+                if new.mode() == git2::FileMode::Commit || seen.contains(path) {
+                    continue;
+                }
+                let (size, _) = odb.read_header(new.id())?;
+                let size = size as u64;
+                let kind = if size <= MAX_POINTER as u64
+                    && is_lfs_pointer(self.repo.find_blob(new.id())?.content())
+                {
+                    OutgoingFileKind::LfsPointer
+                } else if size >= threshold {
+                    OutgoingFileKind::Large
+                } else {
+                    continue;
+                };
+                seen.insert(path.to_path_buf());
+                files.push(OutgoingFile {
+                    path: path.to_path_buf(),
+                    commit: commit.id().to_string(),
+                    size,
+                    kind,
+                });
+                if files.len() == MAX_FILES {
+                    return Ok((files, true));
+                }
+            }
+        }
+        Ok((files, false))
     }
 
     /// Commits Send would push that change files outside the project folder.
@@ -8301,23 +8397,27 @@ impl Workspace {
         Ok(())
     }
 
-    fn remote_advertised_branches(
+    /// Branches the remote advertises right now, with their commits.
+    fn remote_advertised_heads(
         &self,
         remote_name: &str,
         options: &mut RemoteOptions<'_>,
-    ) -> Result<HashSet<String>> {
+    ) -> Result<HashMap<String, git2::Oid>> {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
         let _timeout_guard = options.server_timeout_guard()?;
         let branches = |heads: &[git2::RemoteHead<'_>]| {
             heads
                 .iter()
-                .filter_map(|head| head.name().strip_prefix("refs/heads/"))
-                .map(str::to_string)
-                .collect::<HashSet<_>>()
+                .filter_map(|head| {
+                    head.name()
+                        .strip_prefix("refs/heads/")
+                        .map(|name| (name.to_string(), head.oid()))
+                })
+                .collect::<HashMap<_, _>>()
         };
         if options.has_network_callbacks() {
-            let callbacks = options.remote_callbacks("remote_advertised_branches");
+            let callbacks = options.remote_callbacks("remote_advertised_heads");
             let mut connection = remote.connect_auth(Direction::Fetch, Some(callbacks), None)?;
             let advertised = branches(connection.list()?);
             self.record_remote_head(connection.remote())?;
@@ -8374,6 +8474,12 @@ impl Workspace {
         let variation = self.current_variation_unchecked()?;
         let local_oid = self.repo.head()?.peel_to_commit()?.id().to_string();
         let expected_remote_oid = remote_tracking_oid(&self.repo, &remote, &variation);
+        let advertised_oids = self
+            .remote_advertised_heads(&remote, options)?
+            .into_values()
+            .collect::<Vec<_>>();
+        let (outgoing_files, outgoing_files_truncated) =
+            self.outgoing_files(self.repo.head()?.target(), &advertised_oids)?;
         let token = PublishToken {
             remote: remote.clone(),
             variation: variation.clone(),
@@ -8388,6 +8494,8 @@ impl Workspace {
             local_oid,
             sync_status,
             token,
+            outgoing_files,
+            outgoing_files_truncated,
             can_publish: true,
         })
     }

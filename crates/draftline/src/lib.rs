@@ -101,9 +101,9 @@ pub use pull_request::{
 };
 pub use recovery::{RecoveryOperation, RecoveryState};
 pub use remote::{
-    Contributor, PublishPreflight, PublishResult, PublishToken, RemoteCredential,
-    RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVersionSummary, SyncState,
-    SyncStatus,
+    Contributor, OutgoingFile, OutgoingFileKind, PublishPreflight, PublishResult, PublishToken,
+    RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVersionSummary,
+    SyncState, SyncStatus,
 };
 pub use workspace::{
     AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult, ChangeKind, ChangeSet,

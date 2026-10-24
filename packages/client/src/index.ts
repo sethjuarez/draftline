@@ -980,9 +980,20 @@ export interface PublishPreflight {
   local_oid: string;
   sync_status: SyncStatus;
   token: JsonValue;
+  /** Large files and Git LFS pointers in the commits publish would push. Reported only. */
+  outgoing_files: OutgoingFile[];
+  /** The scan stopped early; treat `outgoing_files` as incomplete. */
+  outgoing_files_truncated: boolean;
   can_publish: boolean;
 }
 
+/** A file in commits the remote doesn't have yet. `lfs_pointer`: Draftline's push never uploads LFS objects. */
+export interface OutgoingFile {
+  path: string;
+  commit: string;
+  size: number;
+  kind: 'large' | 'lfs_pointer' | (string & {});
+}
 export interface PublishResult {
   remote: string;
   variation: string;
