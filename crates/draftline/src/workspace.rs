@@ -6695,6 +6695,18 @@ impl Workspace {
         self.write_incoming_merge_version(variation, &merge_input, label, &tree, files, profile)
     }
 
+    fn ensure_head_unchanged(&self, variation: &str, oid: git2::Oid) -> Result<()> {
+        let now_variation = self.current_variation_unchecked()?;
+        let now_oid = self.repo.head()?.peel_to_commit()?.id();
+        if now_variation != variation || now_oid != oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{variation}@{oid}"),
+                actual: format!("{now_variation}@{now_oid}"),
+            });
+        }
+        Ok(())
+    }
+
     /// Applies incoming changes from a remote using a fast-forward when possible.
     ///
     /// This method is safe to call when [`ApplyIncomingReport::can_proceed`] is
@@ -6736,9 +6748,15 @@ impl Workspace {
             ))));
         }
 
+        // Pin the branch and commit the guard approved: a developer may switch
+        // branches in the shared checkout while the fetch runs.
+        let variation = self.current_variation_unchecked()?;
+        let local_oid = self.repo.head()?.peel_to_commit()?.id();
         let remote_name = remote.as_ref().to_string();
         self.fetch_remote_unchecked(&remote_name, options)?;
         self.fetch_support_refs_with_options(&remote_name, options)?;
+        test_hooks::fire("after_apply_fetch", self.repo.path());
+        self.ensure_head_unchanged(&variation, local_oid)?;
         let status = self.sync_status(&remote_name)?;
 
         match status.state {
@@ -6752,7 +6770,6 @@ impl Workspace {
         }
 
         let applied_count = status.behind;
-        let variation = self.current_variation_unchecked()?;
         let remote_ref = format!("refs/remotes/{remote_name}/{variation}");
         let remote_oid = self.repo.refname_to_id(&remote_ref)?;
         let hazard_commit = self.repo.find_commit(remote_oid)?;
@@ -6780,12 +6797,15 @@ impl Workspace {
             completed: false,
         })?;
 
+        // Git has no lock against an external `git switch`; recheck right
+        // before touching files to keep that window as small as possible.
+        self.ensure_head_unchanged(&variation, local_oid)?;
         // Bring files up to the incoming tree like `git merge --ff-only`: local
         // edits are never overwritten. This runs before the ref moves so HEAD
         // is still the checkout baseline.
         self.checkout_or_keep_recovery(&checkout_commit.tree()?)?;
         self.repo
-            .reference(&branch_ref, target_oid, true, "apply_incoming")?;
+            .reference_matching(&branch_ref, target_oid, true, local_oid, "apply_incoming")?;
 
         self.repo.set_head(&branch_ref)?;
 
@@ -15371,6 +15391,54 @@ mod tests {
             fs::read_to_string(workspace.root().join("post.md")).unwrap(),
             "incoming"
         );
+    }
+
+    #[test]
+    fn apply_incoming_refuses_when_the_branch_switches_during_the_fetch() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+        let author_dir = tempfile::tempdir().unwrap();
+        let author = Workspace::init(author_dir.path()).unwrap();
+        configure_identity(&author, "Seth", "seth@example.com");
+        author
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(author.root(), "plan.sk", b"base");
+        author.save_version("Base").unwrap();
+        author.publish_changes("origin").unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), peer_dir.path()).unwrap();
+        write_file(author.root(), "plan.sk", b"remote");
+        author.save_version("Remote").unwrap();
+        author.publish_changes("origin").unwrap();
+
+        let main = peer.current_variation().unwrap();
+        let head = peer.repo.head().unwrap().peel_to_commit().unwrap();
+        peer.repo.branch("feature/x", &head, false).unwrap();
+        test_hooks::once("after_apply_fetch", |git_dir| {
+            let repo = Repository::open(git_dir).unwrap();
+            repo.set_head("refs/heads/feature/x").unwrap();
+        });
+
+        let error = peer
+            .apply_incoming("origin", &mut RemoteOptions::new())
+            .unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert!(peer.recovery_state().unwrap().is_none());
+        for branch in [main.as_str(), "feature/x"] {
+            assert_eq!(
+                peer.repo
+                    .refname_to_id(&format!("refs/heads/{branch}"))
+                    .unwrap(),
+                head.id()
+            );
+        }
+        assert_eq!(fs::read(peer.root().join("plan.sk")).unwrap(), b"base");
     }
 
     #[test]
