@@ -31,8 +31,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      SELECT_CLIENT: ${{ (github.event_name == 'workflow_call' && inputs.publish_client) || github.event_name == 'workflow_dispatch' }}
-      SELECT_REACT: ${{ (github.event_name == 'workflow_call' && inputs.publish_react) || github.event_name == 'workflow_dispatch' }}
+      # A called workflow sees the caller's event (e.g. push), never workflow_call.
+      SELECT_CLIENT: ${{ github.event_name == 'workflow_dispatch' || inputs.publish_client == true }}
+      SELECT_REACT: ${{ github.event_name == 'workflow_dispatch' || inputs.publish_react == true }}
 
     steps:
       - name: Checkout
