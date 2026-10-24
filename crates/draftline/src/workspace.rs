@@ -1522,6 +1522,8 @@ impl Workspace {
     /// [`DraftlineError::WorkspaceAlreadyInCheckout`]); use this when the
     /// project folder moved or the host deliberately manages a different one.
     /// Refuses while a Draftline operation is running or left unfinished.
+    /// Like [`Workspace::open`], the result has no variation namespace; chain
+    /// [`Workspace::with_variation_namespace`] for a hybrid project.
     pub fn relocate(path: impl AsRef<Path>) -> Result<Self> {
         Self::relocate_with_policy(path, ContentPolicy::default())
     }
@@ -3537,6 +3539,33 @@ impl Workspace {
         if self.repo.find_reference(&branch_ref).is_ok() {
             return Err(DraftlineError::VariationAlreadyExists(name));
         }
+        self.write_variation_metadata(&name, &metadata)?;
+        if let Err(error) = self.branch_here_and_switch(&name, None) {
+            self.clear_unowned_variation_metadata(&name);
+            return Err(error);
+        }
+        Ok(variation_from_name(name.clone(), Some(&name), metadata))
+    }
+
+    /// Undoes metadata written for a branch this operation failed to create,
+    /// unless someone else created that branch meanwhile.
+    fn clear_unowned_variation_metadata(&self, name: &str) {
+        if self
+            .repo
+            .find_reference(&format!("refs/heads/{name}"))
+            .is_err()
+        {
+            let _ = self.clear_variation_metadata(name);
+        }
+    }
+
+    /// Creates `name` at HEAD's commit and points HEAD at it, like
+    /// `git switch -c`, without touching files. HEAD, the old branch, and the
+    /// new one stay locked while HEAD is rechecked, so a developer's commit or
+    /// switch meanwhile refuses and nothing is left behind. With `expected`,
+    /// also refuses unless HEAD is still at that commit.
+    fn branch_here_and_switch(&self, name: &str, expected: Option<Oid>) -> Result<()> {
+        let branch_ref = format!("refs/heads/{name}");
         let read_head = || -> Result<(Option<String>, Option<Oid>)> {
             let head = self.repo.find_reference("HEAD")?;
             let symbolic = head.symbolic_target().ok().flatten().map(str::to_string);
@@ -3544,10 +3573,14 @@ impl Workspace {
             Ok((symbolic, commit))
         };
         let (previous, commit) = read_head()?;
-        self.write_variation_metadata(&name, &metadata)?;
-        // HEAD, the old branch, and the new one stay locked while HEAD is
-        // rechecked and the branch is created, so a developer's commit or
-        // switch meanwhile refuses and nothing is left behind.
+        if expected.is_some() && commit != expected {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{expected:?}"),
+                actual: format!("{commit:?}"),
+            });
+        }
+        test_hooks::fire("before_branch_switch", self.repo.path());
+        let mut committing = false;
         let switched = (|| -> Result<()> {
             let mut transaction = self.repo.transaction()?;
             transaction.lock_ref("HEAD")?;
@@ -3563,48 +3596,52 @@ impl Workspace {
                 });
             }
             if self.repo.find_reference(&branch_ref).is_ok() {
-                return Err(DraftlineError::VariationAlreadyExists(name.clone()));
+                return Err(DraftlineError::VariationAlreadyExists(name.to_string()));
             }
             let message = format!("draftline: start variation {name} here");
             if let Some(commit) = commit {
                 transaction.set_target(&branch_ref, commit, None, &message)?;
             }
             transaction.set_symbolic_target("HEAD", &branch_ref, None, &message)?;
+            committing = true;
             transaction.commit()?;
             Ok(())
         })();
-        if let Err(error) = switched {
-            // libgit2 applies a transaction's refs one by one, so a failed
-            // commit may have applied some. Finish or undo what landed.
-            let head_on_new = self
-                .repo
-                .find_reference("HEAD")
-                .ok()
-                .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string))
-                .as_deref()
-                == Some(branch_ref.as_str());
-            let new_tip = self.repo.refname_to_id(&branch_ref).ok();
-            if head_on_new && new_tip == commit {
-                return Ok(variation_from_name(name.clone(), Some(&name), metadata));
-            }
-            if head_on_new {
-                if let Some(previous) = previous.as_deref() {
-                    let _ = self.repo.reference_symbolic(
-                        "HEAD",
-                        previous,
-                        true,
-                        "draftline: undo start variation",
-                    );
-                }
-            } else if new_tip.is_some() && new_tip == commit {
-                if let Ok(mut reference) = self.repo.find_reference(&branch_ref) {
-                    let _ = reference.delete();
-                }
-            }
-            let _ = self.clear_variation_metadata(&name);
+        let Err(error) = switched else {
+            return Ok(());
+        };
+        if !committing {
+            // Refused before writing anything; the refs aren't ours to touch.
             return Err(error);
         }
-        Ok(variation_from_name(name.clone(), Some(&name), metadata))
+        // libgit2 applies a transaction's refs one by one, so a failed
+        // commit may have applied some. Finish or undo what landed.
+        let head_on_new = self
+            .repo
+            .find_reference("HEAD")
+            .ok()
+            .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string))
+            .as_deref()
+            == Some(branch_ref.as_str());
+        let new_tip = self.repo.refname_to_id(&branch_ref).ok();
+        if head_on_new && new_tip == commit {
+            return Ok(());
+        }
+        if head_on_new {
+            if let Some(previous) = previous.as_deref() {
+                let _ = self.repo.reference_symbolic(
+                    "HEAD",
+                    previous,
+                    true,
+                    "draftline: undo start variation",
+                );
+            }
+        } else if new_tip.is_some() && new_tip == commit {
+            if let Ok(mut reference) = self.repo.find_reference(&branch_ref) {
+                let _ = reference.delete();
+            }
+        }
+        Err(error)
     }
 
     /// Creates a new variation from the current version.
@@ -7842,20 +7879,19 @@ impl Workspace {
         let mut created_variation = false;
         let variation = if current == base {
             let name = planned;
-            let head = self.repo.find_commit(ensure_unmoved()?)?;
-            let mut branch = self.repo.branch(&name, &head, false)?;
-            let switched = (|| -> Result<()> {
-                if !request.title.trim().is_empty() {
-                    self.write_variation_metadata(
-                        &name,
-                        &VariationMetadata::default().with_label(request.title.trim()),
-                    )?;
+            let labeled = !request.title.trim().is_empty();
+            if labeled {
+                self.write_variation_metadata(
+                    &name,
+                    &VariationMetadata::default().with_label(request.title.trim()),
+                )?;
+            }
+            // Creating the branch and moving HEAD together means a crash
+            // can't strand a branch that the retry would then avoid.
+            if let Err(error) = self.branch_here_and_switch(&name, Some(ensure_unmoved()?)) {
+                if labeled {
+                    self.clear_unowned_variation_metadata(&name);
                 }
-                self.repo.set_head(&format!("refs/heads/{name}"))?;
-                Ok(())
-            })();
-            if let Err(error) = switched {
-                let _ = branch.delete();
                 return Err(error);
             }
             created_variation = true;
@@ -15421,6 +15457,147 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.root().join("post.md")).unwrap(),
             "incoming"
+        );
+    }
+
+    /// A developer commits on the checked-out branch from another process.
+    fn developer_commits_at(point: &'static str) {
+        test_hooks::once(point, |git_dir| {
+            let repo = Repository::open(git_dir).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "Developer",
+                &head.tree().unwrap(),
+                &[&head],
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn start_variation_here_keeps_metadata_of_a_branch_created_meanwhile() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        let theirs = VariationMetadata::default().with_label("Theirs");
+        let expected = theirs.clone();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("before_branch_switch", move |_| {
+            let other = Workspace::open(&root).unwrap();
+            other.create_variation("idea").unwrap();
+            other.write_variation_metadata("idea", &theirs).unwrap();
+        });
+
+        let error = workspace
+            .start_variation_here_with_metadata(
+                "idea",
+                VariationMetadata::default().with_label("Mine"),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::VariationAlreadyExists(_)),
+            "{error:?}"
+        );
+        assert!(workspace
+            .repo
+            .find_branch("idea", BranchType::Local)
+            .is_ok());
+        assert_eq!(workspace.read_variation_metadata("idea").unwrap(), expected);
+    }
+
+    #[test]
+    fn start_variation_here_refuses_and_leaves_nothing_when_head_moves() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        let main = workspace.current_variation().unwrap();
+        developer_commits_at("before_branch_switch");
+
+        let error = workspace.start_variation_here("idea").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(workspace.current_variation().unwrap(), main);
+        assert!(workspace
+            .repo
+            .find_branch("idea", BranchType::Local)
+            .is_err());
+        assert_eq!(
+            workspace.read_variation_metadata("idea").unwrap(),
+            VariationMetadata::default()
+        );
+    }
+
+    struct UnreachableHost;
+
+    impl PullRequestProvider for UnreachableHost {
+        fn find_open(
+            &mut self,
+            _: &crate::PullRequestRequest,
+        ) -> Result<Option<crate::PullRequest>> {
+            panic!("Send must stop before the host")
+        }
+        fn create(&mut self, _: &crate::PullRequestRequest) -> Result<crate::PullRequest> {
+            panic!("Send must stop before the host")
+        }
+    }
+
+    #[test]
+    fn send_leaves_no_branch_behind_when_head_moves_as_it_branches() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        workspace.publish_changes("origin").unwrap();
+        write_file(workspace.root(), "plan.sk", b"pitch");
+        workspace.save_version("Pitch").unwrap();
+        let main = workspace.current_variation().unwrap();
+        let request = SendRequest {
+            title: "Pitch".to_string(),
+            base: Some(main.clone()),
+            ..Default::default()
+        };
+        developer_commits_at("before_branch_switch");
+
+        let error = workspace
+            .send(
+                "origin",
+                &request,
+                &mut UnreachableHost,
+                &mut RemoteOptions::new(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(workspace.current_variation().unwrap(), main);
+        let branches = workspace
+            .repo
+            .branches(Some(BranchType::Local))
+            .unwrap()
+            .map(|branch| branch.unwrap().0.name().unwrap().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(branches, vec![main.clone()]);
+        assert_eq!(
+            workspace.read_variation_metadata("pitch").unwrap(),
+            VariationMetadata::default()
         );
     }
 
