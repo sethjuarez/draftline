@@ -83,6 +83,7 @@ Every documented flow must either name executable coverage or explain why the re
 | Flow 15e: work in a separate copy | Covered in Rust | `owned_worktree_starts_from_the_latest_base_and_leaves_this_checkout_alone`, `a_failed_owned_worktree_leaves_nothing_behind` | Not yet exposed to Tauri or TypeScript. |
 | Flow 15f: one workspace per checkout | Covered | `a_checkout_holds_one_workspace`, `relocate_moves_the_workspace_and_refuses_while_an_operation_runs`, `a_claim_on_a_missing_folder_is_reported_stale_and_relocate_recovers` | None known. |
 | Flow 15g: a developer switched the shared checkout | Covered | `saves_and_updates_refuse_a_developer_branch_until_a_variation_starts_here`, `a_detached_checkout_refuses_namespaced_saves` | Host UX for offering `start_variation_here` is host work. |
+| Flow 15h: the base branch was renamed | Covered | `a_renamed_default_branch_is_followed_and_saves_on_the_old_one_can_move` | Host copy for offering `start_variation_here` after a rename is host work. |
 
 ## Business safety principles
 

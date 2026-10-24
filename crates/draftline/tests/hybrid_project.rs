@@ -1823,7 +1823,11 @@ fn send_refuses_a_base_the_remote_lacks_before_changing_anything() {
 fn send_targets_a_default_branch_the_remote_has() {
     let (temp, repo) = code_repo();
     let bare = tempfile::tempdir().unwrap();
-    git2::Repository::init_bare(bare.path()).unwrap();
+    // No advertised default yet: HEAD names a branch that does not exist.
+    git2::Repository::init_bare(bare.path())
+        .unwrap()
+        .set_head("refs/heads/unborn")
+        .unwrap();
     repo.remote("origin", bare.path().to_str().unwrap())
         .unwrap()
         .push(&["refs/heads/main:refs/heads/master"], None)
@@ -1858,6 +1862,16 @@ fn send_targets_a_default_branch_the_remote_has() {
         .set_str("init.defaultBranch", "develop")
         .unwrap();
     assert_eq!(send(&workspace), "develop");
+
+    git2::Repository::open_bare(bare.path())
+        .unwrap()
+        .set_head("refs/heads/master")
+        .unwrap();
+    assert_eq!(
+        send(&workspace),
+        "master",
+        "the remote's advertised default wins over local guesses"
+    );
 }
 
 #[test]
@@ -2450,6 +2464,105 @@ fn incoming_merge_leaves_code_conflicts_to_a_developer() {
     assert!(report.token.is_none());
     assert!(!report.can_merge_cleanly);
     assert_eq!(repo.head().unwrap().target().unwrap(), before);
+}
+
+#[test]
+fn a_renamed_default_branch_is_followed_and_saves_on_the_old_one_can_move() {
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+    repo.find_remote("origin")
+        .unwrap()
+        .fetch(&["main"], None, None)
+        .unwrap();
+    // As a clone leaves it: origin/HEAD names the default branch.
+    repo.reference_symbolic(
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+        true,
+        "clone",
+    )
+    .unwrap();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    workspace.fetch_remote("origin").unwrap();
+    assert_eq!(workspace.base_status("origin").unwrap().variation, "main");
+    write_file(temp.path(), "cutready/intro.sk", "scene one, unsent\n");
+    let saved = workspace.save_version("Unsent intro").unwrap();
+
+    // GitHub renames main to trunk.
+    let remote = git2::Repository::open_bare(bare.path()).unwrap();
+    let tip = remote.refname_to_id("refs/heads/main").unwrap();
+    remote
+        .reference("refs/heads/trunk", tip, false, "rename")
+        .unwrap();
+    remote.set_head("refs/heads/trunk").unwrap();
+    remote
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .delete()
+        .unwrap();
+
+    workspace.fetch_remote("origin").unwrap();
+    let status = workspace.base_status("origin").unwrap();
+    assert_eq!(status.variation, "trunk");
+    assert_eq!(status.base_renamed_from.as_deref(), Some("main"));
+    assert_eq!(
+        repo.find_reference("refs/remotes/origin/HEAD")
+            .unwrap()
+            .symbolic_target()
+            .ok()
+            .flatten(),
+        Some("refs/remotes/origin/main"),
+        "Draftline never rewrites the remote-tracking HEAD"
+    );
+
+    // The old base is now a developer branch: saves move to a variation.
+    write_file(temp.path(), "cutready/intro.sk", "scene one, later\n");
+    assert!(matches!(
+        workspace.save_version("Later").unwrap_err(),
+        DraftlineError::BranchOutsideNamespace(branch) if branch == "main"
+    ));
+    workspace.start_variation_here("cutready/intro").unwrap();
+    workspace.save_version("Later").unwrap();
+    let mut host = FakeHost::default();
+    let result = workspace
+        .send(
+            "origin",
+            &send_request("Intro"),
+            &mut host,
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    assert_eq!(result.base, "trunk");
+    assert_eq!(host.open[0].0.base, "trunk");
+    let sent = remote_branch(bare.path(), "cutready/intro").unwrap();
+    assert!(repo
+        .graph_descendant_of(sent, saved.id().as_str().parse().unwrap())
+        .unwrap());
+
+    // A cache recorded for another URL is ignored.
+    let url = repo
+        .find_remote("origin")
+        .unwrap()
+        .url()
+        .unwrap()
+        .to_string();
+    repo.remote_set_url("origin", "https://example.invalid/other.git")
+        .unwrap();
+    assert_eq!(
+        workspace.base_status("origin").unwrap().base_renamed_from,
+        None
+    );
+    repo.remote_set_url("origin", &url).unwrap();
+
+    // Once the old local branch is gone, the rename stops being reported.
+    repo.find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .delete()
+        .unwrap();
+    assert_eq!(
+        workspace.base_status("origin").unwrap().base_renamed_from,
+        None
+    );
 }
 
 #[test]

@@ -485,6 +485,18 @@ struct WorkspaceClaim {
     project: String,
 }
 
+/// A remote's default branch as it last advertised it, and the one it
+/// replaced. Plain fetches never refresh `refs/remotes/<remote>/HEAD`, and
+/// Draftline doesn't write it, so a renamed default lives here instead.
+#[derive(Clone, Serialize, Deserialize)]
+struct RemoteHead {
+    /// The remote's URL when recorded; a changed URL voids the entry.
+    url: String,
+    head: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<String>,
+}
+
 /// The recovery file on disk: the state plus the project that wrote it.
 /// Records from older versions have no project.
 #[derive(Serialize, Deserialize)]
@@ -3756,6 +3768,7 @@ impl Workspace {
             remote.fetch(&refspec_refs, Some(&mut fetch_options), None)
         };
         options.map_git_result("fetch_all_variations", fetch_result)?;
+        self.record_remote_head(&remote)?;
         Ok(())
     }
 
@@ -6361,6 +6374,7 @@ impl Workspace {
                 behind: 0,
                 state: SyncState::NoRemoteVersion,
                 incoming: Vec::new(),
+                base_renamed_from: self.base_renamed_from(remote, base),
             });
         };
         let (ahead, behind) = self.repo.graph_ahead_behind(local, remote_oid)?;
@@ -6377,6 +6391,7 @@ impl Workspace {
             behind,
             state,
             incoming: self.incoming_versions(local, remote_oid)?,
+            base_renamed_from: self.base_renamed_from(remote, base),
         })
     }
 
@@ -7634,7 +7649,7 @@ impl Workspace {
                 return options.map_git_result("fetch_remote", Err(error));
             }
         }
-        Ok(())
+        self.record_remote_head(&remote)
     }
 
     /// Returns collaboration status for the current variation.
@@ -7654,6 +7669,7 @@ impl Workspace {
                 behind: 0,
                 state: SyncState::NoRemoteVersion,
                 incoming: Vec::new(),
+                base_renamed_from: None,
             });
         };
 
@@ -7672,6 +7688,7 @@ impl Workspace {
             behind,
             state,
             incoming: self.incoming_versions(local, remote_oid)?,
+            base_renamed_from: None,
         })
     }
 
@@ -8252,11 +8269,15 @@ impl Workspace {
         };
         if options.has_network_callbacks() {
             let callbacks = options.remote_callbacks("remote_advertised_branches");
-            let connection = remote.connect_auth(Direction::Fetch, Some(callbacks), None)?;
-            Ok(branches(connection.list()?))
+            let mut connection = remote.connect_auth(Direction::Fetch, Some(callbacks), None)?;
+            let advertised = branches(connection.list()?);
+            self.record_remote_head(connection.remote())?;
+            Ok(advertised)
         } else {
             remote.connect(Direction::Fetch)?;
-            Ok(branches(remote.list()?))
+            let advertised = branches(remote.list()?);
+            self.record_remote_head(&remote)?;
+            Ok(advertised)
         }
     }
 
@@ -10047,6 +10068,9 @@ impl Workspace {
     }
 
     fn default_branch_on(&self, remote: &str) -> Option<String> {
+        if let Some(head) = self.remote_head(remote) {
+            return Some(head.head);
+        }
         let prefix = format!("refs/remotes/{remote}/");
         if let Ok(reference) = self.repo.find_reference(&format!("{prefix}HEAD")) {
             if let Some(name) = reference
@@ -10088,6 +10112,96 @@ impl Workspace {
             }
         }
         names
+    }
+
+    /// Where a remote's advertised default branch is cached: one file per
+    /// remote, shared by every worktree of the repository.
+    fn remote_head_path(&self, remote: &str) -> PathBuf {
+        let key: String = remote.bytes().map(|byte| format!("{byte:02x}")).collect();
+        self.repo
+            .commondir()
+            .join("draftline")
+            .join("remotes")
+            .join(format!("{key}.json"))
+    }
+
+    fn remote_head(&self, remote: &str) -> Option<RemoteHead> {
+        let url = self.repo.find_remote(remote).ok()?.url().ok()?.to_string();
+        let bytes = fs::read(self.remote_head_path(remote)).ok()?;
+        serde_json::from_slice::<RemoteHead>(&bytes)
+            .ok()
+            .filter(|entry| entry.url == url)
+    }
+
+    /// Records the default branch a remote advertised during the fetch that
+    /// just ran, keeping the one it replaced so hosts can spot a rename.
+    fn record_remote_head(&self, remote: &git2::Remote<'_>) -> Result<()> {
+        let (Some(name), Ok(url), Ok(advertised)) = (
+            remote.name().ok().flatten(),
+            remote.url(),
+            remote.default_branch(),
+        ) else {
+            return Ok(());
+        };
+        let Some(head) = advertised
+            .as_str()
+            .ok()
+            .and_then(|target| target.strip_prefix("refs/heads/"))
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+        let existing = self.remote_head(name);
+        let known = existing
+            .as_ref()
+            .map(|entry| entry.head.clone())
+            .or_else(|| {
+                let prefix = format!("refs/remotes/{name}/");
+                self.repo
+                    .find_reference(&format!("{prefix}HEAD"))
+                    .ok()?
+                    .symbolic_target()
+                    .ok()
+                    .flatten()?
+                    .strip_prefix(prefix.as_str())
+                    .map(str::to_string)
+            });
+        let previous = match known {
+            Some(old) if old != head => Some(old),
+            _ => existing.as_ref().and_then(|entry| entry.previous.clone()),
+        }
+        .filter(|previous| *previous != head);
+        if existing
+            .as_ref()
+            .is_some_and(|entry| entry.head == head && entry.previous == previous)
+        {
+            return Ok(());
+        }
+        let entry = RemoteHead {
+            url: url.to_string(),
+            head,
+            previous,
+        };
+        let path = self.remote_head_path(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temp = unique_claim_temp(&path);
+        fs::write(&temp, serde_json::to_vec_pretty(&entry)?)?;
+        if let Err(error) = fs::rename(&temp, &path) {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// The base's old name when the remote renamed its default branch and a
+    /// local branch still carries the old name, so saves there can be moved.
+    fn base_renamed_from(&self, remote: &str, base: &str) -> Option<String> {
+        self.remote_head(remote)?
+            .previous
+            .filter(|previous| previous != base)
+            .filter(|previous| self.repo.find_branch(previous, BranchType::Local).is_ok())
     }
 
     fn listed_variation_tip_oids(&self) -> Result<Vec<(VariationId, Oid)>> {

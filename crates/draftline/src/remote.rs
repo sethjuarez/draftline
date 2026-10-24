@@ -28,6 +28,11 @@ pub struct SyncStatus {
     pub behind: usize,
     pub state: SyncState,
     pub incoming: Vec<RemoteVersionSummary>,
+    /// Set only by base status: the remote renamed its default branch from
+    /// this name, and a local branch still has it. Saves made there can be
+    /// moved with `start_variation_here`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_renamed_from: Option<String>,
 }
 
 /// High-level sync state for product workflows.

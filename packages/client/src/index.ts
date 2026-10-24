@@ -955,6 +955,10 @@ export interface SyncStatus {
   behind: number;
   state: SyncState;
   incoming: RemoteVersionSummary[];
+  /** Base status only: the remote's default branch was renamed from this
+   * name and a local branch still has it; move its saves with
+   * `startVariationHere`. */
+  base_renamed_from?: string;
 }
 
 export interface PublishPreflight {
