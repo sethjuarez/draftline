@@ -131,7 +131,8 @@ Versioning and publishing are driven entirely by commit history, so **all commit
 
 - `fix:` &rarr; patch release
 - `feat:` &rarr; minor release
-- `feat!:` / `fix!:` / `BREAKING CHANGE:` footer &rarr; breaking release
+- `feat!:` / `fix!:` / `BREAKING CHANGE:` footer &rarr; breaking release (a minor bump while
+  versions are below 1.0, via `bump-minor-pre-major`)
 
 ### Managed packages
 

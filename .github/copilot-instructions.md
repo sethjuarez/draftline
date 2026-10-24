@@ -45,7 +45,8 @@ The PR title is validated in CI by the **PR Title** workflow
 ### Breaking changes
 
 Append `!` after the type/scope **and/or** add a `BREAKING CHANGE:` footer, e.g.
-`feat(merge)!: change resolver registration signature`.
+`feat(merge)!: change resolver registration signature`. While a package is below 1.0, a breaking
+change bumps the minor version (`bump-minor-pre-major` in `release-please-config.json`).
 
 ### Scopes
 
