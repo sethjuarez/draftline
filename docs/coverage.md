@@ -113,6 +113,6 @@ Primitive rows use the same scoped-status rule: if the status names a scope, con
 | 9 | Selected-file conflict expansion | Selected save, shelf, and batch discard exist; richer selected-file conflict UX remains future work. | Selected-file conflict reports |
 | 10 | Content policy migration/redaction | Runtime policy changes do not remove or reclassify previously saved content. | `audit_policy`, `migrate_policy`, `redact_content` |
 | 11 | Cleanup preflight expansion | Delete preflights exist; richer host confirmation copy remains future work. | Product copy and confirmation UX |
-| 12 | Large/binary asset policy | Detection alone does not prevent repo bloat or unsupported merge UX. | Asset policy, external storage, LFS-like integration |
+| 12 | Large/binary asset policy | Detection alone does not prevent repo bloat or unsupported merge UX. | Asset policy, external storage, LFS-like integration. LFS detection (`filtered_files`, `LfsContentMissing`) exists; running `git lfs` does not. |
 | 13 | Actor identity and authorship | Commit attribution, audit copy, and support-ref naming need a clear actor/device source. | Identity diagnostics and host-provided actor/device metadata |
 | 14 | Product diagnostics | Host apps need clearer guidance for unusual Git states. | Structured diagnostic report over raw `git2` errors |

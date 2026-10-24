@@ -93,6 +93,7 @@ export interface DraftlineClient {
   repairRecovery(request: RecoveryRequest): Promise<RecoveryRepairResult>;
   rollbackRecovery(request: RecoveryRequest): Promise<RecoveryRepairResult>;
   acknowledgeRecovery(workspacePath: string): Promise<CommandPostconditions>;
+  filteredFiles(request: FilteredFilesRequest): Promise<FilteredFile[]>;
   resolveLegacyHistoryCleanup(
     request: LegacyHistoryCleanupRequest,
   ): Promise<LegacyHistoryCleanupResult>;
@@ -247,6 +248,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       }),
     resolveLegacyHistoryCleanup: (request) =>
       run('resolve_legacy_history_cleanup', { request }),
+    filteredFiles: (request) => run('filtered_files', { request }),
     selectedSave: (request) => run('selected_save', { request }),
     selectedShelve: (request) => run('selected_shelve', { request }),
     selectedDiscard: (request) => run('selected_discard', { request }),
@@ -658,6 +660,16 @@ export interface FileHazard {
   kind: string;
 }
 
+/** A project file Git stores through a filter driver such as Git LFS. */
+export interface FilteredFile {
+  path: string;
+  /** The `filter` attribute's driver, for example `lfs`. */
+  driver: string;
+  /** Git config defines the driver, so plain Git can run it here. */
+  driver_configured: boolean;
+  /** The file on disk is an LFS pointer: its content was never downloaded. */
+  content_missing: boolean;
+}
 export interface PreflightReport {
   operation: string;
   will_write_files: boolean;
@@ -1174,6 +1186,11 @@ export interface GuardedCreateVariationFromVersionRequest extends WorkspaceReque
   metadata?: VariationMetadata;
 }
 
+/** Lists filtered project files, or probes `paths` (which need not exist). */
+export interface FilteredFilesRequest extends WorkspaceRequest {
+  paths?: string[];
+}
+
 /** Starts a variation at the current commit, keeping files and unsaved edits. */
 export interface StartVariationHereRequest extends WorkspaceRequest {
   name: string;
@@ -1338,6 +1355,7 @@ export interface DraftlineHostFacade {
   repairRecovery(operationId: string): Promise<RecoveryRepairResult>;
   rollbackRecovery(operationId: string): Promise<RecoveryRepairResult>;
   acknowledgeRecovery(): Promise<CommandPostconditions>;
+  filteredFiles(paths?: string[]): Promise<FilteredFile[]>;
   resolveLegacyHistoryCleanup(planId: string): Promise<LegacyHistoryCleanupResult>;
   fetchRemote(remote?: string): Promise<FetchRemoteResult>;
   publishCurrentVariation(remote?: string): Promise<PublishCurrentVariationResult>;
@@ -1487,6 +1505,7 @@ export function createDraftlineHostFacade({
     rollbackRecovery: (operationId) =>
       client.rollbackRecovery({ ...workspaceRequest(), operation_id: operationId }),
     acknowledgeRecovery: () => client.acknowledgeRecovery(workspacePath),
+    filteredFiles: (paths) => client.filteredFiles({ ...workspaceRequest(), paths }),
     resolveLegacyHistoryCleanup: (planId) =>
       client.resolveLegacyHistoryCleanup({ ...workspaceRequest(), plan_id: planId }),
     fetchRemote: (remote) => client.fetchRemote(remoteRequest(remote)),
@@ -1851,6 +1870,10 @@ export async function rollbackRecovery(request: RecoveryRequest): Promise<Recove
 
 export async function acknowledgeRecovery(workspacePath: string): Promise<CommandPostconditions> {
   return createDraftlineClient().acknowledgeRecovery(workspacePath);
+}
+
+export async function filteredFiles(request: FilteredFilesRequest): Promise<FilteredFile[]> {
+  return createDraftlineClient().filteredFiles(request);
 }
 
 export async function resolveLegacyHistoryCleanup(

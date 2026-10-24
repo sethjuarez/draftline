@@ -129,3 +129,15 @@ Business goal: "GitHub renamed `master` to `main`; my sends must follow, and my 
 | Correct primitive path | Any fetch (`fetch_remote`, `fetch_all_variations`) or Send records the default branch the remote advertises. `base_status` and Send then target the new name. While a local branch still has the old name, `base_status` reports it in `base_renamed_from` (client `SyncStatus.base_renamed_from`). The old local branch is now a developer branch, so saves made on it move with `start_variation_here(name)` and are sent to the new base. |
 | Safety behavior | The advertised default is cached per remote in the repository's Git directory (`draftline/remotes/`, shared by worktrees) and ignored once the remote's URL changes. Draftline never rewrites `refs/remotes/<remote>/HEAD`, renames, or deletes the old local branch; removing it is the developer's call, and the report clears once it is gone. With a namespace set, saves on the old branch fail with `BranchOutsideNamespace` (Flow 15g). Offline, the last recorded default is used. |
 | Tests | `a_renamed_default_branch_is_followed_and_saves_on_the_old_one_can_move`. |
+
+## Flow 15i: Git LFS in a developer's repo
+
+Business goal: "The developers keep images in Git LFS; don't corrupt them, and tell me why I can't save."
+
+| Question | Answer |
+|---|---|
+| Covered today? | Partially covered: detection and refusal only. |
+| Correct primitive path | `filtered_files()` lists project files under a filter driver (`FilteredFile { path, driver, driver_configured, content_missing }`). `filtered_files_among(paths)` probes paths that need not exist, so a host can check before it writes a screenshot. `inspect` warns with `LfsContentMissing` when project files hold LFS pointer text because the clone never downloaded their content. Client: `filteredFiles`, Tauri: `filtered_files`. |
+| Safety behavior | Draftline cannot run filter drivers, so saves, restores, discards, and checkouts touching a filtered path still refuse before writing. A checkout hazard names whose file it is: `GitFilter` for the project's, `GitFilterOutsideProject` for a developer's file outside the folder, which someone with Git and the driver must update. Pointer files are never read as content by the report; the host should not show them as images. |
+| Tests | `a_clone_without_lfs_content_is_reported_not_read_as_content`, `smudged_lfs_files_are_not_reported_missing`, `a_developer_lfs_change_outside_the_folder_is_named_as_theirs`, `command_contract_lists_and_probes_filtered_files`. |
+| Gap | Running the real driver (`git lfs` when installed) for save, checkout, and upload on send/publish. Until then a folder-level `.gitattributes` with `-filter`, approved by a developer, is the opt-out. |

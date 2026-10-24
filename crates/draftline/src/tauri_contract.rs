@@ -11,19 +11,20 @@ use serde::{Deserialize, Serialize};
 use crate::{
     merge::MergeConflict, AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult,
     ChangeSet, ContentPolicy, ContentPolicyAudit, ContributorProfile, CurrentFileDiff,
-    CurrentFilePreview, DirtySummary, DraftlineError, HistoryEntry, MergeConflictResolution,
-    MergeIncomingReport, MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice,
-    OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight, PublishResult,
-    RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
-    RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result,
-    Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SwitchPolicy, SyncState, SyncStatus,
-    Variation, VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
-    VariationRenamePreflight, VariationRenameToken, VariationSummary, Version, VersionDiff,
-    VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
-    WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
-    WorkspaceGraphNodeDetail, WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
-    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
-    WorkspaceId, WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
+    CurrentFilePreview, DirtySummary, DraftlineError, FilteredFile, HistoryEntry,
+    MergeConflictResolution, MergeIncomingReport, MergeIncomingResult, MergeIncomingToken,
+    MergeResolutionChoice, OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight,
+    PublishResult, RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest,
+    RemoteEndpoint, RemoteOptions, RemoteVariation, RemoteVariationDiagnostics,
+    RestoreVersionTarget, Result, Shelf, ShelfApplyReport, SupportRef, SupportRefScope,
+    SwitchPolicy, SyncState, SyncStatus, Variation, VariationCreatePreflight, VariationCreateToken,
+    VariationId, VariationMetadata, VariationRenamePreflight, VariationRenameToken,
+    VariationSummary, Version, VersionDiff, VersionId, VersionPreview, Workspace,
+    WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor,
+    WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail, WorkspaceGraphOptions,
+    WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRefs,
+    WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection,
+    WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -426,6 +427,15 @@ pub struct StartVariationHereRequest {
     pub name: String,
     #[serde(default)]
     pub metadata: VariationMetadata,
+}
+
+/// Request for project files Git stores through a filter driver such as Git LFS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredFilesRequest {
+    pub workspace_path: PathBuf,
+    /// Probe these paths, which need not exist, instead of every tracked file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<PathBuf>>,
 }
 
 /// Request for remote-aware variation creation preflight.
@@ -1695,6 +1705,34 @@ pub fn start_variation_here_with_context(
         variation,
         postconditions: collect_postconditions(&workspace, false),
     })
+}
+
+/// Lists project files Git stores through a filter driver such as Git LFS,
+/// and whether their content is missing (an undownloaded LFS pointer).
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn filtered_files(request: FilteredFilesRequest) -> Result<Vec<FilteredFile>> {
+    filtered_files_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Lists filtered project files using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn filtered_files_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: FilteredFilesRequest,
+) -> Result<Vec<FilteredFile>> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    match request.paths {
+        Some(paths) => workspace.filtered_files_among(paths),
+        None => workspace.filtered_files(),
+    }
 }
 
 /// Preflights remote-aware local variation creation from a saved version.

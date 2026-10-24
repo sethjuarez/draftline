@@ -255,8 +255,26 @@ pub enum FileHazardKind {
     PolicyExcluded,
     /// Needs a Git filter driver (for example Git LFS) that Draftline cannot run.
     GitFilter,
+    /// A developer's file outside the project folder needs a Git filter
+    /// driver; someone with the driver must make this update with Git.
+    GitFilterOutsideProject,
     /// Has uncommitted local edits that the operation would overwrite.
     LocalChanges,
+}
+
+/// A project file that Git stores through a filter driver such as Git LFS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct FilteredFile {
+    #[serde(serialize_with = "serialize_workspace_path")]
+    pub path: PathBuf,
+    /// The `filter` attribute's driver, for example `lfs`.
+    pub driver: String,
+    /// Git config defines the driver (`filter.<driver>.*`), so plain Git can
+    /// run it here. Draftline still cannot.
+    pub driver_configured: bool,
+    /// The file on disk is a Git LFS pointer: its content was never downloaded.
+    pub content_missing: bool,
 }
 
 /// Read-only view of a version.
@@ -411,6 +429,9 @@ pub enum DiagnosticCode {
     /// The checkout is on a developer's branch, outside this project's
     /// variations; saves and updates refuse until the user starts a variation.
     BranchOutsideNamespace,
+    /// Project files that Git stores with LFS hold pointer text instead of
+    /// their content, because the clone never downloaded it.
+    LfsContentMissing,
 }
 
 /// Severity for a workspace diagnostic.
@@ -1868,6 +1889,26 @@ impl Workspace {
             ));
         }
 
+        match self.missing_lfs_content() {
+            Ok(missing) if !missing.is_empty() => {
+                diagnostics.push(workspace_diagnostic(
+                    DiagnosticCode::LfsContentMissing,
+                    DiagnosticSeverity::Warning,
+                    format!(
+                        "{} project file(s), such as `{}`, are Git LFS pointers; a developer must install Git LFS and run `git lfs pull`",
+                        missing.len(),
+                        missing[0].display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => diagnostics.push(workspace_diagnostic(
+                DiagnosticCode::WorkspaceReadFailed,
+                DiagnosticSeverity::Warning,
+                format!("could not check for Git LFS pointers: {error}"),
+            )),
+        }
+
         if recovery.is_some() {
             diagnostics.push(match self.recovery_owner_elsewhere() {
                 Some(project) => workspace_diagnostic(
@@ -2038,6 +2079,14 @@ impl Workspace {
                 message: "a developer's branch is checked out; Draftline won't save onto it"
                     .to_string(),
                 safe_next_actions: vec![SafeNextAction::StartVariationHere],
+                retry: RetryClass::RetryAfterUserChoice,
+            },
+            DiagnosticCode::LfsContentMissing => ErrorExplanation {
+                code,
+                message:
+                    "some project files are Git LFS pointers; their content was never downloaded"
+                        .to_string(),
+                safe_next_actions: Vec::new(),
                 retry: RetryClass::RetryAfterUserChoice,
             },
         }
@@ -9196,13 +9245,21 @@ impl Workspace {
         let mut hazards = Vec::new();
         for path in paths {
             if self.needs_filter(attributes.as_ref(), path)? {
-                hazards.push(FileHazard {
-                    path: path.clone(),
-                    kind: FileHazardKind::GitFilter,
-                });
+                hazards.push(self.filter_hazard(path.clone()));
             }
         }
         Ok(hazards)
+    }
+
+    /// A filter refusal, naming whether the file is the project's or a
+    /// developer's outside the project folder.
+    fn filter_hazard(&self, path: PathBuf) -> FileHazard {
+        let kind = if path.starts_with(self.scope()) {
+            FileHazardKind::GitFilter
+        } else {
+            FileHazardKind::GitFilterOutsideProject
+        };
+        FileHazard { path, kind }
     }
 
     /// A second handle whose index is `tree`, so attribute lookups see the
@@ -9260,13 +9317,93 @@ impl Workspace {
             Vec::new(),
             refused
                 .into_iter()
-                .map(|path| FileHazard {
-                    path,
-                    kind: FileHazardKind::GitFilter,
-                })
+                .map(|path| self.filter_hazard(path))
                 .collect(),
             None,
         ))))
+    }
+
+    /// Tracked project files that Git stores through a filter driver, such as
+    /// Git LFS, with whether their content is missing from disk.
+    pub fn filtered_files(&self) -> Result<Vec<FilteredFile>> {
+        let paths = self.tracked_project_paths()?;
+        self.filtered_among(paths)
+    }
+
+    /// Tracked project files under a filter whose disk content is a Git LFS
+    /// pointer. Cheap enough for `inspect`: only files of at most 1 KiB are read.
+    fn missing_lfs_content(&self) -> Result<Vec<PathBuf>> {
+        let mut missing = Vec::new();
+        for path in self.tracked_project_paths()? {
+            if is_lfs_pointer_file(&self.root.join(&path))
+                && needs_git_filter(&self.repo, &path, git2::AttrCheckFlags::FILE_THEN_INDEX)?
+            {
+                missing.push(path);
+            }
+        }
+        Ok(missing)
+    }
+
+    /// Stage-0 regular-file index paths in the project that the content
+    /// policy tracks.
+    fn tracked_project_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut index = self.repo.index()?;
+        index.read(false)?;
+        let scope = self.scope().to_path_buf();
+        let mut paths = Vec::new();
+        for entry in index.iter() {
+            if (entry.flags >> 12) & 0x3 != 0 || entry.mode & 0o170000 != 0o100000 {
+                continue;
+            }
+            let path = PathBuf::from(String::from_utf8_lossy(&entry.path).into_owned());
+            if path.starts_with(&scope) && self.content_policy.tracks(&path)? {
+                paths.push(path);
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Which of `paths` Git would store through a filter driver. Paths need
+    /// not exist, so a host can check where it is about to write.
+    pub fn filtered_files_among<I, P>(&self, paths: I) -> Result<Vec<FilteredFile>>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| self.normalize_tracked_content_path(path))
+            .collect::<Result<BTreeSet<_>>>()?;
+        self.filtered_among(paths)
+    }
+
+    fn filtered_among(
+        &self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Vec<FilteredFile>> {
+        let config = self.repo.config()?;
+        let mut files = Vec::new();
+        for path in paths {
+            let Some(driver) =
+                git_filter_driver(&self.repo, &path, git2::AttrCheckFlags::FILE_THEN_INDEX)?
+            else {
+                continue;
+            };
+            let command = |key: &str| {
+                config
+                    .get_string(&format!("filter.{driver}.{key}"))
+                    .is_ok_and(|value| !value.trim().is_empty())
+            };
+            let driver_configured = command("process") || (command("clean") && command("smudge"));
+            let content_missing = is_lfs_pointer_file(&self.root.join(&path));
+            files.push(FilteredFile {
+                path,
+                driver,
+                driver_configured,
+                content_missing,
+            });
+        }
+        Ok(files)
     }
 
     /// Moves working files from the current HEAD tree to `target` the way
@@ -10647,11 +10784,50 @@ fn preflight_report(
 
 /// Whether Git would run a filter driver (for example Git LFS) for `path`.
 fn needs_git_filter(repo: &Repository, path: &Path, flags: git2::AttrCheckFlags) -> Result<bool> {
+    Ok(git_filter_driver(repo, path, flags)?.is_some())
+}
+
+/// The filter driver Git would run for `path`, if any.
+fn git_filter_driver(
+    repo: &Repository,
+    path: &Path,
+    flags: git2::AttrCheckFlags,
+) -> Result<Option<String>> {
     let filter = repo.get_attr(path, "filter", flags)?;
-    Ok(matches!(
-        git2::AttrValue::from_string(filter),
-        git2::AttrValue::True | git2::AttrValue::String(_)
-    ))
+    Ok(match git2::AttrValue::from_string(filter) {
+        git2::AttrValue::True => Some(String::new()),
+        git2::AttrValue::String(driver) => Some(driver.to_string()),
+        _ => None,
+    })
+}
+
+/// Whether the file is a Git LFS pointer (spec v1: at most 1024 bytes, a
+/// `version` line first, then `oid` and `size` lines), meaning its content
+/// was never downloaded.
+fn is_lfs_pointer_file(path: &Path) -> bool {
+    const MAX: u64 = 1024;
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > MAX {
+        return false;
+    }
+    fs::read(path).is_ok_and(|bytes| is_lfs_pointer(&bytes))
+}
+
+fn is_lfs_pointer(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let versioned = lines.next().is_some_and(|line| {
+        line == "version https://git-lfs.github.com/spec/v1"
+            || line == "version https://hawser.github.com/spec/v1"
+    });
+    let rest: Vec<&str> = lines.collect();
+    versioned
+        && rest.iter().any(|line| line.starts_with("oid sha256:"))
+        && rest.iter().any(|line| line.starts_with("size "))
 }
 
 fn discard_preflight_report(

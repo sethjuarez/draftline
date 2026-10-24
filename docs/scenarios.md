@@ -84,6 +84,7 @@ Every documented flow must either name executable coverage or explain why the re
 | Flow 15f: one workspace per checkout | Covered | `a_checkout_holds_one_workspace`, `relocate_moves_the_workspace_and_refuses_while_an_operation_runs`, `a_claim_on_a_missing_folder_is_reported_stale_and_relocate_recovers` | None known. |
 | Flow 15g: a developer switched the shared checkout | Covered | `saves_and_updates_refuse_a_developer_branch_until_a_variation_starts_here`, `a_detached_checkout_refuses_namespaced_saves` | Host UX for offering `start_variation_here` is host work. |
 | Flow 15h: the base branch was renamed | Covered | `a_renamed_default_branch_is_followed_and_saves_on_the_old_one_can_move` | Host copy for offering `start_variation_here` after a rename is host work. |
+| Flow 15i: Git LFS in a developer's repo | Partially covered | `a_clone_without_lfs_content_is_reported_not_read_as_content`, `smudged_lfs_files_are_not_reported_missing`, `a_developer_lfs_change_outside_the_folder_is_named_as_theirs`, `command_contract_lists_and_probes_filtered_files` | Detection only; running `git lfs` for save, checkout, and upload is not built. |
 
 ## Business safety principles
 

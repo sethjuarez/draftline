@@ -3,7 +3,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use draftline::{ContentPolicy, DraftlineError, FileHazardKind, RemoteOptions, Workspace};
+use draftline::{
+    ContentPolicy, DiagnosticCode, DiagnosticSeverity, DraftlineError, FileHazardKind,
+    RemoteOptions, Workspace,
+};
 
 fn write_file(root: &Path, relative: &str, content: &str) {
     let path = root.join(relative);
@@ -708,6 +711,145 @@ fn switch_refuses_a_branch_whose_own_rules_put_a_file_in_lfs() {
     workspace
         .preflight_discard_changes()
         .expect("no pending recovery");
+}
+
+const LFS_POINTER: &str = "version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n";
+
+#[test]
+fn a_clone_without_lfs_content_is_reported_not_read_as_content() {
+    let (temp, repo) = code_repo();
+    write_file(
+        temp.path(),
+        ".gitattributes",
+        "*.sk filter=lfs diff=lfs merge=lfs -text\n",
+    );
+    write_file(temp.path(), "cutready/intro.sk", LFS_POINTER);
+    write_file(temp.path(), "cutready/notes.md", "plain notes\n");
+    commit_all(&repo, "Track sketches with LFS (cloned without git-lfs)");
+    let workspace = scoped(&temp);
+
+    let files = workspace.filtered_files().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, PathBuf::from("cutready/intro.sk"));
+    assert_eq!(files[0].driver, "lfs");
+    assert!(files[0].content_missing);
+    let warning = workspace
+        .inspect()
+        .unwrap()
+        .diagnostics
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == DiagnosticCode::LfsContentMissing)
+        .expect("an LFS warning");
+    assert_eq!(warning.severity, DiagnosticSeverity::Warning);
+
+    // A host can probe where it is about to write before it writes there.
+    let probed = workspace
+        .filtered_files_among(["cutready/next.sk", "cutready/notes.md"])
+        .unwrap();
+    assert_eq!(probed.len(), 1);
+    assert_eq!(probed[0].path, PathBuf::from("cutready/next.sk"));
+    assert!(!probed[0].content_missing);
+
+    repo.config()
+        .unwrap()
+        .set_str("filter.lfs.process", "git-lfs filter-process")
+        .unwrap();
+    assert!(workspace.filtered_files().unwrap()[0].driver_configured);
+}
+
+#[test]
+fn command_contract_lists_and_probes_filtered_files() {
+    use draftline::tauri_contract::{
+        filtered_files_with_context, DraftlineCommandContext, FilteredFilesRequest,
+    };
+    let (temp, repo) = code_repo();
+    write_file(temp.path(), ".gitattributes", "*.sk filter=lfs -text\n");
+    write_file(temp.path(), "cutready/intro.sk", LFS_POINTER);
+    commit_all(&repo, "Track sketches with LFS");
+    scoped(&temp);
+    let mut context = DraftlineCommandContext::new().with_content_policy(cutready_policy());
+    let folder = temp.path().join("cutready");
+
+    let listed = filtered_files_with_context(
+        &mut context,
+        FilteredFilesRequest {
+            workspace_path: folder.clone(),
+            paths: None,
+        },
+    )
+    .unwrap();
+    let json = serde_json::to_value(&listed).unwrap();
+    assert_eq!(json[0]["path"], "cutready/intro.sk");
+    assert_eq!(json[0]["driver"], "lfs");
+    assert_eq!(json[0]["content_missing"], true);
+
+    let probed = filtered_files_with_context(
+        &mut context,
+        FilteredFilesRequest {
+            workspace_path: folder,
+            paths: Some(vec!["cutready/notes.md".into()]),
+        },
+    )
+    .unwrap();
+    assert!(probed.is_empty());
+}
+#[test]
+fn smudged_lfs_files_are_not_reported_missing() {
+    let (temp, _repo) = lfs_project();
+    let workspace = scoped(&temp);
+
+    let files = workspace.filtered_files().unwrap();
+    assert_eq!(files.len(), 1);
+    assert!(!files[0].content_missing);
+    assert!(workspace
+        .inspect()
+        .unwrap()
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.code != DiagnosticCode::LfsContentMissing));
+}
+
+#[test]
+fn a_developer_lfs_change_outside_the_folder_is_named_as_theirs() {
+    let (temp, repo) = code_repo();
+    write_file(
+        temp.path(),
+        ".gitattributes",
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+    );
+    commit_all(&repo, "Track binaries with LFS");
+    commit_smudged(
+        &repo,
+        temp.path(),
+        "assets/logo.bin",
+        "logo one\n",
+        "lfs pointer one\n",
+        "Dev: logo",
+    );
+    let workspace = scoped(&temp);
+    let old = workspace.create_variation("cutready/old").unwrap();
+    commit_smudged(
+        &repo,
+        temp.path(),
+        "assets/logo.bin",
+        "logo two\n",
+        "lfs pointer two\n",
+        "Dev: new logo",
+    );
+
+    let error = workspace
+        .switch_variation(old.id(), draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap_err();
+
+    assert_eq!(
+        hazard_kinds(error),
+        vec![(
+            PathBuf::from("assets/logo.bin"),
+            FileHazardKind::GitFilterOutsideProject
+        )]
+    );
+    assert_eq!(read(temp.path(), "assets/logo.bin"), "logo two\n");
+    assert_eq!(repo.head().unwrap().shorthand().ok(), Some("main"));
 }
 
 fn blob_text(repo: &git2::Repository, spec: &str) -> Vec<u8> {
