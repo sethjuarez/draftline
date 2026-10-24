@@ -125,6 +125,9 @@ pub enum DraftlineError {
     #[error("cannot tell which branch to send to; pass a base branch")]
     SendBaseUnknown,
 
+    #[error("the remote has no branch `{0}` to send to; publish it first or pass a base branch")]
+    SendBaseNotOnRemote(String),
+
     #[error("branch `{0}` is not a variation; switch to one or to the base branch to send")]
     SendOutsideNamespace(String),
 

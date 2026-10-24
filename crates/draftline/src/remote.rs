@@ -270,10 +270,9 @@ impl<'callbacks> RemoteOptions<'callbacks> {
             }
 
             for expectation in &expectations {
-                let Some(update) = updates
-                    .iter()
-                    .find(|update| update.dst_refname() == Some(expectation.dst_refname.as_str()))
-                else {
+                let Some(update) = updates.iter().find(|update| {
+                    update.dst_refname().ok() == Some(expectation.dst_refname.as_str())
+                }) else {
                     return Err(git2::Error::from_str(&format!(
                         "push did not negotiate expected ref {}",
                         expectation.dst_refname

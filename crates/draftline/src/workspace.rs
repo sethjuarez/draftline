@@ -2649,7 +2649,7 @@ impl Workspace {
             .repo
             .find_reference("HEAD")
             .ok()
-            .and_then(|head| head.symbolic_target().map(str::to_string));
+            .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string));
         let tip = self.repo.head().ok().and_then(|head| head.target());
         (name, tip)
     }
@@ -2701,7 +2701,7 @@ impl Workspace {
         let mut changed = Vec::new();
 
         for entry in statuses.iter() {
-            let Some(path) = entry.path() else {
+            let Ok(path) = entry.path() else {
                 continue;
             };
             if !self.content_policy.tracks(path)? {
@@ -2749,7 +2749,7 @@ impl Workspace {
                 continue;
             }
 
-            let Some(path) = entry.path() else {
+            let Ok(path) = entry.path() else {
                 continue;
             };
 
@@ -2827,7 +2827,7 @@ impl Workspace {
         let mut hazards = Vec::new();
 
         for entry in statuses.iter() {
-            let Some(path) = entry.path() else {
+            let Ok(path) = entry.path() else {
                 continue;
             };
             let path_ref = Path::new(path);
@@ -3666,7 +3666,7 @@ impl Workspace {
 
         for reference in references {
             let reference = reference?;
-            let Some(name) = reference.name() else {
+            let Ok(name) = reference.name() else {
                 continue;
             };
             let Some(id) = name.strip_prefix("refs/draftline/shelves/") else {
@@ -6470,7 +6470,7 @@ impl Workspace {
                 if !head.is_branch() {
                     return Err(DraftlineError::NoCurrentVariation);
                 }
-                let Some(name) = head.shorthand() else {
+                let Ok(name) = head.shorthand() else {
                     return Err(DraftlineError::NoCurrentVariation);
                 };
                 Ok(name.to_string())
@@ -6481,7 +6481,7 @@ impl Workspace {
                 self.repo
                     .find_reference("HEAD")
                     .ok()
-                    .and_then(|r| r.symbolic_target().map(str::to_string))
+                    .and_then(|r| r.symbolic_target().ok().flatten().map(str::to_string))
                     .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_string))
                     .ok_or(DraftlineError::NoCurrentVariation)
             }
@@ -6493,7 +6493,13 @@ impl Workspace {
         self.repo
             .find_reference("HEAD")
             .ok()
-            .and_then(|reference| reference.symbolic_target().map(str::to_string))
+            .and_then(|reference| {
+                reference
+                    .symbolic_target()
+                    .ok()
+                    .flatten()
+                    .map(str::to_string)
+            })
             .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_string))
     }
 
@@ -6573,7 +6579,7 @@ impl Workspace {
         let names = self.repo.remotes()?;
         let mut remotes = Vec::new();
 
-        for name in names.iter().flatten() {
+        for name in names.iter().filter_map(|name| name.ok().flatten()) {
             let remote = self.repo.find_remote(name)?;
             remotes.push(RemoteEndpoint {
                 name: name.to_string(),
@@ -7118,7 +7124,7 @@ impl Workspace {
     ) -> Result<()> {
         for reference in self.repo.references_glob(glob)? {
             let reference = reference?;
-            let Some(ref_name) = reference.name() else {
+            let Ok(ref_name) = reference.name() else {
                 continue;
             };
             let Some(target_oid) = reference.target() else {
@@ -7155,7 +7161,7 @@ impl Workspace {
                 if reference.kind() != Some(git2::ReferenceType::Direct) {
                     continue;
                 }
-                if let Some(name) = reference.name() {
+                if let Ok(name) = reference.name() {
                     refs.push(name.to_string());
                 }
             }
@@ -7276,12 +7282,26 @@ impl Workspace {
     ) -> Result<SendResult> {
         self.ensure_no_pending_recovery()?;
         let remote = remote.as_ref();
-        let base = match &request.base {
-            Some(base) => validate_variation_name(base)?,
-            None => self
-                .default_branch_on(remote)
-                .ok_or(DraftlineError::SendBaseUnknown)?,
+        let explicit = match &request.base {
+            Some(base) => Some(validate_variation_name(base)?),
+            None => None,
         };
+        let advertised = self.remote_advertised_branches(remote, options)?;
+        let base = match explicit {
+            Some(base) => base,
+            None => match self.default_branch_on(remote) {
+                Some(base) if advertised.contains(&base) => base,
+                inferred => self
+                    .default_branch_candidates()
+                    .into_iter()
+                    .find(|name| advertised.contains(name))
+                    .or(inferred)
+                    .ok_or(DraftlineError::SendBaseUnknown)?,
+            },
+        };
+        if !advertised.contains(&base) {
+            return Err(DraftlineError::SendBaseNotOnRemote(base));
+        }
         let current = self.current_variation_unchecked()?;
         if let Some(namespace) = &self.variation_namespace {
             if current != base && !current.starts_with(namespace.as_str()) {
@@ -7289,7 +7309,6 @@ impl Workspace {
             }
         }
         self.fetch_remote_variation_ref(remote, &base, options)?;
-        let advertised = self.remote_advertised_branches(remote, options)?;
 
         let mut created_variation = false;
         let variation = if current == base {
@@ -7468,7 +7487,12 @@ impl Workspace {
     /// repository. Other tools' worktrees are never included.
     pub fn owned_worktrees(&self) -> Result<Vec<OwnedWorktree>> {
         let mut owned = Vec::new();
-        for name in self.repo.worktrees()?.iter().flatten() {
+        for name in self
+            .repo
+            .worktrees()?
+            .iter()
+            .filter_map(|name| name.ok().flatten())
+        {
             if !name.starts_with(OWNED_WORKTREE_PREFIX) {
                 continue;
             }
@@ -7479,7 +7503,7 @@ impl Workspace {
                 .and_then(|repo| {
                     repo.head()
                         .ok()
-                        .and_then(|head| head.shorthand().map(str::to_string))
+                        .and_then(|head| head.shorthand().ok().map(str::to_string))
                 });
             owned.push(OwnedWorktree {
                 name: name.to_string(),
@@ -8278,7 +8302,12 @@ impl Workspace {
         committer: &Signature<'_>,
     ) -> Result<()> {
         let head = self.repo.find_reference("HEAD")?;
-        let name = head.symbolic_target().unwrap_or("HEAD").to_string();
+        let name = head
+            .symbolic_target()
+            .ok()
+            .flatten()
+            .unwrap_or("HEAD")
+            .to_string();
         let mut transaction = self.repo.transaction()?;
         transaction.lock_ref(&name)?;
         let current = self.repo.refname_to_id(&name).ok();
@@ -8289,7 +8318,7 @@ impl Workspace {
                 actual: format!("{current:?}"),
             });
         }
-        let summary = commit.summary().unwrap_or_default();
+        let summary = commit.summary().ok().flatten().unwrap_or_default();
         let message = match parent {
             Some(_) => format!("commit: {summary}"),
             None => format!("commit (initial): {summary}"),
@@ -8764,7 +8793,8 @@ impl Workspace {
 
         let statuses = self.repo.statuses(Some(&mut options))?;
         for entry in statuses.iter() {
-            if !entry.status().is_index_renamed() || entry.path().map(Path::new) != Some(path) {
+            if !entry.status().is_index_renamed() || entry.path().ok().map(Path::new) != Some(path)
+            {
                 continue;
             }
 
@@ -9114,7 +9144,7 @@ impl Workspace {
         paths: &mut BTreeSet<PathBuf>,
     ) -> Result<()> {
         for entry in tree.iter() {
-            let Some(name) = entry.name() else {
+            let Ok(name) = entry.name() else {
                 continue;
             };
             let path = prefix.join(name);
@@ -9223,8 +9253,9 @@ impl Workspace {
         }
     }
 
-    /// The branch new work starts from: `origin/HEAD`'s target, else a local
-    /// `main` or `master`.
+    /// The branch new work starts from: `origin/HEAD`'s target, else the first
+    /// of `init.defaultBranch`, `main`, `master` and `trunk` that exists on
+    /// `origin` (as last fetched), else the first that exists locally.
     fn default_branch(&self) -> Option<String> {
         self.default_branch_on("origin")
     }
@@ -9234,15 +9265,43 @@ impl Workspace {
         if let Ok(reference) = self.repo.find_reference(&format!("{prefix}HEAD")) {
             if let Some(name) = reference
                 .symbolic_target()
+                .ok()
+                .flatten()
                 .and_then(|target| target.strip_prefix(prefix.as_str()))
             {
                 return Some(name.to_string());
             }
         }
-        ["main", "master"]
+        let candidates = self.default_branch_candidates();
+        candidates
+            .iter()
+            .find(|name| self.repo.find_reference(&format!("{prefix}{name}")).is_ok())
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|name| self.repo.find_branch(name, BranchType::Local).is_ok())
+            })
+            .cloned()
+    }
+
+    fn default_branch_candidates(&self) -> Vec<String> {
+        let configured = self
+            .repo
+            .config()
+            .and_then(|config| config.get_string("init.defaultBranch"))
+            .ok()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
+        let mut names = Vec::new();
+        for name in configured
             .into_iter()
-            .find(|name| self.repo.find_branch(name, BranchType::Local).is_ok())
-            .map(str::to_string)
+            .chain(["main", "master", "trunk"].map(str::to_string))
+        {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
     }
 
     fn listed_variation_tip_oids(&self) -> Result<Vec<(VariationId, Oid)>> {
@@ -9316,7 +9375,7 @@ impl Workspace {
                 continue;
             }
 
-            let Some(ref_name) = reference.name() else {
+            let Ok(ref_name) = reference.name() else {
                 continue;
             };
             let Some(name) = ref_name.strip_prefix(&prefix) else {
@@ -9798,7 +9857,7 @@ fn collect_preview_files(
     content_policy: &ContentPolicy,
 ) -> Result<()> {
     for entry in tree.iter() {
-        let Some(name) = entry.name() else {
+        let Ok(name) = entry.name() else {
             continue;
         };
         let path = prefix.join(name);
@@ -9834,7 +9893,7 @@ fn collect_preview_files(
 fn contributor_from_signature(signature: &git2::Signature<'_>) -> Contributor {
     Contributor {
         name: signature.name().unwrap_or("Unknown").to_string(),
-        email: signature.email().map(ToString::to_string),
+        email: signature.email().ok().map(ToString::to_string),
     }
 }
 
@@ -9962,7 +10021,12 @@ impl<'r> ScopedHistory<'r> {
 fn version_from_commit(commit: &Commit<'_>) -> Version {
     Version {
         id: VersionId::from(commit.id()),
-        label: commit.summary().unwrap_or_default().to_string(),
+        label: commit
+            .summary()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .to_string(),
         author: contributor_from_signature(&commit.author()),
         saved_by: contributor_from_signature(&commit.committer()),
         time_seconds: commit.time().seconds(),
@@ -10569,7 +10633,12 @@ fn remote_from_remote_tracking_ref(ref_name: &str) -> Option<String> {
 fn remote_summary_from_commit(commit: &Commit<'_>) -> RemoteVersionSummary {
     RemoteVersionSummary {
         id: commit.id().to_string(),
-        label: commit.summary().unwrap_or_default().to_string(),
+        label: commit
+            .summary()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .to_string(),
         author: contributor_from_signature(&commit.author()),
         time_seconds: commit.time().seconds(),
     }
@@ -10709,7 +10778,7 @@ fn tree_contains_path(tree: &Tree<'_>, path: &Path) -> Result<bool> {
 }
 
 fn ensure_remote_transport_supported(remote: &git2::Remote<'_>) -> Result<()> {
-    if let Some(url) = remote.url() {
+    if let Ok(url) = remote.url() {
         ensure_supported_remote_url(url)?;
     }
     Ok(())
@@ -11263,7 +11332,7 @@ mod tests {
 
     fn head_summary(workspace: &Workspace) -> String {
         let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
-        head.summary().unwrap().to_string()
+        head.summary().unwrap().unwrap().to_string()
     }
 
     fn assert_clean(workspace: &Workspace) {
@@ -11644,7 +11713,7 @@ mod tests {
         assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
         assert!(workspace.recovery_state().unwrap().is_some());
         let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(head.message(), Some("dev"));
+        assert_eq!(head.message().ok(), Some("dev"));
     }
 
     /// A developer commit of `code.rs` on the current branch, outside Draftline.
@@ -12059,6 +12128,58 @@ mod tests {
     }
 
     #[test]
+    fn the_default_branch_can_be_trunk_or_configured() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = init_workspace_with_initial_branch(temp.path(), "trunk");
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        write_file(workspace.root(), "plan.sk", b"v1");
+        workspace.save_version("First").unwrap();
+        assert_eq!(workspace.default_branch().as_deref(), Some("trunk"));
+
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        workspace.repo.branch("develop", &head, false).unwrap();
+        workspace
+            .repo
+            .config()
+            .unwrap()
+            .set_str("init.defaultBranch", "develop")
+            .unwrap();
+        assert_eq!(workspace.default_branch().as_deref(), Some("develop"));
+
+        workspace
+            .repo
+            .config()
+            .unwrap()
+            .set_str("init.defaultBranch", "release")
+            .unwrap();
+        workspace
+            .repo
+            .reference("refs/remotes/origin/release", head.id(), false, "test")
+            .unwrap();
+        assert_eq!(
+            workspace.default_branch().as_deref(),
+            Some("release"),
+            "a configured default that exists only on origin still counts"
+        );
+
+        workspace
+            .repo
+            .config()
+            .unwrap()
+            .set_str("init.defaultBranch", "develop")
+            .unwrap();
+        workspace
+            .repo
+            .reference("refs/remotes/origin/main", head.id(), false, "test")
+            .unwrap();
+        assert_eq!(
+            workspace.default_branch().as_deref(),
+            Some("main"),
+            "a branch origin has beats a local-only configured default"
+        );
+    }
+
+    #[test]
     fn a_discard_waits_out_a_brief_index_lock() {
         let (_temp, workspace, _) = two_saves();
         write_file(workspace.root(), "plan.sk", b"edit");
@@ -12098,8 +12219,8 @@ mod tests {
         workspace.save_version("Third").unwrap();
 
         let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(head.summary(), Some("Third"));
-        assert_eq!(head.parent(0).unwrap().summary(), Some("dev"));
+        assert_eq!(head.summary().unwrap(), Some("Third"));
+        assert_eq!(head.parent(0).unwrap().summary().unwrap(), Some("dev"));
         let tree = head.tree().unwrap();
         assert!(tree.get_name("code.rs").is_some(), "keeps the dev commit");
         let plan = workspace
@@ -12226,7 +12347,7 @@ mod tests {
         assert!(matches!(error, DraftlineError::GitIndexLocked), "{error:?}");
         assert!(workspace.recovery_state().unwrap().is_some());
         let head = workspace.repo.head().unwrap();
-        assert_eq!(head.name(), Some("refs/heads/twin"));
+        assert_eq!(head.name().ok(), Some("refs/heads/twin"));
     }
 
     #[test]
@@ -12337,7 +12458,7 @@ mod tests {
             Err(DraftlineError::LocalStateChanged { .. })
         ));
         let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(head.summary(), Some("dev"));
+        assert_eq!(head.summary().unwrap(), Some("dev"));
     }
 
     #[test]

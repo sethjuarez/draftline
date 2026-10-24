@@ -258,7 +258,7 @@ fn project_folder_in_linked_worktree_scopes_to_worktree() {
         .get()
         .peel_to_commit()
         .unwrap();
-    assert_eq!(session_tip.summary(), Some("Worktree save"));
+    assert_eq!(session_tip.summary().unwrap(), Some("Worktree save"));
 }
 
 #[test]
@@ -663,7 +663,7 @@ fn restore_and_switch_never_write_lfs_pointers_over_real_files() {
 
     assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene two\n");
     assert_eq!(repo.head().unwrap().target(), head);
-    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert_eq!(repo.head().unwrap().shorthand().ok(), Some("main"));
     workspace
         .preflight_discard_changes()
         .expect("no pending recovery");
@@ -704,7 +704,7 @@ fn switch_refuses_a_branch_whose_own_rules_put_a_file_in_lfs() {
 
     assert!(is_filter_refusal(error));
     assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one\n");
-    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert_eq!(repo.head().unwrap().shorthand().ok(), Some("main"));
     workspace
         .preflight_discard_changes()
         .expect("no pending recovery");
@@ -890,8 +890,12 @@ fn saves_log_the_saver_in_the_reflog_like_git_commit() {
     for name in ["HEAD", "refs/heads/main"] {
         let reflog = repo.reflog(name).unwrap();
         let entry = reflog.get(0).unwrap();
-        assert_eq!(entry.message(), Some("commit: Revise intro"), "{name}");
-        assert_eq!(entry.committer().name(), Some("Bea"), "{name}");
+        assert_eq!(
+            entry.message().unwrap(),
+            Some("commit: Revise intro"),
+            "{name}"
+        );
+        assert_eq!(entry.committer().name().ok(), Some("Bea"), "{name}");
         assert_eq!(entry.id_new(), head_id(&repo), "{name}");
     }
 }
@@ -1557,7 +1561,7 @@ fn send_from_the_default_branch_moves_work_to_a_new_branch_and_opens_a_pull_requ
     assert_eq!(host.open[0].0.head, "cutready/revise-intro-for-q3");
     assert_eq!(host.open[0].0.title, "Revise intro for Q3!");
     assert_eq!(
-        repo.head().unwrap().shorthand(),
+        repo.head().unwrap().shorthand().ok(),
         Some("cutready/revise-intro-for-q3")
     );
     assert_eq!(
@@ -1673,7 +1677,7 @@ fn send_refuses_unsaved_project_changes_before_creating_a_branch() {
         matches!(error, DraftlineError::PreflightFailed(_)),
         "{error:?}"
     );
-    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert_eq!(repo.head().unwrap().shorthand().ok(), Some("main"));
     assert!(repo.find_branch("draft", git2::BranchType::Local).is_err());
 }
 
@@ -1685,8 +1689,8 @@ fn send_needs_a_known_base_branch() {
     repo.remote("origin", bare.path().to_str().unwrap())
         .unwrap();
     let head = repo.head().unwrap().peel_to_commit().unwrap();
-    repo.branch("trunk", &head, false).unwrap();
-    repo.set_head("refs/heads/trunk").unwrap();
+    repo.branch("release-train", &head, false).unwrap();
+    repo.set_head("refs/heads/release-train").unwrap();
     repo.find_branch("main", git2::BranchType::Local)
         .unwrap()
         .delete()
@@ -1705,6 +1709,84 @@ fn send_needs_a_known_base_branch() {
         matches!(error, DraftlineError::SendBaseUnknown),
         "{error:?}"
     );
+}
+
+#[test]
+fn send_refuses_a_base_the_remote_lacks_before_changing_anything() {
+    let (temp, repo) = code_repo();
+    let bare = tempfile::tempdir().unwrap();
+    git2::Repository::init_bare(bare.path()).unwrap();
+    repo.remote("origin", bare.path().to_str().unwrap())
+        .unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, for review\n");
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    workspace.save_version("Revise intro").unwrap();
+    let mut host = FakeHost::default();
+
+    // An empty remote advertises no refs; git2 0.20 aborted listing them.
+    let error = workspace
+        .send(
+            "origin",
+            &send_request("Revise intro"),
+            &mut host,
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(&error, DraftlineError::SendBaseNotOnRemote(base) if base == "main"),
+        "{error:?}"
+    );
+    assert!(host.open.is_empty());
+    assert_eq!(repo.head().unwrap().shorthand().ok(), Some("main"));
+    assert_eq!(repo.branches(None).unwrap().count(), 1, "no branch created");
+    assert!(git2::Repository::open_bare(bare.path())
+        .unwrap()
+        .references()
+        .unwrap()
+        .next()
+        .is_none());
+}
+
+#[test]
+fn send_targets_a_default_branch_the_remote_has() {
+    let (temp, repo) = code_repo();
+    let bare = tempfile::tempdir().unwrap();
+    git2::Repository::init_bare(bare.path()).unwrap();
+    repo.remote("origin", bare.path().to_str().unwrap())
+        .unwrap()
+        .push(&["refs/heads/main:refs/heads/master"], None)
+        .unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, for review\n");
+    let workspace = scoped(&temp);
+    workspace.save_version("Revise intro").unwrap();
+    let send = |workspace: &draftline::Workspace| {
+        workspace
+            .send(
+                "origin",
+                &send_request("Revise intro"),
+                &mut FakeHost::default(),
+                &mut RemoteOptions::new(),
+            )
+            .unwrap()
+            .base
+    };
+
+    assert_eq!(
+        send(&workspace),
+        "master",
+        "local main is not on the remote"
+    );
+
+    repo.find_remote("origin")
+        .unwrap()
+        .push(&["refs/heads/main:refs/heads/develop"], None)
+        .unwrap();
+    repo.config()
+        .unwrap()
+        .set_str("init.defaultBranch", "develop")
+        .unwrap();
+    assert_eq!(send(&workspace), "develop");
 }
 
 #[test]
@@ -1794,7 +1876,7 @@ fn namespaced_workspace_leaves_developer_branches_alone() {
         .is_err());
     assert!(remote_branch(bare.path(), "feature/login").is_some());
     assert_eq!(
-        repo.head().unwrap().shorthand(),
+        repo.head().unwrap().shorthand().ok(),
         Some("main"),
         "nothing switched"
     );
@@ -2284,7 +2366,7 @@ fn owned_worktree_starts_from_the_latest_base_and_leaves_this_checkout_alone() {
     assert_eq!(owned.project_path, owned.path.join("cutready"));
     assert_eq!(read(&owned.path, "cutready/outro.sk"), "outro on main\n");
 
-    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert_eq!(repo.head().unwrap().shorthand().ok(), Some("main"));
     assert_eq!(repo.head().unwrap().target().unwrap(), head_before);
     assert!(status(&repo, "src/main.rs").contains(git2::Status::INDEX_MODIFIED));
 

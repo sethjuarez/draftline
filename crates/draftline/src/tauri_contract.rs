@@ -2751,6 +2751,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::RemoteOperationTimedOut { .. } => "remote_operation_timed_out",
         DraftlineError::InvalidMergeResolution(_) => "invalid_merge_resolution",
         DraftlineError::SendBaseUnknown => "send_base_unknown",
+        DraftlineError::SendBaseNotOnRemote(_) => "send_base_not_on_remote",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::VariationOutsideNamespace(_) => "variation_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
