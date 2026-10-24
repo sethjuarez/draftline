@@ -96,7 +96,8 @@ pub use profile::{
     default_git_identity, AttributionOperation, ContributorProfile, ContributorProvider,
 };
 pub use pull_request::{
-    PullRequest, PullRequestProvider, PullRequestRequest, SendRequest, SendResult,
+    DeveloperCommit, PullRequest, PullRequestProvider, PullRequestRequest, SendPreflight,
+    SendRequest, SendResult,
 };
 pub use recovery::{RecoveryOperation, RecoveryState};
 pub use remote::{

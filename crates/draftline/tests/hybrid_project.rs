@@ -2255,6 +2255,117 @@ fn send_hands_a_stale_local_base_back_to_the_fresh_upstream() {
     assert_eq!(repo.refname_to_id("refs/heads/main").unwrap(), fresh);
 }
 
+#[test]
+fn send_refuses_to_carry_a_developers_unpushed_base_commits() {
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+    let upstream = remote_branch(bare.path(), "main").unwrap();
+    write_file(temp.path(), "src/secret.rs", "pub fn unreleased() {}\n");
+    let developer = commit_all(&repo, "Unreleased developer work");
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "pitch\n");
+    workspace.save_version("Pitch").unwrap();
+    let local_main = repo.refname_to_id("refs/heads/main").unwrap();
+
+    let preflight = workspace
+        .preflight_send("origin", &send_request("Pitch"), &mut RemoteOptions::new())
+        .unwrap();
+    assert!(!preflight.can_proceed);
+    assert!(preflight.creates_variation);
+    assert_eq!(preflight.variation, "cutready/pitch");
+    assert_eq!(preflight.outgoing_versions, 2);
+    assert_eq!(preflight.developer_commits.len(), 1);
+    assert_eq!(preflight.developer_commits[0].id, developer.to_string());
+    assert_eq!(
+        preflight.developer_commits[0].outside_paths,
+        vec![PathBuf::from("src/secret.rs")]
+    );
+
+    let mut host = FakeHost::default();
+    let error = workspace
+        .send(
+            "origin",
+            &send_request("Pitch"),
+            &mut host,
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+    match error {
+        DraftlineError::SendCarriesDeveloperCommits(commits) => {
+            assert_eq!(commits, preflight.developer_commits)
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(repo.head().unwrap().shorthand().ok(), Some("main"));
+    assert_eq!(repo.refname_to_id("refs/heads/main").unwrap(), local_main);
+    assert!(repo
+        .find_branch("cutready/pitch", git2::BranchType::Local)
+        .is_err());
+    assert_eq!(remote_branch(bare.path(), "main"), Some(upstream));
+    assert_eq!(remote_branch(bare.path(), "cutready/pitch"), None);
+    assert!(host.open.is_empty());
+
+    // Once the developer pushes (their push includes the save), nothing
+    // developer-owned is outgoing and Send proceeds.
+    push_main(&repo);
+    let preflight = workspace
+        .preflight_send("origin", &send_request("Pitch"), &mut RemoteOptions::new())
+        .unwrap();
+    assert!(preflight.can_proceed, "{preflight:?}");
+    assert!(preflight.developer_commits.is_empty());
+    workspace
+        .send(
+            "origin",
+            &send_request("Pitch"),
+            &mut host,
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn send_refuses_a_variation_started_on_unpushed_developer_work() {
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/x", &head, false).unwrap();
+    repo.set_head("refs/heads/feature/x").unwrap();
+    write_file(temp.path(), "src/feature.rs", "pub fn x() {}\n");
+    commit_all(&repo, "Feature x");
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    workspace.start_variation_here("cutready/x").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "x pitch\n");
+    workspace.save_version("X pitch").unwrap();
+
+    let error = workspace
+        .send(
+            "origin",
+            &send_request("X pitch"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&error, DraftlineError::SendCarriesDeveloperCommits(commits) if commits.len() == 1),
+        "{error:?}"
+    );
+    assert_eq!(remote_branch(bare.path(), "cutready/x"), None);
+}
+
+#[test]
+fn standalone_send_never_flags_developer_commits() {
+    let (temp, repo) = code_repo();
+    let (_bare, _other_dir, _other) = with_remote(&repo);
+    write_file(temp.path(), "src/main.rs", "fn main() { changed() }\n");
+    commit_all(&repo, "Whole-repo work");
+    let workspace = Workspace::open(temp.path()).unwrap();
+    let preflight = workspace
+        .preflight_send("origin", &send_request("All"), &mut RemoteOptions::new())
+        .unwrap();
+    assert!(preflight.developer_commits.is_empty(), "{preflight:?}");
+    assert!(preflight.can_proceed, "{preflight:?}");
+}
+
 fn tree_text(repo: &git2::Repository, rev: &str, relative: &str) -> Option<String> {
     let tree = repo.revparse_single(rev).unwrap().peel_to_tree().unwrap();
     let entry = tree.get_path(Path::new(relative)).ok()?;
@@ -2387,6 +2498,85 @@ fn bringing_in_the_latest_base_merges_everything_into_the_variation() {
     assert_eq!(read(temp.path(), "cutready/outro.sk"), "outro\n");
     assert_eq!(repo.refname_to_id("refs/heads/main").unwrap(), main_before);
     assert_eq!(workspace.base_status("origin").unwrap().behind, 0);
+
+    // The merge carries developer code, but only from the base: Send passes.
+    let sent = workspace
+        .send(
+            "origin",
+            &send_request("Pitch"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        remote_branch(bare.path(), "cutready/pitch"),
+        Some(head.id())
+    );
+    assert!(!sent.created_variation);
+}
+
+#[test]
+fn send_refuses_a_merge_that_resolves_code_outside_the_project() {
+    let (temp, repo) = code_repo();
+    let (bare, other_dir, other) = with_remote(&repo);
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "pitch\n");
+    workspace.save_version("Pitch").unwrap();
+    workspace
+        .send(
+            "origin",
+            &send_request("Pitch"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    let sent = remote_branch(bare.path(), "cutready/pitch").unwrap();
+    write_file(other_dir.path(), "src/lib.rs", "pub fn shared() {}\n");
+    commit_all(&other, "Teammate on main");
+    push_main(&other);
+    workspace.fetch_remote("origin").unwrap();
+
+    // A developer merges main by hand and edits code in the merge itself.
+    let ours = repo.head().unwrap().peel_to_commit().unwrap();
+    let theirs = repo
+        .find_commit(repo.refname_to_id("refs/remotes/origin/main").unwrap())
+        .unwrap();
+    let mut index = repo.merge_commits(&ours, &theirs, None).unwrap();
+    let blob = repo.blob(b"pub fn shared() { tweaked() }\n").unwrap();
+    let mut entry = index.get_path(Path::new("src/lib.rs"), 0).unwrap();
+    entry.id = blob;
+    entry.file_size = 0;
+    index.add(&entry).unwrap();
+    let tree = repo.find_tree(index.write_tree_to(&repo).unwrap()).unwrap();
+    let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+    let merge = repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Hand merge",
+            &tree,
+            &[&ours, &theirs],
+        )
+        .unwrap();
+
+    let error = workspace
+        .send(
+            "origin",
+            &send_request("Pitch"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+    match error {
+        DraftlineError::SendCarriesDeveloperCommits(commits) => {
+            assert_eq!(commits.len(), 1);
+            assert_eq!(commits[0].id, merge.to_string());
+            assert_eq!(commits[0].outside_paths, vec![PathBuf::from("src/lib.rs")]);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(remote_branch(bare.path(), "cutready/pitch"), Some(sent));
 }
 
 #[test]

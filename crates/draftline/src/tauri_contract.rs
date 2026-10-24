@@ -2879,6 +2879,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::WorkspaceAlreadyInCheckout(_) => "workspace_already_in_checkout",
         DraftlineError::InvalidWorkspaceClaim(_) => "invalid_workspace_claim",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
+        DraftlineError::SendCarriesDeveloperCommits(_) => "send_carries_developer_commits",
         DraftlineError::VariationOutsideNamespace(_) => "variation_outside_namespace",
         DraftlineError::BranchOutsideNamespace(_) => "branch_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
@@ -2919,6 +2920,9 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         }
         DraftlineError::BranchOutsideNamespace(branch) => {
             Some(serde_json::json!({ "branch": branch }))
+        }
+        DraftlineError::SendCarriesDeveloperCommits(commits) => {
+            Some(serde_json::json!({ "developer_commits": commits }))
         }
         DraftlineError::SyncNeedsMerge(status) => match serde_json::to_value(status.as_ref()) {
             Ok(value) => Some(value),

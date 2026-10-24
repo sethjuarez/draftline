@@ -12,7 +12,10 @@ use git2::{
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::merge::{MergeConflict, MergeInput, ResolverRegistry};
-use crate::pull_request::{PullRequestProvider, PullRequestRequest, SendRequest, SendResult};
+use crate::pull_request::{
+    DeveloperCommit, PullRequestProvider, PullRequestRequest, SendPreflight, SendRequest,
+    SendResult,
+};
 use crate::recovery::RecoveryOperation;
 use crate::remote::{ensure_supported_remote_url, PushRefExpectation};
 use crate::worktree::{OwnedWorktree, WorktreeStart, OWNED_WORKTREE_PREFIX};
@@ -1272,6 +1275,19 @@ struct IncomingMergeInput<'repo> {
 struct CleanMergePlan {
     files: Vec<MergeFileChange>,
     conflicts: Vec<MergeConflict>,
+}
+
+struct SendTarget {
+    base: String,
+    advertised: HashSet<String>,
+    current: String,
+}
+
+/// The branch and commit Send checked, which publishing must still find.
+struct SendGuard<'a> {
+    head: git2::Oid,
+    base: &'a str,
+    variation: &'a str,
 }
 
 struct MergeFileChange {
@@ -7317,6 +7333,23 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<()> {
         let variation = self.current_variation_unchecked()?;
+        self.push_variation_with_lease(
+            remote_name,
+            &variation,
+            expected_old_oid,
+            expected_new_oid,
+            options,
+        )
+    }
+
+    fn push_variation_with_lease(
+        &self,
+        remote_name: &str,
+        variation: &str,
+        expected_old_oid: Option<String>,
+        expected_new_oid: String,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<()> {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
         let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
@@ -7655,33 +7688,31 @@ impl Workspace {
     ) -> Result<SendResult> {
         self.ensure_no_pending_recovery()?;
         let remote = remote.as_ref();
-        let explicit = match &request.base {
-            Some(base) => Some(validate_variation_name(base)?),
-            None => None,
-        };
-        let advertised = self.remote_advertised_branches(remote, options)?;
-        let base = match explicit {
-            Some(base) => base,
-            None => match self.default_branch_on(remote) {
-                Some(base) if advertised.contains(&base) => base,
-                inferred => self
-                    .default_branch_candidates()
-                    .into_iter()
-                    .find(|name| advertised.contains(name))
-                    .or(inferred)
-                    .ok_or(DraftlineError::SendBaseUnknown)?,
-            },
-        };
-        if !advertised.contains(&base) {
-            return Err(DraftlineError::SendBaseNotOnRemote(base));
+        let target = self.resolve_send_target(remote, request, options)?;
+        let SendTarget {
+            base,
+            advertised,
+            current,
+        } = target;
+        // Every later step works on this exact commit, so a developer commit
+        // landing mid-send is never carried unscanned.
+        let scanned = self.repo.head().ok().and_then(|head| head.target());
+        let developer_commits = self.developer_commits_to_send(remote, &base, &current, scanned)?;
+        if !developer_commits.is_empty() {
+            return Err(DraftlineError::SendCarriesDeveloperCommits(
+                developer_commits,
+            ));
         }
-        let current = self.current_variation_unchecked()?;
-        if let Some(namespace) = &self.variation_namespace {
-            if current != base && !current.starts_with(namespace.as_str()) {
-                return Err(DraftlineError::SendOutsideNamespace(current));
+        let ensure_unmoved = || -> Result<git2::Oid> {
+            let actual = self.repo.head().ok().and_then(|head| head.target());
+            match (scanned, actual) {
+                (Some(expected), Some(actual)) if expected == actual => Ok(expected),
+                _ => Err(DraftlineError::LocalStateChanged {
+                    expected: scanned.map(|oid| oid.to_string()).unwrap_or_default(),
+                    actual: actual.map(|oid| oid.to_string()).unwrap_or_default(),
+                }),
             }
-        }
-        self.fetch_remote_variation_ref(remote, &base, options)?;
+        };
 
         let mut created_variation = false;
         let variation = if current == base {
@@ -7695,22 +7726,8 @@ impl Workspace {
             if !report.can_proceed {
                 return Err(DraftlineError::PreflightFailed(Box::new(report)));
             }
-            let taken = |name: &str| {
-                self.repo.find_branch(name, BranchType::Local).is_ok() || advertised.contains(name)
-            };
-            let name = match &request.branch {
-                Some(name) => validate_variation_name(name)?,
-                None => self.unused_send_branch_name(&request.title, taken)?,
-            };
-            if let Some(namespace) = &self.variation_namespace {
-                if !name.starts_with(namespace.as_str()) {
-                    return Err(DraftlineError::SendOutsideNamespace(name));
-                }
-            }
-            if taken(&name) {
-                return Err(DraftlineError::VariationAlreadyExists(name));
-            }
-            let head = self.repo.head()?.peel_to_commit()?;
+            let name = self.new_send_branch_name(request, &advertised)?;
+            let head = self.repo.find_commit(ensure_unmoved()?)?;
             let mut branch = self.repo.branch(&name, &head, false)?;
             let switched = (|| -> Result<()> {
                 if !request.title.trim().is_empty() {
@@ -7744,7 +7761,15 @@ impl Workspace {
             }
             _ => None,
         };
-        let published = self.publish_changes_with_options(remote, options)?;
+        let published = self.publish_changes_expecting(
+            remote,
+            options,
+            Some(SendGuard {
+                head: ensure_unmoved()?,
+                base: &base,
+                variation: &variation,
+            }),
+        )?;
         let published_versions = base_ahead.unwrap_or(published.published_versions);
         if self
             .repo
@@ -7778,6 +7803,199 @@ impl Workspace {
             pull_request,
             created_pull_request,
         })
+    }
+
+    /// Checks what [`Self::send`] would do without pushing, creating a branch,
+    /// or moving the base. It refreshes the base's remote-tracking ref. Lists
+    /// developer commits Send would refuse to carry, so a host can explain
+    /// the refusal before the user clicks Send.
+    pub fn preflight_send(
+        &self,
+        remote: impl AsRef<str>,
+        request: &SendRequest,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<SendPreflight> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref();
+        let SendTarget {
+            base,
+            advertised,
+            current,
+        } = self.resolve_send_target(remote, request, options)?;
+        let creates_variation = current == base;
+        let variation = if creates_variation {
+            self.new_send_branch_name(request, &advertised)?
+        } else {
+            current.clone()
+        };
+        let head = self.repo.head().ok().and_then(|head| head.target());
+        let developer_commits = self.developer_commits_to_send(remote, &base, &current, head)?;
+        let has_unsaved_changes = !self.changed_files_unchecked()?.is_empty();
+        let outgoing_versions = match self
+            .repo
+            .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
+        {
+            Ok(base_oid) => match head {
+                Some(head) => self.repo.graph_ahead_behind(head, base_oid)?.0,
+                None => 0,
+            },
+            Err(_) => 0,
+        };
+        let can_proceed = developer_commits.is_empty() && !has_unsaved_changes;
+        Ok(SendPreflight {
+            remote: remote.to_string(),
+            base,
+            variation,
+            creates_variation,
+            outgoing_versions,
+            has_unsaved_changes,
+            developer_commits,
+            can_proceed,
+        })
+    }
+
+    /// Resolves Send's base, enforces the variation namespace, and refreshes
+    /// the base's and current variation's remote-tracking refs.
+    fn resolve_send_target(
+        &self,
+        remote: &str,
+        request: &SendRequest,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<SendTarget> {
+        let explicit = match &request.base {
+            Some(base) => Some(validate_variation_name(base)?),
+            None => None,
+        };
+        let advertised = self.remote_advertised_branches(remote, options)?;
+        let base = match explicit {
+            Some(base) => base,
+            None => match self.default_branch_on(remote) {
+                Some(base) if advertised.contains(&base) => base,
+                inferred => self
+                    .default_branch_candidates()
+                    .into_iter()
+                    .find(|name| advertised.contains(name))
+                    .or(inferred)
+                    .ok_or(DraftlineError::SendBaseUnknown)?,
+            },
+        };
+        if !advertised.contains(&base) {
+            return Err(DraftlineError::SendBaseNotOnRemote(base));
+        }
+        let current = self.current_variation_unchecked()?;
+        if let Some(namespace) = &self.variation_namespace {
+            if current != base && !current.starts_with(namespace.as_str()) {
+                return Err(DraftlineError::SendOutsideNamespace(current));
+            }
+        }
+        self.fetch_remote_variation_ref(remote, &base, options)?;
+        if current != base && advertised.contains(&current) {
+            self.fetch_remote_variation_ref(remote, &current, options)?;
+        }
+        Ok(SendTarget {
+            base,
+            advertised,
+            current,
+        })
+    }
+
+    /// The branch Send creates when run on the base branch.
+    fn new_send_branch_name(
+        &self,
+        request: &SendRequest,
+        advertised: &HashSet<String>,
+    ) -> Result<String> {
+        let taken = |name: &str| {
+            self.repo.find_branch(name, BranchType::Local).is_ok() || advertised.contains(name)
+        };
+        let name = match &request.branch {
+            Some(name) => validate_variation_name(name)?,
+            None => self.unused_send_branch_name(&request.title, taken)?,
+        };
+        if let Some(namespace) = &self.variation_namespace {
+            if !name.starts_with(namespace.as_str()) {
+                return Err(DraftlineError::SendOutsideNamespace(name));
+            }
+        }
+        if taken(&name) {
+            return Err(DraftlineError::VariationAlreadyExists(name));
+        }
+        Ok(name)
+    }
+
+    /// Commits Send would push that change files outside the project folder.
+    /// Outgoing means reachable from `head` but not from the remote base or
+    /// the variation's own remote-tracking ref. Draftline saves only touch the
+    /// folder. A merge is listed only for outside paths that match none of its
+    /// parents (a hand-made resolution), so Draftline's merges of the base
+    /// pass. Anything listed is a developer's work. Standalone projects own
+    /// the whole repository.
+    fn developer_commits_to_send(
+        &self,
+        remote: &str,
+        base: &str,
+        variation: &str,
+        head: Option<git2::Oid>,
+    ) -> Result<Vec<DeveloperCommit>> {
+        const MAX_PATHS: usize = 20;
+        let scope = self.scope();
+        if scope.as_os_str().is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(head) = head else {
+            return Ok(Vec::new());
+        };
+        let mut walk = self.repo.revwalk()?;
+        walk.push(head)?;
+        for name in [base, variation] {
+            if let Ok(oid) = self
+                .repo
+                .refname_to_id(&format!("refs/remotes/{remote}/{name}"))
+            {
+                walk.hide(oid)?;
+            }
+        }
+        let outside_changes =
+            |from: Option<&git2::Tree<'_>>, to: &git2::Tree<'_>| -> Result<BTreeSet<PathBuf>> {
+                let diff = self.repo.diff_tree_to_tree(from, Some(to), None)?;
+                Ok(diff
+                    .deltas()
+                    .flat_map(|delta| [delta.old_file().path(), delta.new_file().path()])
+                    .flatten()
+                    .filter(|path| !path.starts_with(scope))
+                    .map(Path::to_path_buf)
+                    .collect())
+            };
+        let mut found = Vec::new();
+        for oid in walk {
+            let commit = self.repo.find_commit(oid?)?;
+            let tree = commit.tree()?;
+            let mut outside: Option<BTreeSet<PathBuf>> = None;
+            if commit.parent_count() == 0 {
+                outside = Some(outside_changes(None, &tree)?);
+            }
+            for parent in commit.parents() {
+                let changed = outside_changes(Some(&parent.tree()?), &tree)?;
+                outside = Some(match outside {
+                    None => changed,
+                    Some(previous) => previous.intersection(&changed).cloned().collect(),
+                });
+            }
+            let outside = outside.unwrap_or_default();
+            if !outside.is_empty() {
+                found.push(DeveloperCommit {
+                    id: commit.id().to_string(),
+                    summary: commit
+                        .summary()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        .to_string(),
+                    outside_paths: outside.into_iter().take(MAX_PATHS).collect(),
+                });
+            }
+        }
+        Ok(found)
     }
 
     /// Creates a separate checkout under `worktrees_dir` on a new branch named
@@ -8176,6 +8394,18 @@ impl Workspace {
         remote: impl AsRef<str>,
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishResult> {
+        self.publish_changes_expecting(remote.as_ref(), options, None)
+    }
+
+    /// Publishes. Send passes a [`SendGuard`]: the branch and commit it checked
+    /// must still be checked out after this fetch, are rescanned for developer
+    /// commits, and exactly that commit is pushed to that branch.
+    fn publish_changes_expecting(
+        &self,
+        remote: &str,
+        options: &mut RemoteOptions<'_>,
+        send_guard: Option<SendGuard<'_>>,
+    ) -> Result<PublishResult> {
         self.ensure_no_pending_recovery()?;
         let report = preflight_report(
             "publish_changes",
@@ -8189,8 +8419,35 @@ impl Workspace {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
 
-        let remote_name = remote.as_ref().to_string();
+        let remote_name = remote.to_string();
         self.fetch_remote_unchecked(&remote_name, options)?;
+        if let Some(guard) = &send_guard {
+            let current = self.current_variation_unchecked()?;
+            let actual = self
+                .repo
+                .refname_to_id(&format!("refs/heads/{current}"))
+                .ok();
+            if current != guard.variation || actual != Some(guard.head) {
+                return Err(DraftlineError::LocalStateChanged {
+                    expected: format!("{}@{}", guard.variation, guard.head),
+                    actual: format!(
+                        "{current}@{}",
+                        actual.map(|oid| oid.to_string()).unwrap_or_default()
+                    ),
+                });
+            }
+            let developer_commits = self.developer_commits_to_send(
+                &remote_name,
+                guard.base,
+                guard.variation,
+                Some(guard.head),
+            )?;
+            if !developer_commits.is_empty() {
+                return Err(DraftlineError::SendCarriesDeveloperCommits(
+                    developer_commits,
+                ));
+            }
+        }
         let status = self.sync_status(&remote_name)?;
         if matches!(
             status.state,
@@ -8199,9 +8456,21 @@ impl Workspace {
             return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
         }
 
-        let variation = self.current_variation_unchecked()?;
+        let variation = match &send_guard {
+            Some(guard) => guard.variation.to_string(),
+            None => self.current_variation_unchecked()?,
+        };
         if status.ahead > 0 {
-            let push_result = self.push_current_variation_with_options(&remote_name, options);
+            let push_result = match &send_guard {
+                None => self.push_current_variation_with_options(&remote_name, options),
+                Some(guard) => self.push_variation_with_lease(
+                    &remote_name,
+                    guard.variation,
+                    remote_tracking_oid(&self.repo, &remote_name, guard.variation),
+                    guard.head.to_string(),
+                    options,
+                ),
+            };
             if let Err(error) = push_result {
                 self.fetch_remote_unchecked(&remote_name, options)?;
                 let refreshed = self.sync_status(&remote_name)?;

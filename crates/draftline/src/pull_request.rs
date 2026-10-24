@@ -62,3 +62,31 @@ pub struct SendResult {
     /// `false` when an already-open pull request was reused.
     pub created_pull_request: bool,
 }
+
+/// A commit Send would push that changes files outside the project folder:
+/// a developer's work, not the business user's. Send refuses to carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeveloperCommit {
+    pub id: String,
+    pub summary: String,
+    /// Up to the first 20 paths it changes outside the project folder.
+    pub outside_paths: Vec<std::path::PathBuf>,
+}
+
+/// What [`crate::Workspace::send`] would do, checked without pushing,
+/// creating a branch, or moving the base.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendPreflight {
+    pub remote: String,
+    pub base: String,
+    /// The branch Send would push: the current one, or the one it would create.
+    pub variation: String,
+    pub creates_variation: bool,
+    /// Commits the base on the remote doesn't have yet.
+    pub outgoing_versions: usize,
+    /// Unsaved project changes; Send refuses them on the base branch.
+    pub has_unsaved_changes: bool,
+    /// Developer commits Send would carry; Send refuses while any are listed.
+    pub developer_commits: Vec<DeveloperCommit>,
+    pub can_proceed: bool,
+}
