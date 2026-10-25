@@ -11853,7 +11853,8 @@ impl Workspace {
                     .flatten()?
                     .strip_prefix(prefix.as_str())
                     .map(str::to_string)
-            });
+            })
+            .or_else(|| self.vanished_default_branch(remote, name, &head));
         let previous = match known {
             Some(old) if old != head => Some(old),
             _ => existing.as_ref().and_then(|entry| entry.previous.clone()),
@@ -11878,6 +11879,43 @@ impl Workspace {
         fs::write(&temp, serde_json::to_vec_pretty(&entry)?)?;
         replace_file(&temp, &path)?;
         Ok(())
+    }
+
+    /// With no earlier record of the remote's default, the old name is a
+    /// local default-named branch that tracks a branch of the same name the
+    /// remote no longer advertises.
+    fn vanished_default_branch(
+        &self,
+        remote: &git2::Remote<'_>,
+        name: &str,
+        head: &str,
+    ) -> Option<String> {
+        let advertised: BTreeSet<String> = remote
+            .list()
+            .ok()?
+            .iter()
+            .map(|entry| entry.name().to_string())
+            .collect();
+        self.default_branch_candidates().into_iter().find(|old| {
+            let merge = format!("refs/heads/{old}");
+            old != head
+                && !advertised.contains(&merge)
+                && self.repo.find_branch(old, BranchType::Local).is_ok()
+                && self
+                    .repo
+                    .branch_upstream_remote(&merge)
+                    .ok()
+                    .and_then(|buf| buf.as_str().map(str::to_string).ok())
+                    .as_deref()
+                    == Some(name)
+                && self
+                    .repo
+                    .branch_upstream_merge(&merge)
+                    .ok()
+                    .and_then(|buf| buf.as_str().map(str::to_string).ok())
+                    .as_deref()
+                    == Some(merge.as_str())
+        })
     }
 
     /// The base's old name when the remote renamed its default branch and a

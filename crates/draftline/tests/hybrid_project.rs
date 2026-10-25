@@ -2988,6 +2988,67 @@ fn a_renamed_default_branch_is_followed_and_saves_on_the_old_one_can_move() {
 }
 
 #[test]
+fn a_rename_is_noticed_without_origin_head_or_an_earlier_fetch() {
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+    // As `git push -u origin main` leaves it: an upstream, no origin/HEAD.
+    let mut config = repo.config().unwrap();
+    config.set_str("branch.main.remote", "origin").unwrap();
+    config
+        .set_str("branch.main.merge", "refs/heads/main")
+        .unwrap();
+    let _ = repo
+        .find_reference("refs/remotes/origin/HEAD")
+        .map(|mut head| head.delete().unwrap());
+
+    let remote = git2::Repository::open_bare(bare.path()).unwrap();
+    let tip = remote.refname_to_id("refs/heads/main").unwrap();
+    remote
+        .reference("refs/heads/trunk", tip, false, "rename")
+        .unwrap();
+    remote.set_head("refs/heads/trunk").unwrap();
+    remote
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .delete()
+        .unwrap();
+
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    workspace.fetch_remote("origin").unwrap();
+    let status = workspace.base_status("origin").unwrap();
+    assert_eq!(status.variation, "trunk");
+    assert_eq!(status.base_renamed_from.as_deref(), Some("main"));
+}
+
+#[test]
+fn a_still_advertised_branch_is_not_a_rename() {
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+    let mut config = repo.config().unwrap();
+    config.set_str("branch.main.remote", "origin").unwrap();
+    config
+        .set_str("branch.main.merge", "refs/heads/main")
+        .unwrap();
+    let _ = repo
+        .find_reference("refs/remotes/origin/HEAD")
+        .map(|mut head| head.delete().unwrap());
+    // The remote's default is trunk, but main is still there.
+    let remote = git2::Repository::open_bare(bare.path()).unwrap();
+    let tip = remote.refname_to_id("refs/heads/main").unwrap();
+    remote
+        .reference("refs/heads/trunk", tip, false, "new default")
+        .unwrap();
+    remote.set_head("refs/heads/trunk").unwrap();
+
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    workspace.fetch_remote("origin").unwrap();
+    assert_eq!(
+        workspace.base_status("origin").unwrap().base_renamed_from,
+        None
+    );
+}
+
+#[test]
 fn bringing_in_the_latest_base_merges_everything_into_the_variation() {
     let (temp, repo) = code_repo();
     let (bare, other_dir, other) = with_remote(&repo);

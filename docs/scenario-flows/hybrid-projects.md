@@ -123,8 +123,8 @@ Business goal: "GitHub renamed `master` to `main`; my sends must follow, and my 
 |---|---|
 | Covered today? | Covered. |
 | Correct primitive path | Any fetch (`fetch_remote`, `fetch_all_variations`) or Send records the default branch the remote advertises. `base_status` and Send then target the new name. While a local branch still has the old name, `base_status` reports it in `base_renamed_from` (client `SyncStatus.base_renamed_from`). Saves still land on the old local branch, and Send moves them to a namespaced branch aimed at the new base. |
-| Safety behavior | The advertised default is cached per remote in the repository's Git directory (`draftline/remotes/`, shared by worktrees) and ignored once the remote's URL changes. Draftline never rewrites `refs/remotes/<remote>/HEAD`, renames, or deletes the old local branch; removing it is the developer's call, and the report clears once it is gone. Offline, the last recorded default is used. |
-| Tests | `a_renamed_default_branch_is_followed_and_saves_on_the_old_one_can_move`. |
+| Safety behavior | The advertised default is cached per remote in the repository's Git directory (`draftline/remotes/`, shared by worktrees) and ignored once the remote's URL changes. Draftline never rewrites `refs/remotes/<remote>/HEAD`, renames, or deletes the old local branch; removing it is the developer's call, and the report clears once it is gone. With no earlier record and no `refs/remotes/<remote>/HEAD` (for example after `git init` and `git push -u`), the old name is a local `main`, `master`, `trunk`, or `init.defaultBranch` branch whose upstream is a same-named branch the remote no longer advertises. Offline, the last recorded default is used. |
+| Tests | `a_renamed_default_branch_is_followed_and_saves_on_the_old_one_can_move`, `a_rename_is_noticed_without_origin_head_or_an_earlier_fetch`, `a_still_advertised_branch_is_not_a_rename`. |
 
 ## Flow 15i: Git LFS in a developer's repo
 
