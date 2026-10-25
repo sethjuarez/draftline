@@ -1310,13 +1310,13 @@ fn scoped_versions_skip_developer_commits_outside_the_project() {
 }
 
 #[test]
-fn scoped_history_rewrites_parents_across_hidden_commits_and_pins_head() {
+fn scoped_history_lists_teammates_commits_and_flags_project_changes() {
     let (temp, repo) = code_repo();
     let workspace = scoped(&temp);
     let initial = repo.head().unwrap().target().unwrap();
 
     write_file(temp.path(), "src/main.rs", "fn main() { a() }\n");
-    commit_all(&repo, "Dev: a");
+    let dev_a = commit_all(&repo, "Dev: a");
     write_file(temp.path(), "cutready/intro.sk", "scene one, revised\n");
     workspace.save_version("BU revise").unwrap();
     let save = repo.head().unwrap().target().unwrap();
@@ -1335,12 +1335,21 @@ fn scoped_history_rewrites_parents_across_hidden_commits_and_pins_head() {
         .collect::<Vec<_>>();
     assert_eq!(
         ids,
-        [dev_tip.to_string(), save.to_string(), initial.to_string()]
+        [
+            dev_tip.to_string(),
+            save.to_string(),
+            dev_a.to_string(),
+            initial.to_string()
+        ]
     );
-    assert!(
-        history[0].is_head,
-        "HEAD stays visible even when it is code-only"
+    assert_eq!(
+        history
+            .iter()
+            .map(|entry| entry.touches_project)
+            .collect::<Vec<_>>(),
+        [false, true, false, true]
     );
+    assert!(history[0].is_head);
     let parents = |index: usize| {
         history[index]
             .parent_ids
@@ -1349,30 +1358,31 @@ fn scoped_history_rewrites_parents_across_hidden_commits_and_pins_head() {
             .collect::<Vec<_>>()
     };
     assert_eq!(parents(0), [save.to_string()]);
-    assert_eq!(parents(1), [initial.to_string()], "skips the hidden Dev: a");
-    assert!(parents(2).is_empty());
+    assert_eq!(parents(1), [dev_a.to_string()]);
+    assert!(parents(3).is_empty());
 
     let graph = workspace
         .workspace_graph(draftline::WorkspaceGraphOptions::default())
         .unwrap();
-    assert_eq!(graph.nodes.len(), 3);
+    assert_eq!(graph.nodes.len(), 4);
     let save_node = graph
         .nodes
         .iter()
         .find(|node| node.version.id().to_string() == save.to_string())
         .unwrap();
+    assert!(save_node.touches_project);
     assert_eq!(
         save_node
             .parent_version_ids
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
-        [initial.to_string()]
+        [dev_a.to_string()]
     );
 }
 
 #[test]
-fn scoped_history_follows_the_side_that_brought_project_changes_through_a_merge() {
+fn a_merge_that_only_brings_one_sides_project_changes_does_not_touch_the_project() {
     let (temp, repo) = code_repo();
     let workspace = scoped(&temp);
     let initial = repo.head().unwrap().peel_to_commit().unwrap();
@@ -1448,9 +1458,9 @@ fn scoped_history_follows_the_side_that_brought_project_changes_through_a_merge(
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
-        [initial.id().to_string(), feature.id().to_string()],
-        "the code-only first parent collapses to the last project version"
+        [code.id().to_string(), feature.id().to_string()]
     );
+    assert!(!head.touches_project);
 }
 
 #[test]
@@ -1621,10 +1631,9 @@ fn variation_namespace_hides_developer_branches() {
 }
 
 #[test]
-fn scoped_graph_ancestor_and_counts_skip_hidden_developer_commits() {
+fn scoped_graph_ancestor_and_counts_include_teammates_commits() {
     let (temp, repo) = code_repo();
     let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
-    let initial = repo.head().unwrap().target().unwrap();
     write_file(temp.path(), "src/main.rs", "fn main() { fork() }\n");
     let fork = repo
         .find_commit(commit_all(&repo, "Dev: fork point"))
@@ -1647,7 +1656,7 @@ fn scoped_graph_ancestor_and_counts_skip_hidden_developer_commits() {
         .unwrap()
         .common_ancestor
         .unwrap();
-    assert_eq!(ancestor.to_string(), initial.to_string());
+    assert_eq!(ancestor.to_string(), fork.id().to_string());
     let path = workspace
         .workspace_graph_path(
             left.id(),
@@ -1666,7 +1675,7 @@ fn scoped_graph_ancestor_and_counts_skip_hidden_developer_commits() {
         .collect::<Vec<_>>();
     assert_eq!(
         counts,
-        [("cutready/pitch".to_string(), 2), ("main".to_string(), 2)]
+        [("cutready/pitch".to_string(), 3), ("main".to_string(), 3)]
     );
 }
 

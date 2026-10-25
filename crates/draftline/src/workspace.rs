@@ -812,7 +812,8 @@ pub struct WorkspaceGraphBoundary {
     pub hidden_child_count: usize,
 }
 
-/// A graph-ready saved version node.
+/// A graph-ready commit node. In a project folder, `touches_project` is false
+/// for teammates' commits that don't change the folder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct WorkspaceGraphNode {
@@ -826,6 +827,10 @@ pub struct WorkspaceGraphNode {
     pub parent_ids: Vec<WorkspaceGraphNodeId>,
     pub parent_version_ids: Vec<VersionId>,
     pub variation_tips: Vec<VariationId>,
+    /// Whether this commit changes the project folder; see
+    /// [`HistoryEntry::touches_project`].
+    #[serde(default = "touches_project_by_default")]
+    pub touches_project: bool,
     pub is_head: bool,
     pub is_current: bool,
     pub is_tip: bool,
@@ -1073,6 +1078,16 @@ pub struct HistoryEntry {
     /// parents.  Merge commits have multiple parents, but Draftline
     /// discourages merge commits in favour of sequential saves.
     pub parent_ids: Vec<VersionId>,
+    /// `true` when this commit changes the project folder. In a project folder
+    /// inside a larger repository, teammates' commits that only touch other
+    /// files are listed too, with `false`; standalone workspaces are always
+    /// `true`.
+    #[serde(default = "touches_project_by_default")]
+    pub touches_project: bool,
+}
+
+fn touches_project_by_default() -> bool {
+    true
 }
 
 /// Per-variation snapshot with head version and total version count.
@@ -5425,6 +5440,11 @@ impl Workspace {
 
     /// Returns the version history for the current variation with variation-tip annotations.
     ///
+    /// Like `git log`, this lists every commit on the branch, including
+    /// teammates' commits that don't change the project folder; check
+    /// [`HistoryEntry::touches_project`]. [`Workspace::versions`] lists only
+    /// the commits that change the folder.
+    ///
     /// Each entry carries the version metadata plus the list of variation IDs
     /// whose tip commit is exactly that version — useful for rendering a branch
     /// graph or timeline where multiple variations share common ancestors.
@@ -5448,16 +5468,14 @@ impl Workspace {
             return Ok(Vec::new());
         }
 
-        let mut history = self.scoped_history(&tips);
+        let mut project = ProjectChanges::new(&self.repo, self.scope());
         let mut entries = Vec::new();
         for oid in walk {
             let commit = self.repo.find_commit(oid?)?;
-            if history.shows(&commit)? {
-                let parents = history.parents(&commit)?;
-                entries.push(history_entry_from_commit(
-                    &commit, &parents, &tips, head_oid,
-                )?);
-            }
+            let touches = project.touches(&commit)?;
+            entries.push(history_entry_from_commit(
+                &commit, touches, &tips, head_oid,
+            )?);
         }
         Ok(entries)
     }
@@ -5496,16 +5514,14 @@ impl Workspace {
             walk.push(tip)?;
         }
 
-        let mut history = self.scoped_history(&tips);
+        let mut project = ProjectChanges::new(&self.repo, self.scope());
         let mut entries = Vec::new();
         for oid in walk {
             let commit = self.repo.find_commit(oid?)?;
-            if history.shows(&commit)? {
-                let parents = history.parents(&commit)?;
-                entries.push(history_entry_from_commit(
-                    &commit, &parents, &tips, head_oid,
-                )?);
-            }
+            let touches = project.touches(&commit)?;
+            entries.push(history_entry_from_commit(
+                &commit, touches, &tips, head_oid,
+            )?);
         }
         Ok(entries)
     }
@@ -5623,25 +5639,18 @@ impl Workspace {
         let walk_result = (|| -> Result<()> {
             let mut walk = self.repo.revwalk()?;
             walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
-            let mut history = ScopedHistory::new(
-                &self.repo,
-                self.scope(),
-                push_oids.iter().copied().chain(head_oid),
-            );
+            let mut project = ProjectChanges::new(&self.repo, self.scope());
             for oid in push_oids {
                 walk.push(oid)?;
             }
             for oid in walk {
                 let oid = oid?;
                 let commit = self.repo.find_commit(oid)?;
-                if !history.shows(&commit)? {
-                    continue;
-                }
                 if total >= start && total < end {
-                    let parents = history.parents(&commit)?;
+                    let touches = project.touches(&commit)?;
                     nodes.push(workspace_graph_node_from_commit(
                         &commit,
-                        history_entry_from_commit(&commit, &parents, &tips, head_oid)?,
+                        history_entry_from_commit(&commit, touches, &tips, head_oid)?,
                         &local_reachable,
                         &remote_reachable,
                         &support_reachable,
@@ -6205,19 +6214,7 @@ impl Workspace {
             Err(error) if error.code() == git2::ErrorCode::NotFound => None,
             Err(error) => return Err(error.into()),
         };
-        // In a scoped workspace the merge base may be a hidden developer-only
-        // commit; report the nearest version the graph actually shows.
-        let common_ancestor = match merge_base {
-            Some(oid) => {
-                let mut tips = self.variation_tips_map()?;
-                tips.entry(left_oid).or_default();
-                tips.entry(right_oid).or_default();
-                self.scoped_history(&tips)
-                    .nearest_shown(oid)?
-                    .map(VersionId::from)
-            }
-            None => None,
-        };
+        let common_ancestor = merge_base.map(VersionId::from);
         Ok(WorkspaceGraphCommonAncestor {
             left_version: left.clone(),
             right_version: right.clone(),
@@ -6250,7 +6247,11 @@ impl Workspace {
             .filter(|graph_ref| graph_ref.target == node.id)
             .cloned()
             .collect::<Vec<_>>();
-        let changed_files = if let Some(parent) = node.parent_version_ids.first() {
+        // A commit that doesn't touch the project matches some parent's project
+        // tree, so it has no project changes even when it is a merge.
+        let changed_files = if !node.touches_project {
+            Vec::new()
+        } else if let Some(parent) = node.parent_version_ids.first() {
             self.diff_versions(parent, version)?.files
         } else {
             Vec::new()
@@ -6327,12 +6328,10 @@ impl Workspace {
                     let head_version = Some(version_from_commit(&tip));
                     let mut walk = self.repo.revwalk()?;
                     walk.push(tip.id())?;
-                    let mut history = ScopedHistory::new(&self.repo, self.scope(), [tip.id()]);
                     let mut count = 0;
                     for oid in walk {
-                        if history.shows(&self.repo.find_commit(oid?)?)? {
-                            count += 1;
-                        }
+                        oid?;
+                        count += 1;
                     }
                     (head_version, count)
                 }
@@ -10345,22 +10344,15 @@ impl Workspace {
         if walk.push_head().is_err() {
             return Ok(Vec::new());
         }
-        let mut history = ScopedHistory::new(&self.repo, self.scope(), []);
+        let mut project = ProjectChanges::new(&self.repo, self.scope());
         let mut versions = Vec::new();
         for oid in walk {
             let commit = self.repo.find_commit(oid?)?;
-            if history.shows(&commit)? {
+            if project.touches(&commit)? {
                 versions.push(version_from_commit(&commit));
             }
         }
         Ok(versions)
-    }
-
-    /// Path-limited history pinned to HEAD and every listed tip so labels stay
-    /// anchored even when a tip is a developer-only commit.
-    fn scoped_history(&self, tips: &HashMap<Oid, Vec<VariationId>>) -> ScopedHistory<'_> {
-        let head = self.repo.head().ok().and_then(|head| head.target());
-        ScopedHistory::new(&self.repo, self.scope(), tips.keys().copied().chain(head))
     }
 
     fn lists_variation(&self, name: &str, current: Option<&str>) -> bool {
@@ -11168,27 +11160,20 @@ fn signature_from_contributor(contributor: &Contributor) -> Result<Signature<'st
     Ok(Signature::now(name, email)?)
 }
 
-/// Path-limited history like `git log --parents -- <scope>`: in a scoped
-/// workspace only commits that change the project folder are shown (plus
-/// pinned ref tips), and parents are rewritten to the nearest shown ancestor,
-/// following the parent whose project folder is unchanged through merges.
-/// Unscoped workspaces show every commit with its real parents.
-struct ScopedHistory<'r> {
+/// Tells which commits change the project folder, like
+/// `git log -- <scope>`. In an unscoped workspace every commit does.
+struct ProjectChanges<'r> {
     repo: &'r Repository,
     scope: Option<PathBuf>,
-    pinned: HashSet<Oid>,
     scope_trees: HashMap<Oid, Option<Oid>>,
-    nearest: HashMap<Oid, Option<Oid>>,
 }
 
-impl<'r> ScopedHistory<'r> {
-    fn new(repo: &'r Repository, scope: &Path, pinned: impl IntoIterator<Item = Oid>) -> Self {
+impl<'r> ProjectChanges<'r> {
+    fn new(repo: &'r Repository, scope: &Path) -> Self {
         Self {
             repo,
             scope: (!scope.as_os_str().is_empty()).then(|| scope.to_path_buf()),
-            pinned: pinned.into_iter().collect(),
             scope_trees: HashMap::new(),
-            nearest: HashMap::new(),
         }
     }
 
@@ -11206,68 +11191,22 @@ impl<'r> ScopedHistory<'r> {
         Ok(id)
     }
 
-    /// The first parent whose project folder is identical to `commit`'s.
-    fn unchanged_parent(&mut self, scope: &Path, commit: &Commit<'_>) -> Result<Option<Oid>> {
-        let own = self.scope_tree(scope, commit.id())?;
-        for parent in commit.parent_ids() {
-            if self.scope_tree(scope, parent)? == own {
-                return Ok(Some(parent));
-            }
-        }
-        Ok(None)
-    }
-
-    fn shows(&mut self, commit: &Commit<'_>) -> Result<bool> {
+    /// A commit touches the folder unless some parent has an identical
+    /// folder; a merge that only takes one side's folder does not.
+    fn touches(&mut self, commit: &Commit<'_>) -> Result<bool> {
         let Some(scope) = self.scope.clone() else {
             return Ok(true);
         };
-        if self.pinned.contains(&commit.id()) {
-            return Ok(true);
-        }
+        let own = self.scope_tree(&scope, commit.id())?;
         if commit.parent_count() == 0 {
-            return Ok(self.scope_tree(&scope, commit.id())?.is_some());
+            return Ok(own.is_some());
         }
-        Ok(self.unchanged_parent(&scope, commit)?.is_none())
-    }
-
-    /// The nearest shown commit at or below `oid`, iteratively so long runs of
-    /// developer-only commits cannot overflow the stack.
-    fn nearest_shown(&mut self, oid: Oid) -> Result<Option<Oid>> {
-        let Some(scope) = self.scope.clone() else {
-            return Ok(Some(oid));
-        };
-        let mut hidden = Vec::new();
-        let mut current = Some(oid);
-        let found = loop {
-            let Some(oid) = current else {
-                break None;
-            };
-            if let Some(cached) = self.nearest.get(&oid) {
-                break *cached;
-            }
-            let commit = self.repo.find_commit(oid)?;
-            if self.shows(&commit)? {
-                break Some(oid);
-            }
-            hidden.push(oid);
-            current = self.unchanged_parent(&scope, &commit)?;
-        };
-        for oid in hidden {
-            self.nearest.insert(oid, found);
-        }
-        Ok(found)
-    }
-
-    fn parents(&mut self, commit: &Commit<'_>) -> Result<Vec<Oid>> {
-        let mut parents = Vec::new();
         for parent in commit.parent_ids() {
-            if let Some(shown) = self.nearest_shown(parent)? {
-                if !parents.contains(&shown) {
-                    parents.push(shown);
-                }
+            if self.scope_tree(&scope, parent)? == own {
+                return Ok(false);
             }
         }
-        Ok(parents)
+        Ok(true)
     }
 }
 
@@ -11288,7 +11227,7 @@ fn version_from_commit(commit: &Commit<'_>) -> Version {
 
 fn history_entry_from_commit(
     commit: &Commit<'_>,
-    parents: &[Oid],
+    touches_project: bool,
     tips: &HashMap<Oid, Vec<VariationId>>,
     head_oid: Option<Oid>,
 ) -> Result<HistoryEntry> {
@@ -11297,12 +11236,13 @@ fn history_entry_from_commit(
     let mut variation_tips = tips.get(&oid).cloned().unwrap_or_default();
     variation_tips.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     let is_head = head_oid == Some(oid);
-    let parent_ids = parents.iter().copied().map(VersionId::from).collect();
+    let parent_ids = commit.parent_ids().map(VersionId::from).collect();
     Ok(HistoryEntry {
         version,
         variation_tips,
         is_head,
         parent_ids,
+        touches_project,
     })
 }
 
@@ -11377,6 +11317,7 @@ fn workspace_graph_node_from_commit(
         parent_ids,
         parent_version_ids: history_entry.parent_ids,
         variation_tips: history_entry.variation_tips,
+        touches_project: history_entry.touches_project,
         is_head,
         is_current: is_head,
         is_tip,

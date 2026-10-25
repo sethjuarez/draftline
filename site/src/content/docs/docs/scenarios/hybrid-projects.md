@@ -55,14 +55,14 @@ Business goal: "Save my edits without disturbing the developer's code."
 
 ## Flow 15b: developers commit with plain Git
 
-Business goal: "See the developer's edits to our project as part of its history."
+Business goal: "See my teammates' work as part of the history."
 
 | Question | Answer |
 |---|---|
 | Covered today? | Covered. |
 | Correct primitive path | `versions`, `history`, and the graph APIs. |
-| Safety behavior | Commits that touch the folder show up as versions, whoever made them. `versions` hides code-only commits; `history` links across them but keeps the current HEAD as an anchor. |
-| Tests | `scoped_versions_skip_developer_commits_outside_the_project`, `scoped_history_rewrites_parents_across_hidden_commits_and_pins_head`, `scoped_history_follows_the_side_that_brought_project_changes_through_a_merge`. |
+| Safety behavior | `history`, `full_history` and the graph show every commit on the branch with its real parents, like `git log`; each entry's `touches_project` says whether it changes the folder, so a host can dim teammates' code-only commits. A merge that only takes one side's folder does not touch it. `versions` lists only commits that touch the folder (like `git log -- <folder>`), the states a business user can restore. Common ancestors and variation counts use the same full history. |
+| Tests | `scoped_versions_skip_developer_commits_outside_the_project`, `scoped_history_lists_teammates_commits_and_flags_project_changes`, `a_merge_that_only_brings_one_sides_project_changes_does_not_touch_the_project`, `scoped_graph_ancestor_and_counts_include_teammates_commits`. |
 
 ## Flow 15c: send work for review
 

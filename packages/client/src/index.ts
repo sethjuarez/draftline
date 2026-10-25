@@ -374,6 +374,8 @@ export interface HistoryEntry {
   variation_tips: string[];
   is_head: boolean;
   parent_ids: string[];
+  /** False for teammates' commits that don't change the project folder. */
+  touches_project: boolean;
 }
 
 export type WorkspaceGraphAction =
@@ -419,6 +421,8 @@ export interface WorkspaceGraphNode {
   parent_ids: string[];
   parent_version_ids: string[];
   variation_tips: string[];
+  /** False for teammates' commits that don't change the project folder. */
+  touches_project: boolean;
   is_head: boolean;
   is_current: boolean;
   is_tip: boolean;

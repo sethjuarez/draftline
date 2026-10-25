@@ -448,7 +448,7 @@ export const flowMatrix: Flow[] = [
     title: "Developers commit with plain Git",
     group: "Hybrid projects",
     status: "Covered",
-    outcome: "Show developer commits that touch the project as versions; hide code-only ones.",
+    outcome: "History shows teammates' commits, flagged when they don't touch the project; versions list only project changes.",
   },
   {
     id: "15c",
