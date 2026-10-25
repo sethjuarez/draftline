@@ -4468,6 +4468,59 @@ fn an_invalid_marker_is_fixed_by_managing_the_folder_again() {
 }
 
 #[test]
+fn managing_a_path_that_is_not_a_plain_folder_changes_nothing() {
+    let (temp, _repo) = code_repo();
+    scoped(&temp);
+    let marker = temp.path().join(".draftline");
+    fs::write(&marker, "not json").unwrap();
+    write_file(temp.path(), "notes.txt", "notes\n");
+    let notes = temp.path().join("notes.txt");
+    assert_eq!(
+        Workspace::probe(&notes).unwrap().state,
+        FolderState::InvalidMarker
+    );
+    assert!(
+        Workspace::apply_folder_fix(&notes, cutready_policy(), &FolderFix::ManageHere).is_err()
+    );
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "not json");
+    assert_eq!(read(temp.path(), "notes.txt"), "notes\n");
+
+    // Nor in a repository nobody manages yet.
+    let (fresh, _repo) = code_repo();
+    write_file(fresh.path(), "notes.txt", "notes\n");
+    let notes = fresh.path().join("notes.txt");
+    assert!(
+        Workspace::apply_folder_fix(&notes, cutready_policy(), &FolderFix::ManageHere).is_err()
+    );
+    assert!(Workspace::open_with_policy(&notes, cutready_policy()).is_err());
+    assert!(!fresh.path().join(".draftline").exists());
+    assert_eq!(
+        Workspace::probe(fresh.path().join("cutready"))
+            .unwrap()
+            .state,
+        FolderState::Unmanaged
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn init_never_creates_folders_through_a_junction() {
+    let (temp, _repo) = code_repo();
+    let outside = tempfile::tempdir().unwrap();
+    let link = temp.path().join("link");
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(outside.path())
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    assert!(Workspace::init_with_policy(link.join("deck"), cutready_policy()).is_err());
+    assert!(!outside.path().join("deck").exists());
+    assert!(!temp.path().join(".draftline").exists());
+}
+
+#[test]
 fn a_fix_the_probe_does_not_offer_is_refused() {
     let (temp, _repo) = code_repo();
     scoped(&temp);

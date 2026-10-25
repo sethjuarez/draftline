@@ -1612,23 +1612,40 @@ impl Workspace {
     /// repository and scopes itself to the folder instead of creating a nested
     /// repository.
     pub fn init_with_policy(path: impl AsRef<Path>, content_policy: ContentPolicy) -> Result<Self> {
-        let path = path.as_ref();
-        let created = create_missing_dirs(path)?;
-
-        let repo = match Repository::discover(path) {
-            Ok(repo) => repo,
-            Err(_) => {
-                let initial_head = default_initial_variation_name();
-                let mut options = RepositoryInitOptions::new();
-                options.initial_head(&initial_head);
-                Repository::init_opts(path, &options)?
-            }
+        let path = absolute_path(path.as_ref())?;
+        let path = path.as_path();
+        ensure_plain_or_missing(path)?;
+        let anchor = path
+            .ancestors()
+            .find(|ancestor| ancestor.exists())
+            .unwrap_or(path);
+        let mut created = Vec::new();
+        let result = match Repository::discover(anchor) {
+            // Inside a repository, create the folder only within it, never
+            // through a file, symlink, or junction.
+            Ok(repo) => match repo.workdir().map(Path::to_path_buf) {
+                Some(workdir) => folder_in(&workdir, path)
+                    .and_then(|folder| create_folder_tracking(&workdir, &folder, &mut created))
+                    .and_then(|_| Self::from_repository(repo, path, content_policy)),
+                None => create_missing_dirs(path)
+                    .map_err(DraftlineError::from)
+                    .and_then(|dirs| {
+                        created = dirs;
+                        Self::from_repository(repo, path, content_policy)
+                    }),
+            },
+            Err(_) => create_missing_dirs(path)
+                .map_err(DraftlineError::from)
+                .and_then(|dirs| {
+                    created = dirs;
+                    let initial_head = default_initial_variation_name();
+                    let mut options = RepositoryInitOptions::new();
+                    options.initial_head(&initial_head);
+                    Ok(Repository::init_opts(path, &options)?)
+                })
+                .and_then(|repo| Self::from_repository(repo, path, content_policy)),
         };
-
-        let result = Self::from_repository(repo, path, content_policy);
-        if let Err(DraftlineError::FolderIsElsewhere(_) | DraftlineError::FolderMissing(_)) =
-            &result
-        {
+        if result.is_err() {
             // Leave no trace of a refused folder; `remove_dir` only removes empty ones.
             for dir in created.iter().rev() {
                 if fs::remove_dir(dir).is_err() {
@@ -1644,6 +1661,7 @@ impl Workspace {
         project_path: &Path,
         content_policy: ContentPolicy,
     ) -> Result<Self> {
+        ensure_plain_or_missing(project_path)?;
         let workspace = Self::unclaimed(repo, project_path, content_policy)?;
         workspace.claim_checkout(true)?;
         Ok(workspace)
@@ -1788,6 +1806,13 @@ impl Workspace {
                                 requested.display()
                             )));
                         }
+                        // The folder must be one Draftline can manage before
+                        // anything is written.
+                        located.ensure_no_pending_recovery_in_checkout()?;
+                        create_folder_within(
+                            &located.root,
+                            &folder_in(&located.root, &requested)?,
+                        )?;
                         // Marker first: if the claim then fails, opening
                         // repairs it from the marker.
                         located.write_marker()?;
@@ -12243,22 +12268,43 @@ fn write_index_or_reload(index: &mut git2::Index) -> Result<()> {
 /// file, symlink, or junction, so a checked-out link can't place it outside
 /// `root`.
 fn create_folder_within(root: &Path, folder: &Path) -> Result<PathBuf> {
+    create_folder_tracking(root, folder, &mut Vec::new())
+}
+
+/// [`create_folder_within`], recording each folder it creates in `created`.
+fn create_folder_tracking(
+    root: &Path,
+    folder: &Path,
+    created: &mut Vec<PathBuf>,
+) -> Result<PathBuf> {
     let mut path = root.to_path_buf();
     for component in folder.components() {
         path.push(component);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => {
-                return Err(DraftlineError::InvalidFolderMarker(format!(
-                    "{} is not a plain folder",
-                    path.display()
-                )))
+            Ok(_) => return Err(not_a_plain_folder(&path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&path)?;
+                created.push(path.clone());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&path)?,
             Err(error) => return Err(error.into()),
         }
     }
     Ok(path)
+}
+
+/// Refuses a path that exists but isn't a real directory (a file, symlink, or junction).
+fn ensure_plain_or_missing(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(not_a_plain_folder(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn not_a_plain_folder(path: &Path) -> DraftlineError {
+    DraftlineError::InvalidFolderMarker(format!("{} is not a plain folder", path.display()))
 }
 
 fn remove_workspace_path_if_exists(path: &Path) -> Result<()> {
