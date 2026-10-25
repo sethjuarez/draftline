@@ -3773,6 +3773,63 @@ fn dismissing_an_unpublished_0_5_cleanup_moves_nothing_and_keeps_its_backup() {
 }
 
 #[test]
+fn a_switch_interrupted_onto_a_branch_naming_another_folder_can_finish() {
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    write_file(temp.path(), "cutready/intro.sk", "intro\n");
+    pitch.save_version("Intro").unwrap();
+    drop(pitch);
+
+    // A branch where the folder moved to deck.
+    repo.branch(
+        "deck-home",
+        &repo.head().unwrap().peel_to_commit().unwrap(),
+        false,
+    )
+    .unwrap();
+    repo.set_head("refs/heads/deck-home").unwrap();
+    write_file(temp.path(), "deck/intro.sk", "intro\n");
+    fs::remove_dir_all(temp.path().join("cutready")).unwrap();
+    fs::write(
+        temp.path().join(".draftline"),
+        r#"{"format":1,"folder":"deck"}"#,
+    )
+    .unwrap();
+    commit_all(&repo, "Move to deck");
+    let target = repo.head().unwrap().peel_to_tree().unwrap();
+
+    // Draftline's switch from main crashed after the checkout, before HEAD moved.
+    repo.set_head("refs/heads/main").unwrap();
+    let from = repo.head().unwrap().peel_to_tree().unwrap().id();
+    let mut index = repo.index().unwrap();
+    index.read_tree(&target).unwrap();
+    index.write().unwrap();
+    let ledger = serde_json::json!({
+        "operation_id": "interrupted",
+        "operation": "SwitchVariation",
+        "original_variation": "main",
+        "target": "deck-home",
+        "completed": false,
+        "project": "cutready",
+        "checkout": { "from_tree": from.to_string(), "to_tree": target.id().to_string() },
+    });
+    fs::write(
+        repo.path().join("draftline").join("recovery.json"),
+        serde_json::to_vec(&ledger).unwrap(),
+    )
+    .unwrap();
+
+    // cutready is gone from disk; deck, which the new marker names, finishes it.
+    let deck = Workspace::open_with_policy(temp.path().join("deck"), cutready_policy()).unwrap();
+    deck.repair_recovery("interrupted").unwrap();
+    assert_eq!(
+        repo.head().unwrap().shorthand(),
+        Ok("deck-home"),
+        "the switch finished"
+    );
+}
+
+#[test]
 fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
     let (temp, repo) = code_repo();
     let (_bare, other_dir, other) = with_remote(&repo);
@@ -3821,13 +3878,23 @@ fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
         vec![draftline::SafeNextAction::RepairRecovery]
     );
 
-    // Pitch can still open and finish it while the marker names deck, so
-    // neither folder is stuck.
+    // Pitch can still open while the marker names deck, so neither folder is
+    // stuck, but it may only drop the record: repairing or rolling back would
+    // write to a folder Draftline no longer manages.
     let probe = Workspace::probe(temp.path().join("cutready")).unwrap();
     assert_eq!(probe.suggestions[0].fix, draftline::FolderFix::Open);
     let reopened =
         Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
-    reopened.repair_recovery("interrupted").unwrap();
+    for error in [
+        reopened.repair_recovery("interrupted").unwrap_err(),
+        reopened.rollback_recovery("interrupted").unwrap_err(),
+    ] {
+        assert!(
+            matches!(&error, DraftlineError::FolderIsElsewhere(folder) if folder == Path::new("deck")),
+            "{error:?}"
+        );
+    }
+    reopened.acknowledge_recovery().unwrap();
     moved.save_version("Slide").unwrap();
     assert!(matches!(
         pitch.save_version("Pitch").unwrap_err(),

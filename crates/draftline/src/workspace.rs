@@ -2001,7 +2001,8 @@ impl Workspace {
         };
         if self.unfinished_operation_touches(&mine) {
             probe.folder = Some(PathBuf::from(&mine));
-            probe.detail = Some("An operation was interrupted; open to finish it.".to_string());
+            probe.detail =
+                Some("An operation was interrupted; open to finish or acknowledge it.".to_string());
             probe.suggestions = vec![suggest(FolderFix::Open, "Open and finish it")];
             return Ok(probe);
         }
@@ -3037,6 +3038,7 @@ impl Workspace {
         self.clear_stale_lock()?;
         let _lock = self.acquire_for_index("repair_recovery")?;
         let state = self.pending_recovery(operation_id.as_ref())?;
+        self.ensure_recovery_may_write()?;
 
         match state.operation {
             RecoveryOperation::SwitchVariation => {
@@ -3164,6 +3166,7 @@ impl Workspace {
         self.clear_stale_lock()?;
         let _lock = self.acquire_for_index("rollback_recovery")?;
         let state = self.pending_recovery(operation_id.as_ref())?;
+        self.ensure_recovery_may_write()?;
 
         match state.operation {
             RecoveryOperation::SwitchVariation => {
@@ -10174,8 +10177,18 @@ impl Workspace {
         let project = ledger.project?;
         (!ledger.state.completed
             && project != self.project_key()
-            && !self.unfinished_operation_touches(&self.project_key()))
+            && !self.unfinished_operation_touches(&self.project_key())
+            && !self.marked_by_recovery())
         .then(|| PathBuf::from(project))
+    }
+
+    /// Whether the checkout's marker names this folder because the interrupted
+    /// operation checked out one of its recorded commits, so this folder (the
+    /// one now on disk) may finish it.
+    fn marked_by_recovery(&self) -> bool {
+        let mine = self.project_key();
+        self.read_marker().ok().flatten().as_deref() == Some(mine.as_str())
+            && self.recorded_markers().contains(&mine)
     }
 
     /// Whether `folder` recorded an unfinished operation, or is either end of
@@ -10192,10 +10205,19 @@ impl Workspace {
         if state.completed {
             return false;
         }
-        if ledger.project.as_deref() == Some(folder) {
-            return true;
-        }
-        if state.operation != RecoveryOperation::MoveFolder {
+        ledger.project.as_deref() == Some(folder) || self.pending_move_touches(folder)
+    }
+
+    /// Whether an unfinished folder move has `folder` at either end.
+    fn pending_move_touches(&self, folder: &str) -> bool {
+        let Ok(bytes) = fs::read(self.ledger_path()) else {
+            return false;
+        };
+        let Ok(ledger) = serde_json::from_slice::<RecoveryLedger>(&bytes) else {
+            return false;
+        };
+        let state = ledger.state;
+        if state.completed || state.operation != RecoveryOperation::MoveFolder {
             return false;
         }
         let folder = marker_folder(folder);
@@ -10206,6 +10228,53 @@ impl Workspace {
         })
     }
 
+    /// Repair and rollback write files, the index, HEAD or refs, so outside an
+    /// interrupted move they run only while this is still the managed folder.
+    /// The operation itself may have checked out a tree whose marker names
+    /// another folder (for example a switch interrupted before HEAD moved), so
+    /// a marker from one of its recorded checkout trees still allows it. After a
+    /// developer checks out some other branch naming another folder, the
+    /// recording folder can only acknowledge (drop) the record.
+    fn ensure_recovery_may_write(&self) -> Result<()> {
+        let mine = self.project_key();
+        if self.pending_move_touches(&mine) {
+            return Ok(());
+        }
+        let owner = match self.read_marker()? {
+            Some(folder) => folder,
+            None => {
+                // With neither, this folder claims the checkout as the first
+                // one opened would; a folder that claimed it first wins.
+                let path = self.claim_path();
+                match self.publish_new_claim(&path) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                folder_key(&claimed_project(&self.read_claim(&path)?, &path)?)
+            }
+        };
+        if owner == mine || self.recorded_markers().contains(&owner) {
+            Ok(())
+        } else {
+            Err(DraftlineError::FolderIsElsewhere(PathBuf::from(owner)))
+        }
+    }
+
+    /// The folders named by the markers of the trees the pending checkout was
+    /// moving between. Only these immutable recorded trees count, never
+    /// branch tips that may have moved since.
+    fn recorded_markers(&self) -> Vec<String> {
+        self.recorded_checkout()
+            .map(|(from, to)| {
+                [from, to]
+                    .iter()
+                    .filter_map(|tree| tree_marker_folder(&self.repo, tree))
+                    .map(|folder| folder_key(&folder))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     fn project_key(&self) -> String {
         folder_key(self.scope())
     }
