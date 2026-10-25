@@ -3004,6 +3004,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::SendBaseNotOnRemote(_) => "send_base_not_on_remote",
         DraftlineError::FolderIsElsewhere(_) => "folder_is_elsewhere",
         DraftlineError::FolderMissing(_) => "folder_missing",
+        DraftlineError::IncomingFolderElsewhere(_) => "incoming_folder_elsewhere",
         DraftlineError::InvalidFolderMarker(_) => "invalid_folder_marker",
         DraftlineError::FolderMoveRefused(_) => "folder_move_refused",
         DraftlineError::FolderFixUnavailable(_) => "folder_fix_unavailable",
@@ -3042,7 +3043,9 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         DraftlineError::RecoveryInOtherFolder(folder) => {
             Some(serde_json::json!({ "folder": folder }))
         }
-        DraftlineError::FolderIsElsewhere(folder) | DraftlineError::FolderMissing(folder) => {
+        DraftlineError::FolderIsElsewhere(folder)
+        | DraftlineError::FolderMissing(folder)
+        | DraftlineError::IncomingFolderElsewhere(folder) => {
             Some(serde_json::json!({ "folder": folder }))
         }
         DraftlineError::SyncNeedsMerge(status) => match serde_json::to_value(status.as_ref()) {

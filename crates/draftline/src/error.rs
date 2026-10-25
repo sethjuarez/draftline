@@ -135,6 +135,14 @@ pub enum DraftlineError {
     )]
     FolderIsElsewhere(std::path::PathBuf),
 
+    /// The incoming version keeps Draftline's folder somewhere else: move the
+    /// folder there, then merge.
+    #[error(
+        "the incoming version keeps Draftline's folder at {}; move the folder there, then merge",
+        workspace_folder(.0)
+    )]
+    IncomingFolderElsewhere(std::path::PathBuf),
+
     /// The folder Draftline manages isn't here: it was renamed or deleted
     /// outside Draftline, or the current branch doesn't have it.
     #[error(

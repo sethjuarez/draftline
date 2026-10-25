@@ -2715,6 +2715,71 @@ fn tree_text(repo: &git2::Repository, rev: &str, relative: &str) -> Option<Strin
 }
 
 #[test]
+fn incoming_edits_from_before_a_move_land_in_the_moved_folder() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let mut workspace = scoped(&temp);
+    write_file(temp.path(), "cutready/outro.sk", "my outro\n");
+    workspace.save_version("My outro").unwrap();
+    workspace.move_folder("demos/pitch").unwrap();
+
+    write_file(other_dir.path(), "cutready/intro.sk", "teammate intro\n");
+    write_file(other_dir.path(), "src/lib.rs", "pub fn shared() {}\n");
+    commit_all(&other, "Teammate intro");
+    push_main(&other);
+
+    workspace.fetch_remote("origin").unwrap();
+    let report = workspace.preflight_merge_incoming("origin").unwrap();
+    assert!(report.can_merge_cleanly, "{report:?}");
+    workspace
+        .merge_incoming(report.token.unwrap(), "Merge", &mut RemoteOptions::new())
+        .unwrap();
+
+    assert_eq!(
+        read(temp.path(), "demos/pitch/intro.sk"),
+        "teammate intro\n"
+    );
+    assert_eq!(read(temp.path(), "demos/pitch/outro.sk"), "my outro\n");
+    assert_eq!(read(temp.path(), "src/lib.rs"), "pub fn shared() {}\n");
+    assert!(!temp.path().join("cutready").exists());
+    assert_eq!(tree_text(&repo, "HEAD", "cutready/intro.sk"), None);
+}
+
+#[test]
+fn an_incoming_move_elsewhere_is_followed_before_merging() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let mut theirs =
+        Workspace::init_with_policy(other_dir.path().join("cutready"), cutready_policy()).unwrap();
+    theirs.move_folder("demos/pitch").unwrap();
+    write_file(other_dir.path(), "demos/pitch/intro.sk", "teammate intro\n");
+    theirs.save_version("Teammate intro").unwrap();
+    push_main(&other);
+
+    let mut workspace = scoped(&temp);
+    write_file(temp.path(), "cutready/outro.sk", "my outro\n");
+    workspace.save_version("My outro").unwrap();
+    workspace.fetch_remote("origin").unwrap();
+    let err = workspace.preflight_merge_incoming("origin").unwrap_err();
+    assert!(
+        matches!(&err, DraftlineError::IncomingFolderElsewhere(folder) if folder == Path::new("demos/pitch")),
+        "{err:?}"
+    );
+
+    workspace.move_folder("demos/pitch").unwrap();
+    let report = workspace.preflight_merge_incoming("origin").unwrap();
+    assert!(report.can_merge_cleanly, "{report:?}");
+    workspace
+        .merge_incoming(report.token.unwrap(), "Merge", &mut RemoteOptions::new())
+        .unwrap();
+    assert_eq!(
+        read(temp.path(), "demos/pitch/intro.sk"),
+        "teammate intro\n"
+    );
+    assert_eq!(read(temp.path(), "demos/pitch/outro.sk"), "my outro\n");
+    assert_eq!(tree_text(&repo, "HEAD", "cutready/outro.sk"), None);
+}
+#[test]
 fn incoming_merge_keeps_teammate_code_and_the_developer_index() {
     let (temp, repo) = code_repo();
     let (_bare, other_dir, other) = with_remote(&repo);

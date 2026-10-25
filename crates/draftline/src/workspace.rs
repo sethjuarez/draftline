@@ -7143,12 +7143,9 @@ impl Workspace {
 
         if Self::mergeable_state(&sync_status.state, source.is_some()) {
             let merge_input = self.merge_input_for_status(&sync_status)?;
-            let plan = self.plan_clean_merge(
-                &merge_input.base_commit.tree()?,
-                &merge_input.local_commit.tree()?,
-                &merge_input.remote_commit.tree()?,
-            )?;
-            match self.merged_tree(&merge_input, &plan.files)? {
+            let trees = self.merge_trees_for(&merge_input)?;
+            let plan = self.plan_clean_merge(&trees[0], &trees[1], &trees[2])?;
+            match self.merged_tree(&trees, &plan.files)? {
                 Ok(tree) => file_hazards = self.target_tree_hazards(&self.repo.find_tree(tree)?)?,
                 Err(paths) => developer_conflicts = paths,
             }
@@ -7337,11 +7334,8 @@ impl Workspace {
             });
         }
 
-        let plan = self.plan_clean_merge(
-            &merge_input.base_commit.tree()?,
-            &merge_input.local_commit.tree()?,
-            &merge_input.remote_commit.tree()?,
-        )?;
+        let trees = self.merge_trees_for(&merge_input)?;
+        let plan = self.plan_clean_merge(&trees[0], &trees[1], &trees[2])?;
         let files = match resolutions {
             Some(resolutions) => self.resolve_merge_plan(plan, resolutions)?,
             None if !plan.conflicts.is_empty() => {
@@ -7355,7 +7349,7 @@ impl Workspace {
             }
             None => plan.files,
         };
-        let tree = match self.merged_tree(&merge_input, &files)? {
+        let tree = match self.merged_tree(&trees, &files)? {
             Ok(tree) => self.repo.find_tree(tree)?,
             Err(paths) => return Err(DraftlineError::MergeNeedsDeveloper(paths)),
         };
@@ -10933,6 +10927,42 @@ impl Workspace {
         })
     }
 
+    /// The merge's base, local and remote trees, with the folder where the
+    /// local side keeps it, so a move on one side doesn't drop the other
+    /// side's edits. Refuses when the remote moved the folder somewhere else:
+    /// the host moves it there too, then merges.
+    fn merge_trees_for(&self, input: &IncomingMergeInput<'_>) -> Result<[Tree<'_>; 3]> {
+        let mut folders = FolderChanges::new(&self.repo, self.scope());
+        let ours = folders.folder_at(&input.local_commit)?;
+        let base = folders.folder_at(&input.base_commit)?;
+        let theirs = folders.folder_at(&input.remote_commit)?;
+        if theirs != ours && theirs != base {
+            return Err(DraftlineError::IncomingFolderElsewhere(theirs));
+        }
+        let local = self.repo.find_tree(input.local_commit.tree_id())?;
+        let marker = local.get_name(FOLDER_MARKER).map(|entry| entry.id());
+        let fit = |commit: &Commit<'_>, folder: &Path| -> Result<Tree<'_>> {
+            if folder == ours {
+                return Ok(self.repo.find_tree(commit.tree_id())?);
+            }
+            let tree = self.relocated_tree(commit)?;
+            let id = match marker {
+                Some(marker) => {
+                    let mut update = git2::build::TreeUpdateBuilder::new();
+                    update.upsert(FOLDER_MARKER, marker, git2::FileMode::Blob);
+                    update.create_updated(&self.repo, &tree)?
+                }
+                None => tree_without(&self.repo, &tree, FOLDER_MARKER)?,
+            };
+            Ok(self.repo.find_tree(id)?)
+        };
+        Ok([
+            fit(&input.base_commit, &base)?,
+            local,
+            fit(&input.remote_commit, &theirs)?,
+        ])
+    }
+
     fn plan_clean_merge(
         &self,
         base_tree: &Tree<'_>,
@@ -11033,15 +11063,13 @@ impl Workspace {
     /// instead: they belong to a developer.
     fn merged_tree(
         &self,
-        input: &IncomingMergeInput<'_>,
+        trees: &[Tree<'_>; 3],
         files: &[MergeFileChange],
     ) -> Result<std::result::Result<Oid, Vec<PathBuf>>> {
-        let base_tree = input.base_commit.tree()?;
-        let local_tree = input.local_commit.tree()?;
-        let remote_tree = input.remote_commit.tree()?;
+        let [base_tree, local_tree, remote_tree] = trees;
         let mut index = self
             .repo
-            .merge_trees(&base_tree, &local_tree, &remote_tree, None)?;
+            .merge_trees(base_tree, local_tree, remote_tree, None)?;
 
         let mut developer_conflicts = BTreeSet::new();
         let mut content_conflicts = BTreeSet::new();
@@ -11068,7 +11096,7 @@ impl Workspace {
         let merged = self.repo.find_tree(index.write_tree_to(&self.repo)?)?;
 
         let mut paths = BTreeSet::new();
-        for tree in [&base_tree, &local_tree, &remote_tree, &merged] {
+        for tree in [base_tree, local_tree, remote_tree, &merged] {
             self.collect_tracked_tree_paths(tree, Path::new(""), &mut paths)?;
         }
         let planned = files
