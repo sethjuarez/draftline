@@ -4381,13 +4381,8 @@ impl Workspace {
         }
         test_hooks::fire("before_branch_switch", self.repo.path());
         let mut committing = false;
-        let switched = (|| -> Result<()> {
-            let mut transaction = self.repo.transaction()?;
-            transaction.lock_ref("HEAD")?;
-            if let Some(previous) = previous.as_deref() {
-                transaction.lock_ref(previous)?;
-            }
-            transaction.lock_ref(&branch_ref)?;
+        let message = format!("draftline: start variation {name} here");
+        let recheck = || -> Result<()> {
             let now = read_head()?;
             if now != (previous.clone(), commit) {
                 return Err(DraftlineError::LocalStateChanged {
@@ -4395,12 +4390,40 @@ impl Workspace {
                     actual: format!("{:?}@{:?}", now.0, now.1),
                 });
             }
+            Ok(())
+        };
+        let lock_head = |transaction: &mut git2::Transaction<'_>| -> Result<()> {
+            transaction.lock_ref("HEAD")?;
+            if let Some(previous) = previous.as_deref() {
+                transaction.lock_ref(previous)?;
+            }
+            transaction.lock_ref(&branch_ref)?;
+            Ok(())
+        };
+        let switched = (|| -> Result<()> {
+            // libgit2 applies a transaction's refs in no set order, so create
+            // the branch first and move HEAD after: a crash in between leaves
+            // a spare branch, never HEAD on a branch that doesn't exist.
+            let mut transaction = self.repo.transaction()?;
+            lock_head(&mut transaction)?;
+            recheck()?;
             if self.repo.find_reference(&branch_ref).is_ok() {
                 return Err(DraftlineError::VariationAlreadyExists(name.to_string()));
             }
-            let message = format!("draftline: start variation {name} here");
             if let Some(commit) = commit {
                 transaction.set_target(&branch_ref, commit, None, &message)?;
+                committing = true;
+                transaction.commit()?;
+                test_hooks::fire("between_branch_and_switch", self.repo.path());
+                transaction = self.repo.transaction()?;
+                lock_head(&mut transaction)?;
+                recheck()?;
+                if self.repo.refname_to_id(&branch_ref).ok() != Some(commit) {
+                    return Err(DraftlineError::LocalStateChanged {
+                        expected: format!("{branch_ref}@{commit}"),
+                        actual: format!("{branch_ref} moved"),
+                    });
+                }
             }
             transaction.set_symbolic_target("HEAD", &branch_ref, None, &message)?;
             committing = true;
@@ -8608,6 +8631,8 @@ impl Workspace {
         provider: &mut dyn PullRequestProvider,
         options: &mut RemoteOptions<'_>,
     ) -> Result<SendResult> {
+        // Held through the push; the pull request is the host's, outside it.
+        let lock = self.acquire_operation_lock("send")?;
         self.ensure_no_pending_recovery()?;
         let remote = remote.as_ref();
         let target = self.resolve_send_target(remote, request, options)?;
@@ -8718,6 +8743,7 @@ impl Workspace {
                 .find_branch(&variation, BranchType::Local)?
                 .set_upstream(Some(&format!("{remote}/{variation}")))?;
         }
+        drop(lock);
 
         let pull_request_request = PullRequestRequest {
             remote: remote.to_string(),
@@ -9067,6 +9093,7 @@ impl Workspace {
         remote: impl AsRef<str>,
         start: WorktreeStart,
     ) -> Result<OwnedWorktree> {
+        let _lock = self.acquire_operation_lock("create_owned_worktree")?;
         self.ensure_no_pending_recovery()?;
         let remote = remote.as_ref();
         let start_commit = match start {
@@ -9180,6 +9207,8 @@ impl Workspace {
         if !name.starts_with(OWNED_WORKTREE_PREFIX) {
             return Err(DraftlineError::NotOwnedWorktree(name.to_string()));
         }
+        let _lock = self.acquire_operation_lock("remove_owned_worktree")?;
+        self.ensure_no_pending_recovery()?;
         let worktree = self.repo.find_worktree(name)?;
         let path = worktree.path().to_path_buf();
         let in_use = match (fs::canonicalize(&path), fs::canonicalize(&self.root)) {
@@ -9188,6 +9217,21 @@ impl Workspace {
         };
         if in_use {
             return Err(DraftlineError::OwnedWorktreeInUse(name.to_string()));
+        }
+        // Draftline running there, or an operation it must still finish,
+        // keeps the checkout unless the caller discards it. Its lock is held
+        // through the prune so nothing starts there meanwhile.
+        let mut _target_lock = None;
+        if let Ok(checkout) = Repository::open_from_worktree(&worktree) {
+            let draftline = checkout.path().join("draftline");
+            _target_lock = Some(OperationLock::acquire(
+                &draftline.join("operation.lock"),
+                "remove_owned_worktree",
+            )?);
+            let ledger = draftline.join("recovery.json");
+            if !discard_changes && ledger.exists() {
+                return Err(DraftlineError::OwnedWorktreeHasChanges(vec![ledger]));
+            }
         }
         if !discard_changes && path.exists() {
             // Damaged metadata means its changes can't be checked; keep it.
@@ -9479,6 +9523,7 @@ impl Workspace {
         remote: impl AsRef<str>,
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishResult> {
+        let _lock = self.acquire_operation_lock("publish_changes")?;
         self.publish_changes_expecting(remote.as_ref(), options, None)
     }
 
@@ -16931,6 +16976,28 @@ mod tests {
             workspace.read_variation_metadata("idea").unwrap(),
             VariationMetadata::default()
         );
+    }
+
+    #[test]
+    fn start_variation_here_removes_its_branch_when_head_moves_before_the_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        let main = workspace.current_variation().unwrap();
+        developer_commits_at("between_branch_and_switch");
+
+        let error = workspace.start_variation_here("idea").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(workspace.current_variation().unwrap(), main);
+        assert!(workspace
+            .repo
+            .find_branch("idea", BranchType::Local)
+            .is_err());
     }
 
     struct UnreachableHost;

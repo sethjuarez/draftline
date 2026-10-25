@@ -3456,6 +3456,68 @@ fn removing_an_owned_worktree_keeps_its_branch_and_refuses_unsaved_work() {
 }
 
 #[test]
+fn removing_an_owned_worktree_waits_for_draftline_running_or_unfinished_there() {
+    let (temp, _repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let worktrees = tempfile::tempdir().unwrap();
+    let owned = workspace
+        .create_owned_worktree(
+            worktrees.path(),
+            "Busy",
+            "origin",
+            draftline::WorktreeStart::LatestBase,
+        )
+        .unwrap();
+    let draftline = temp
+        .path()
+        .join(".git/worktrees")
+        .join(&owned.name)
+        .join("draftline");
+    std::fs::create_dir_all(&draftline).unwrap();
+
+    std::fs::write(draftline.join("operation.lock"), "{}").unwrap();
+    assert!(matches!(
+        workspace.remove_owned_worktree(&owned.name, true),
+        Err(DraftlineError::WorkspaceLocked)
+    ));
+    std::fs::remove_file(draftline.join("operation.lock")).unwrap();
+
+    std::fs::write(draftline.join("recovery.json"), "{}").unwrap();
+    assert!(matches!(
+        workspace.remove_owned_worktree(&owned.name, false),
+        Err(DraftlineError::OwnedWorktreeHasChanges(_))
+    ));
+    assert!(owned.path.exists());
+    workspace.remove_owned_worktree(&owned.name, true).unwrap();
+    assert!(!owned.path.exists());
+}
+
+#[test]
+fn publishing_and_owned_worktrees_wait_for_another_draftline_operation() {
+    let (temp, _repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let lock = temp.path().join(".git/draftline/operation.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, "{}").unwrap();
+
+    assert!(matches!(
+        workspace.publish_changes("origin"),
+        Err(DraftlineError::WorkspaceLocked)
+    ));
+    let worktrees = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        workspace.create_owned_worktree(
+            worktrees.path(),
+            "Blocked",
+            "origin",
+            draftline::WorktreeStart::LatestBase,
+        ),
+        Err(DraftlineError::WorkspaceLocked)
+    ));
+    assert!(workspace.owned_worktrees().unwrap().is_empty());
+}
+
+#[test]
 fn removing_an_owned_worktree_with_damaged_metadata_keeps_its_files() {
     let (temp, _repo) = code_repo();
     let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
