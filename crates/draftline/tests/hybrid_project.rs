@@ -3261,6 +3261,67 @@ fn repairing_a_finished_incoming_merge_keeps_newer_project_edits() {
 }
 
 #[test]
+fn a_clone_opens_the_folder_its_marker_names() {
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    pitch.save_version("Marker").unwrap();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+
+    let target = tempfile::tempdir().unwrap();
+    let clone = Workspace::clone_workspace_with_policy(
+        bare.path().to_str().unwrap(),
+        target.path().join("copy"),
+        cutready_policy(),
+    )
+    .unwrap();
+    assert_eq!(clone.scope(), Path::new("cutready"));
+    assert_eq!(read(target.path(), "copy/cutready/intro.sk"), "scene one\n");
+}
+
+#[test]
+fn owned_worktrees_open_where_their_commit_keeps_the_folder() {
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    pitch.save_version("Marker").unwrap();
+    let (_bare, other_dir, _other) = with_remote(&repo);
+    let worktrees = tempfile::tempdir().unwrap();
+    let before = pitch
+        .create_owned_worktree(
+            worktrees.path(),
+            "Before",
+            "origin",
+            draftline::WorktreeStart::CurrentVersion,
+        )
+        .unwrap();
+    // A teammate moves the folder and shares it.
+    let mut theirs =
+        Workspace::open_with_policy(other_dir.path().join("cutready"), cutready_policy()).unwrap();
+    theirs.move_folder(other_dir.path().join("demos")).unwrap();
+    theirs.publish_changes("origin").unwrap();
+    pitch.fetch_remote("origin").unwrap();
+
+    let after = pitch
+        .create_owned_worktree(
+            worktrees.path(),
+            "After",
+            "origin",
+            draftline::WorktreeStart::LatestBase,
+        )
+        .unwrap();
+    assert_eq!(after.project_path, after.path.join("demos"));
+    assert_eq!(read(&after.path, "demos/intro.sk"), "scene one\n");
+    let mut listed = pitch.owned_worktrees().unwrap();
+    listed.sort_by(|a, b| a.name.cmp(&b.name));
+    let paths: Vec<_> = listed
+        .iter()
+        .map(|owned| owned.project_path.clone())
+        .collect();
+    assert_eq!(
+        paths,
+        [after.path.join("demos"), before.path.join("cutready")]
+    );
+}
+#[test]
 fn owned_worktree_starts_from_the_latest_base_and_leaves_this_checkout_alone() {
     let (temp, repo) = code_repo();
     let (_bare, other_dir, other) = with_remote(&repo);

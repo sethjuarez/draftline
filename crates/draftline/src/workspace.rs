@@ -2408,7 +2408,11 @@ impl Workspace {
             builder.fetch_options(fetch_options);
         }
         let repo = builder.clone(remote_url.as_ref(), path.as_ref())?;
-        Self::from_repository(repo, path.as_ref(), content_policy)
+        // Open the folder the repository's marker names, not its root.
+        // The folder may not exist on the cloned branch yet.
+        let folder = head_marker_folder(&repo).unwrap_or_default();
+        let project = create_folder_within(path.as_ref(), &folder)?;
+        Self::from_repository(repo, &project, content_policy)
     }
 
     /// Adds a semantic merge resolver ahead of Draftline's built-in resolvers.
@@ -9092,6 +9096,9 @@ impl Workspace {
         })?;
         let name = worktree_name(&variation);
         let path = worktrees_dir.join(&name);
+        // The folder lives where the starting commit's marker says.
+        let folder = tree_marker_folder(&self.repo, &start_commit.tree()?)
+            .unwrap_or_else(|| self.scope().to_path_buf());
         fs::create_dir_all(worktrees_dir)?;
 
         let reference = self
@@ -9100,13 +9107,12 @@ impl Workspace {
             .into_reference();
         let mut options = git2::WorktreeAddOptions::new();
         options.reference(Some(&reference));
-        // The project may not exist yet where the branch starts.
-        let project_path = path.join(self.scope());
+        // The folder may not exist yet where the branch starts.
         let added = self
             .repo
             .worktree(&name, &path, Some(&options))
             .map_err(DraftlineError::from)
-            .and_then(|_| fs::create_dir_all(&project_path).map_err(DraftlineError::from));
+            .and_then(|_| create_folder_within(&path, &folder));
         if let Err(error) = added {
             drop(reference);
             self.roll_back_owned_worktree(&name, &path, &variation)?;
@@ -9121,7 +9127,7 @@ impl Workspace {
             .unwrap_or(path);
         Ok(OwnedWorktree {
             name,
-            project_path: path.join(self.scope()),
+            project_path: path.join(folder),
             path,
             variation: Some(variation),
         })
@@ -9142,16 +9148,19 @@ impl Workspace {
             }
             let worktree = self.repo.find_worktree(name)?;
             let path = worktree.path().components().collect::<PathBuf>();
-            let variation = Repository::open_from_worktree(&worktree)
-                .ok()
-                .and_then(|repo| {
-                    repo.head()
-                        .ok()
-                        .and_then(|head| head.shorthand().ok().map(str::to_string))
-                });
+            let checkout = Repository::open_from_worktree(&worktree).ok();
+            let variation = checkout.as_ref().and_then(|repo| {
+                repo.head()
+                    .ok()
+                    .and_then(|head| head.shorthand().ok().map(str::to_string))
+            });
+            let folder = checkout
+                .as_ref()
+                .and_then(head_marker_folder)
+                .unwrap_or_else(|| self.scope().to_path_buf());
             owned.push(OwnedWorktree {
                 name: name.to_string(),
-                project_path: path.join(self.scope()),
+                project_path: path.join(folder),
                 path,
                 variation,
             });
@@ -12166,6 +12175,28 @@ fn write_index_or_reload(index: &mut git2::Index) -> Result<()> {
     Ok(())
 }
 
+/// Creates `root/folder` one level at a time, refusing to pass through a
+/// file, symlink, or junction, so a checked-out link can't place it outside
+/// `root`.
+fn create_folder_within(root: &Path, folder: &Path) -> Result<PathBuf> {
+    let mut path = root.to_path_buf();
+    for component in folder.components() {
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(DraftlineError::InvalidFolderMarker(format!(
+                    "{} is not a plain folder",
+                    path.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&path)?,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(path)
+}
+
 fn remove_workspace_path_if_exists(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -12371,6 +12402,12 @@ fn moved_from(commit: &Commit<'_>) -> Option<PathBuf> {
         return Some(PathBuf::new());
     }
     canonical_folder(value).filter(|folder| !folder.as_os_str().is_empty())
+}
+
+/// The folder the checked-out commit's [`FOLDER_MARKER`] names, if any.
+fn head_marker_folder(repo: &Repository) -> Option<PathBuf> {
+    let tree = repo.head().ok()?.peel_to_tree().ok()?;
+    tree_marker_folder(repo, &tree)
 }
 
 /// The folder `tree`'s own [`FOLDER_MARKER`] names, if it is a valid one.
@@ -16747,6 +16784,30 @@ mod tests {
         assert_eq!(probe.folder.as_deref(), Some(Path::new("deck")));
         let deck = Workspace::open(temp.path().join("deck")).unwrap();
         assert!(deck.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_folder_is_created_inside_its_root_and_never_through_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let made = create_folder_within(temp.path(), Path::new("a/b")).unwrap();
+        assert_eq!(made, temp.path().join("a").join("b"));
+        assert!(made.is_dir());
+        create_folder_within(temp.path(), Path::new("a/b")).unwrap();
+
+        write_file(temp.path(), "file", b"x");
+        assert!(matches!(
+            create_folder_within(temp.path(), Path::new("file/inner")),
+            Err(DraftlineError::InvalidFolderMarker(_))
+        ));
+        assert!(!temp.path().join("file").join("inner").exists());
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), temp.path().join("link")).unwrap();
+            assert!(create_folder_within(temp.path(), Path::new("link/inner")).is_err());
+            assert!(!outside.path().join("inner").exists());
+        }
     }
 
     #[test]
