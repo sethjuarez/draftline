@@ -3653,10 +3653,7 @@ impl Workspace {
         } else {
             let temp = unique_claim_temp(&path);
             fs::write(&temp, serde_json::to_vec_pretty(&remaining)?)?;
-            if let Err(error) = fs::rename(&temp, &path) {
-                let _ = fs::remove_file(&temp);
-                return Err(error.into());
-            }
+            replace_file(&temp, &path)?;
         }
         Ok(())
     }
@@ -10023,10 +10020,7 @@ impl Workspace {
         let path = self.marker_path();
         let temp = unique_claim_temp(&path);
         fs::write(&temp, bytes)?;
-        if let Err(error) = fs::rename(&temp, &path) {
-            let _ = fs::remove_file(&temp);
-            return Err(error.into());
-        }
+        replace_file(&temp, &path)?;
         Ok(())
     }
 
@@ -10131,10 +10125,7 @@ impl Workspace {
                 project: folder.to_string(),
             })?,
         )?;
-        if let Err(error) = fs::rename(&temp, &path) {
-            let _ = fs::remove_file(&temp);
-            return Err(error.into());
-        }
+        replace_file(&temp, &path)?;
         Ok(())
     }
 
@@ -11778,10 +11769,7 @@ impl Workspace {
         }
         let temp = unique_claim_temp(&path);
         fs::write(&temp, serde_json::to_vec_pretty(&entry)?)?;
-        if let Err(error) = fs::rename(&temp, &path) {
-            let _ = fs::remove_file(&temp);
-            return Err(error.into());
-        }
+        replace_file(&temp, &path)?;
         Ok(())
     }
 
@@ -12363,6 +12351,7 @@ fn create_folder_tracking(
     folder: &Path,
     created: &mut Vec<PathBuf>,
 ) -> Result<PathBuf> {
+    let canonical_root = fs::canonicalize(root)?;
     let mut path = root.to_path_buf();
     for component in folder.components() {
         path.push(component);
@@ -12372,6 +12361,17 @@ fn create_folder_tracking(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 fs::create_dir(&path)?;
                 created.push(path.clone());
+                // A parent swapped for a link after it was checked would put
+                // the new folder outside the repository. Deleting by path
+                // would follow that link too, so leave the empty folders and
+                // forget them rather than risk removing someone else's.
+                let inside = fs::canonicalize(&path)
+                    .map(|resolved| resolved.starts_with(&canonical_root))
+                    .unwrap_or(false);
+                if !inside {
+                    created.clear();
+                    return Err(not_a_plain_folder(&path));
+                }
             }
             Err(error) => return Err(error.into()),
         }
@@ -12386,6 +12386,30 @@ fn ensure_plain_or_missing(path: &Path) -> Result<()> {
         Ok(_) => Err(not_a_plain_folder(path)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Atomically replaces `path` with `temp`, removing `temp` on failure. On
+/// Windows, a scanner or indexer briefly holding `path` makes the rename fail
+/// with access denied, so it retries for a moment as Git for Windows does.
+fn replace_file(temp: &Path, path: &Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match fs::rename(temp, path) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
+                    && attempt < 10 =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
+            }
+            Err(error) => {
+                let _ = fs::remove_file(temp);
+                return Err(error);
+            }
+        }
     }
 }
 
