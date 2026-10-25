@@ -4571,6 +4571,35 @@ fn switching_to_a_branch_with_the_folder_refuses_untracked_files_in_the_way() {
 }
 
 #[test]
+fn a_move_refuses_staged_files_the_folder_skips() {
+    let (temp, repo) = code_repo();
+    let mut pitch = scoped(&temp);
+    pitch.save_version("Marker").unwrap();
+    // The cutready policy skips cache/, but Git has it staged.
+    write_file(temp.path(), "cutready/cache/thumb.bin", "cache\n");
+    let mut index = repo.index().unwrap();
+    index
+        .add_path(Path::new("cutready/cache/thumb.bin"))
+        .unwrap();
+    index.write().unwrap();
+
+    let probe = Workspace::probe(temp.path().join("demos")).unwrap();
+    assert!(!fixes(&probe).contains(&FolderFix::MoveFolderHere {
+        from: "cutready".into()
+    }));
+    let error = pitch.move_folder(temp.path().join("demos")).err().unwrap();
+    assert!(
+        matches!(error, DraftlineError::FolderMoveRefused(_)),
+        "{error:?}"
+    );
+    assert_eq!(read(temp.path(), "cutready/cache/thumb.bin"), "cache\n");
+    assert_eq!(
+        status(&repo, "cutready/cache/thumb.bin"),
+        git2::Status::INDEX_NEW
+    );
+}
+
+#[test]
 fn a_folder_can_move_into_its_own_subfolder() {
     let (temp, repo) = code_repo();
     let mut pitch = scoped(&temp);

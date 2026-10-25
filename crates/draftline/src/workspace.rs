@@ -1848,6 +1848,13 @@ impl Workspace {
         if !report.can_proceed {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
+        // Changes the policy skips still matter to Git's index.
+        if let Some(path) = self.move_blockers(&from)?.into_iter().next() {
+            return Err(DraftlineError::FolderMoveRefused(format!(
+                "{} has changes Git hasn't committed; commit or discard them first",
+                folder_key(&path)
+            )));
+        }
 
         let (author, committer) = self.rewrite_signatures(None)?;
         let operation_id = new_operation_id();
@@ -1889,7 +1896,7 @@ impl Workspace {
         self.advance_head(&branch, &commit, Some(&head_commit), &committer)?;
         test_hooks::fire("after_folder_move_commit", self.repo.path());
 
-        let left_behind = self.move_leftovers(&from, &to);
+        let (left_behind, _) = self.move_leftovers(&from, &to);
         self.content_policy = self.content_policy.clone().scoped_to(&to)?;
         self.write_claim()?;
         self.write_recovery_state(&RecoveryState {
@@ -2002,7 +2009,7 @@ impl Workspace {
                     &format!("Open {label}"),
                 ));
                 if self.move_refusal(&head, &folder, self.scope())?.is_none()
-                    && !self.has_tracked_edits_under(&folder)?
+                    && self.move_blockers(&folder)?.is_empty()
                 {
                     probe.suggestions.push(suggest(
                         FolderFix::MoveFolderHere { from: folder },
@@ -2045,20 +2052,29 @@ impl Workspace {
         Ok(probe)
     }
 
-    /// Whether a file Git tracks under `folder` differs from the last save.
-    fn has_tracked_edits_under(&self, folder: &Path) -> Result<bool> {
+    /// Files under `folder` a move would lose or split from Git's index:
+    /// staged or edited tracked files, conflicts, and new files the folder
+    /// keeps. Untracked files it leaves out follow the move as leftovers.
+    fn move_blockers(&self, folder: &Path) -> Result<Vec<PathBuf>> {
+        let policy = self.content_policy.clone().scoped_to(folder)?;
         let mut options = StatusOptions::new();
-        options.include_untracked(false).include_ignored(false);
-        if !folder.as_os_str().is_empty() {
-            options
-                .pathspec(folder_key(folder))
-                .disable_pathspec_match(true);
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(false);
+        limit_status_to_scope(&mut options, folder);
+        let mut blockers = Vec::new();
+        for entry in self.repo.statuses(Some(&mut options))?.iter() {
+            let status = entry.status();
+            let Ok(path) = entry.path() else {
+                continue;
+            };
+            if status == Status::CURRENT || (status == Status::WT_NEW && !policy.tracks(path)?) {
+                continue;
+            }
+            blockers.push(PathBuf::from(path));
         }
-        Ok(self
-            .repo
-            .statuses(Some(&mut options))?
-            .iter()
-            .any(|entry| entry.status() != Status::CURRENT))
+        Ok(blockers)
     }
 
     /// Managing this folder in place of a missing `old` one keeps the one
@@ -2283,28 +2299,48 @@ impl Workspace {
     }
 
     /// Moves untracked and ignored files the checkout left in `from` into
-    /// `to`, returning those that stayed. Nothing follows from the root: its
-    /// untracked files are anyone's.
-    fn move_leftovers(&self, from: &Path, to: &Path) -> Vec<PathBuf> {
+    /// `to`, returning those that stayed and whether any moved. Nothing
+    /// follows from the root: its untracked files are anyone's. Files Git's
+    /// index tracks are never moved.
+    fn move_leftovers(&self, from: &Path, to: &Path) -> (Vec<PathBuf>, bool) {
         if from.as_os_str().is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
+        // Read fresh: another process may have committed since this opened.
+        let index = self
+            .repo
+            .index()
+            .and_then(|mut index| index.read(false).map(|()| index))
+            .ok();
+        let tracked = |relative: &Path| {
+            index.as_ref().is_none_or(|index| {
+                let key = folder_key(&from.join(relative));
+                index.get_path(Path::new(&key), 0).is_some()
+                    || index.find_prefix(format!("{key}/")).is_ok()
+            })
+        };
         let source = self.root.join(from);
         let destination = self.root.join(to);
         let (mut files, mut dirs) = (Vec::new(), Vec::new());
         collect_leftovers(&source, &destination, &mut files, &mut dirs);
         let mut left_behind = Vec::new();
+        let mut moved_any = false;
         for file in files {
             let Ok(relative) = file.strip_prefix(&source) else {
                 continue;
             };
+            if tracked(relative) {
+                continue;
+            }
             let target = destination.join(relative);
             let moved = target.symlink_metadata().is_err()
                 && target
                     .parent()
                     .is_none_or(|parent| fs::create_dir_all(parent).is_ok())
                 && fs::rename(&file, &target).is_ok();
-            if !moved {
+            if moved {
+                moved_any = true;
+            } else {
                 left_behind.push(from.join(relative));
             }
         }
@@ -2312,7 +2348,7 @@ impl Workspace {
             let _ = fs::remove_dir(dir);
         }
         let _ = fs::remove_dir(&source);
-        left_behind
+        (left_behind, moved_any)
     }
 
     /// Points the local record at the folder the marker on disk names.
@@ -3127,16 +3163,25 @@ impl Workspace {
         };
         let changed_workspace = self.finish_switch_at(None, &branch)?;
         self.sync_claim_to_marker()?;
-        // The checkout leaves the abandoned side's folder behind when empty;
-        // its parents may predate the move, so they stay.
+        let mut moved_leftovers = false;
         if let Some((from, to)) = state.target.as_deref().and_then(|t| t.split_once(" -> ")) {
+            // Settled on the moved side: untracked files follow, as in a move
+            // that finished. Otherwise they never left.
+            if let FolderOwner::Folder(settled) = self.marker_owner()? {
+                if marker_folder(&settled) == to && from != to {
+                    let key = |side: &str| PathBuf::from(if side == "." { "" } else { side });
+                    moved_leftovers = self.move_leftovers(&key(from), &key(to)).1;
+                }
+            }
+            // The checkout leaves the abandoned side's folder behind when
+            // empty; its parents may predate the move, so they stay.
             for side in [from, to] {
                 if side != "." {
                     let _ = fs::remove_dir(self.root.join(side));
                 }
             }
         }
-        self.complete_recovery(state, changed_workspace)
+        self.complete_recovery(state, changed_workspace || moved_leftovers)
     }
 
     /// Undoes an interrupted shelve. The shelf is deleted only while every
@@ -16702,6 +16747,52 @@ mod tests {
         assert_eq!(probe.folder.as_deref(), Some(Path::new("deck")));
         let deck = Workspace::open(temp.path().join("deck")).unwrap();
         assert!(deck.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_recovered_move_brings_ignored_leftovers_along() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        write_file(temp.path(), "README.md", b"app");
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        index.write().unwrap();
+        let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "App", &tree, &[])
+            .unwrap();
+        let mut workspace = Workspace::init(temp.path().join("deck")).unwrap();
+        write_file(workspace.root(), "deck/plan.sk", b"base");
+        write_file(workspace.root(), "deck/.gitignore", b"cache/\n");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "deck/cache/thumb.bin", b"cache");
+        test_hooks::once("after_folder_move_commit", |_| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workspace.move_folder("pitch").map(|_| ())
+        }));
+        assert!(crashed.is_err());
+        let operation = workspace.recovery_state().unwrap().unwrap().operation_id;
+        assert!(temp.path().join("deck/cache/thumb.bin").is_file());
+        // A developer commits a file into the old folder after the crash.
+        write_file(temp.path(), "deck/dev.txt", b"dev");
+        let mut index = repo.index().unwrap();
+        index.read(false).unwrap();
+        index.add_path(Path::new("deck/dev.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "Dev", &tree, &[&head])
+            .unwrap();
+
+        let pitch = Workspace::open(temp.path().join("pitch")).unwrap();
+        pitch.rollback_recovery(&operation).unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("pitch/cache/thumb.bin")).unwrap(),
+            b"cache"
+        );
+        assert!(!temp.path().join("deck/cache").exists());
+        assert_eq!(fs::read(temp.path().join("deck/dev.txt")).unwrap(), b"dev");
+        assert!(!temp.path().join("pitch/dev.txt").exists());
     }
 
     /// A developer commits on the checked-out branch from another process.
