@@ -3481,6 +3481,9 @@ fn removing_an_owned_worktree_keeps_its_branch_and_refuses_unsaved_work() {
     let copy = Workspace::open_with_policy(&owned.project_path, cutready_policy()).unwrap();
     write_file(&owned.path, "cutready/intro.sk", "saved in copy\n");
     copy.save_version("Saved").unwrap();
+    // A finished recovery-tracked operation leaves a completed record behind.
+    write_file(&owned.path, "cutready/intro.sk", "scrapped\n");
+    copy.discard_changes().unwrap();
     assert!(matches!(
         copy.remove_owned_worktree(&owned.name, true),
         Err(DraftlineError::OwnedWorktreeInUse(_))
@@ -3494,7 +3497,8 @@ fn removing_an_owned_worktree_keeps_its_branch_and_refuses_unsaved_work() {
     ));
     assert!(owned.path.exists());
 
-    workspace.remove_owned_worktree(&owned.name, true).unwrap();
+    std::fs::remove_file(owned.path.join("notes.txt")).unwrap();
+    workspace.remove_owned_worktree(&owned.name, false).unwrap();
     assert!(!owned.path.exists());
     assert!(workspace.owned_worktrees().unwrap().is_empty());
     let branch = repo

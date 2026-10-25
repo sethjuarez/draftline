@@ -9288,7 +9288,14 @@ impl Workspace {
                 "remove_owned_worktree",
             )?);
             let ledger = draftline.join("recovery.json");
-            if !discard_changes && ledger.exists() {
+            // A finished operation leaves its record behind marked completed;
+            // only an unfinished (or unreadable) one keeps the checkout.
+            let pending = ledger.exists()
+                && fs::read(&ledger)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<RecoveryLedger>(&bytes).ok())
+                    .is_none_or(|ledger| !ledger.state.completed);
+            if !discard_changes && pending {
                 return Err(DraftlineError::OwnedWorktreeHasChanges(vec![ledger]));
             }
         }
