@@ -4541,6 +4541,40 @@ fn neither_init_nor_a_move_goes_through_a_junction() {
 }
 
 #[test]
+fn managing_a_folder_waits_for_an_unfinished_operation() {
+    let (temp, repo) = code_repo();
+    fs::create_dir_all(repo.path().join("draftline")).unwrap();
+    let ledger = serde_json::json!({
+        "operation_id": "interrupted",
+        "operation": "SwitchVariation",
+        "original_variation": "main",
+        "target": "main",
+        "completed": false,
+        "project": "deck",
+    });
+    fs::write(
+        repo.path().join("draftline").join("recovery.json"),
+        serde_json::to_vec(&ledger).unwrap(),
+    )
+    .unwrap();
+    let error = refused(Workspace::apply_folder_fix(
+        temp.path().join("cutready"),
+        cutready_policy(),
+        &FolderFix::ManageHere,
+    ));
+    assert!(
+        matches!(error, DraftlineError::RecoveryInOtherFolder(_)),
+        "{error:?}"
+    );
+    assert!(!temp.path().join(".draftline").exists());
+    assert!(!repo
+        .path()
+        .join("draftline")
+        .join("workspace.json")
+        .exists());
+}
+
+#[test]
 fn a_fix_the_probe_does_not_offer_is_refused() {
     let (temp, _repo) = code_repo();
     scoped(&temp);

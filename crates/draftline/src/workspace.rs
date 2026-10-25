@@ -1791,6 +1791,8 @@ impl Workspace {
             FolderFix::Open => Self::open_with_policy(&requested, content_policy),
             FolderFix::ManageHere => {
                 if let Some(located) = Self::located(&requested, content_policy.clone())? {
+                    // Never claim a checkout while an operation is unfinished.
+                    located.ensure_no_pending_recovery_in_checkout()?;
                     if probe.state != FolderState::Unmanaged {
                         // Decide and publish under the lock, so two folders
                         // can't both take over in a race.
@@ -1806,9 +1808,9 @@ impl Workspace {
                                 requested.display()
                             )));
                         }
+                        located.ensure_no_pending_recovery_in_checkout()?;
                         // The folder must be one Draftline can manage before
                         // anything is written.
-                        located.ensure_no_pending_recovery_in_checkout()?;
                         create_folder_within(
                             &located.root,
                             &folder_in(&located.root, &requested)?,
