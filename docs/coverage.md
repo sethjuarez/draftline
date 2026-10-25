@@ -70,7 +70,7 @@ Primitive rows use the same scoped-status rule: if the status names a scope, con
 |---|---|---|---|
 | Open local workspace | Covered | `Workspace::open`, `Workspace::open_with_policy` | Discovers existing repository. |
 | Check a folder before opening | Covered | `Workspace::probe`, `Workspace::apply_folder_fix` | Reports the folder's state (new, ready, managed elsewhere, missing, invalid) with fixes the host passes back. |
-| Move the managed folder | Covered | `move_folder` | One save that rewrites `.draftline`; sub to root only when the repository holds nothing else; interruptions are recoverable; history, diffs and restore follow the folder. |
+| Move the managed folder | Covered | `move_folder` | One save that rewrites `.draftline`; repository files like `.gitignore` and `.github/` stay at the root; sub to root only when the repository holds nothing else; interruptions are recoverable; history, diffs and restore follow the folder. |
 | Adopt existing repo | Partially covered | `open`, `workspace_summary`, status/history/remote APIs, `inspect`, `preflight_adopt_workspace` | Setup preflight exists; app-specific migration decisions and broader Git-shape diagnostics remain host work. |
 | Agent-safe API surface | Partially covered | Rust APIs plus JSON helpers for `inspect` and `capabilities`, `verify_workspace`, `explain_error` | No standalone CLI/tool facade or generic execute protocol yet. |
 | Create local workspace | Covered | `Workspace::init`, `Workspace::init_with_policy` | Creates folder/repository if needed. |

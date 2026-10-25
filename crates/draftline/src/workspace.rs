@@ -506,6 +506,29 @@ struct WorkspaceClaim {
 /// It is committed with saves, so every clone and branch agrees.
 const FOLDER_MARKER: &str = ".draftline";
 
+/// Files that describe the repository rather than a folder in it. They stay
+/// at the root when a root folder moves into a subfolder.
+const REPOSITORY_FILES: [&str; 5] = [
+    FOLDER_MARKER,
+    ".gitignore",
+    ".gitattributes",
+    ".gitmodules",
+    ".github",
+];
+
+/// Whether `path`'s first component is one of [`REPOSITORY_FILES`].
+fn is_repository_file(path: &[u8]) -> bool {
+    let first = path.split(|byte| *byte == b'/').next().unwrap_or_default();
+    REPOSITORY_FILES.iter().any(|name| name.as_bytes() == first)
+}
+
+/// [`is_repository_file`] for a repository-relative path.
+fn is_repository_path(path: &Path) -> bool {
+    path.components()
+        .next()
+        .is_some_and(|first| is_repository_file(first.as_os_str().as_encoded_bytes()))
+}
+
 /// The trailer on a folder move's commit naming where the folder was.
 const MOVED_FROM_TRAILER: &str = "Draftline-Moved-From";
 
@@ -2252,15 +2275,24 @@ impl Workspace {
         }
         if let Some(first) = to.components().next() {
             let first = first.as_os_str();
-            if first == ".git" || first == FOLDER_MARKER {
+            if first == ".git" || is_repository_path(to) {
                 return Ok(Some(format!("{to_label} is reserved")));
             }
         }
         // Files already saved under `to` would mix with the folder's own,
-        // except the folder itself when it moves up into `to`.
+        // except the folder itself when it moves up into `to`. The root's
+        // repository files stay put unless the folder brings its own.
         let into_own_subfolder = to.starts_with(from);
+        let to_root = to.as_os_str().is_empty();
+        let brings = |path: &Path| {
+            path.components()
+                .next()
+                .is_some_and(|first| head.get_path(&from.join(first)).is_ok())
+        };
         let blocking = tracked_paths_under(head, to)?.into_iter().find(|path| {
-            path != Path::new(FOLDER_MARKER) && (into_own_subfolder || !path.starts_with(from))
+            path != Path::new(FOLDER_MARKER)
+                && (into_own_subfolder || !path.starts_with(from))
+                && !(to_root && is_repository_path(path) && !brings(path))
         });
         if let Some(path) = blocking {
             return Ok(Some(if to.as_os_str().is_empty() {
@@ -2296,7 +2328,7 @@ impl Workspace {
     }
 
     /// `head` with the folder's files moved from `from` to `to` and
-    /// [`FOLDER_MARKER`] naming `to`.
+    /// [`FOLDER_MARKER`] naming `to`. From the root, [`REPOSITORY_FILES`] stay.
     fn moved_tree(&self, head: &Tree<'_>, from: &Path, to: &Path) -> Result<Oid> {
         let mut source = git2::Index::new()?;
         source.read_tree(head)?;
@@ -2307,7 +2339,8 @@ impl Workspace {
             if entry.path == FOLDER_MARKER.as_bytes() {
                 continue;
             }
-            if let Some(rest) = strip_folder(&entry.path, from.as_bytes()) {
+            let stays = from.is_empty() && is_repository_file(&entry.path);
+            if let Some(rest) = strip_folder(&entry.path, from.as_bytes()).filter(|_| !stays) {
                 let mut path = to.as_bytes().to_vec();
                 if !path.is_empty() {
                     path.push(b'/');
@@ -10831,34 +10864,38 @@ impl Workspace {
         if from == self.scope() {
             return Ok(self.repo.find_tree(tree.id())?);
         }
-        // The folder's content as it was: a root folder is everything but the marker.
+        // The folder's content as it was: a root folder is everything but the
+        // repository files.
         let content = if from.as_os_str().is_empty() {
-            Some(tree_without(&self.repo, &tree, FOLDER_MARKER)?)
+            Some(split_root(&self.repo, &tree)?.0)
         } else {
             optional_tree_entry(&tree, &from)?
         };
         let id = match scope_pathspec(self.scope()) {
-            // Now the root: the folder's content is the whole tree, under today's marker.
+            // Now the root: the folder's content is the whole tree, beside
+            // today's repository files.
             None => {
                 let content = match content {
                     Some(content) => content,
                     None => self.empty_tree_id()?,
                 };
                 let content = self.repo.find_tree(content)?;
-                match self.head_tree_or_empty()?.get_name(FOLDER_MARKER) {
-                    Some(marker) => {
-                        let mut update = git2::build::TreeUpdateBuilder::new();
-                        update.upsert(FOLDER_MARKER, marker.id(), git2::FileMode::Blob);
-                        update.create_updated(&self.repo, &content)?
+                let head = self.head_tree_or_empty()?;
+                let mut update = git2::build::TreeUpdateBuilder::new();
+                for entry in head.iter() {
+                    if is_repository_file(entry.name_bytes()) {
+                        if let Ok(name) = entry.name() {
+                            update.upsert(name, entry.id(), entry_file_mode(&entry));
+                        }
                     }
-                    None => content.id(),
                 }
+                update.create_updated(&self.repo, &content)?
             }
             Some(pathspec) => {
-                // The folder leaves its old place; a root folder held nothing
-                // else, so nothing else carries over.
+                // The folder leaves its old place; a root folder leaves only
+                // the repository files behind.
                 let base = if from.as_os_str().is_empty() {
-                    self.empty_tree_id()?
+                    split_root(&self.repo, &tree)?.1
                 } else {
                     tree_without(&self.repo, &tree, &folder_key(&from))?
                 };
@@ -10878,17 +10915,27 @@ impl Workspace {
 
     fn compose_scoped_tree(&self, base: &Tree<'_>, source: &Tree<'_>) -> Result<Oid> {
         let Some(pathspec) = scope_pathspec(self.scope()) else {
-            // The marker describes the repository, not a version of the
-            // folder, so restoring never changes it.
-            let wanted = base.get_name(FOLDER_MARKER).map(|entry| entry.id());
-            if source.get_name(FOLDER_MARKER).map(|entry| entry.id()) == wanted {
+            // Repository files describe the repository, not a version of the
+            // folder, so restoring never changes them.
+            let mut update = git2::build::TreeUpdateBuilder::new();
+            let mut changed = false;
+            for name in REPOSITORY_FILES {
+                let wanted = base.get_name(name);
+                let have = source.get_name(name);
+                if wanted.as_ref().map(|entry| (entry.id(), entry.filemode()))
+                    == have.as_ref().map(|entry| (entry.id(), entry.filemode()))
+                {
+                    continue;
+                }
+                changed = true;
+                match wanted {
+                    Some(entry) => update.upsert(name, entry.id(), entry_file_mode(&entry)),
+                    None => update.remove(name),
+                };
+            }
+            if !changed {
                 return Ok(source.id());
             }
-            let mut update = git2::build::TreeUpdateBuilder::new();
-            match wanted {
-                Some(marker) => update.upsert(FOLDER_MARKER, marker, git2::FileMode::Blob),
-                None => update.remove(FOLDER_MARKER),
-            };
             return Ok(update.create_updated(&self.repo, source)?);
         };
         let source_entry = optional_tree_entry(source, self.scope())?;
@@ -12480,6 +12527,26 @@ impl<'r> FolderChanges<'r> {
 }
 
 /// `tree` without the entry at `path`, if it has one.
+/// A root folder's tree split into its content and the
+/// [`REPOSITORY_FILES`] beside it, the marker in neither.
+fn split_root(repo: &Repository, tree: &Tree<'_>) -> Result<(Oid, Oid)> {
+    let mut content = git2::build::TreeUpdateBuilder::new();
+    let mut repository = git2::build::TreeUpdateBuilder::new();
+    for entry in tree.iter() {
+        let name = String::from_utf8_lossy(entry.name_bytes()).into_owned();
+        if is_repository_file(entry.name_bytes()) {
+            content.remove(&name);
+        }
+        if !is_repository_file(entry.name_bytes()) || name == FOLDER_MARKER {
+            repository.remove(&name);
+        }
+    }
+    Ok((
+        content.create_updated(repo, tree)?,
+        repository.create_updated(repo, tree)?,
+    ))
+}
+
 fn tree_without(repo: &Repository, tree: &Tree<'_>, path: &str) -> Result<Oid> {
     if tree.get_path(Path::new(path)).is_err() {
         return Ok(tree.id());
@@ -13497,6 +13564,14 @@ fn blob_file_mode(mode: i32) -> git2::FileMode {
         0o100755 => git2::FileMode::BlobExecutable,
         0o120000 => git2::FileMode::Link,
         _ => git2::FileMode::Blob,
+    }
+}
+
+fn entry_file_mode(entry: &git2::TreeEntry<'_>) -> git2::FileMode {
+    match entry.filemode() {
+        0o040000 => git2::FileMode::Tree,
+        0o160000 => git2::FileMode::Commit,
+        mode => blob_file_mode(mode),
     }
 }
 

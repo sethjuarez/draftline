@@ -4167,11 +4167,15 @@ fn a_root_folder_marker_names_the_whole_repository_and_survives_restore() {
     let root = Workspace::open_with_policy(temp.path(), cutready_policy()).unwrap();
     let marker = fs::read_to_string(temp.path().join(".draftline")).unwrap();
     assert!(marker.contains("\"folder\": \".\""), "{marker}");
+    write_file(temp.path(), ".gitignore", "*.tmp\n");
+    commit_all(&repo, "Ignore");
     write_file(temp.path(), "notes.md", "draft\n");
     root.save_version("Draft").unwrap();
     let first = root.versions().unwrap()[0].id().clone();
     write_file(temp.path(), "notes.md", "notes\n");
     root.save_version("Notes").unwrap();
+    write_file(temp.path(), ".gitignore", "*.tmp\n*.log\n");
+    commit_all(&repo, "Ignore logs");
     let head = repo.head().unwrap().peel_to_tree().unwrap();
     assert!(head.get_name(".draftline").is_some());
 
@@ -4186,6 +4190,11 @@ fn a_root_folder_marker_names_the_whole_repository_and_survives_restore() {
     root.restore_version_as_new_save(&first, "Back").unwrap();
     assert_eq!(head_marker(&repo), marker);
     assert_eq!(read(temp.path(), "notes.md"), "draft\n");
+    assert_eq!(
+        read(temp.path(), ".gitignore"),
+        "*.tmp\n*.log\n",
+        "repository files are not the folder's to restore"
+    );
     let head = repo.head().unwrap().peel_to_tree().unwrap();
     assert!(head.get_name(".draftline").is_some());
     assert!(temp.path().join(".draftline").is_file());
@@ -4821,6 +4830,9 @@ fn a_folder_can_move_into_its_own_subfolder() {
 #[test]
 fn the_root_folder_moves_into_a_subfolder_and_back() {
     let (temp, repo) = code_repo();
+    write_file(temp.path(), ".gitignore", "*.tmp\n");
+    write_file(temp.path(), ".github/CODEOWNERS", "* @team\n");
+    commit_all(&repo, "Repository files");
     let mut root = Workspace::open_with_policy(temp.path(), cutready_policy()).unwrap();
     root.save_version("Marker").unwrap();
     write_file(temp.path(), "scratch.tmp", "mine\n");
@@ -4829,18 +4841,29 @@ fn the_root_folder_moves_into_a_subfolder_and_back() {
     assert_eq!(moved.from, PathBuf::new());
     let tree = repo.head().unwrap().peel_to_tree().unwrap();
     let names: Vec<_> = tree.iter().map(|e| e.name().unwrap().to_string()).collect();
-    assert_eq!(names, [".draftline", "business"]);
+    assert_eq!(
+        names,
+        [".draftline", ".github", ".gitignore", "business"],
+        "repository files stay at the root"
+    );
     assert_eq!(read(temp.path(), "business/src/main.rs"), "fn main() {}\n");
+    assert_eq!(read(temp.path(), ".gitignore"), "*.tmp\n");
+    assert!(!temp.path().join("business/.gitignore").exists());
     assert_eq!(
         read(temp.path(), "scratch.tmp"),
         "mine\n",
         "root leftovers stay"
     );
+    // A version from before the move reads as the folder's content alone.
+    let before = root.versions().unwrap().into_iter().nth(1).unwrap();
+    let diff = root.diff_version_to_workspace(before.id()).unwrap();
+    assert!(diff.files.is_empty(), "{:?}", diff.files);
 
-    // Back to the root: allowed, because the repository holds nothing else.
+    // Back to the root: allowed, because the repository holds only its own files.
     root.move_folder("").unwrap();
     assert_eq!(root.scope(), Path::new(""));
     assert_eq!(read(temp.path(), "src/main.rs"), "fn main() {}\n");
+    assert_eq!(read(temp.path(), ".gitignore"), "*.tmp\n");
     assert!(!temp.path().join("business").exists());
 }
 
