@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.6.0...draftline-v0.7.0) (2026-10-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* **workspace:** SendRequest.expected_head and SendPreflight.head are replaced by SendRequest.expected and SendPreflight.token.
+
+### Features
+
+* **workspace:** manage one folder as a teammate in developer repositories ([#54](https://github.com/sethjuarez/draftline/issues/54)) ([b537879](https://github.com/sethjuarez/draftline/commit/b537879f814c07f9eb00b7ff882e7d1ddeb5544c))
+
 ## [0.6.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.5.0...draftline-v0.6.0) (2026-10-24)
 
 
