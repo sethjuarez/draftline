@@ -518,6 +518,7 @@ struct FolderMarker {
 }
 
 /// Who manages the repository, as the marker or local record says.
+#[derive(PartialEq)]
 enum FolderOwner {
     Nobody,
     Folder(String),
@@ -2133,12 +2134,30 @@ impl Workspace {
             .is_some_and(|marker| marker.format == 1 && marker.folder == marker_folder(key))
     }
 
+    /// Under the lock, refuses a folder fix once another folder took over
+    /// since the probe: the marker, or the claim when there is no marker,
+    /// must still name this folder.
+    fn ensure_still_managed(&self, doing: &str) -> Result<()> {
+        let owner = match self.marker_owner()? {
+            FolderOwner::Nobody => self.claim_owner()?,
+            owner => owner,
+        };
+        if owner == FolderOwner::Folder(self.project_key()) {
+            return Ok(());
+        }
+        Err(DraftlineError::FolderFixUnavailable(format!(
+            "{doing} {} is no longer offered: Draftline manages another folder now",
+            folder_label(self.scope())
+        )))
+    }
+
     /// Puts this folder's files back from HEAD, leaving everything else alone.
     fn restore_missing_folder(&self) -> Result<()> {
         fs::create_dir_all(self.draftline_dir())?;
         let _lock = OperationLock::acquire(&self.lock_path(), "restore_folder")?;
         self.while_git_busy(|| self.ensure_git_index_unlocked())?;
         self.ensure_no_pending_recovery_in_checkout()?;
+        self.ensure_still_managed("restoring")?;
         // No early return if the folder reappeared: it may be back only in
         // part, and a safe checkout only recreates what is still missing.
         let head = self.repo.head()?.peel_to_tree()?;
@@ -2177,6 +2196,7 @@ impl Workspace {
         let _lock = OperationLock::acquire(&self.lock_path(), "switch_to_folder_branch")?;
         self.while_git_busy(|| self.ensure_git_index_unlocked())?;
         self.ensure_no_pending_recovery_in_checkout()?;
+        self.ensure_still_managed("switching")?;
         // Decide again under the lock: the folder may be back, or the branch
         // may no longer have it.
         let key = self.project_key();
@@ -11179,6 +11199,20 @@ impl Workspace {
             if folder == ours {
                 return Ok(self.repo.find_tree(commit.tree_id())?);
             }
+            // Relocating replaces whatever sits where the folder is now; a
+            // teammate's files there would vanish from the merge unseen.
+            let tree = commit.tree()?;
+            let dropped: Vec<PathBuf> = if folder.as_os_str().is_empty() {
+                Vec::new()
+            } else {
+                tracked_paths_under(&tree, &ours)?
+                    .into_iter()
+                    .filter(|path| !path.starts_with(folder) && path != Path::new(FOLDER_MARKER))
+                    .collect()
+            };
+            if !dropped.is_empty() {
+                return Err(DraftlineError::MergeNeedsDeveloper(dropped));
+            }
             let tree = self.relocated_tree(commit)?;
             let id = match marker {
                 Some(marker) => {
@@ -16883,6 +16917,50 @@ mod tests {
             assert!(create_folder_within(temp.path(), Path::new("link/inner")).is_err());
             assert!(!outside.path().join("inner").exists());
         }
+    }
+
+    #[test]
+    fn folder_fixes_stop_once_another_folder_took_over() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        write_file(temp.path(), "README.md", b"app");
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        index.write().unwrap();
+        let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "App", &tree, &[])
+            .unwrap();
+        let workspace = Workspace::init(temp.path().join("deck")).unwrap();
+        write_file(workspace.root(), "deck/plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        let branch = workspace.current_variation().unwrap();
+        fs::remove_dir_all(temp.path().join("deck")).unwrap();
+        // The handle a fix would use, taken before the race.
+        let managed =
+            Workspace::located_in(&temp.path().join("deck"), ContentPolicy::default(), None)
+                .unwrap()
+                .unwrap();
+
+        // Meanwhile another folder takes over.
+        let marker = fs::read(temp.path().join(FOLDER_MARKER)).unwrap();
+        write_file(temp.path(), FOLDER_MARKER, &marker_bytes("other").unwrap());
+        for result in [
+            managed.restore_missing_folder(),
+            managed.switch_to_folder_branch(&branch),
+        ] {
+            assert!(
+                matches!(&result, Err(DraftlineError::FolderFixUnavailable(reason))
+                    if reason.contains("another folder")),
+                "{:?}",
+                result.err()
+            );
+        }
+        assert!(!temp.path().join("deck").exists());
+
+        fs::write(temp.path().join(FOLDER_MARKER), marker).unwrap();
+        managed.restore_missing_folder().unwrap();
+        assert_eq!(fs::read(temp.path().join("deck/plan.sk")).unwrap(), b"base");
     }
 
     #[test]

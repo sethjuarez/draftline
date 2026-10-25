@@ -1341,10 +1341,20 @@ export interface DraftlineHostFacadeOptions {
 }
 
 export interface DraftlineHostFacade {
+  /** The folder this facade is bound to. It never changes; see `moveFolder`. */
   workspacePath: string;
   open(): Promise<WorkspaceOpenResult>;
   probeFolder(): Promise<FolderProbe>;
+  /**
+   * Applies a fix `probeFolder` offered. When the fix names a `folder` other
+   * than this one, it opens that folder: create a new facade for it.
+   */
   applyFolderFix(fix: FolderFix): Promise<WorkspaceOpenResult>;
+  /**
+   * Moves the managed folder to `to` (absolute, or relative to the repository
+   * root). This facade stays bound to the old path, which Draftline refuses
+   * from then on: create a new facade for the new folder.
+   */
   moveFolder(to: string): Promise<MoveFolderResult>;
   inspect(): Promise<WorkspaceDiagnostics>;
   preflightSwitchVariation(variationId: string): Promise<PreflightReport>;

@@ -2773,6 +2773,30 @@ fn incoming_edits_from_before_a_move_land_in_the_moved_folder() {
 }
 
 #[test]
+fn incoming_developer_files_where_the_folder_moved_stop_the_merge() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let mut workspace = scoped(&temp);
+    workspace.move_folder("demos/pitch").unwrap();
+
+    // A developer, still seeing the folder at cutready, puts code where it now is.
+    write_file(other_dir.path(), "demos/pitch/server.rs", "fn serve() {}\n");
+    commit_all(&other, "Pitch server");
+    push_main(&other);
+
+    workspace.fetch_remote("origin").unwrap();
+    let err = workspace.preflight_merge_incoming("origin").unwrap_err();
+    assert!(
+        matches!(&err, DraftlineError::MergeNeedsDeveloper(paths)
+            if paths == &[PathBuf::from("demos/pitch/server.rs")]),
+        "{err:?}"
+    );
+    let head = repo.head().unwrap().target().unwrap();
+    assert!(!temp.path().join("demos/pitch/server.rs").exists());
+    assert_eq!(repo.head().unwrap().target().unwrap(), head);
+}
+
+#[test]
 fn an_incoming_move_elsewhere_is_followed_before_merging() {
     let (temp, repo) = code_repo();
     let (_bare, other_dir, other) = with_remote(&repo);
