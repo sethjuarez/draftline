@@ -468,6 +468,9 @@ pub struct OperationLockMetadata {
     pub process_id: u32,
     pub owner: Option<String>,
     pub created_at_seconds: u64,
+    /// Machine that took the lock; absent in locks from older versions.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 /// Read-only report for the current operation lock file.
@@ -13392,9 +13395,78 @@ fn inspect_operation_lock_path(path: &Path) -> Result<OperationLockInspection> {
     })
 }
 
+/// A lock is stale once its process is gone on this machine, or after
+/// `STALE_LOCK_SECONDS` when that can't be known (another machine, or an
+/// unsupported platform). A reused process id only delays clearing.
 fn operation_lock_metadata_is_stale(metadata: &OperationLockMetadata) -> bool {
-    metadata.process_id != std::process::id()
-        && now_seconds().saturating_sub(metadata.created_at_seconds) >= STALE_LOCK_SECONDS
+    if metadata.process_id == std::process::id() {
+        return false;
+    }
+    if now_seconds().saturating_sub(metadata.created_at_seconds) >= STALE_LOCK_SECONDS {
+        return true;
+    }
+    let same_host = match (&metadata.host, current_host()) {
+        (Some(recorded), Some(current)) => recorded.eq_ignore_ascii_case(&current),
+        _ => true,
+    };
+    same_host && process_is_running(metadata.process_id) == Some(false)
+}
+
+fn current_host() -> Option<String> {
+    ["COMPUTERNAME", "HOSTNAME"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .or_else(|| fs::read_to_string("/etc/hostname").ok())
+        .or_else(|| fs::read_to_string("/proc/sys/kernel/hostname").ok())
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+}
+
+/// `Some(false)` only when the process is known to be gone.
+#[cfg(windows)]
+fn process_is_running(process_id: u32) -> Option<bool> {
+    type Handle = *mut std::ffi::c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> Handle;
+        fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+    // SAFETY: plain Win32 calls; the handle is closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error().raw_os_error();
+            return Some(error != Some(ERROR_INVALID_PARAMETER));
+        }
+        let mut exit_code = 0u32;
+        let read = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        (read != 0).then_some(exit_code == STILL_ACTIVE)
+    }
+}
+
+/// `Some(false)` only when the process is known to be gone.
+#[cfg(unix)]
+fn process_is_running(process_id: u32) -> Option<bool> {
+    const ESRCH: i32 = 3;
+    extern "C" {
+        fn kill(process_id: i32, signal: i32) -> i32;
+    }
+    let process_id = i32::try_from(process_id).ok().filter(|id| *id > 0)?;
+    // SAFETY: signal 0 only checks that the process exists.
+    if unsafe { kill(process_id, 0) } == 0 {
+        return Some(true);
+    }
+    Some(std::io::Error::last_os_error().raw_os_error() != Some(ESRCH))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn process_is_running(_process_id: u32) -> Option<bool> {
+    None
 }
 
 fn new_operation_lock_metadata(operation: impl Into<String>) -> OperationLockMetadata {
@@ -13406,6 +13478,7 @@ fn new_operation_lock_metadata(operation: impl Into<String>) -> OperationLockMet
             .ok()
             .or_else(|| std::env::var("USERNAME").ok()),
         created_at_seconds: now_seconds(),
+        host: current_host(),
     }
 }
 
@@ -16874,6 +16947,7 @@ mod tests {
             process_id: u32::MAX,
             owner: None,
             created_at_seconds: 1,
+            host: None,
         };
         fs::create_dir_all(workspace.draftline_dir()).unwrap();
         fs::write(
@@ -16893,6 +16967,52 @@ mod tests {
         let err = workspace.clear_stale_lock().unwrap_err();
         assert!(matches!(err, DraftlineError::WorkspaceLocked));
         assert!(workspace.lock_path().exists());
+    }
+
+    #[test]
+    fn a_lock_from_a_crashed_process_clears_right_away() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd")
+        } else {
+            std::process::Command::new("cat")
+        }
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+        let mut metadata = new_operation_lock_metadata("crash_test");
+        metadata.process_id = child.id();
+        fs::create_dir_all(workspace.draftline_dir()).unwrap();
+        let write_lock = |metadata: &OperationLockMetadata| {
+            fs::write(
+                workspace.lock_path(),
+                serde_json::to_vec_pretty(metadata).unwrap(),
+            )
+            .unwrap()
+        };
+        write_lock(&metadata);
+
+        assert!(!workspace.inspect_operation_lock().unwrap().is_stale);
+        assert!(matches!(
+            workspace.clear_stale_lock().unwrap_err(),
+            DraftlineError::WorkspaceLocked
+        ));
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(workspace.inspect_operation_lock().unwrap().is_stale);
+
+        // Another machine's lock can't be judged by process id.
+        metadata.host = Some("another-machine".to_string());
+        write_lock(&metadata);
+        assert!(!workspace.inspect_operation_lock().unwrap().is_stale);
+
+        metadata.host = current_host();
+        write_lock(&metadata);
+        workspace.clear_stale_lock().unwrap();
+        assert!(!workspace.lock_path().exists());
     }
 
     #[test]

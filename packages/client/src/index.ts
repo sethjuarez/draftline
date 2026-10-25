@@ -781,6 +781,7 @@ export interface OperationLockMetadata {
   process_id: number;
   owner?: string | null;
   created_at_seconds: number;
+  host?: string | null;
 }
 
 export interface WorkspaceDiagnostic {
