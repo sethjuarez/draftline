@@ -3773,6 +3773,32 @@ fn dismissing_an_unpublished_0_5_cleanup_moves_nothing_and_keeps_its_backup() {
 }
 
 #[test]
+fn unreadable_0_5_cleanup_records_are_skipped() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp);
+    legacy_cleanup(&temp, &repo);
+    let path = repo.path().join("draftline/history-cleanup/pending.json");
+    let mut records: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    records.push(serde_json::json!({ "plan_id": 7 }));
+    fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+
+    let cleanups = workspace.legacy_history_cleanups().unwrap();
+    let [cleanup] = cleanups.as_slice() else {
+        panic!("{cleanups:?}");
+    };
+    assert_eq!(cleanup.plan_id, "cleanup-1");
+
+    fs::write(&path, b"{ not json").unwrap();
+    assert!(workspace.legacy_history_cleanups().unwrap().is_empty());
+    assert!(workspace
+        .workspace_summary()
+        .unwrap()
+        .legacy_history_cleanups
+        .is_empty());
+}
+
+#[test]
 fn a_switch_interrupted_onto_a_branch_naming_another_folder_can_finish() {
     let (temp, repo) = code_repo();
     let pitch = scoped(&temp);

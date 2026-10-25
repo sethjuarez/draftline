@@ -3693,12 +3693,28 @@ impl Workspace {
             .join("pending.json")
     }
 
+    /// Reads 0.5's pending history cleanups, skipping any it can't parse:
+    /// they are informational, so a damaged file never blocks the folder.
     fn read_legacy_pending_cleanups(&self) -> Result<Vec<LegacyPendingCleanupRecord>> {
-        match fs::read(self.legacy_pending_cleanup_path()) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(error) => Err(error.into()),
-        }
+        let bytes = match fs::read(self.legacy_pending_cleanup_path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let Ok(raw) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) else {
+            tracing::warn!("skipping unreadable 0.5 history cleanup records");
+            return Ok(Vec::new());
+        };
+        Ok(raw
+            .into_iter()
+            .filter_map(|value| {
+                serde_json::from_value(value)
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, "skipping unreadable 0.5 history cleanup record")
+                    })
+                    .ok()
+            })
+            .collect())
     }
 
     /// Lists history cleanups that Draftline 0.5 applied locally but never
