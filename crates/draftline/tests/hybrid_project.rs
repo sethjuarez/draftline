@@ -1505,10 +1505,10 @@ fn command_context_applies_the_variation_namespace_on_every_open() {
 }
 
 #[test]
-fn command_contract_reports_developer_branches_and_starts_a_variation_there() {
+fn command_contract_saves_on_a_developer_branch_and_starts_a_variation_there() {
     use draftline::tauri_contract::{
         save_with_context, start_variation_here_with_context, DraftlineCommandContext, SaveRequest,
-        StartVariationHereRequest, TauriCommandError,
+        StartVariationHereRequest,
     };
     let (temp, repo) = code_repo();
     scoped(&temp);
@@ -1521,19 +1521,22 @@ fn command_contract_reports_developer_branches_and_starts_a_variation_there() {
         .with_content_policy(cutready_policy())
         .with_variation_namespace("cutready/")
         .unwrap();
-
-    let error = TauriCommandError::from(
+    let save = |context: &mut DraftlineCommandContext| {
         save_with_context(
-            &mut context,
+            context,
             SaveRequest {
                 workspace_path: folder.clone(),
                 label: "Pitch".into(),
             },
         )
-        .unwrap_err(),
+        .unwrap();
+    };
+
+    save(&mut context);
+    assert_ne!(
+        repo.refname_to_id("refs/heads/feature/x").unwrap(),
+        head.id()
     );
-    assert_eq!(error.code, "branch_outside_namespace");
-    assert_eq!(error.details.unwrap()["branch"], "feature/x");
 
     let started = start_variation_here_with_context(
         &mut context,
@@ -1545,14 +1548,8 @@ fn command_contract_reports_developer_branches_and_starts_a_variation_there() {
     )
     .unwrap();
     assert_eq!(started.variation.name, "cutready/rescue");
-    save_with_context(
-        &mut context,
-        SaveRequest {
-            workspace_path: folder,
-            label: "Pitch".into(),
-        },
-    )
-    .unwrap();
+    std::fs::write(folder.join("intro.sk"), "pitch v2").unwrap();
+    save(&mut context);
 }
 
 #[test]
@@ -2174,30 +2171,49 @@ fn namespaced_archive_restore_stays_inside_the_namespace() {
 }
 
 #[test]
-fn send_rejects_developer_branches_outside_the_variation_namespace() {
+fn send_from_a_developer_branch_moves_work_to_a_namespaced_branch() {
     let (temp, repo) = code_repo();
     let (bare, _other_dir, _other) = with_remote(&repo);
     let head = repo.head().unwrap().peel_to_commit().unwrap();
     repo.branch("feature/login", &head, false).unwrap();
     repo.set_head("refs/heads/feature/login").unwrap();
     let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "login pitch\n");
+    workspace.save_version("Login pitch").unwrap();
+    let saved = repo.refname_to_id("refs/heads/feature/login").unwrap();
 
-    let error = workspace
+    let preflight = workspace
+        .preflight_send("origin", &send_request("Login"), &mut RemoteOptions::new())
+        .unwrap();
+    assert!(preflight.creates_variation);
+    assert_eq!(preflight.variation, "cutready/login");
+    let mut host = FakeHost::default();
+    let result = workspace
         .send(
             "origin",
             &send_request("Login"),
-            &mut FakeHost::default(),
+            &mut host,
             &mut RemoteOptions::new(),
         )
-        .unwrap_err();
+        .unwrap();
 
+    assert!(result.created_variation);
+    assert_eq!(result.variation, "cutready/login");
+    assert_eq!(workspace.current_variation().unwrap(), "cutready/login");
+    assert_eq!(remote_branch(bare.path(), "cutready/login"), Some(saved));
     assert!(
-        matches!(error, DraftlineError::SendOutsideNamespace(ref name) if name == "feature/login"),
-        "{error:?}"
+        remote_branch(bare.path(), "feature/login").is_none(),
+        "Draftline only pushes branches it owns"
     );
-    assert!(remote_branch(bare.path(), "feature/login").is_none());
+    assert_eq!(
+        repo.refname_to_id("refs/heads/feature/login").unwrap(),
+        saved
+    );
+    assert_eq!(host.open[0].0.head, "cutready/login");
 
     repo.set_head("refs/heads/main").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
     let error = workspace
         .send(
             "origin",
@@ -2220,109 +2236,60 @@ fn send_rejects_developer_branches_outside_the_variation_namespace() {
 }
 
 #[test]
-fn saves_and_updates_refuse_a_developer_branch_until_a_variation_starts_here() {
-    use draftline::{DiagnosticCode, RestoreVersionTarget, SafeNextAction, VariationId};
-    let on_dev_branch = |result: draftline::Result<()>| match result {
-        Err(DraftlineError::BranchOutsideNamespace(name)) => assert_eq!(name, "feature/x"),
-        other => panic!("expected BranchOutsideNamespace, got {other:?}"),
-    };
+fn saves_and_updates_work_on_a_developer_branch_like_a_teammates() {
+    use draftline::{DiagnosticSeverity, SafeNextAction};
     let (temp, repo) = code_repo();
     let (_bare, _other_dir, _other) = with_remote(&repo);
     let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
-    let version = workspace.versions().unwrap()[0].id().clone();
     // A developer runs `git switch -c feature/x` in the shared checkout.
     let head = repo.head().unwrap().peel_to_commit().unwrap();
     repo.branch("feature/x", &head, false).unwrap();
     repo.set_head("refs/heads/feature/x").unwrap();
-    write_file(temp.path(), "cutready/intro.sk", "scene one, revised\n");
-
-    on_dev_branch(workspace.save_version("Pitch").map(|_| ()));
-    on_dev_branch(workspace.save_files(["intro.sk"], "Pitch").map(|_| ()));
-    on_dev_branch(workspace.preflight_save_files(["intro.sk"]).map(|_| ()));
-    on_dev_branch(
-        workspace
-            .restore_version_as_new_save(&version, "Back")
-            .map(|_| ()),
-    );
-    for target in [
-        RestoreVersionTarget::Current,
-        RestoreVersionTarget::Existing {
-            variation: VariationId::from("feature/x"),
-        },
-    ] {
-        on_dev_branch(
-            workspace
-                .restore_version_as_new_save_to_variation(&version, "Back", target)
-                .map(|_| ()),
-        );
-    }
-    on_dev_branch(workspace.preflight_apply_incoming("origin").map(|_| ()));
-    on_dev_branch(workspace.preflight_merge_incoming("origin").map(|_| ()));
-    on_dev_branch(workspace.preflight_merge_base("origin").map(|_| ()));
-    on_dev_branch(
-        workspace
-            .apply_incoming("origin", &mut RemoteOptions::new())
-            .map(|_| ()),
-    );
-    assert_eq!(
-        repo.head().unwrap().peel_to_commit().unwrap().id(),
-        head.id()
-    );
-
     let inspection = workspace.inspect().unwrap();
-    assert!(inspection
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == DiagnosticCode::BranchOutsideNamespace));
+    assert!(
+        !inspection
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Blocking),
+        "{inspection:?}"
+    );
     assert_eq!(
         inspection.safe_next_actions,
-        vec![SafeNextAction::StartVariationHere]
+        vec![SafeNextAction::NormalWork]
     );
 
-    // Shelving stays available, and leaves the developer's branch alone.
-    workspace.shelve_changes("wip").unwrap();
-    workspace.apply_shelf("wip").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, revised\n");
+    let saved = workspace.save_version("Pitch").unwrap();
+    assert_eq!(workspace.current_variation().unwrap(), "feature/x");
     assert_eq!(
-        read(temp.path(), "cutready/intro.sk"),
-        "scene one, revised\n"
+        repo.refname_to_id("refs/heads/feature/x")
+            .unwrap()
+            .to_string(),
+        saved.id().as_str()
     );
+    workspace.preflight_apply_incoming("origin").unwrap();
+    workspace.preflight_merge_base("origin").unwrap();
 
+    // Starting a variation here is still a way to keep work apart.
     let error = workspace.start_variation_here("feature/y").unwrap_err();
     assert!(
         matches!(error, DraftlineError::VariationOutsideNamespace(_)),
         "{error:?}"
     );
-    let rescue = workspace.start_variation_here("cutready/rescue").unwrap();
-    assert!(rescue.is_current);
-    assert_eq!(workspace.current_variation().unwrap(), "cutready/rescue");
+    workspace.start_variation_here("cutready/rescue").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, again\n");
+    workspace.save_version("Again").unwrap();
     assert_eq!(
-        read(temp.path(), "cutready/intro.sk"),
-        "scene one, revised\n",
-        "unsaved edits come along"
-    );
-    assert_eq!(
-        workspace.inspect().unwrap().safe_next_actions,
-        vec![SafeNextAction::SaveFirst, SafeNextAction::DiscardChanges]
-    );
-    workspace.save_version("Pitch").unwrap();
-    assert_eq!(
-        repo.refname_to_id("refs/heads/feature/x").unwrap(),
-        head.id(),
-        "the developer's branch never moved"
-    );
-    assert_eq!(
-        repo.find_reference("refs/heads/cutready/rescue")
+        repo.refname_to_id("refs/heads/feature/x")
             .unwrap()
-            .peel_to_commit()
-            .unwrap()
-            .parent_id(0)
-            .unwrap(),
-        head.id()
+            .to_string(),
+        saved.id().as_str(),
+        "the developer's branch stays where the last save there left it"
     );
 }
 
 #[test]
-fn a_detached_checkout_refuses_namespaced_saves() {
+fn a_detached_checkout_refuses_saves_until_a_variation_starts_here() {
     let (temp, repo) = code_repo();
     let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
     let head = repo.head().unwrap().peel_to_commit().unwrap().id();
@@ -2331,13 +2298,15 @@ fn a_detached_checkout_refuses_namespaced_saves() {
 
     let error = workspace.save_version("Pitch").unwrap_err();
     assert!(
-        matches!(error, DraftlineError::BranchOutsideNamespace(ref name) if name == "HEAD"),
+        matches!(error, DraftlineError::NoCurrentVariation),
         "{error:?}"
     );
-    assert_eq!(
-        workspace.inspect().unwrap().safe_next_actions,
-        [draftline::SafeNextAction::StartVariationHere]
-    );
+    assert!(workspace
+        .inspect()
+        .unwrap()
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == draftline::DiagnosticCode::NoCurrentVariation));
     workspace.start_variation_here("cutready/rescue").unwrap();
     workspace.save_version("Pitch").unwrap();
     assert_eq!(workspace.current_variation().unwrap(), "cutready/rescue");
@@ -2425,7 +2394,7 @@ fn send_hands_a_stale_local_base_back_to_the_fresh_upstream() {
 }
 
 #[test]
-fn send_refuses_to_carry_a_developers_unpushed_base_commits() {
+fn send_carries_a_teammates_unpushed_base_commits_and_leaves_their_base_alone() {
     let (temp, repo) = code_repo();
     let (bare, _other_dir, _other) = with_remote(&repo);
     let upstream = remote_branch(bare.path(), "main").unwrap();
@@ -2439,9 +2408,8 @@ fn send_refuses_to_carry_a_developers_unpushed_base_commits() {
     let preflight = workspace
         .preflight_send("origin", &send_request("Pitch"), &mut RemoteOptions::new())
         .unwrap();
-    assert!(!preflight.can_proceed);
+    assert!(preflight.can_proceed, "{preflight:?}");
     assert!(preflight.creates_variation);
-    assert_eq!(preflight.variation, "cutready/pitch");
     assert_eq!(preflight.outgoing_versions, 2);
     assert_eq!(preflight.developer_commits.len(), 1);
     assert_eq!(preflight.developer_commits[0].id, developer.to_string());
@@ -2451,90 +2419,65 @@ fn send_refuses_to_carry_a_developers_unpushed_base_commits() {
     );
 
     let mut host = FakeHost::default();
-    let error = workspace
+    let result = workspace
         .send(
             "origin",
-            &send_request("Pitch"),
+            &draftline::SendRequest {
+                expected: Some(preflight.token),
+                ..send_request("Pitch")
+            },
             &mut host,
             &mut RemoteOptions::new(),
         )
-        .unwrap_err();
-    match error {
-        DraftlineError::SendCarriesDeveloperCommits(commits) => {
-            assert_eq!(commits, preflight.developer_commits)
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
-    assert_eq!(repo.head().unwrap().shorthand().ok(), Some("main"));
-    assert_eq!(repo.refname_to_id("refs/heads/main").unwrap(), local_main);
-    assert!(repo
-        .find_branch("cutready/pitch", git2::BranchType::Local)
-        .is_err());
+        .unwrap();
+    assert_eq!(result.variation, "cutready/pitch");
+    assert_eq!(
+        remote_branch(bare.path(), "cutready/pitch"),
+        Some(local_main)
+    );
+    assert_eq!(
+        repo.refname_to_id("refs/heads/main").unwrap(),
+        local_main,
+        "the teammate's unpushed main is theirs to push"
+    );
     assert_eq!(remote_branch(bare.path(), "main"), Some(upstream));
-    assert_eq!(remote_branch(bare.path(), "cutready/pitch"), None);
-    assert!(host.open.is_empty());
-
-    // Once the developer pushes (their push includes the save), nothing
-    // developer-owned is outgoing and Send proceeds.
-    push_main(&repo);
-    let preflight = workspace
-        .preflight_send("origin", &send_request("Pitch"), &mut RemoteOptions::new())
-        .unwrap();
-    assert!(preflight.can_proceed, "{preflight:?}");
-    assert!(preflight.developer_commits.is_empty());
-    workspace
-        .send(
-            "origin",
-            &send_request("Pitch"),
-            &mut host,
-            &mut RemoteOptions::new(),
-        )
-        .unwrap();
+    assert_eq!(host.open.len(), 1);
 }
 
 #[test]
-fn send_refuses_a_variation_started_on_unpushed_developer_work() {
+fn send_carries_a_variation_started_on_a_teammates_branch() {
     let (temp, repo) = code_repo();
     let (bare, _other_dir, _other) = with_remote(&repo);
     let head = repo.head().unwrap().peel_to_commit().unwrap();
     repo.branch("feature/x", &head, false).unwrap();
     repo.set_head("refs/heads/feature/x").unwrap();
     write_file(temp.path(), "src/feature.rs", "pub fn x() {}\n");
-    commit_all(&repo, "Feature x");
+    let feature = commit_all(&repo, "Feature x");
     let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
     workspace.start_variation_here("cutready/x").unwrap();
     write_file(temp.path(), "cutready/intro.sk", "x pitch\n");
     workspace.save_version("X pitch").unwrap();
 
-    let error = workspace
+    let preflight = workspace
+        .preflight_send(
+            "origin",
+            &send_request("X pitch"),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    assert!(preflight.can_proceed);
+    assert_eq!(preflight.developer_commits.len(), 1);
+    workspace
         .send(
             "origin",
             &send_request("X pitch"),
             &mut FakeHost::default(),
             &mut RemoteOptions::new(),
         )
-        .unwrap_err();
-    assert!(
-        matches!(&error, DraftlineError::SendCarriesDeveloperCommits(commits) if commits.len() == 1),
-        "{error:?}"
-    );
-    assert_eq!(remote_branch(bare.path(), "cutready/x"), None);
-
-    // Publishing the variation first doesn't launder the developer commit.
-    workspace.publish_changes("origin").unwrap();
-    assert!(remote_branch(bare.path(), "cutready/x").is_some());
-    let error = workspace
-        .send(
-            "origin",
-            &send_request("X pitch"),
-            &mut FakeHost::default(),
-            &mut RemoteOptions::new(),
-        )
-        .unwrap_err();
-    assert!(
-        matches!(&error, DraftlineError::SendCarriesDeveloperCommits(commits) if commits.len() == 1),
-        "{error:?}"
-    );
+        .unwrap();
+    let sent = remote_branch(bare.path(), "cutready/x").unwrap();
+    assert!(repo.graph_descendant_of(sent, feature).unwrap());
+    assert_eq!(repo.refname_to_id("refs/heads/feature/x").unwrap(), feature);
 }
 
 #[test]
@@ -2861,13 +2804,9 @@ fn a_renamed_default_branch_is_followed_and_saves_on_the_old_one_can_move() {
         "Draftline never rewrites the remote-tracking HEAD"
     );
 
-    // The old base is now a developer branch: saves move to a variation.
+    // The old base is now just a branch: saves still land on it, and Send
+    // moves them to a variation aimed at the new base.
     write_file(temp.path(), "cutready/intro.sk", "scene one, later\n");
-    assert!(matches!(
-        workspace.save_version("Later").unwrap_err(),
-        DraftlineError::BranchOutsideNamespace(branch) if branch == "main"
-    ));
-    workspace.start_variation_here("cutready/intro").unwrap();
     workspace.save_version("Later").unwrap();
     let mut host = FakeHost::default();
     let result = workspace
@@ -2975,7 +2914,7 @@ fn bringing_in_the_latest_base_merges_everything_into_the_variation() {
 }
 
 #[test]
-fn send_refuses_a_merge_that_resolves_code_outside_the_project() {
+fn send_lists_a_merge_that_resolves_code_outside_the_project() {
     let (temp, repo) = code_repo();
     let (bare, other_dir, other) = with_remote(&repo);
     let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
@@ -3019,23 +2958,24 @@ fn send_refuses_a_merge_that_resolves_code_outside_the_project() {
         )
         .unwrap();
 
-    let error = workspace
+    let preflight = workspace
+        .preflight_send("origin", &send_request("Pitch"), &mut RemoteOptions::new())
+        .unwrap();
+    let commits = &preflight.developer_commits;
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].id, merge.to_string());
+    assert_eq!(commits[0].outside_paths, vec![PathBuf::from("src/lib.rs")]);
+    assert!(preflight.can_proceed);
+    workspace
         .send(
             "origin",
             &send_request("Pitch"),
             &mut FakeHost::default(),
             &mut RemoteOptions::new(),
         )
-        .unwrap_err();
-    match error {
-        DraftlineError::SendCarriesDeveloperCommits(commits) => {
-            assert_eq!(commits.len(), 1);
-            assert_eq!(commits[0].id, merge.to_string());
-            assert_eq!(commits[0].outside_paths, vec![PathBuf::from("src/lib.rs")]);
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
-    assert_eq!(remote_branch(bare.path(), "cutready/pitch"), Some(sent));
+        .unwrap();
+    assert_ne!(remote_branch(bare.path(), "cutready/pitch"), Some(sent));
+    assert_eq!(remote_branch(bare.path(), "cutready/pitch"), Some(merge));
 }
 
 #[test]

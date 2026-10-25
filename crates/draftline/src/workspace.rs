@@ -408,9 +408,6 @@ pub enum SafeNextAction {
     ConfigureRemote,
     /// Another project in this checkout must finish its interrupted operation.
     FinishInOtherProject,
-    /// A developer's branch is checked out; start a variation at this commit
-    /// with [`Workspace::start_variation_here`] to keep working.
-    StartVariationHere,
 }
 
 /// Stable diagnostic codes for workspace inspection.
@@ -427,9 +424,6 @@ pub enum DiagnosticCode {
     NoCurrentVariation,
     WorkspaceReadFailed,
     PolicyTrackedFileIgnored,
-    /// The checkout is on a developer's branch, outside this project's
-    /// variations; saves and updates refuse until the user starts a variation.
-    BranchOutsideNamespace,
     /// Project files that Git stores with LFS hold pointer text instead of
     /// their content, because the clone never downloaded it.
     LfsContentMissing,
@@ -1322,7 +1316,6 @@ struct SendTarget {
 /// The branch and commit Send checked, which publishing must still find.
 struct SendGuard<'a> {
     head: git2::Oid,
-    base: &'a str,
     variation: &'a str,
 }
 
@@ -1759,23 +1752,19 @@ impl Workspace {
         Ok(())
     }
 
-    /// With a namespace set, Draftline writes history only on the base branch
-    /// or its own variations. A developer who switched the shared checkout to
-    /// their own branch keeps it: saves and updates refuse instead of
-    /// committing onto it. Shelve and discard stay available.
-    fn ensure_current_branch_writable(&self) -> Result<()> {
-        if self.variation_namespace.is_none() {
-            return Ok(());
-        }
-        let current = match self.current_variation_unchecked() {
-            Ok(current) => current,
-            Err(DraftlineError::NoCurrentVariation) => {
-                return Err(DraftlineError::BranchOutsideNamespace("HEAD".to_string()))
-            }
-            Err(error) => return Err(error),
-        };
-        self.ensure_variation_switchable(&current)
-            .map_err(|_| DraftlineError::BranchOutsideNamespace(current))
+    /// Saves and updates land on whatever branch is checked out, like a
+    /// teammate's would, but never on a detached `HEAD`, where the next switch
+    /// would strand them. Shelve and discard stay available. Returns the
+    /// branch's full ref name, which the write then pins.
+    fn ensure_on_branch(&self) -> Result<String> {
+        self.repo
+            .find_reference("HEAD")?
+            .symbolic_target()
+            .ok()
+            .flatten()
+            .filter(|target| target.starts_with("refs/heads/"))
+            .map(str::to_string)
+            .ok_or(DraftlineError::NoCurrentVariation)
     }
 
     /// Returns the current content policy.
@@ -1805,26 +1794,7 @@ impl Workspace {
         };
 
         let current_variation = match self.current_variation_unchecked() {
-            Ok(variation) => {
-                if self.ensure_current_branch_writable().is_err() {
-                    diagnostics.push(workspace_diagnostic(
-                        DiagnosticCode::BranchOutsideNamespace,
-                        DiagnosticSeverity::Blocking,
-                        format!(
-                            "branch `{variation}` belongs to a developer; start a variation here to keep saving"
-                        ),
-                    ));
-                }
-                Some(VariationId::from(variation))
-            }
-            Err(DraftlineError::NoCurrentVariation) if self.variation_namespace.is_some() => {
-                diagnostics.push(workspace_diagnostic(
-                    DiagnosticCode::BranchOutsideNamespace,
-                    DiagnosticSeverity::Blocking,
-                    "checkout is detached; start a variation here to keep saving",
-                ));
-                None
-            }
+            Ok(variation) => Some(VariationId::from(variation)),
             Err(DraftlineError::NoCurrentVariation) => {
                 diagnostics.push(workspace_diagnostic(
                     DiagnosticCode::NoCurrentVariation,
@@ -2077,13 +2047,6 @@ impl Workspace {
                 code,
                 message: "Git ignore rules hide content tracked by policy".to_string(),
                 safe_next_actions: Vec::new(),
-                retry: RetryClass::RetryAfterUserChoice,
-            },
-            DiagnosticCode::BranchOutsideNamespace => ErrorExplanation {
-                code,
-                message: "a developer's branch is checked out; Draftline won't save onto it"
-                    .to_string(),
-                safe_next_actions: vec![SafeNextAction::StartVariationHere],
                 retry: RetryClass::RetryAfterUserChoice,
             },
             DiagnosticCode::LfsContentMissing => ErrorExplanation {
@@ -2889,13 +2852,21 @@ impl Workspace {
         label: impl AsRef<str>,
         profile: Option<&ContributorProfile>,
     ) -> Result<Version> {
+        let branch = self.ensure_on_branch()?;
+        test_hooks::fire("after_branch_pinned", self.repo.path());
         self.while_head_moves_forward(|retrying| {
             let changed_files = self.changed_files_unchecked()?;
             if retrying && changed_files.is_empty() {
                 return Ok(None);
             }
-            self.commit_content_changes(&changed_files, "save_version", label.as_ref(), profile)
-                .map(Some)
+            self.commit_content_changes(
+                &branch,
+                &changed_files,
+                "save_version",
+                label.as_ref(),
+                profile,
+            )
+            .map(Some)
         })
     }
 
@@ -2906,7 +2877,7 @@ impl Workspace {
         P: AsRef<Path>,
     {
         self.ensure_no_pending_recovery()?;
-        self.ensure_current_branch_writable()?;
+        self.ensure_on_branch()?;
         let changed_files = self.selected_changed_files(paths)?;
         Ok(selected_files_preflight_report(
             "save_files",
@@ -2950,7 +2921,7 @@ impl Workspace {
     {
         let _lock = self.acquire_for_index("save_files")?;
         self.ensure_no_pending_recovery()?;
-        self.ensure_current_branch_writable()?;
+        let branch = self.ensure_on_branch()?;
         let paths = paths
             .into_iter()
             .map(|path| path.as_ref().to_path_buf())
@@ -2965,8 +2936,14 @@ impl Workspace {
                     selected_files_preflight_report("save_files", false, changed_files),
                 )));
             }
-            self.commit_content_changes(&changed_files, "save_files", label.as_ref(), profile)
-                .map(Some)
+            self.commit_content_changes(
+                &branch,
+                &changed_files,
+                "save_files",
+                label.as_ref(),
+                profile,
+            )
+            .map(Some)
         })
     }
 
@@ -5137,7 +5114,7 @@ impl Workspace {
     ) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
         let _lock = self.acquire_for_index("restore_version_as_new_save")?;
-        self.ensure_current_branch_writable()?;
+        let branch = self.ensure_on_branch()?;
         let head_commit = self.repo.head()?.peel_to_commit()?;
         let restored_tree = {
             let source = self.find_version_commit(version)?.tree()?;
@@ -5178,7 +5155,12 @@ impl Workspace {
             &restored_tree,
             &[&head_commit],
         )?;
-        self.advance_head(&self.repo.find_commit(oid)?, Some(&head_commit), &committer)?;
+        self.advance_head(
+            &branch,
+            &self.repo.find_commit(oid)?,
+            Some(&head_commit),
+            &committer,
+        )?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -6391,7 +6373,7 @@ impl Workspace {
     /// ```
     pub fn preflight_apply_incoming(&self, remote: impl AsRef<str>) -> Result<ApplyIncomingReport> {
         self.ensure_no_pending_recovery()?;
-        self.ensure_current_branch_writable()?;
+        self.ensure_on_branch()?;
         let sync_status = self.sync_status(remote)?;
         let dirty_files = self.changed_files_unchecked()?;
 
@@ -6493,7 +6475,7 @@ impl Workspace {
         sync_status: SyncStatus,
         source: Option<String>,
     ) -> Result<MergeIncomingReport> {
-        self.ensure_current_branch_writable()?;
+        self.ensure_on_branch()?;
         let dirty_files = self.changed_files_unchecked()?;
         let mut file_hazards = Vec::new();
         let mut conflicts = Vec::new();
@@ -6639,7 +6621,7 @@ impl Workspace {
     ) -> Result<MergeIncomingResult> {
         self.ensure_no_pending_recovery()?;
         let _lock = self.acquire_for_index(operation)?;
-        self.ensure_current_branch_writable()?;
+        self.ensure_on_branch()?;
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
@@ -6772,7 +6754,7 @@ impl Workspace {
     ) -> Result<ApplyIncomingResult> {
         self.ensure_no_pending_recovery()?;
         let _lock = self.acquire_for_index("apply_incoming")?;
-        self.ensure_current_branch_writable()?;
+        self.ensure_on_branch()?;
 
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
@@ -7023,7 +7005,7 @@ impl Workspace {
     ) -> Result<(String, VariationMetadata, Oid)> {
         match target {
             RestoreVersionTarget::Current => {
-                self.ensure_current_branch_writable()?;
+                self.ensure_on_branch()?;
                 let parent_oid = self.repo.head()?.peel_to_commit()?.id();
                 let metadata = self.read_variation_metadata(current_variation)?;
                 Ok((current_variation.to_string(), metadata, parent_oid))
@@ -7032,7 +7014,7 @@ impl Workspace {
                 if variation.as_str() != current_variation {
                     self.ensure_variation_in_namespace(variation.as_str())?;
                 } else {
-                    self.ensure_current_branch_writable()?;
+                    self.ensure_on_branch()?;
                 }
                 let branch = self
                     .repo
@@ -7804,10 +7786,14 @@ impl Workspace {
     /// Shares saved work the way the Copilot app does: push the current branch
     /// (never forced) and open a pull request, or reuse the one already open.
     ///
-    /// On the base branch, Send first moves the work onto a new branch named
-    /// from the variation namespace and title, then hands the local base back
-    /// to its upstream so it never diverges. Retrying after a failure is safe:
-    /// the push becomes a no-op and the open pull request is found.
+    /// On the base branch, or on a branch outside the variation namespace,
+    /// Send first moves the work onto a new branch named from the namespace
+    /// and title, so it only ever pushes branches it owns. Leaving the base, it
+    /// hands the local base back to its upstream when every unpushed base
+    /// commit is the project's own. Teammates' commits on the branch go along:
+    /// [`Self::preflight_send`] lists them so the host can say so. Retrying
+    /// after a failure is safe: the push becomes a no-op and the open pull
+    /// request is found.
     pub fn send(
         &self,
         remote: impl AsRef<str>,
@@ -7824,10 +7810,11 @@ impl Workspace {
             current,
             ..
         } = target;
-        // Every later step works on this exact commit, so a developer commit
-        // landing mid-send is never carried unscanned.
+        // Every later step works on this exact commit, so a teammate's commit
+        // landing mid-send never goes out unapproved.
         let scanned = self.repo.head().ok().and_then(|head| head.target());
-        if current == base {
+        let creates_variation = self.send_creates_variation(&current, &base);
+        if creates_variation {
             let report = preflight_report(
                 "send",
                 false,
@@ -7839,7 +7826,7 @@ impl Workspace {
                 return Err(DraftlineError::PreflightFailed(Box::new(report)));
             }
         }
-        let planned = if current == base {
+        let planned = if creates_variation {
             self.new_send_branch_name(request, &advertised)?
         } else {
             current.clone()
@@ -7859,12 +7846,6 @@ impl Workspace {
                 });
             }
         }
-        let developer_commits = self.developer_commits_to_send(remote, &base, scanned)?;
-        if !developer_commits.is_empty() {
-            return Err(DraftlineError::SendCarriesDeveloperCommits(
-                developer_commits,
-            ));
-        }
         let ensure_unmoved = || -> Result<git2::Oid> {
             let actual = self.repo.head().ok().and_then(|head| head.target());
             match (scanned, actual) {
@@ -7877,7 +7858,7 @@ impl Workspace {
         };
 
         let mut created_variation = false;
-        let variation = if current == base {
+        let variation = if creates_variation {
             let name = planned;
             let labeled = !request.title.trim().is_empty();
             if labeled {
@@ -7917,7 +7898,6 @@ impl Workspace {
             options,
             Some(SendGuard {
                 head: ensure_unmoved()?,
-                base: &base,
                 variation: &variation,
             }),
         )?;
@@ -7958,8 +7938,8 @@ impl Workspace {
 
     /// Checks what [`Self::send`] would do without pushing, creating a branch,
     /// or moving the base. It refreshes the base's remote-tracking ref. Lists
-    /// developer commits Send would refuse to carry, so a host can explain
-    /// the refusal before the user clicks Send.
+    /// teammates' commits that change files outside the project, which Send
+    /// carries too, so the host can tell the user before they confirm.
     pub fn preflight_send(
         &self,
         remote: impl AsRef<str>,
@@ -7974,7 +7954,7 @@ impl Workspace {
             advertised_oids,
             current,
         } = self.resolve_send_target(remote, request, options)?;
-        let creates_variation = current == base;
+        let creates_variation = self.send_creates_variation(&current, &base);
         let variation = if creates_variation {
             self.new_send_branch_name(request, &advertised)?
         } else {
@@ -7995,7 +7975,7 @@ impl Workspace {
         };
         let (outgoing_files, outgoing_files_truncated) =
             self.outgoing_files(head, &advertised_oids)?;
-        let can_proceed = developer_commits.is_empty() && !has_unsaved_changes;
+        let can_proceed = !has_unsaved_changes;
         let token = SendToken {
             remote: remote.to_string(),
             base: base.clone(),
@@ -8029,8 +8009,8 @@ impl Workspace {
         )
     }
 
-    /// Resolves Send's base, enforces the variation namespace, and refreshes
-    /// the base's and current variation's remote-tracking refs.
+    /// Resolves Send's base and refreshes the base's and current variation's
+    /// remote-tracking refs.
     fn resolve_send_target(
         &self,
         remote: &str,
@@ -8060,11 +8040,6 @@ impl Workspace {
             return Err(DraftlineError::SendBaseNotOnRemote(base));
         }
         let current = self.current_variation_unchecked()?;
-        if let Some(namespace) = &self.variation_namespace {
-            if current != base && !current.starts_with(namespace.as_str()) {
-                return Err(DraftlineError::SendOutsideNamespace(current));
-            }
-        }
         self.fetch_remote_variation_ref(remote, &base, options)?;
         if current != base && advertised.contains(&current) {
             self.fetch_remote_variation_ref(remote, &current, options)?;
@@ -8077,7 +8052,17 @@ impl Workspace {
         })
     }
 
-    /// The branch Send creates when run on the base branch.
+    /// Send pushes only branches Draftline owns: from the base, or from a
+    /// developer's branch outside the namespace, it starts a new one.
+    fn send_creates_variation(&self, current: &str, base: &str) -> bool {
+        current == base
+            || self
+                .variation_namespace
+                .as_deref()
+                .is_some_and(|namespace| !current.starts_with(namespace))
+    }
+
+    /// The branch Send creates when run on the base or a developer's branch.
     fn new_send_branch_name(
         &self,
         request: &SendRequest,
@@ -8457,8 +8442,10 @@ impl Workspace {
 
     /// Moves the local base to its freshly fetched remote-tracking ref when the
     /// current branch carries every local base commit, so nothing is lost and
-    /// the base never diverges from upstream. The worktree is untouched. Runs on every send, which also repairs a send
-    /// that failed after switching branches.
+    /// the base never diverges from upstream. The worktree is untouched. Runs
+    /// on every send, which also repairs a send that failed after switching
+    /// branches. A base holding a teammate's unpushed commits outside the
+    /// project is theirs to push, so it stays where it is.
     fn hand_base_back_to_upstream(&self, base: &str, remote: &str) -> Result<()> {
         let Ok(upstream) = self
             .repo
@@ -8474,7 +8461,12 @@ impl Workspace {
         };
         let head = self.repo.head()?.peel_to_commit()?.id();
         let carried = head == local_oid || self.repo.graph_descendant_of(head, local_oid)?;
-        if local_oid != upstream && carried {
+        if local_oid != upstream
+            && carried
+            && self
+                .developer_commits_to_send(remote, base, Some(local_oid))?
+                .is_empty()
+        {
             local.get_mut().set_target(
                 upstream,
                 &format!("draftline: send moved local work off {base}"),
@@ -8665,8 +8657,8 @@ impl Workspace {
     }
 
     /// Publishes. Send passes a [`SendGuard`]: the branch and commit it checked
-    /// must still be checked out after this fetch, are rescanned for developer
-    /// commits, and exactly that commit is pushed to that branch.
+    /// must still be checked out after this fetch, and exactly that commit is
+    /// pushed to that branch.
     fn publish_changes_expecting(
         &self,
         remote: &str,
@@ -8702,13 +8694,6 @@ impl Workspace {
                         actual.map(|oid| oid.to_string()).unwrap_or_default()
                     ),
                 });
-            }
-            let developer_commits =
-                self.developer_commits_to_send(&remote_name, guard.base, Some(guard.head))?;
-            if !developer_commits.is_empty() {
-                return Err(DraftlineError::SendCarriesDeveloperCommits(
-                    developer_commits,
-                ));
             }
         }
         let status = self.sync_status(&remote_name)?;
@@ -9238,14 +9223,23 @@ impl Workspace {
 
     /// Commits `changed_files` on top of HEAD, then syncs only the saved paths
     /// in the real index so `git status` stays clean for them.
+    /// Commits onto `branch`, the branch the save started on; a switch to
+    /// another branch at any point refuses with `LocalStateChanged`.
     fn commit_content_changes(
         &self,
+        branch: &str,
         changed_files: &[ChangedFile],
         operation: &str,
         label: &str,
         profile: Option<&ContributorProfile>,
     ) -> Result<Version> {
-        self.ensure_current_branch_writable()?;
+        let now = self.ensure_on_branch()?;
+        if now != branch {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: branch.to_string(),
+                actual: now,
+            });
+        }
         let parent = self
             .repo
             .head()
@@ -9267,7 +9261,7 @@ impl Workspace {
         let commit = self.repo.find_commit(oid)?;
         let previous = self.while_git_busy(|| self.stage_from(&commit, &affected_paths))?;
         if let Err(error) =
-            self.while_git_busy(|| self.advance_head(&commit, parent.as_ref(), &committer))
+            self.while_git_busy(|| self.advance_head(branch, &commit, parent.as_ref(), &committer))
         {
             self.restore_index_entries(&affected_paths, previous)?;
             return Err(error);
@@ -9325,28 +9319,22 @@ impl Workspace {
         write_index_or_reload(&mut index)
     }
 
-    /// Moves HEAD's branch (or a detached HEAD) to `commit` only if it still
-    /// points at `parent`, holding the ref's lock as `git commit` does.
+    /// Moves `branch`, the one checked out when the save began, to `commit`
+    /// only if `HEAD` is still on it and it still points at `parent`, holding
+    /// the refs' locks as `git commit` does.
     fn advance_head(
         &self,
+        branch: &str,
         commit: &Commit<'_>,
         parent: Option<&Commit<'_>>,
         committer: &Signature<'_>,
     ) -> Result<()> {
-        let head = self.repo.find_reference("HEAD")?;
-        let name = head
-            .symbolic_target()
-            .ok()
-            .flatten()
-            .unwrap_or("HEAD")
-            .to_string();
+        let name = branch.to_string();
         let mut transaction = self.repo.transaction()?;
         transaction.lock_ref("HEAD")?;
-        if name != "HEAD" {
-            transaction.lock_ref(&name)?;
-        }
-        // Rechecked under the locks: a switch to a developer branch at the
-        // same commit after the guard must not let this save move it.
+        transaction.lock_ref(&name)?;
+        // A switch to another branch at the same commit after the save began
+        // must not land the save there.
         let now = self.repo.find_reference("HEAD")?;
         let now = now.symbolic_target().ok().flatten().unwrap_or("HEAD");
         if now != name {
@@ -9355,7 +9343,6 @@ impl Workspace {
                 actual: now.to_string(),
             });
         }
-        self.ensure_current_branch_writable()?;
         let current = self.repo.refname_to_id(&name).ok();
         let expected = parent.map(Commit::id);
         if current != expected {
@@ -11951,18 +11938,11 @@ fn safe_next_actions_for_inspection(
     }
     if recovery.is_some()
         || operation_lock.state == OperationLockState::Locked
-        || diagnostics.iter().any(|diagnostic| {
-            diagnostic.severity == DiagnosticSeverity::Blocking
-                && diagnostic.code != DiagnosticCode::BranchOutsideNamespace
-        })
+        || diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Blocking)
     {
         return vec![SafeNextAction::RepairRecovery];
-    }
-    if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == DiagnosticCode::BranchOutsideNamespace)
-    {
-        return vec![SafeNextAction::StartVariationHere];
     }
 
     if dirty.is_dirty {
@@ -13551,9 +13531,8 @@ mod tests {
     }
 
     #[test]
-    fn a_namespaced_save_refuses_a_switch_to_a_developer_branch_at_the_same_commit() {
+    fn a_save_refuses_a_switch_to_another_branch_at_the_same_commit() {
         let (_temp, workspace, _) = two_saves();
-        let workspace = workspace.with_variation_namespace("cutready/").unwrap();
         write_file(workspace.root(), "plan.sk", b"edit");
         let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
         workspace.repo.branch("feature/x", &head, false).unwrap();
@@ -13568,7 +13547,36 @@ mod tests {
         let error = workspace.save_version("Third").unwrap_err();
 
         assert!(
-            matches!(error, DraftlineError::BranchOutsideNamespace(ref name) if name == "feature/x"),
+            matches!(error, DraftlineError::LocalStateChanged { ref actual, .. } if actual == "refs/heads/feature/x"),
+            "{error:?}"
+        );
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id("refs/heads/feature/x")
+                .unwrap(),
+            head.id()
+        );
+    }
+
+    #[test]
+    fn a_save_refuses_a_switch_to_another_branch_while_it_scans_changes() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        workspace.repo.branch("feature/x", &head, false).unwrap();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_branch_pinned", move |_| {
+            Repository::open(&root)
+                .unwrap()
+                .set_head("refs/heads/feature/x")
+                .unwrap();
+        });
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { ref actual, .. } if actual == "refs/heads/feature/x"),
             "{error:?}"
         );
         assert_eq!(
@@ -13802,7 +13810,8 @@ mod tests {
             )
             .unwrap();
 
-        let moved = workspace.advance_head(&saved, Some(&base), &signature);
+        let branch = workspace.repo.head().unwrap().name().unwrap().to_string();
+        let moved = workspace.advance_head(&branch, &saved, Some(&base), &signature);
         assert!(matches!(
             moved,
             Err(DraftlineError::LocalStateChanged { .. })

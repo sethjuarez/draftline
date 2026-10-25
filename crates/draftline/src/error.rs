@@ -145,27 +145,11 @@ pub enum DraftlineError {
     #[error("unreadable Draftline workspace record: {0}")]
     InvalidWorkspaceClaim(String),
 
-    #[error("branch `{0}` is not a variation; switch to one or to the base branch to send")]
+    #[error("Send branch `{0}` is outside this project's variation namespace")]
     SendOutsideNamespace(String),
-
-    /// Send would push commits that change files outside the project folder
-    /// (for example a developer's unpushed commits on the local base). A
-    /// developer must push or move them first.
-    #[error(
-        "send would share {} developer commit(s) that change files outside the project; ask a developer to push or move them first",
-        .0.len()
-    )]
-    SendCarriesDeveloperCommits(Vec<crate::DeveloperCommit>),
 
     #[error("branch `{0}` is outside this project's variations")]
     VariationOutsideNamespace(String),
-
-    /// A developer checked out a branch that is neither the base nor one of
-    /// this project's variations; Draftline won't write onto it.
-    #[error(
-        "branch `{0}` belongs to a developer; switch back to the base branch or move this work to its own worktree"
-    )]
-    BranchOutsideNamespace(String),
 
     #[error("pull request provider failed: {0}")]
     PullRequest(String),

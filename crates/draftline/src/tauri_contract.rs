@@ -1676,7 +1676,7 @@ pub fn create_variation_from_version_with_context(
 }
 
 /// Starts a variation at the current commit and moves the checkout onto it,
-/// keeping files and unsaved edits. The way out of `branch_outside_namespace`.
+/// keeping files and unsaved edits, so a developer's branch stays theirs.
 #[tracing::instrument(
     err(level = tracing::Level::WARN),
     skip_all,
@@ -2918,9 +2918,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::WorkspaceClaimStale(_) => "workspace_claim_stale",
         DraftlineError::InvalidWorkspaceClaim(_) => "invalid_workspace_claim",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
-        DraftlineError::SendCarriesDeveloperCommits(_) => "send_carries_developer_commits",
         DraftlineError::VariationOutsideNamespace(_) => "variation_outside_namespace",
-        DraftlineError::BranchOutsideNamespace(_) => "branch_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
         DraftlineError::MergeNeedsDeveloper(_) => "merge_needs_developer",
         DraftlineError::NotOwnedWorktree(_) => "not_owned_worktree",
@@ -2957,12 +2955,6 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         DraftlineError::WorkspaceAlreadyInCheckout(project)
         | DraftlineError::WorkspaceClaimStale(project) => {
             Some(serde_json::json!({ "project": project }))
-        }
-        DraftlineError::BranchOutsideNamespace(branch) => {
-            Some(serde_json::json!({ "branch": branch }))
-        }
-        DraftlineError::SendCarriesDeveloperCommits(commits) => {
-            Some(serde_json::json!({ "developer_commits": commits }))
         }
         DraftlineError::SyncNeedsMerge(status) => match serde_json::to_value(status.as_ref()) {
             Ok(value) => Some(value),
