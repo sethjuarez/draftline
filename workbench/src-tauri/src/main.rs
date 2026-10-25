@@ -607,8 +607,12 @@ fn acknowledge_recovery(
 }
 
 #[tauri::command]
-fn probe_folder(request: WorkspaceRequest) -> TauriCommandResult<draftline::FolderProbe> {
-    contract::into_tauri_result(contract::probe_folder(request))
+fn probe_folder(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<draftline::FolderProbe> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::probe_folder_with_context(&context, request))
 }
 
 #[tauri::command]

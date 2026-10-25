@@ -1343,6 +1343,9 @@ export interface DraftlineHostFacadeOptions {
 export interface DraftlineHostFacade {
   workspacePath: string;
   open(): Promise<WorkspaceOpenResult>;
+  probeFolder(): Promise<FolderProbe>;
+  applyFolderFix(fix: FolderFix): Promise<WorkspaceOpenResult>;
+  moveFolder(to: string): Promise<MoveFolderResult>;
   inspect(): Promise<WorkspaceDiagnostics>;
   preflightSwitchVariation(variationId: string): Promise<PreflightReport>;
   switchVariation(variationId: string): Promise<SwitchVariationResult>;
@@ -1471,6 +1474,9 @@ export function createDraftlineHostFacade({
   return {
     workspacePath,
     open: () => client.openWorkspace(workspacePath),
+    probeFolder: () => client.probeFolder(workspacePath),
+    applyFolderFix: (fix) => client.applyFolderFix(workspacePath, fix),
+    moveFolder: (to) => client.moveFolder({ ...workspaceRequest(), to }),
     inspect: () => client.inspectWorkspace(workspacePath),
     preflightSwitchVariation: (variationId) =>
       client.preflightSwitchVariation({ ...workspaceRequest(), variation_id: variationId }),

@@ -521,6 +521,18 @@ describe('createDraftlineClient', () => {
     await facade.preflightRenameVariation('master', 'main');
     await facade.renameVariation('master', 'main', renameToken);
     await facade.save('Facade save');
+    await facade.probeFolder();
+    await facade.applyFolderFix({ action: 'manage_here' });
+    await facade.moveFolder('decks');
+    expect(invoke).toHaveBeenCalledWith('probe_folder', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('apply_folder_fix', {
+      request: { workspace_path: 'C:\\repo', fix: { action: 'manage_here' } },
+    });
+    expect(invoke).toHaveBeenCalledWith('move_folder', {
+      request: { workspace_path: 'C:\\repo', to: 'decks' },
+    });
     expect(invoke).toHaveBeenCalledWith('open_workspace', {
       request: { workspace_path: 'C:\\repo' },
     });

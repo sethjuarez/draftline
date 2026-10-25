@@ -1904,6 +1904,31 @@ fn send_refuses_unsaved_project_changes_before_creating_a_branch() {
     );
     assert_eq!(repo.head().unwrap().shorthand().ok(), Some("main"));
     assert!(repo.find_branch("draft", git2::BranchType::Local).is_err());
+
+    // On its own branch too: the edit would silently stay behind.
+    workspace.save_version("Intro").unwrap();
+    let mut host = FakeHost::default();
+    workspace
+        .send(
+            "origin",
+            &send_request("Draft"),
+            &mut host,
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "unsaved again\n");
+    let error = workspace
+        .send(
+            "origin",
+            &send_request("Draft"),
+            &mut host,
+            &mut RemoteOptions::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::PreflightFailed(_)),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -2252,6 +2277,8 @@ fn send_from_a_developer_branch_moves_work_to_a_namespaced_branch() {
         matches!(error, DraftlineError::SendOutsideNamespace(_)),
         "{error:?}"
     );
+    let tauri = draftline::tauri_contract::TauriCommandError::from(error);
+    assert_eq!(tauri.details.unwrap()["branch"], "feature/login-2");
     assert!(repo
         .find_branch("feature/login-2", git2::BranchType::Local)
         .is_err());
@@ -3219,6 +3246,7 @@ fn tauri_merge_reports_code_conflicts_as_needing_a_developer() {
     ))
     .unwrap_err();
     assert_eq!(error.code, "merge_needs_developer");
+    assert_eq!(error.details.unwrap()["paths"][0], "src/main.rs");
 }
 
 #[test]

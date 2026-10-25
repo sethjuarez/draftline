@@ -8677,17 +8677,16 @@ impl Workspace {
         // landing mid-send never goes out unapproved.
         let scanned = self.repo.head().ok().and_then(|head| head.target());
         let creates_variation = self.send_creates_variation(&current, &base);
-        if creates_variation {
-            let report = preflight_report(
-                "send",
-                false,
-                self.changed_files_unchecked()?,
-                Vec::new(),
-                None,
-            );
-            if !report.can_proceed {
-                return Err(DraftlineError::PreflightFailed(Box::new(report)));
-            }
+        // Unsaved edits would silently stay behind; the host saves first.
+        let report = preflight_report(
+            "send",
+            false,
+            self.changed_files_unchecked()?,
+            Vec::new(),
+            None,
+        );
+        if !report.can_proceed {
+            return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
         let planned = if creates_variation {
             self.new_send_branch_name(request, &advertised)?

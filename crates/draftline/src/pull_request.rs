@@ -84,7 +84,9 @@ pub struct SendResult {
 }
 
 /// A commit Send would push that changes files outside the project folder:
-/// a developer's work, not the business user's. Send refuses to carry it.
+/// a teammate's work or a hand-made merge resolution. Send carries it, like
+/// any teammate's commit on the branch; the host shows who else is in the
+/// pull request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeveloperCommit {
     pub id: String,
@@ -106,9 +108,9 @@ pub struct SendPreflight {
     pub token: SendToken,
     /// Commits the base on the remote doesn't have yet.
     pub outgoing_versions: usize,
-    /// Unsaved project changes; Send refuses them on the base branch.
+    /// Unsaved changes in the folder; Send refuses while there are any.
     pub has_unsaved_changes: bool,
-    /// Developer commits Send would carry; Send refuses while any are listed.
+    /// Developer commits Send would carry along.
     pub developer_commits: Vec<DeveloperCommit>,
     /// Large files and LFS pointers in the commits Send would push.
     #[serde(default)]

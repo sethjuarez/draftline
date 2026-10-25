@@ -3068,6 +3068,14 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         | DraftlineError::IncomingFolderElsewhere(folder) => {
             Some(serde_json::json!({ "folder": folder }))
         }
+        DraftlineError::MergeNeedsDeveloper(paths)
+        | DraftlineError::OwnedWorktreeHasChanges(paths) => {
+            Some(serde_json::json!({ "paths": paths }))
+        }
+        DraftlineError::SendOutsideNamespace(branch)
+        | DraftlineError::VariationOutsideNamespace(branch) => {
+            Some(serde_json::json!({ "branch": branch }))
+        }
         DraftlineError::SyncNeedsMerge(status) => match serde_json::to_value(status.as_ref()) {
             Ok(value) => Some(value),
             Err(error) => Some(serde_json::json!({
