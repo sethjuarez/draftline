@@ -1997,10 +1997,10 @@ impl Workspace {
             detail: None,
             suggestions: Vec::new(),
         };
-        if self.pending_move_touches(&mine) {
+        if self.unfinished_operation_touches(&mine) {
             probe.folder = Some(PathBuf::from(&mine));
-            probe.detail = Some("A folder move was interrupted; open to finish it.".to_string());
-            probe.suggestions = vec![suggest(FolderFix::Open, "Open and finish the move")];
+            probe.detail = Some("An operation was interrupted; open to finish it.".to_string());
+            probe.suggestions = vec![suggest(FolderFix::Open, "Open and finish it")];
             return Ok(probe);
         }
         let owner = match self.marker_owner()? {
@@ -9874,7 +9874,7 @@ impl Workspace {
     fn claim_checkout(&self, opening: bool) -> Result<()> {
         let mine = self.project_key();
         // Either end of an interrupted move may open, so recovery can finish it.
-        if self.pending_move_touches(&mine) {
+        if self.unfinished_operation_touches(&mine) {
             return Ok(());
         }
         let owner = match self.read_marker()? {
@@ -10165,12 +10165,14 @@ impl Workspace {
         let project = ledger.project?;
         (!ledger.state.completed
             && project != self.project_key()
-            && !self.pending_move_touches(&self.project_key()))
+            && !self.unfinished_operation_touches(&self.project_key()))
         .then(|| PathBuf::from(project))
     }
 
-    /// Whether an unfinished folder move has `folder` at either end.
-    fn pending_move_touches(&self, folder: &str) -> bool {
+    /// Whether `folder` recorded an unfinished operation, or is either end of
+    /// an unfinished move. That folder may always open to finish it, even when
+    /// the interrupted checkout left a marker naming another folder.
+    fn unfinished_operation_touches(&self, folder: &str) -> bool {
         let Ok(bytes) = fs::read(self.ledger_path()) else {
             return false;
         };
@@ -10178,7 +10180,13 @@ impl Workspace {
             return false;
         };
         let state = ledger.state;
-        if state.completed || state.operation != RecoveryOperation::MoveFolder {
+        if state.completed {
+            return false;
+        }
+        if ledger.project.as_deref() == Some(folder) {
+            return true;
+        }
+        if state.operation != RecoveryOperation::MoveFolder {
             return false;
         }
         let folder = marker_folder(folder);

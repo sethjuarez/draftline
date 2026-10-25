@@ -3808,7 +3808,6 @@ fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
     let deck = temp.path().join("deck");
     fs::create_dir_all(&deck).unwrap();
     let marker = temp.path().join(".draftline");
-    let pitch_marker = fs::read_to_string(&marker).unwrap();
     fs::write(&marker, r#"{"format":1,"folder":"deck"}"#).unwrap();
     let moved = Workspace::open_with_policy(&deck, cutready_policy()).unwrap();
     write_file(temp.path(), "deck/slide.sk", "slide\n");
@@ -3822,10 +3821,18 @@ fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
         vec![draftline::SafeNextAction::RepairRecovery]
     );
 
-    fs::write(&marker, pitch_marker).unwrap();
-    pitch.repair_recovery("interrupted").unwrap();
-    fs::write(&marker, r#"{"format":1,"folder":"deck"}"#).unwrap();
+    // Pitch can still open and finish it while the marker names deck, so
+    // neither folder is stuck.
+    let probe = Workspace::probe(temp.path().join("cutready")).unwrap();
+    assert_eq!(probe.suggestions[0].fix, draftline::FolderFix::Open);
+    let reopened =
+        Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    reopened.repair_recovery("interrupted").unwrap();
     moved.save_version("Slide").unwrap();
+    assert!(matches!(
+        pitch.save_version("Pitch").unwrap_err(),
+        DraftlineError::FolderIsElsewhere(_)
+    ));
 }
 
 fn refused(result: draftline::Result<Workspace>) -> DraftlineError {
