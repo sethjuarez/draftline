@@ -196,7 +196,14 @@ fn save_commits_only_project_content() {
         .deltas()
         .map(|delta| delta.new_file().path().unwrap().to_path_buf())
         .collect::<Vec<_>>();
-    assert_eq!(paths, vec![PathBuf::from("cutready/intro.sk")]);
+    // The first save also commits the folder marker.
+    assert_eq!(
+        paths,
+        vec![
+            PathBuf::from(".draftline"),
+            PathBuf::from("cutready/intro.sk")
+        ]
+    );
     assert_eq!(
         fs::read_to_string(temp.path().join("README.md")).unwrap(),
         "# app edited by a developer\n",
@@ -351,7 +358,10 @@ fn save_leaves_developer_staged_changes_staged_and_uncommitted() {
 
     assert_eq!(
         head_paths_changed(&repo),
-        vec![PathBuf::from("cutready/intro.sk")]
+        vec![
+            PathBuf::from(".draftline"),
+            PathBuf::from("cutready/intro.sk")
+        ]
     );
     assert_eq!(status(&repo, "src/lib.rs"), git2::Status::INDEX_NEW);
     assert_eq!(status(&repo, "README.md"), git2::Status::INDEX_MODIFIED);
@@ -1132,7 +1142,10 @@ fn save_of_a_rename_out_of_the_project_leaves_the_target_to_the_developer() {
 
     assert_eq!(
         head_paths_changed(&repo),
-        vec![PathBuf::from("cutready/intro.sk")]
+        vec![
+            PathBuf::from(".draftline"),
+            PathBuf::from("cutready/intro.sk")
+        ]
     );
     assert!(status(&repo, "notes/intro.sk").contains(git2::Status::INDEX_NEW));
 }
@@ -3542,10 +3555,16 @@ fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
     )
     .unwrap();
 
-    // The workspace can't move to another folder until pitch finishes.
+    // Once Draftline manages another folder, it can't write until pitch
+    // finishes the recovery.
     let deck = temp.path().join("deck");
     fs::create_dir_all(&deck).unwrap();
-    let error = refused(Workspace::relocate_with_policy(&deck, cutready_policy()));
+    let marker = temp.path().join(".draftline");
+    let pitch_marker = fs::read_to_string(&marker).unwrap();
+    fs::write(&marker, r#"{"format":1,"folder":"deck"}"#).unwrap();
+    let moved = Workspace::open_with_policy(&deck, cutready_policy()).unwrap();
+    write_file(temp.path(), "deck/slide.sk", "slide\n");
+    let error = moved.save_version("Slide").unwrap_err();
     assert!(
         matches!(&error, DraftlineError::RecoveryInOtherProject(project) if project == Path::new("cutready")),
         "{error:?}"
@@ -3555,10 +3574,10 @@ fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
         vec![draftline::SafeNextAction::RepairRecovery]
     );
 
+    fs::write(&marker, pitch_marker).unwrap();
     pitch.repair_recovery("interrupted").unwrap();
-    let deck = Workspace::relocate_with_policy(&deck, cutready_policy()).unwrap();
-    write_file(temp.path(), "deck/slide.sk", "slide\n");
-    deck.save_version("Slide").unwrap();
+    fs::write(&marker, r#"{"format":1,"folder":"deck"}"#).unwrap();
+    moved.save_version("Slide").unwrap();
 }
 
 fn refused(result: draftline::Result<Workspace>) -> DraftlineError {
@@ -3570,8 +3589,8 @@ fn refused(result: draftline::Result<Workspace>) -> DraftlineError {
 
 fn claimed_elsewhere(error: DraftlineError) -> PathBuf {
     match error {
-        DraftlineError::WorkspaceAlreadyInCheckout(project) => project,
-        other => panic!("expected WorkspaceAlreadyInCheckout, got {other:?}"),
+        DraftlineError::FolderIsElsewhere(project) => project,
+        other => panic!("expected FolderIsElsewhere, got {other:?}"),
     }
 }
 
@@ -3649,27 +3668,20 @@ fn each_linked_worktree_holds_its_own_workspace() {
 }
 
 #[test]
-fn relocate_moves_the_workspace_and_refuses_while_an_operation_runs() {
+fn a_handle_on_a_folder_draftline_no_longer_manages_cant_keep_writing() {
     let (temp, repo) = code_repo();
     let stale = scoped(&temp);
-    let deck = temp.path().join("deck");
-    fs::create_dir_all(&deck).unwrap();
+    fs::create_dir_all(temp.path().join("deck")).unwrap();
+    fs::write(
+        temp.path().join(".draftline"),
+        "{ \"format\": 1, \"folder\": \"deck\" }\n",
+    )
+    .unwrap();
 
-    let lock = repo.path().join("draftline").join("operation.lock");
-    fs::write(&lock, r#"{"operation":"save","pid":1,"created_at":"now"}"#).unwrap();
-    assert!(matches!(
-        refused(Workspace::relocate_with_policy(&deck, cutready_policy())),
-        DraftlineError::WorkspaceLocked
-    ));
-    fs::remove_file(&lock).unwrap();
-
-    let moved = Workspace::relocate_with_policy(&deck, cutready_policy()).unwrap();
-    assert_eq!(moved.scope(), Path::new("deck"));
-
-    // A handle opened before the move can't keep writing to the old folder.
     write_file(temp.path(), "cutready/intro.sk", "late edit\n");
     let error = stale.save_version("Late").unwrap_err();
     assert_eq!(claimed_elsewhere(error), PathBuf::from("deck"));
+    let lock = repo.path().join("draftline").join("operation.lock");
     assert!(!lock.exists(), "the refused save released the lock");
     let error = stale.create_variation("cutready/late").unwrap_err();
     assert_eq!(claimed_elsewhere(error), PathBuf::from("deck"));
@@ -3680,16 +3692,11 @@ fn relocate_moves_the_workspace_and_refuses_while_an_operation_runs() {
     assert!(repo
         .find_branch("cutready/late", git2::BranchType::Local)
         .is_err());
-    Workspace::open_with_policy(&deck, cutready_policy()).unwrap();
-    let error = refused(Workspace::open_with_policy(
-        temp.path().join("cutready"),
-        cutready_policy(),
-    ));
-    assert_eq!(claimed_elsewhere(error), PathBuf::from("deck"));
+    Workspace::open_with_policy(temp.path().join("deck"), cutready_policy()).unwrap();
 }
 
 #[test]
-fn a_claim_on_a_missing_folder_is_reported_stale_and_relocate_recovers() {
+fn a_missing_folder_is_reported_until_it_comes_back() {
     let (temp, _repo) = code_repo();
     let pitch = scoped(&temp);
     write_file(temp.path(), "cutready/intro.sk", "intro\n");
@@ -3700,20 +3707,20 @@ fn a_claim_on_a_missing_folder_is_reported_stale_and_relocate_recovers() {
     fs::rename(temp.path().join("cutready"), temp.path().join("pitch")).unwrap();
     let error = pitch.save_version("Gone").unwrap_err();
     assert!(
-        matches!(error, DraftlineError::WorkspaceClaimStale(_)),
+        matches!(error, DraftlineError::FolderMissing(_)),
         "{error:?}"
     );
     drop(pitch);
     let renamed = temp.path().join("pitch");
     let error = refused(Workspace::open_with_policy(&renamed, cutready_policy()));
     assert!(
-        matches!(&error, DraftlineError::WorkspaceClaimStale(project) if project == Path::new("cutready")),
+        matches!(&error, DraftlineError::FolderMissing(project) if project == Path::new("cutready")),
         "{error:?}"
     );
     assert!(error.to_string().contains("missing"), "{error}");
     let tauri = draftline::tauri_contract::TauriCommandError::from(error);
-    assert_eq!(tauri.code, "workspace_claim_stale");
-    assert_eq!(tauri.details.unwrap()["project"], "cutready");
+    assert_eq!(tauri.code, "folder_missing");
+    assert_eq!(tauri.details.unwrap()["folder"], "cutready");
 
     // A refused init cleans up the folders it created.
     let error = refused(Workspace::init_with_policy(
@@ -3721,18 +3728,17 @@ fn a_claim_on_a_missing_folder_is_reported_stale_and_relocate_recovers() {
         cutready_policy(),
     ));
     assert!(
-        matches!(error, DraftlineError::WorkspaceClaimStale(_)),
+        matches!(error, DraftlineError::FolderMissing(_)),
         "{error:?}"
     );
     assert!(!temp.path().join("deck").exists());
 
-    let moved = Workspace::relocate_with_policy(&renamed, cutready_policy()).unwrap();
-    assert_eq!(moved.scope(), Path::new("pitch"));
-    Workspace::open_with_policy(&renamed, cutready_policy()).unwrap();
+    fs::rename(&renamed, temp.path().join("cutready")).unwrap();
+    Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
 }
 
 #[test]
-fn a_branch_without_the_folder_reports_a_stale_claim_but_can_switch_back() {
+fn a_branch_without_the_folder_reports_it_missing_but_can_switch_back() {
     let (temp, repo) = code_repo();
     let pitch = scoped(&temp);
     let base = draftline::VariationId::from(pitch.current_variation().unwrap());
@@ -3756,7 +3762,7 @@ fn a_branch_without_the_folder_reports_a_stale_claim_but_can_switch_back() {
         cutready_policy(),
     ));
     assert!(
-        matches!(&error, DraftlineError::WorkspaceClaimStale(project) if project == Path::new("cutready")),
+        matches!(&error, DraftlineError::FolderMissing(project) if project == Path::new("cutready")),
         "{error:?}"
     );
 
@@ -3768,48 +3774,267 @@ fn a_branch_without_the_folder_reports_a_stale_claim_but_can_switch_back() {
 }
 
 #[test]
-fn a_claim_naming_a_folder_outside_the_checkout_is_invalid() {
+fn a_record_naming_a_folder_outside_the_checkout_is_invalid() {
     let (temp, repo) = code_repo();
     scoped(&temp);
+    let marker = temp.path().join(".draftline");
     let claim = repo.path().join("draftline").join("workspace.json");
-    let mut projects = vec!["../elsewhere", "/abs"];
+    let mut folders = vec!["../elsewhere", "/abs", "cutready/", "./cutready", ""];
     if cfg!(windows) {
-        // A backslash is a separator only on Windows; claims always use `/`.
-        projects.push("cutready\\\\scenes");
+        // A backslash is a separator only on Windows; records always use `/`.
+        folders.push("cutready\\\\scenes");
     }
-    for project in projects {
-        fs::write(&claim, format!(r#"{{"project":"{project}"}}"#)).unwrap();
+    for folder in folders {
+        fs::write(&marker, format!(r#"{{"format":1,"folder":"{folder}"}}"#)).unwrap();
         let error = refused(Workspace::open_with_policy(
             temp.path().join("cutready"),
             cutready_policy(),
         ));
         assert!(
-            matches!(error, DraftlineError::InvalidWorkspaceClaim(_)),
-            "{project}: {error:?}"
+            matches!(error, DraftlineError::InvalidFolderMarker(_)),
+            "marker {folder}: {error:?}"
+        );
+        let tauri = draftline::tauri_contract::TauriCommandError::from(error);
+        assert_eq!(tauri.code, "invalid_folder_marker");
+    }
+    fs::remove_file(&marker).unwrap();
+
+    // The checkout's own record is held to the same rules.
+    for folder in ["../elsewhere", "/abs"] {
+        fs::write(&claim, format!(r#"{{"project":"{folder}"}}"#)).unwrap();
+        let error = refused(Workspace::open_with_policy(
+            temp.path().join("cutready"),
+            cutready_policy(),
+        ));
+        assert!(
+            matches!(error, DraftlineError::InvalidFolderMarker(_)),
+            "claim {folder}: {error:?}"
         );
     }
-    Workspace::relocate_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    fs::remove_file(&claim).unwrap();
+    Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
 }
 
 #[test]
-fn an_unreadable_claim_is_reported_and_relocate_resets_it() {
+fn an_unreadable_record_is_reported_and_deleting_it_resets_it() {
     let (temp, repo) = code_repo();
     scoped(&temp);
-    fs::write(
-        repo.path().join("draftline").join("workspace.json"),
-        "not json",
-    )
-    .unwrap();
+    let marker = temp.path().join(".draftline");
+    for contents in ["not json", r#"{"format":2,"folder":"cutready"}"#] {
+        fs::write(&marker, contents).unwrap();
+        let error = refused(Workspace::open_with_policy(
+            temp.path().join("cutready"),
+            cutready_policy(),
+        ));
+        assert!(
+            matches!(error, DraftlineError::InvalidFolderMarker(_)),
+            "{contents}: {error:?}"
+        );
+    }
+    fs::remove_file(&marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    let error = refused(Workspace::open_with_policy(
+        temp.path().join("cutready"),
+        cutready_policy(),
+    ));
+    assert!(error.to_string().contains("is a folder"), "{error}");
+    fs::remove_dir(&marker).unwrap();
+
+    let claim = repo.path().join("draftline").join("workspace.json");
+    fs::write(&claim, "not json").unwrap();
     let error = refused(Workspace::open_with_policy(
         temp.path().join("cutready"),
         cutready_policy(),
     ));
     assert!(
-        matches!(error, DraftlineError::InvalidWorkspaceClaim(_)),
+        matches!(error, DraftlineError::InvalidFolderMarker(_)),
         "{error:?}"
     );
-    Workspace::relocate_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    fs::remove_file(&claim).unwrap();
     Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+}
+
+#[test]
+fn opening_writes_the_folder_marker_and_the_next_save_commits_it() {
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    let marker = fs::read_to_string(temp.path().join(".draftline")).unwrap();
+    assert_eq!(
+        marker,
+        "{\n  \"format\": 1,\n  \"folder\": \"cutready\"\n}\n"
+    );
+    write_file(temp.path(), "cutready/intro.sk", "intro\n");
+    pitch.save_version("Intro").unwrap();
+    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+    assert!(tree.get_name(".draftline").is_some());
+
+    // A fresh clone has no local record; the committed marker decides.
+    fs::remove_file(repo.path().join("draftline").join("workspace.json")).unwrap();
+    drop(pitch);
+    fs::create_dir_all(temp.path().join("deck")).unwrap();
+    let error = refused(Workspace::open_with_policy(
+        temp.path().join("deck"),
+        cutready_policy(),
+    ));
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("cutready"));
+    Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    assert!(repo
+        .path()
+        .join("draftline")
+        .join("workspace.json")
+        .exists());
+}
+
+#[test]
+fn a_root_folder_marker_names_the_whole_repository_and_survives_restore() {
+    let (temp, repo) = code_repo();
+    let root = Workspace::open_with_policy(temp.path(), cutready_policy()).unwrap();
+    let marker = fs::read_to_string(temp.path().join(".draftline")).unwrap();
+    assert!(marker.contains("\"folder\": \".\""), "{marker}");
+    write_file(temp.path(), "notes.md", "draft\n");
+    root.save_version("Draft").unwrap();
+    let first = root.versions().unwrap()[0].id().clone();
+    write_file(temp.path(), "notes.md", "notes\n");
+    root.save_version("Notes").unwrap();
+    let head = repo.head().unwrap().peel_to_tree().unwrap();
+    assert!(head.get_name(".draftline").is_some());
+
+    // A restore never rewrites the marker, even to an older copy.
+    fs::write(
+        temp.path().join(".draftline"),
+        "{ \"format\": 1, \"folder\": \".\" }\n",
+    )
+    .unwrap();
+    root.save_version("Reformat").unwrap();
+    let marker = head_marker(&repo);
+    root.restore_version_as_new_save(&first, "Back").unwrap();
+    assert_eq!(head_marker(&repo), marker);
+    assert_eq!(read(temp.path(), "notes.md"), "draft\n");
+    let head = repo.head().unwrap().peel_to_tree().unwrap();
+    assert!(head.get_name(".draftline").is_some());
+    assert!(temp.path().join(".draftline").is_file());
+}
+
+#[test]
+fn restoring_a_version_never_brings_back_a_marker_head_lacks() {
+    let (temp, repo) = code_repo();
+    let root = Workspace::open_with_policy(temp.path(), cutready_policy()).unwrap();
+    write_file(temp.path(), "notes.md", "draft\n");
+    root.save_version("Draft").unwrap();
+    let draft = root.versions().unwrap()[0].id().clone();
+
+    // A developer removes the marker from the branch.
+    fs::remove_file(temp.path().join(".draftline")).unwrap();
+    let mut index = repo.index().unwrap();
+    index.remove_path(Path::new(".draftline")).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: drop the marker");
+    write_file(temp.path(), "notes.md", "later\n");
+    root.save_version("Later").unwrap();
+    assert!(repo
+        .head()
+        .unwrap()
+        .peel_to_tree()
+        .unwrap()
+        .get_name(".draftline")
+        .is_none());
+
+    root.restore_version_as_new_save(&draft, "Back").unwrap();
+    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+    assert!(tree.get_name(".draftline").is_none());
+    assert_eq!(read(temp.path(), "notes.md"), "draft\n");
+}
+
+#[test]
+fn a_committed_marker_corrects_a_stale_local_record() {
+    let (temp, repo) = code_repo();
+    scoped(&temp);
+    let claim = repo.path().join("draftline").join("workspace.json");
+    fs::write(&claim, r#"{"project":"deck"}"#).unwrap();
+    Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    let record = fs::read_to_string(&claim).unwrap();
+    assert!(record.contains("\"cutready\""), "{record}");
+}
+
+#[test]
+fn switching_to_a_branch_whose_marker_names_another_folder_follows_it() {
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    let base = draftline::VariationId::from(pitch.current_variation().unwrap());
+    write_file(temp.path(), "cutready/intro.sk", "intro\n");
+    pitch.save_version("Intro").unwrap();
+
+    // A teammate's branch where Draftline manages `deck`.
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/deck", &head, false).unwrap();
+    repo.set_head("refs/heads/feature/deck").unwrap();
+    write_file(temp.path(), "deck/slide.sk", "slide\n");
+    fs::write(
+        temp.path().join(".draftline"),
+        "{ \"format\": 1, \"folder\": \"deck\" }\n",
+    )
+    .unwrap();
+    commit_all(&repo, "Dev: manage deck");
+    repo.set_head(&format!("refs/heads/{}", base.as_str()))
+        .unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let deck = draftline::VariationId::from("feature/deck".to_string());
+    pitch
+        .switch_variation(&deck, draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    let error = pitch.save_version("Stale").unwrap_err();
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("deck"));
+
+    // The host reopens the folder the branch names, and can switch back.
+    drop(pitch);
+    let deck_ws = Workspace::open_with_policy(temp.path().join("deck"), cutready_policy()).unwrap();
+    deck_ws
+        .switch_variation(&base, draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    drop(deck_ws);
+    Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+}
+
+fn head_marker(repo: &git2::Repository) -> git2::Oid {
+    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+    let id = tree.get_name(".draftline").unwrap().id();
+    id
+}
+
+#[test]
+fn a_branch_without_the_marker_keeps_the_same_folder() {
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    let base = draftline::VariationId::from(pitch.current_variation().unwrap());
+    let before = repo.head().unwrap().peel_to_commit().unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "intro\n");
+    pitch.save_version("Intro").unwrap();
+
+    // A developer branch from before the marker was committed.
+    repo.branch("feature/old", &before, false).unwrap();
+    let old = draftline::VariationId::from("feature/old".to_string());
+    pitch
+        .switch_variation(&old, draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    assert!(!temp.path().join(".draftline").exists());
+    fs::create_dir_all(temp.path().join("deck")).unwrap();
+    let error = refused(Workspace::open_with_policy(
+        temp.path().join("deck"),
+        cutready_policy(),
+    ));
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("cutready"));
+
+    // Reopening writes the marker again; switching back still works.
+    drop(pitch);
+    let pitch =
+        Workspace::open_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    assert!(temp.path().join(".draftline").is_file());
+    pitch
+        .switch_variation(&base, draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "intro\n");
 }
 
 #[test]
@@ -3844,6 +4069,7 @@ fn a_checkout_from_an_older_draftline_is_claimed_on_first_open() {
     let (temp, repo) = code_repo();
     scoped(&temp);
     fs::remove_file(repo.path().join("draftline").join("workspace.json")).unwrap();
+    fs::remove_file(temp.path().join(".draftline")).unwrap();
     let deck = temp.path().join("deck");
     fs::create_dir_all(&deck).unwrap();
     Workspace::open_with_policy(&deck, cutready_policy()).unwrap();
@@ -3881,7 +4107,7 @@ fn concurrent_opens_of_different_folders_let_exactly_one_claim_the_checkout() {
         for result in &results {
             if let Err(error) = result {
                 assert!(
-                    matches!(error, DraftlineError::WorkspaceAlreadyInCheckout(p) if p == winners[0]),
+                    matches!(error, DraftlineError::FolderIsElsewhere(p) if p == winners[0]),
                     "{error:?}"
                 );
             }

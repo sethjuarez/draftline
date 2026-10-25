@@ -128,22 +128,23 @@ pub enum DraftlineError {
     #[error("the remote has no branch `{0}` to send to; publish it first or pass a base branch")]
     SendBaseNotOnRemote(String),
 
+    /// Draftline manages a different folder in this repository.
     #[error(
-        "this checkout's Draftline workspace is {}; open that folder, or relocate the workspace",
+        "Draftline manages {} in this repository; open that folder instead",
         workspace_folder(.0)
     )]
-    WorkspaceAlreadyInCheckout(std::path::PathBuf),
+    FolderIsElsewhere(std::path::PathBuf),
 
-    /// The checkout's workspace claim names a folder that isn't here: it was
-    /// renamed or deleted, or the current branch doesn't have it.
+    /// The folder Draftline manages isn't here: it was renamed or deleted
+    /// outside Draftline, or the current branch doesn't have it.
     #[error(
-        "this checkout's Draftline workspace was {}, which is missing here; switch back to the branch that has it, or relocate the workspace",
+        "Draftline manages {}, which is missing here; switch back to a branch that has it, or fix `.draftline`",
         workspace_folder(.0)
     )]
-    WorkspaceClaimStale(std::path::PathBuf),
+    FolderMissing(std::path::PathBuf),
 
-    #[error("unreadable Draftline workspace record: {0}")]
-    InvalidWorkspaceClaim(String),
+    #[error("unreadable Draftline folder record: {0}")]
+    InvalidFolderMarker(String),
 
     #[error("Send branch `{0}` is outside this project's variation namespace")]
     SendOutsideNamespace(String),

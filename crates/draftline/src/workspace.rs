@@ -494,11 +494,24 @@ pub struct OperationLockInspection {
     pub diagnostics: Vec<WorkspaceDiagnostic>,
 }
 
-/// The folder a checkout's Draftline workspace manages, relative to the
-/// repository root (`""` for the root itself).
+/// The checkout's own record of the folder Draftline manages, relative to the
+/// repository root (`""` for the root itself). [`FOLDER_MARKER`] wins when the
+/// working tree has one; this covers branches without it.
 #[derive(Serialize, Deserialize)]
 struct WorkspaceClaim {
     project: String,
+}
+
+/// The file at the repository root that names the folder Draftline manages.
+/// It is committed with saves, so every clone and branch agrees.
+const FOLDER_MARKER: &str = ".draftline";
+
+/// The contents of [`FOLDER_MARKER`]: `{ "format": 1, "folder": "cutready" }`,
+/// with `"."` for the whole repository.
+#[derive(Serialize, Deserialize)]
+struct FolderMarker {
+    format: u32,
+    folder: String,
 }
 
 /// A remote's default branch as it last advertised it, and the one it
@@ -1510,9 +1523,8 @@ impl Workspace {
         };
 
         let result = Self::from_repository(repo, path, content_policy);
-        if let Err(
-            DraftlineError::WorkspaceAlreadyInCheckout(_) | DraftlineError::WorkspaceClaimStale(_),
-        ) = &result
+        if let Err(DraftlineError::FolderIsElsewhere(_) | DraftlineError::FolderMissing(_)) =
+            &result
         {
             // Leave no trace of a refused folder; `remove_dir` only removes empty ones.
             for dir in created.iter().rev() {
@@ -1524,39 +1536,13 @@ impl Workspace {
         result
     }
 
-    /// Moves this checkout's Draftline workspace to the folder at `path`.
-    ///
-    /// A checkout holds one Draftline workspace (see
-    /// [`DraftlineError::WorkspaceAlreadyInCheckout`]); use this when the
-    /// project folder moved or the host deliberately manages a different one.
-    /// Refuses while a Draftline operation is running or left unfinished.
-    /// Like [`Workspace::open`], the result has no variation namespace; chain
-    /// [`Workspace::with_variation_namespace`] for a hybrid project.
-    pub fn relocate(path: impl AsRef<Path>) -> Result<Self> {
-        Self::relocate_with_policy(path, ContentPolicy::default())
-    }
-
-    /// Moves this checkout's Draftline workspace with an explicit content
-    /// policy; see [`Workspace::relocate`].
-    pub fn relocate_with_policy(
-        path: impl AsRef<Path>,
-        content_policy: ContentPolicy,
-    ) -> Result<Self> {
-        let repo = Repository::discover(path.as_ref())?;
-        let workspace = Self::unclaimed(repo, path.as_ref(), content_policy)?;
-        let _lock = OperationLock::acquire(&workspace.lock_path(), "relocate workspace")?;
-        workspace.ensure_no_pending_recovery_in_checkout()?;
-        workspace.write_claim()?;
-        Ok(workspace)
-    }
-
     fn from_repository(
         repo: Repository,
         project_path: &Path,
         content_policy: ContentPolicy,
     ) -> Result<Self> {
         let workspace = Self::unclaimed(repo, project_path, content_policy)?;
-        workspace.claim_checkout()?;
+        workspace.claim_checkout(true)?;
         Ok(workspace)
     }
 
@@ -2160,7 +2146,7 @@ impl Workspace {
 
     /// Clears an abandoned operation lock only when lock metadata marks it stale.
     pub fn clear_stale_lock(&self) -> Result<()> {
-        self.claim_checkout()?;
+        self.claim_checkout(false)?;
         let inspection = self.inspect_operation_lock()?;
         if inspection.state == OperationLockState::Unlocked {
             return Ok(());
@@ -3176,6 +3162,10 @@ impl Workspace {
             let Ok(path) = entry.path() else {
                 continue;
             };
+            // Draftline owns its marker; checkout handles an unsaved one.
+            if path == FOLDER_MARKER {
+                continue;
+            }
             let path_ref = Path::new(path);
             let status = entry.status();
 
@@ -3226,6 +3216,7 @@ impl Workspace {
         // cannot see, so flag those up front instead of failing mid-operation.
         for path in self.obstructed_paths(head_tree.as_ref(), target_tree, &target_paths)? {
             if hazards.iter().any(|hazard| hazard.path == path)
+                || path == Path::new(FOLDER_MARKER)
                 || self.content_policy.tracks(&path)?
             {
                 continue;
@@ -8197,7 +8188,7 @@ impl Workspace {
                     .deltas()
                     .flat_map(|delta| [delta.old_file().path(), delta.new_file().path()])
                     .flatten()
-                    .filter(|path| !path.starts_with(scope))
+                    .filter(|path| !path.starts_with(scope) && *path != Path::new(FOLDER_MARKER))
                     .map(Path::to_path_buf)
                     .collect())
             };
@@ -8888,11 +8879,11 @@ impl Workspace {
         Ok(())
     }
 
-    /// Takes the Draftline lock, then confirms this workspace still holds the
-    /// checkout, so a handle opened before a relocate can't keep writing.
+    /// Takes the Draftline lock, then confirms Draftline still manages this
+    /// folder, so a handle on a folder that was moved can't keep writing.
     fn acquire_operation_lock(&self, operation: &str) -> Result<OperationLock> {
         let lock = OperationLock::acquire(&self.lock_path(), operation)?;
-        self.claim_checkout()?;
+        self.claim_checkout(false)?;
         Ok(lock)
     }
 
@@ -8990,36 +8981,147 @@ impl Workspace {
         self.draftline_dir().join("workspace.json")
     }
 
-    /// A checkout has one current branch, and variations, sends, merges, the
-    /// operation lock and recovery all act on it, so it holds one Draftline
-    /// workspace. The first workspace opened in a checkout claims it; any other
-    /// folder is refused until [`Workspace::relocate`] moves the claim.
-    fn claim_checkout(&self) -> Result<()> {
-        let path = self.claim_path();
-        if !path.exists() {
-            match self.publish_new_claim(&path) {
-                Ok(()) => return Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+    /// Draftline manages one folder per repository: the one [`FOLDER_MARKER`]
+    /// names. A branch without the file falls back to the checkout's local
+    /// record, and the first folder opened claims a repository with neither.
+    /// Opening writes the marker when the working tree lacks it, and the next
+    /// save commits it. Any other folder is refused.
+    fn claim_checkout(&self, opening: bool) -> Result<()> {
+        let mine = self.project_key();
+        let owner = match self.read_marker()? {
+            Some(folder) => {
+                if opening && folder == mine {
+                    self.record_local_claim()?;
+                }
+                folder
             }
-        }
+            None => {
+                let path = self.claim_path();
+                let mut published = false;
+                if !path.exists() {
+                    match self.publish_new_claim(&path) {
+                        Ok(()) => published = true,
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                let folder = if published {
+                    mine.clone()
+                } else {
+                    folder_key(&claimed_project(&self.read_claim(&path)?, &path)?)
+                };
+                if opening && folder == mine {
+                    self.write_marker()?;
+                }
+                folder
+            }
+        };
 
-        let claimed = self.read_claim(&path)?;
-        let project = claimed_project(&claimed, &path)?;
-        let missing = self.claimed_folder_missing(&project)?;
-        if claimed.project == self.project_key() {
+        let folder = PathBuf::from(&owner);
+        let missing = self.claimed_folder_missing(&folder)?;
+        if owner == mine {
             // Our own folder vanished while HEAD still tracks it (renamed or
             // deleted outside Draftline): refuse, or a save would record
             // every file as deleted. A branch that lacks the folder is fine,
             // so the host can still switch back.
-            if missing && self.head_tree_or_empty()?.get_path(&project).is_ok() {
-                return Err(DraftlineError::WorkspaceClaimStale(project));
+            if missing && self.head_tree_or_empty()?.get_path(&folder).is_ok() {
+                return Err(DraftlineError::FolderMissing(folder));
             }
             Ok(())
         } else if missing {
-            Err(DraftlineError::WorkspaceClaimStale(project))
+            Err(DraftlineError::FolderMissing(folder))
         } else {
-            Err(DraftlineError::WorkspaceAlreadyInCheckout(project))
+            Err(DraftlineError::FolderIsElsewhere(folder))
+        }
+    }
+
+    fn marker_path(&self) -> PathBuf {
+        self.root.join(FOLDER_MARKER)
+    }
+
+    /// The folder the working tree's [`FOLDER_MARKER`] names, if it has one.
+    fn read_marker(&self) -> Result<Option<String>> {
+        let path = self.marker_path();
+        let invalid = |reason: String| {
+            DraftlineError::InvalidFolderMarker(format!("{}: {reason}", path.display()))
+        };
+        if path.is_dir() {
+            return Err(invalid("is a folder, not a file".to_string()));
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let marker: FolderMarker =
+            serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
+        if marker.format != 1 {
+            return Err(invalid(format!(
+                "format {} needs a newer Draftline",
+                marker.format
+            )));
+        }
+        if marker.folder == "." {
+            return Ok(Some(String::new()));
+        }
+        canonical_folder(&marker.folder)
+            .filter(|folder| !folder.as_os_str().is_empty())
+            .map(|folder| Some(folder_key(&folder)))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "folder {:?} is not a folder inside this repository",
+                    marker.folder
+                ))
+            })
+    }
+
+    /// Writes [`FOLDER_MARKER`] for this folder; a rename keeps readers from
+    /// ever seeing a partial file.
+    fn write_marker(&self) -> Result<()> {
+        let folder = match self.project_key() {
+            key if key.is_empty() => ".".to_string(),
+            key => key,
+        };
+        let mut bytes = serde_json::to_vec_pretty(&FolderMarker { format: 1, folder })?;
+        bytes.push(b'\n');
+        let path = self.marker_path();
+        let temp = unique_claim_temp(&path);
+        fs::write(&temp, bytes)?;
+        if let Err(error) = fs::rename(&temp, &path) {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// Points the local record at this folder once the marker agrees, so
+    /// branches without the marker keep the same owner.
+    fn record_local_claim(&self) -> Result<()> {
+        let path = self.claim_path();
+        let current = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<WorkspaceClaim>(&bytes).ok());
+        if current.is_some_and(|claim| claim.project == self.project_key()) {
+            return Ok(());
+        }
+        self.write_claim()
+    }
+
+    /// A marker no commit has yet would block checking out a branch that has
+    /// one, as any untracked file would; the branch's own marker wins.
+    fn drop_unsaved_marker_for(&self, target: &Tree<'_>) -> Result<()> {
+        if target.get_name(FOLDER_MARKER).is_none() || !self.marker_path().is_file() {
+            return Ok(());
+        }
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        if index.get_path(Path::new(FOLDER_MARKER), 0).is_some() {
+            return Ok(());
+        }
+        match fs::remove_file(self.marker_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -9069,8 +9171,8 @@ impl Workspace {
             let bytes = fs::read(path)?;
             if !bytes.is_empty() || std::time::Instant::now() >= deadline {
                 return serde_json::from_slice(&bytes).map_err(|error| {
-                    DraftlineError::InvalidWorkspaceClaim(format!(
-                        "{}: {error}; use Workspace::relocate to reset it",
+                    DraftlineError::InvalidFolderMarker(format!(
+                        "{}: {error}; delete it to reset it",
                         path.display()
                     ))
                 });
@@ -9100,7 +9202,7 @@ impl Workspace {
     /// Every operation that reads or writes the checkout passes here, so a
     /// handle whose folder no longer holds the checkout's claim is refused.
     fn ensure_no_pending_recovery(&self) -> Result<()> {
-        self.claim_checkout()?;
+        self.claim_checkout(false)?;
         self.ensure_no_pending_recovery_in_checkout()
     }
 
@@ -9132,11 +9234,7 @@ impl Workspace {
     }
 
     fn project_key(&self) -> String {
-        self.scope()
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/")
+        folder_key(self.scope())
     }
 
     fn normalize_tracked_content_path(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -9197,6 +9295,11 @@ impl Workspace {
                 ChangeKind::Deleted => removals.push(changed.path.clone()),
                 _ => additions.push(changed.path.clone()),
             }
+        }
+        // The marker is committed with every save, so clones and other
+        // branches learn which folder Draftline manages.
+        if self.marker_path().is_file() {
+            additions.push(PathBuf::from(FOLDER_MARKER));
         }
         self.ensure_no_filtered_content(&additions, operation)?;
 
@@ -9586,6 +9689,7 @@ impl Workspace {
     /// `git checkout` does: files with local edits are never overwritten.
     /// Must run before HEAD or its branch moves, since HEAD is the baseline.
     fn checkout_tree_safely(&self, target: &Tree<'_>) -> Result<()> {
+        self.drop_unsaved_marker_for(target)?;
         let baseline = self.repo.head().and_then(|head| head.peel_to_tree()).ok();
         let position = self.head_position();
         let mut checkout = CheckoutBuilder::new();
@@ -9740,7 +9844,18 @@ impl Workspace {
     /// Unscoped workspaces use `source` as-is.
     fn compose_scoped_tree(&self, base: &Tree<'_>, source: &Tree<'_>) -> Result<Oid> {
         let Some(pathspec) = scope_pathspec(self.scope()) else {
-            return Ok(source.id());
+            // The marker describes the repository, not a version of the
+            // folder, so restoring never changes it.
+            let wanted = base.get_name(FOLDER_MARKER).map(|entry| entry.id());
+            if source.get_name(FOLDER_MARKER).map(|entry| entry.id()) == wanted {
+                return Ok(source.id());
+            }
+            let mut update = git2::build::TreeUpdateBuilder::new();
+            match wanted {
+                Some(marker) => update.upsert(FOLDER_MARKER, marker, git2::FileMode::Blob),
+                None => update.remove(FOLDER_MARKER),
+            };
+            return Ok(update.create_updated(&self.repo, source)?);
         };
         let source_entry = optional_tree_entry(source, self.scope())?;
         let base_entry = optional_tree_entry(base, self.scope())?;
@@ -12322,23 +12437,29 @@ fn create_missing_dirs(path: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// A claim's folder must be a canonical path inside the checkout, so a
 /// tampered claim can't point the host at a folder elsewhere.
 fn claimed_project(claim: &WorkspaceClaim, path: &Path) -> Result<PathBuf> {
-    let invalid = || {
-        DraftlineError::InvalidWorkspaceClaim(format!(
-            "{}: project {:?} is not a folder inside this checkout; use Workspace::relocate to reset it",
+    canonical_folder(&claim.project).ok_or_else(|| {
+        DraftlineError::InvalidFolderMarker(format!(
+            "{}: folder {:?} is not a folder inside this checkout; delete it to reset it",
             path.display(),
             claim.project
         ))
-    };
-    let project = normalize_workspace_relative(&claim.project).map_err(|_| invalid())?;
-    let canonical = project
+    })
+}
+
+/// `raw` as a repository-relative folder, only if it is already written the
+/// canonical way (`a/b`, no `.`/`..`, no trailing slash; `""` for the root).
+fn canonical_folder(raw: &str) -> Option<PathBuf> {
+    let folder = normalize_workspace_relative(raw).ok()?;
+    (folder_key(&folder) == raw).then_some(folder)
+}
+
+/// A repository-relative folder written with `/`, `""` for the root.
+fn folder_key(folder: &Path) -> String {
+    folder
         .components()
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
-        .join("/");
-    if canonical != claim.project {
-        return Err(invalid());
-    }
-    Ok(project)
+        .join("/")
 }
 
 fn unique_claim_temp(path: &Path) -> PathBuf {

@@ -473,10 +473,10 @@ export const flowMatrix: Flow[] = [
   },
   {
     id: "15f",
-    title: "One workspace per checkout",
+    title: "Draftline manages one folder",
     group: "Hybrid projects",
     status: "Covered",
-    outcome: "Keep many projects in one workspace folder; refuse a second folder until it is relocated.",
+    outcome: "A committed root .draftline file names the one folder Draftline manages; other folders are refused.",
   },
 ];
 
