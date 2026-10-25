@@ -287,7 +287,7 @@ describe('createDraftlineClient', () => {
     await client.probeFolder('C:\\repo\\cutready');
     await client.applyFolderFix('C:\\repo\\cutready', { action: 'switch_to_branch', branch: 'main' });
     await client.moveFolder({ workspace_path: 'C:\\repo\\cutready', to: 'demos' });
-    await client.resolveLegacyHistoryCleanup({ workspace_path: 'C:\\repo', plan_id: 'plan-1' });
+    await client.dismissLegacyHistoryCleanup({ workspace_path: 'C:\\repo', plan_id: 'plan-1' });
     await client.startVariationHere({ workspace_path: 'C:\\repo', name: 'cutready/rescue' });
     await client.filteredFiles({ workspace_path: 'C:\\repo', paths: ['cutready/shot.png'] });
 
@@ -456,7 +456,7 @@ describe('createDraftlineClient', () => {
     expect(invoke).toHaveBeenCalledWith('move_folder', {
       request: { workspace_path: 'C:\\repo\\cutready', to: 'demos' },
     });
-    expect(invoke).toHaveBeenCalledWith('resolve_legacy_history_cleanup', {
+    expect(invoke).toHaveBeenCalledWith('dismiss_legacy_history_cleanup', {
       request: { workspace_path: 'C:\\repo', plan_id: 'plan-1' },
     });
     expect(invoke).toHaveBeenCalledWith('start_variation_here', {

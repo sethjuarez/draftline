@@ -5,7 +5,7 @@ use draftline::tauri_contract::{
     CreateVariationFromVersionRequest, CreateVariationFromVersionResult, CurrentFileRequest,
     DeleteShelfResult, DiffVersionsRequest, FetchRemoteResult, FilteredFilesRequest,
     GuardedCreateVariationFromVersionRequest, GuardedCreateVariationFromVersionResult,
-    LegacyHistoryCleanupRequest, LegacyHistoryCleanupResult, ListSupportRefsRequest,
+    LegacyHistoryCleanupRequest, ListSupportRefsRequest,
     MergeIncomingCommandResult, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
     PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
     PublishCurrentVariationRequest, PublishCurrentVariationResult, RecoveryRequest, RemoteRequest,
@@ -637,12 +637,12 @@ fn move_folder(
 }
 
 #[tauri::command]
-fn resolve_legacy_history_cleanup(
+fn dismiss_legacy_history_cleanup(
     state: tauri::State<'_, DraftlineContextState>,
     request: LegacyHistoryCleanupRequest,
-) -> TauriCommandResult<LegacyHistoryCleanupResult> {
+) -> TauriCommandResult<CommandPostconditions> {
     let mut context = lock_context(state.inner())?;
-    contract::into_tauri_result(contract::resolve_legacy_history_cleanup_with_context(
+    contract::into_tauri_result(contract::dismiss_legacy_history_cleanup_with_context(
         &mut context,
         request,
     ))
@@ -840,7 +840,7 @@ fn main() {
             probe_folder,
             apply_folder_fix,
             move_folder,
-            resolve_legacy_history_cleanup,
+            dismiss_legacy_history_cleanup,
             selected_save,
             selected_shelve,
             selected_discard,

@@ -97,9 +97,7 @@ export interface DraftlineClient {
   rollbackRecovery(request: RecoveryRequest): Promise<RecoveryRepairResult>;
   acknowledgeRecovery(workspacePath: string): Promise<CommandPostconditions>;
   filteredFiles(request: FilteredFilesRequest): Promise<FilteredFile[]>;
-  resolveLegacyHistoryCleanup(
-    request: LegacyHistoryCleanupRequest,
-  ): Promise<LegacyHistoryCleanupResult>;
+  dismissLegacyHistoryCleanup(request: LegacyHistoryCleanupRequest): Promise<CommandPostconditions>;
   selectedSave(request: SelectedSaveRequest): Promise<SelectedSaveResult>;
   selectedShelve(request: SelectedShelveRequest): Promise<SelectedShelveResult>;
   selectedDiscard(request: SelectedDiscardRequest): Promise<SelectedDiscardResult>;
@@ -258,8 +256,8 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('acknowledge_recovery', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
-    resolveLegacyHistoryCleanup: (request) =>
-      run('resolve_legacy_history_cleanup', { request }),
+    dismissLegacyHistoryCleanup: (request) =>
+      run('dismiss_legacy_history_cleanup', { request }),
     filteredFiles: (request) => run('filtered_files', { request }),
     selectedSave: (request) => run('selected_save', { request }),
     selectedShelve: (request) => run('selected_shelve', { request }),
@@ -714,7 +712,7 @@ export interface WorkspaceSummary {
   is_dirty: boolean;
   recovery?: RecoveryState | null;
   state_may_be_inconsistent: boolean;
-  /** History cleanups Draftline 0.5 left pending; resolve each with `resolveLegacyHistoryCleanup`. */
+  /** History cleanups Draftline 0.5 left pending; dismiss each with `dismissLegacyHistoryCleanup`. */
   legacy_history_cleanups?: LegacyHistoryCleanup[];
 }
 
@@ -723,16 +721,8 @@ export interface LegacyHistoryCleanup {
   variation: string;
   original_head: string;
   replacement_head: string;
+  /** Support refs holding the original history; restore one as a variation to bring it back. */
   backup_refs: string[];
-  /** True when the variation can go back to its original commits with no file changes. */
-  can_restore_original: boolean;
-}
-
-export type LegacyCleanupResolution = 'restored_original' | 'forgotten';
-
-export interface LegacyHistoryCleanupResult {
-  resolution: LegacyCleanupResolution;
-  postconditions: CommandPostconditions;
 }
 
 export interface RemoteEndpoint {
@@ -1448,7 +1438,7 @@ export interface DraftlineHostFacade {
   rollbackRecovery(operationId: string): Promise<RecoveryRepairResult>;
   acknowledgeRecovery(): Promise<CommandPostconditions>;
   filteredFiles(paths?: string[]): Promise<FilteredFile[]>;
-  resolveLegacyHistoryCleanup(planId: string): Promise<LegacyHistoryCleanupResult>;
+  dismissLegacyHistoryCleanup(planId: string): Promise<CommandPostconditions>;
   fetchRemote(remote?: string): Promise<FetchRemoteResult>;
   publishCurrentVariation(remote?: string): Promise<PublishCurrentVariationResult>;
   preflightApplyIncoming(remote?: string): Promise<ApplyIncomingReport>;
@@ -1601,8 +1591,8 @@ export function createDraftlineHostFacade({
       client.rollbackRecovery({ ...workspaceRequest(), operation_id: operationId }),
     acknowledgeRecovery: () => client.acknowledgeRecovery(workspacePath),
     filteredFiles: (paths) => client.filteredFiles({ ...workspaceRequest(), paths }),
-    resolveLegacyHistoryCleanup: (planId) =>
-      client.resolveLegacyHistoryCleanup({ ...workspaceRequest(), plan_id: planId }),
+    dismissLegacyHistoryCleanup: (planId) =>
+      client.dismissLegacyHistoryCleanup({ ...workspaceRequest(), plan_id: planId }),
     fetchRemote: (remote) => client.fetchRemote(remoteRequest(remote)),
     publishCurrentVariation: (remote) => client.publishCurrentVariation(remoteRequest(remote)),
     preflightApplyIncoming: (remote) => client.preflightApplyIncoming(remoteRequest(remote)),
@@ -1986,10 +1976,10 @@ export async function filteredFiles(request: FilteredFilesRequest): Promise<Filt
   return createDraftlineClient().filteredFiles(request);
 }
 
-export async function resolveLegacyHistoryCleanup(
+export async function dismissLegacyHistoryCleanup(
   request: LegacyHistoryCleanupRequest,
-): Promise<LegacyHistoryCleanupResult> {
-  return createDraftlineClient().resolveLegacyHistoryCleanup(request);
+): Promise<CommandPostconditions> {
+  return createDraftlineClient().dismissLegacyHistoryCleanup(request);
 }
 
 export async function selectedSave(request: SelectedSaveRequest): Promise<SelectedSaveResult> {

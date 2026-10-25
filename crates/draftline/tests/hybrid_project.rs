@@ -3695,12 +3695,19 @@ fn legacy_cleanup(temp: &tempfile::TempDir, repo: &git2::Repository) -> (git2::O
         .unwrap();
     repo.reference("refs/heads/main", replacement, true, "0.5 cleanup")
         .unwrap();
+    repo.reference(
+        "refs/draftline/backups/history-cleanup/cleanup-1/main",
+        original,
+        true,
+        "0.5 backup",
+    )
+    .unwrap();
     let pending = serde_json::json!([{
         "plan_id": "cleanup-1",
         "target_variation": "main",
         "expected_local_head": original.to_string(),
         "replacement_head": replacement.to_string(),
-        "backup_refs": ["refs/draftline/backups/history-cleanup/cleanup-1"],
+        "backup_refs": ["refs/draftline/backups/history-cleanup/cleanup-1/main"],
         "ref_updates": [],
         "publish_status": "not_published",
     }]);
@@ -3711,7 +3718,7 @@ fn legacy_cleanup(temp: &tempfile::TempDir, repo: &git2::Repository) -> (git2::O
 }
 
 #[test]
-fn unpublished_0_5_history_cleanup_goes_back_to_the_original_history() {
+fn dismissing_an_unpublished_0_5_cleanup_moves_nothing_and_keeps_its_backup() {
     let (temp, repo) = code_repo();
     let workspace = scoped(&temp);
     let (original, replacement) = legacy_cleanup(&temp, &repo);
@@ -3722,18 +3729,14 @@ fn unpublished_0_5_history_cleanup_goes_back_to_the_original_history() {
     };
     assert_eq!(cleanup.plan_id, "cleanup-1");
     assert_eq!(cleanup.replacement_head, replacement.to_string());
-    assert!(cleanup.can_restore_original);
 
-    let resolution = workspace
-        .resolve_legacy_history_cleanup("cleanup-1")
+    workspace
+        .dismiss_legacy_history_cleanup("cleanup-1")
         .unwrap();
     assert_eq!(
-        resolution,
-        draftline::LegacyCleanupResolution::RestoredOriginal
-    );
-    assert_eq!(
         repo.find_reference("refs/heads/main").unwrap().target(),
-        Some(original)
+        Some(replacement),
+        "dismissing never moves a branch"
     );
     assert!(!workspace.workspace_summary().unwrap().is_dirty);
     assert!(workspace.legacy_history_cleanups().unwrap().is_empty());
@@ -3742,58 +3745,27 @@ fn unpublished_0_5_history_cleanup_goes_back_to_the_original_history() {
         .join("draftline/history-cleanup/pending.json")
         .exists());
     assert!(matches!(
-        workspace.resolve_legacy_history_cleanup("cleanup-1"),
+        workspace.dismiss_legacy_history_cleanup("cleanup-1"),
         Err(DraftlineError::RecoveryNotFound(_))
     ));
-}
 
-#[test]
-fn legacy_history_cleanup_with_newer_saves_is_only_forgotten() {
-    let (temp, repo) = code_repo();
-    let workspace = scoped(&temp);
-    legacy_cleanup(&temp, &repo);
-    write_file(temp.path(), "cutready/intro.sk", "after upgrade\n");
-    let saved = workspace.save_version("After upgrade").unwrap();
-
-    assert!(!workspace.legacy_history_cleanups().unwrap()[0].can_restore_original);
-    let resolution = workspace
-        .resolve_legacy_history_cleanup("cleanup-1")
+    // The original history is still a support ref the host can bring back.
+    let backups = workspace
+        .list_support_refs(draftline::SupportRefScope::Local)
         .unwrap();
-    assert_eq!(resolution, draftline::LegacyCleanupResolution::Forgotten);
+    let [backup] = backups.as_slice() else {
+        panic!("{backups:?}");
+    };
+    let restored = workspace
+        .restore_support_ref_as_variation(&backup.id, "before-cleanup")
+        .unwrap();
     assert_eq!(
-        repo.find_reference("refs/heads/main").unwrap().target(),
-        Some(git2::Oid::from_str(saved.id().as_str()).unwrap())
+        repo.find_reference("refs/heads/before-cleanup")
+            .unwrap()
+            .target(),
+        Some(original)
     );
-    assert!(workspace.legacy_history_cleanups().unwrap().is_empty());
-}
-
-#[test]
-fn a_legacy_cleanup_whose_history_was_pushed_is_only_forgotten() {
-    let (temp, repo) = code_repo();
-    let workspace = scoped(&temp);
-    let (_original, replacement) = legacy_cleanup(&temp, &repo);
-    // Someone pushed the cleaned-up history, and built on it, after all.
-    let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
-    let tree = repo.find_commit(replacement).unwrap().tree().unwrap();
-    let parent = repo.find_commit(replacement).unwrap();
-    let pushed = repo
-        .commit(
-            None,
-            &signature,
-            &signature,
-            "Built on it",
-            &tree,
-            &[&parent],
-        )
-        .unwrap();
-    repo.reference("refs/remotes/origin/main", pushed, true, "pushed")
-        .unwrap();
-
-    assert!(!workspace.legacy_history_cleanups().unwrap()[0].can_restore_original);
-    let resolution = workspace
-        .resolve_legacy_history_cleanup("cleanup-1")
-        .unwrap();
-    assert_eq!(resolution, draftline::LegacyCleanupResolution::Forgotten);
+    assert_eq!(restored.id().as_str(), "before-cleanup");
     assert_eq!(
         repo.find_reference("refs/heads/main").unwrap().target(),
         Some(replacement)
