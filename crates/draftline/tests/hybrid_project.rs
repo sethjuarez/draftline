@@ -3729,6 +3729,39 @@ fn legacy_history_cleanup_with_newer_saves_is_only_forgotten() {
 }
 
 #[test]
+fn a_legacy_cleanup_whose_history_was_pushed_is_only_forgotten() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp);
+    let (_original, replacement) = legacy_cleanup(&temp, &repo);
+    // Someone pushed the cleaned-up history, and built on it, after all.
+    let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+    let tree = repo.find_commit(replacement).unwrap().tree().unwrap();
+    let parent = repo.find_commit(replacement).unwrap();
+    let pushed = repo
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "Built on it",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+    repo.reference("refs/remotes/origin/main", pushed, true, "pushed")
+        .unwrap();
+
+    assert!(!workspace.legacy_history_cleanups().unwrap()[0].can_restore_original);
+    let resolution = workspace
+        .resolve_legacy_history_cleanup("cleanup-1")
+        .unwrap();
+    assert_eq!(resolution, draftline::LegacyCleanupResolution::Forgotten);
+    assert_eq!(
+        repo.find_reference("refs/heads/main").unwrap().target(),
+        Some(replacement)
+    );
+}
+
+#[test]
 fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
     let (temp, repo) = code_repo();
     let (_bare, other_dir, other) = with_remote(&repo);

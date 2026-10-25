@@ -3562,7 +3562,32 @@ impl Workspace {
             .and_then(|branch| branch.get().target())
             .is_some_and(|oid| oid.to_string() == record.replacement_head);
         let original = tree_of(&record.expected_local_head);
-        at_replacement && original.is_some() && original == tree_of(&record.replacement_head)
+        at_replacement
+            && original.is_some()
+            && original == tree_of(&record.replacement_head)
+            && !self.reachable_from_any_remote(&record.replacement_head)
+    }
+
+    /// Whether any remote-tracking ref holds `id`: once the cleanup's history
+    /// was pushed, moving the branch back would rewrite shared history.
+    fn reachable_from_any_remote(&self, id: &str) -> bool {
+        let Ok(oid) = Oid::from_str(id) else {
+            return false;
+        };
+        let Ok(mut references) = self.repo.references_glob("refs/remotes/*") else {
+            return true;
+        };
+        references.any(|reference| {
+            // Unreadable or dangling refs count as holding it.
+            let Some(tip) = reference
+                .ok()
+                .and_then(|reference| reference.resolve().ok())
+                .and_then(|reference| reference.target())
+            else {
+                return true;
+            };
+            tip == oid || self.repo.graph_descendant_of(tip, oid).unwrap_or(true)
+        })
     }
 
     /// Resolves a history cleanup left pending by Draftline 0.5. While the
