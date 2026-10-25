@@ -1777,8 +1777,10 @@ impl Workspace {
                                 requested.display()
                             )));
                         }
-                        located.write_claim()?;
+                        // Marker first: if the claim then fails, opening
+                        // repairs it from the marker.
                         located.write_marker()?;
+                        located.write_claim()?;
                     }
                 }
                 Self::init_with_policy(&requested, content_policy)
@@ -1985,8 +1987,12 @@ impl Workspace {
             FolderOwner::Invalid(reason) => {
                 probe.state = FolderState::InvalidMarker;
                 probe.detail = Some(reason);
-                probe.suggestions =
-                    vec![suggest(FolderFix::ManageHere, "Manage this folder instead")];
+                // A folder named .draftline can't be replaced with the marker
+                // without deleting what's in it; someone has to move it.
+                if !self.marker_path().is_dir() {
+                    probe.suggestions =
+                        vec![suggest(FolderFix::ManageHere, "Manage this folder instead")];
+                }
                 return Ok(probe);
             }
             FolderOwner::Folder(owner) => owner,

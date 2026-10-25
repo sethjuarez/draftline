@@ -4411,6 +4411,16 @@ fn probing_reports_each_folder_state_with_fixes() {
     let probe = Workspace::probe(&cutready).unwrap();
     assert_eq!(probe.state, FolderState::InvalidMarker);
     assert_eq!(fixes(&probe), [FolderFix::ManageHere]);
+    // A folder named .draftline isn't overwritten; someone has to move it.
+    fs::remove_file(&marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    let probe = Workspace::probe(&cutready).unwrap();
+    assert_eq!(probe.state, FolderState::InvalidMarker);
+    assert!(fixes(&probe).is_empty());
+    assert!(
+        Workspace::apply_folder_fix(&cutready, cutready_policy(), &FolderFix::ManageHere).is_err()
+    );
+    fs::remove_dir(&marker).unwrap();
     fs::write(&marker, r#"{"format":2,"folder":"cutready"}"#).unwrap();
     let probe = Workspace::probe(&cutready).unwrap();
     assert_eq!(probe.state, FolderState::NewerFormat);
