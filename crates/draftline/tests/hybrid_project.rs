@@ -1778,8 +1778,8 @@ fn send_from_the_default_branch_moves_work_to_a_new_branch_and_opens_a_pull_requ
     );
     assert_eq!(
         repo.refname_to_id("refs/heads/main").unwrap(),
-        base,
-        "local main is handed back to its upstream"
+        saved.id().as_str().parse().unwrap(),
+        "Draftline never moves the base; it keeps the save until pushed"
     );
     assert_eq!(
         remote_branch(bare.path(), "cutready/revise-intro-for-q3"),
@@ -2396,7 +2396,7 @@ fn starting_a_variation_refuses_an_existing_name_and_leaves_head_alone() {
 }
 
 #[test]
-fn send_hands_a_stale_local_base_back_to_the_fresh_upstream() {
+fn send_leaves_a_stale_local_base_where_it_is() {
     let (temp, repo) = code_repo();
     let (bare, other_dir, other) = with_remote(&repo);
     write_file(other_dir.path(), "README.md", "# teammate\n");
@@ -2405,7 +2405,7 @@ fn send_hands_a_stale_local_base_back_to_the_fresh_upstream() {
     let fresh = remote_branch(bare.path(), "main").unwrap();
     let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
     write_file(temp.path(), "cutready/intro.sk", "pitch\n");
-    workspace.save_version("Pitch").unwrap();
+    let saved = workspace.save_version("Pitch").unwrap();
 
     let result = workspace
         .send(
@@ -2418,30 +2418,13 @@ fn send_hands_a_stale_local_base_back_to_the_fresh_upstream() {
 
     assert_eq!(result.variation, "cutready/pitch");
     assert_eq!(result.published_versions, 1);
-    assert_eq!(repo.refname_to_id("refs/heads/main").unwrap(), fresh);
-
-    // A send interrupted after switching branches is repaired by the next one.
-    write_file(temp.path(), "cutready/intro.sk", "pitch v2\n");
-    workspace.save_version("Pitch v2").unwrap();
-    let carried = repo.head().unwrap().peel_to_commit().unwrap();
-    repo.reference(
-        "refs/heads/main",
-        carried.id(),
-        true,
-        "simulate interruption",
-    )
-    .unwrap();
-    workspace
-        .send(
-            "origin",
-            &send_request("Pitch"),
-            &mut FakeHost::default(),
-            &mut RemoteOptions::new(),
-        )
-        .unwrap();
-    assert_eq!(repo.refname_to_id("refs/heads/main").unwrap(), fresh);
+    // Draftline never moves or rewinds the base, even one behind upstream.
+    assert_eq!(
+        repo.refname_to_id("refs/heads/main").unwrap().to_string(),
+        saved.id().as_str()
+    );
+    assert_ne!(repo.refname_to_id("refs/heads/main").unwrap(), fresh);
 }
-
 #[test]
 fn a_folder_move_and_older_saves_are_not_developer_commits() {
     let (temp, repo) = code_repo();

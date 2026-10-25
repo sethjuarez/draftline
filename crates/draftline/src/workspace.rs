@@ -8678,9 +8678,8 @@ impl Workspace {
     ///
     /// On the base branch, or on a branch outside the variation namespace,
     /// Send first moves the work onto a new branch named from the namespace
-    /// and title, so it only ever pushes branches it owns. Leaving the base, it
-    /// hands the local base back to its upstream when every unpushed base
-    /// commit is the project's own. Teammates' commits on the branch go along:
+    /// and title, so it only ever pushes branches it owns. The base itself is
+    /// never moved or rewound. Teammates' commits on the branch go along:
     /// [`Self::preflight_send`] lists them so the host can say so. Retrying
     /// after a failure is safe: the push becomes a no-op and the open pull
     /// request is found.
@@ -8771,7 +8770,6 @@ impl Workspace {
         } else {
             current
         };
-        self.hand_base_back_to_upstream(&base, remote)?;
 
         let base_ahead = match (
             advertised.contains(&variation),
@@ -9374,41 +9372,6 @@ impl Workspace {
             .find(|name| !taken(name))
             .expect("an unused suffix exists");
         validate_variation_name(&name)
-    }
-
-    /// Moves the local base to its freshly fetched remote-tracking ref when the
-    /// current branch carries every local base commit, so nothing is lost and
-    /// the base never diverges from upstream. The worktree is untouched. Runs
-    /// on every send, which also repairs a send that failed after switching
-    /// branches. A base holding a teammate's unpushed commits outside the
-    /// project is theirs to push, so it stays where it is.
-    fn hand_base_back_to_upstream(&self, base: &str, remote: &str) -> Result<()> {
-        let Ok(upstream) = self
-            .repo
-            .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
-        else {
-            return Ok(());
-        };
-        let Ok(mut local) = self.repo.find_branch(base, BranchType::Local) else {
-            return Ok(());
-        };
-        let Some(local_oid) = local.get().target() else {
-            return Ok(());
-        };
-        let head = self.repo.head()?.peel_to_commit()?.id();
-        let carried = head == local_oid || self.repo.graph_descendant_of(head, local_oid)?;
-        if local_oid != upstream
-            && carried
-            && self
-                .developer_commits_to_send(remote, base, Some(local_oid))?
-                .is_empty()
-        {
-            local.get_mut().set_target(
-                upstream,
-                &format!("draftline: send moved local work off {base}"),
-            )?;
-        }
-        Ok(())
     }
 
     /// Branches the remote advertises right now, with their commits.
