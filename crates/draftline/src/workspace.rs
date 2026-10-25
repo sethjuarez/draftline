@@ -1678,8 +1678,22 @@ impl Workspace {
     /// with fixes the host can offer. Call it before opening a folder and pass
     /// the chosen fix to [`Workspace::apply_folder_fix`].
     pub fn probe(path: impl AsRef<Path>) -> Result<FolderProbe> {
-        let requested = absolute_path(path.as_ref())?;
-        match Self::located(&requested, ContentPolicy::default())? {
+        Self::probe_in(path.as_ref(), None)
+    }
+
+    /// [`Workspace::probe`] for a host that keeps its variations in
+    /// `namespace` (see [`Workspace::with_variation_namespace`]): only the
+    /// base branch and branches inside it are offered to switch to.
+    pub fn probe_with_namespace(
+        path: impl AsRef<Path>,
+        namespace: impl Into<String>,
+    ) -> Result<FolderProbe> {
+        Self::probe_in(path.as_ref(), Some(namespace.into()))
+    }
+
+    fn probe_in(path: &Path, namespace: Option<String>) -> Result<FolderProbe> {
+        let requested = absolute_path(path)?;
+        match Self::located_in(&requested, ContentPolicy::default(), namespace)? {
             Some(located) => located.probe_located(requested),
             None => Ok(FolderProbe {
                 state: FolderState::NotARepository,
@@ -1700,7 +1714,41 @@ impl Workspace {
         content_policy: ContentPolicy,
         fix: &FolderFix,
     ) -> Result<Self> {
-        let probe = Self::probe(path)?;
+        Self::apply_folder_fix_in(path.as_ref(), content_policy, None, fix)
+    }
+
+    /// [`Workspace::apply_folder_fix`] for a fix
+    /// [`Workspace::probe_with_namespace`] offered. The result has the
+    /// namespace set.
+    pub fn apply_folder_fix_with_namespace(
+        path: impl AsRef<Path>,
+        content_policy: ContentPolicy,
+        namespace: impl Into<String>,
+        fix: &FolderFix,
+    ) -> Result<Self> {
+        Self::apply_folder_fix_in(path.as_ref(), content_policy, Some(namespace.into()), fix)
+    }
+
+    fn apply_folder_fix_in(
+        path: &Path,
+        content_policy: ContentPolicy,
+        namespace: Option<String>,
+        fix: &FolderFix,
+    ) -> Result<Self> {
+        let workspace = Self::apply_offered_fix(path, content_policy, namespace.clone(), fix)?;
+        match namespace {
+            Some(namespace) => workspace.with_variation_namespace(namespace),
+            None => Ok(workspace),
+        }
+    }
+
+    fn apply_offered_fix(
+        path: &Path,
+        content_policy: ContentPolicy,
+        namespace: Option<String>,
+        fix: &FolderFix,
+    ) -> Result<Self> {
+        let probe = Self::probe_in(path, namespace.clone())?;
         if !probe.suggestions.iter().any(|offered| &offered.fix == fix) {
             return Err(DraftlineError::FolderFixUnavailable(format!(
                 "{} is not offered for {}",
@@ -1744,15 +1792,17 @@ impl Workspace {
                 Ok(workspace)
             }
             FolderFix::RestoreFolder { folder } => {
-                let managed = Self::located(&root.join(folder), content_policy.clone())?
-                    .ok_or_else(|| DraftlineError::FolderMissing(folder.clone()))?;
+                let managed =
+                    Self::located_in(&root.join(folder), content_policy.clone(), namespace)?
+                        .ok_or_else(|| DraftlineError::FolderMissing(folder.clone()))?;
                 managed.restore_missing_folder()?;
                 Self::open_with_policy(root.join(folder), content_policy)
             }
             FolderFix::SwitchToBranch { branch } => {
                 let folder = probe.folder.clone().unwrap_or_default();
-                let managed = Self::located(&root.join(&folder), content_policy.clone())?
-                    .ok_or_else(|| DraftlineError::FolderMissing(folder.clone()))?;
+                let managed =
+                    Self::located_in(&root.join(&folder), content_policy.clone(), namespace)?
+                        .ok_or_else(|| DraftlineError::FolderMissing(folder.clone()))?;
                 managed.switch_to_folder_branch(branch)?;
                 Self::open_with_policy(root.join(folder), content_policy)
             }
@@ -1862,6 +1912,17 @@ impl Workspace {
     /// without claiming or creating anything. `None` outside a repository with
     /// a working tree.
     fn located(path: &Path, content_policy: ContentPolicy) -> Result<Option<Self>> {
+        Self::located_in(path, content_policy, None)
+    }
+
+    fn located_in(
+        path: &Path,
+        content_policy: ContentPolicy,
+        namespace: Option<String>,
+    ) -> Result<Option<Self>> {
+        if let Some(namespace) = &namespace {
+            validate_variation_namespace(namespace)?;
+        }
         let Some(existing) = path.ancestors().find(|ancestor| ancestor.exists()) else {
             return Ok(None);
         };
@@ -1877,7 +1938,7 @@ impl Workspace {
             repo,
             content_policy,
             resolver_registry: ResolverRegistry::with_default_resolvers(),
-            variation_namespace: None,
+            variation_namespace: namespace,
         }))
     }
 
@@ -1954,7 +2015,7 @@ impl Workspace {
 
         probe.state = FolderState::FolderMissing;
         probe.detail = Some(format!("Draftline manages {label}, which isn't on disk."));
-        let tracked = head.get_path(&folder).is_ok();
+        let tracked = tracks_folder(&head, &folder);
         if tracked {
             probe.suggestions.push(suggest(
                 FolderFix::RestoreFolder {
@@ -1962,12 +2023,15 @@ impl Workspace {
                 },
                 &format!("Restore {label}"),
             ));
-        }
-        for branch in self.branches_with_folder(&folder, &owner)? {
-            let label = format!("Switch to {branch}, which has {label}");
-            probe
-                .suggestions
-                .push(suggest(FolderFix::SwitchToBranch { branch }, &label));
+        } else {
+            // A switch recreates only files that differ, so it can't bring
+            // back a folder the checked-out commit still tracks.
+            for branch in self.branches_with_folder(&folder, &owner)? {
+                let label = format!("Switch to {branch}, which has {label}");
+                probe
+                    .suggestions
+                    .push(suggest(FolderFix::SwitchToBranch { branch }, &label));
+            }
         }
         if owner == mine && !tracked {
             probe
@@ -2018,7 +2082,9 @@ impl Workspace {
             let Some(name) = branch.name()?.map(str::to_string) else {
                 continue;
             };
-            if current.as_deref() == Some(name.as_str()) {
+            if current.as_deref() == Some(name.as_str())
+                || self.ensure_variation_switchable(&name).is_err()
+            {
                 continue;
             }
             let commit = branch.get().peel_to_commit()?;
@@ -2047,22 +2113,38 @@ impl Workspace {
 
     /// Puts this folder's files back from HEAD, leaving everything else alone.
     fn restore_missing_folder(&self) -> Result<()> {
+        fs::create_dir_all(self.draftline_dir())?;
         let _lock = OperationLock::acquire(&self.lock_path(), "restore_folder")?;
         self.while_git_busy(|| self.ensure_git_index_unlocked())?;
-        let paths = tracked_paths_under(&self.repo.head()?.peel_to_tree()?, self.scope())?;
+        self.ensure_no_pending_recovery_in_checkout()?;
+        // No early return if the folder reappeared: it may be back only in
+        // part, and a safe checkout only recreates what is still missing.
+        let head = self.repo.head()?.peel_to_tree()?;
+        let paths = if tracks_folder(&head, self.scope()) {
+            tracked_paths_under(&head, self.scope())?
+        } else {
+            Vec::new()
+        };
         if paths.is_empty() {
-            return Ok(());
+            return Err(DraftlineError::FolderFixUnavailable(format!(
+                "the checked-out commit has no {} to restore",
+                folder_label(self.scope())
+            )));
         }
+        // From HEAD's tree, so files whose deletion is staged come back too.
         let mut checkout = CheckoutBuilder::new();
         checkout
             .safe()
             .recreate_missing(true)
+            .overwrite_ignored(false)
             .disable_pathspec_match(true);
         for path in &paths {
             checkout.path(path);
         }
-        self.repo.checkout_head(Some(&mut checkout))?;
-        Ok(())
+        let refused = RefCell::default();
+        self.checkout_refusing_filters(checkout, &refused, &head, |checkout| {
+            self.repo.checkout_tree(head.as_object(), Some(checkout))
+        })
     }
 
     /// Switches the checkout to `branch` for a folder that can't open yet,
@@ -2073,7 +2155,30 @@ impl Workspace {
         let _lock = OperationLock::acquire(&self.lock_path(), "switch_to_folder_branch")?;
         self.while_git_busy(|| self.ensure_git_index_unlocked())?;
         self.ensure_no_pending_recovery_in_checkout()?;
+        // Decide again under the lock: the folder may be back, or the branch
+        // may no longer have it.
+        let key = self.project_key();
+        if !self.claimed_folder_missing(self.scope())?
+            || tracks_folder(&self.head_tree_or_empty()?, self.scope())
+            || !self
+                .branches_with_folder(self.scope(), &key)?
+                .contains(&branch)
+        {
+            return Err(DraftlineError::FolderFixUnavailable(format!(
+                "switching to {branch} is no longer offered"
+            )));
+        }
         let target = self.branch_tree(&branch)?;
+        let file_hazards = self.target_tree_hazards(&target)?;
+        if !file_hazards.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "switch_variation",
+                true,
+                Vec::new(),
+                file_hazards,
+                Some(format!("current -> {branch}")),
+            ))));
+        }
         let operation_id = new_operation_id();
         self.write_recovery_state_for_checkout(
             &RecoveryState {
@@ -13420,6 +13525,14 @@ fn folder_in(root: &Path, path: &Path) -> Result<PathBuf> {
 }
 
 /// Every tracked path in `tree` at or below `prefix` (all of them for the root).
+/// Whether `tree` has `folder` as a directory (a file at that path isn't it).
+fn tracks_folder(tree: &Tree<'_>, folder: &Path) -> bool {
+    folder.as_os_str().is_empty()
+        || tree
+            .get_path(folder)
+            .is_ok_and(|entry| entry.kind() == Some(ObjectType::Tree))
+}
+
 fn tracked_paths_under(tree: &Tree<'_>, prefix: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {

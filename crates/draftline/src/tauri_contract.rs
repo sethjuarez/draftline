@@ -800,7 +800,19 @@ pub struct MoveFolderResult {
 /// Reports a folder's state and suggested fixes before opening it. Read-only.
 #[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
 pub fn probe_folder(request: WorkspaceRequest) -> Result<FolderProbe> {
-    Workspace::probe(&request.workspace_path)
+    probe_folder_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Probes a folder with the host-configured variation namespace, so only
+/// branches the host may switch to are offered.
+pub fn probe_folder_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceRequest,
+) -> Result<FolderProbe> {
+    match &context.variation_namespace {
+        Some(namespace) => Workspace::probe_with_namespace(&request.workspace_path, namespace),
+        None => Workspace::probe(&request.workspace_path),
+    }
 }
 
 /// Applies a fix [`probe_folder`] offered, then opens the resulting folder.
@@ -823,11 +835,19 @@ pub fn apply_folder_fix_with_context(
     context: &mut DraftlineCommandContext<'_>,
     request: ApplyFolderFixRequest,
 ) -> Result<WorkspaceOpenResult> {
-    let workspace = context.namespaced(Workspace::apply_folder_fix(
-        &request.workspace_path,
-        context.content_policy.clone(),
-        &request.fix,
-    )?)?;
+    let workspace = match &context.variation_namespace {
+        Some(namespace) => Workspace::apply_folder_fix_with_namespace(
+            &request.workspace_path,
+            context.content_policy.clone(),
+            namespace,
+            &request.fix,
+        )?,
+        None => Workspace::apply_folder_fix(
+            &request.workspace_path,
+            context.content_policy.clone(),
+            &request.fix,
+        )?,
+    };
     context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
     Ok(WorkspaceOpenResult {
         diagnostics: workspace_diagnostics(&workspace)?,

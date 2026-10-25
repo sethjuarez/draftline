@@ -4426,6 +4426,151 @@ fn moving_the_folder_is_one_save_that_rewrites_the_marker() {
 }
 
 #[test]
+fn a_folder_removed_with_git_rm_can_be_restored() {
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    pitch.save_version("Marker").unwrap();
+    drop(pitch);
+    fs::remove_dir_all(temp.path().join("cutready")).unwrap();
+    let mut index = repo.index().unwrap();
+    index.remove_dir(Path::new("cutready"), 0).unwrap();
+    index.write().unwrap();
+
+    let fix = FolderFix::RestoreFolder {
+        folder: "cutready".into(),
+    };
+    assert!(fixes(&Workspace::probe(temp.path().join("cutready")).unwrap()).contains(&fix));
+    Workspace::apply_folder_fix(temp.path().join("cutready"), cutready_policy(), &fix).unwrap();
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one\n");
+    assert_eq!(status(&repo, "cutready/intro.sk"), git2::Status::CURRENT);
+}
+
+#[test]
+fn restoring_refuses_once_the_folder_comes_back_in_part() {
+    let (temp, _repo) = code_repo();
+    write_file(temp.path(), "cutready/outro.sk", "scene two\n");
+    let pitch = scoped(&temp);
+    pitch.save_version("Marker").unwrap();
+    drop(pitch);
+    fs::remove_dir_all(temp.path().join("cutready")).unwrap();
+    let fix = FolderFix::RestoreFolder {
+        folder: "cutready".into(),
+    };
+    assert!(fixes(&Workspace::probe(temp.path().join("cutready")).unwrap()).contains(&fix));
+
+    // Someone puts one file back, edited, before the fix runs: the state
+    // changed, so the fix is refused and the host re-probes. (If it races
+    // past that check, the safe checkout under the lock restores the rest.)
+    write_file(temp.path(), "cutready/intro.sk", "edited meanwhile\n");
+    let error = Workspace::apply_folder_fix(temp.path().join("cutready"), cutready_policy(), &fix)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, DraftlineError::FolderFixUnavailable(_)),
+        "{error:?}"
+    );
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "edited meanwhile\n");
+}
+
+#[test]
+fn a_namespaced_probe_offers_only_branches_the_host_may_switch_to() {
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    pitch.save_version("Marker").unwrap();
+    drop(pitch);
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/x", &head, false).unwrap();
+    repo.branch("cutready/pitch", &head, false).unwrap();
+    repo.branch("feature/old", &head, false).unwrap();
+    repo.set_head("refs/heads/feature/old").unwrap();
+    fs::remove_dir_all(temp.path().join("cutready")).unwrap();
+    let mut index = repo.index().unwrap();
+    index.remove_dir(Path::new("cutready"), 0).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: drop the deck");
+
+    let deck = temp.path().join("cutready");
+    let branches = |probe: &draftline::FolderProbe| -> Vec<String> {
+        fixes(probe)
+            .into_iter()
+            .filter_map(|fix| match fix {
+                FolderFix::SwitchToBranch { branch } => Some(branch),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut open = branches(&Workspace::probe(&deck).unwrap());
+    open.sort();
+    assert_eq!(open, ["cutready/pitch", "feature/x", "main"]);
+    let mut namespaced = branches(&Workspace::probe_with_namespace(&deck, "cutready/").unwrap());
+    namespaced.sort();
+    assert_eq!(namespaced, ["cutready/pitch", "main"]);
+
+    let refused = Workspace::apply_folder_fix_with_namespace(
+        &deck,
+        cutready_policy(),
+        "cutready/",
+        &FolderFix::SwitchToBranch {
+            branch: "feature/x".into(),
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(
+        matches!(refused, DraftlineError::FolderFixUnavailable(_)),
+        "{refused:?}"
+    );
+    let back = Workspace::apply_folder_fix_with_namespace(
+        &deck,
+        cutready_policy(),
+        "cutready/",
+        &FolderFix::SwitchToBranch {
+            branch: "cutready/pitch".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(back.current_variation().unwrap(), "cutready/pitch");
+    assert_eq!(back.variation_namespace(), Some("cutready/"));
+}
+
+#[test]
+fn switching_to_a_branch_with_the_folder_refuses_untracked_files_in_the_way() {
+    let (temp, repo) = code_repo();
+    write_file(temp.path(), "src/extra.rs", "pub fn extra() {}\n");
+    commit_all(&repo, "Dev: extra");
+    let pitch = scoped(&temp);
+    pitch.save_version("Marker").unwrap();
+    drop(pitch);
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/old", &head, false).unwrap();
+    repo.set_head("refs/heads/feature/old").unwrap();
+    fs::remove_dir_all(temp.path().join("cutready")).unwrap();
+    fs::remove_file(temp.path().join("src/extra.rs")).unwrap();
+    let mut index = repo.index().unwrap();
+    index.remove_dir(Path::new("cutready"), 0).unwrap();
+    index.remove_path(Path::new("src/extra.rs")).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: drop the deck");
+    write_file(temp.path(), "src/extra.rs", "untracked work\n");
+
+    let error = Workspace::apply_folder_fix(
+        temp.path().join("cutready"),
+        cutready_policy(),
+        &FolderFix::SwitchToBranch {
+            branch: "main".into(),
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(
+        matches!(error, DraftlineError::PreflightFailed(_)),
+        "{error:?}"
+    );
+    assert_eq!(read(temp.path(), "src/extra.rs"), "untracked work\n");
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "feature/old");
+}
+
+#[test]
 fn a_folder_can_move_into_its_own_subfolder() {
     let (temp, repo) = code_repo();
     let mut pitch = scoped(&temp);
