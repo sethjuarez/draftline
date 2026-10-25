@@ -7371,11 +7371,17 @@ impl Workspace {
 
         if Self::mergeable_state(&sync_status.state, source.is_some()) {
             let merge_input = self.merge_input_for_status(&sync_status)?;
-            let trees = self.merge_trees_for(&merge_input)?;
+            let (trees, dropped) = self.merge_trees_for(&merge_input)?;
             let plan = self.plan_clean_merge(&trees[0], &trees[1], &trees[2])?;
-            match self.merged_tree(&trees, &plan.files)? {
-                Ok(tree) => file_hazards = self.target_tree_hazards(&self.repo.find_tree(tree)?)?,
-                Err(paths) => developer_conflicts = paths,
+            if !dropped.is_empty() {
+                developer_conflicts = dropped;
+            } else {
+                match self.merged_tree(&trees, &plan.files)? {
+                    Ok(tree) => {
+                        file_hazards = self.target_tree_hazards(&self.repo.find_tree(tree)?)?
+                    }
+                    Err(paths) => developer_conflicts = paths,
+                }
             }
             conflicts = plan.conflicts;
             if dirty_files.is_empty() && file_hazards.is_empty() && developer_conflicts.is_empty() {
@@ -7562,7 +7568,10 @@ impl Workspace {
             });
         }
 
-        let trees = self.merge_trees_for(&merge_input)?;
+        let (trees, dropped) = self.merge_trees_for(&merge_input)?;
+        if !dropped.is_empty() {
+            return Err(DraftlineError::MergeNeedsDeveloper(dropped));
+        }
         let plan = self.plan_clean_merge(&trees[0], &trees[1], &trees[2])?;
         let files = match resolutions {
             Some(resolutions) => self.resolve_merge_plan(plan, resolutions)?,
@@ -11185,7 +11194,15 @@ impl Workspace {
     /// local side keeps it, so a move on one side doesn't drop the other
     /// side's edits. Refuses when the remote moved the folder somewhere else:
     /// the host moves it there too, then merges.
-    fn merge_trees_for(&self, input: &IncomingMergeInput<'_>) -> Result<[Tree<'_>; 3]> {
+    ///
+    /// Relocating replaces whatever the other trees hold where the folder is
+    /// now (everything outside it, when it is now the root). Files the
+    /// incoming side changed there would vanish from the merge, so they come
+    /// back as developer conflicts instead.
+    fn merge_trees_for(
+        &self,
+        input: &IncomingMergeInput<'_>,
+    ) -> Result<([Tree<'_>; 3], Vec<PathBuf>)> {
         let mut folders = FolderChanges::new(&self.repo, self.scope());
         let ours = folders.folder_at(&input.local_commit)?;
         let base = folders.folder_at(&input.base_commit)?;
@@ -11193,25 +11210,26 @@ impl Workspace {
         if theirs != ours && theirs != base {
             return Err(DraftlineError::IncomingFolderElsewhere(theirs));
         }
+        let mut dropped = Vec::new();
+        if theirs != ours && !theirs.as_os_str().is_empty() {
+            let remote = input.remote_commit.tree()?;
+            let original = input.base_commit.tree()?;
+            let blob =
+                |tree: &Tree<'_>, path: &Path| tree.get_path(path).ok().map(|entry| entry.id());
+            for path in tracked_paths_under(&remote, &ours)? {
+                if !path.starts_with(&theirs)
+                    && path != Path::new(FOLDER_MARKER)
+                    && blob(&remote, &path) != blob(&original, &path)
+                {
+                    dropped.push(path);
+                }
+            }
+        }
         let local = self.repo.find_tree(input.local_commit.tree_id())?;
         let marker = local.get_name(FOLDER_MARKER).map(|entry| entry.id());
         let fit = |commit: &Commit<'_>, folder: &Path| -> Result<Tree<'_>> {
             if folder == ours {
                 return Ok(self.repo.find_tree(commit.tree_id())?);
-            }
-            // Relocating replaces whatever sits where the folder is now; a
-            // teammate's files there would vanish from the merge unseen.
-            let tree = commit.tree()?;
-            let dropped: Vec<PathBuf> = if folder.as_os_str().is_empty() {
-                Vec::new()
-            } else {
-                tracked_paths_under(&tree, &ours)?
-                    .into_iter()
-                    .filter(|path| !path.starts_with(folder) && path != Path::new(FOLDER_MARKER))
-                    .collect()
-            };
-            if !dropped.is_empty() {
-                return Err(DraftlineError::MergeNeedsDeveloper(dropped));
             }
             let tree = self.relocated_tree(commit)?;
             let id = match marker {
@@ -11224,11 +11242,14 @@ impl Workspace {
             };
             Ok(self.repo.find_tree(id)?)
         };
-        Ok([
-            fit(&input.base_commit, &base)?,
-            local,
-            fit(&input.remote_commit, &theirs)?,
-        ])
+        Ok((
+            [
+                fit(&input.base_commit, &base)?,
+                local,
+                fit(&input.remote_commit, &theirs)?,
+            ],
+            dropped,
+        ))
     }
 
     fn plan_clean_merge(

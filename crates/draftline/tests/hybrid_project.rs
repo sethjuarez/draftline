@@ -2785,12 +2785,12 @@ fn incoming_developer_files_where_the_folder_moved_stop_the_merge() {
     push_main(&other);
 
     workspace.fetch_remote("origin").unwrap();
-    let err = workspace.preflight_merge_incoming("origin").unwrap_err();
-    assert!(
-        matches!(&err, DraftlineError::MergeNeedsDeveloper(paths)
-            if paths == &[PathBuf::from("demos/pitch/server.rs")]),
-        "{err:?}"
+    let report = workspace.preflight_merge_incoming("origin").unwrap();
+    assert_eq!(
+        report.developer_conflicts,
+        vec![PathBuf::from("demos/pitch/server.rs")]
     );
+    assert!(report.token.is_none() && !report.can_merge_cleanly);
     let head = repo.head().unwrap().target().unwrap();
     assert!(!temp.path().join("demos/pitch/server.rs").exists());
     assert_eq!(repo.head().unwrap().target().unwrap(), head);
