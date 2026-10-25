@@ -159,7 +159,9 @@ not managed by release-please.
 3. Merging that PR creates the component-prefixed tags and GitHub releases.
 4. The `release-please` workflow then automatically publishes each package that was actually
    released: the crate via `cargo publish`, the npm packages to npmjs and GitHub Packages.
-   The site is not registry-published — GitHub Pages already deploys on every push to `main`.
+   npm publishing is dispatched as its own `npm-publish.yml` run, because npm trusted
+   publishing only accepts that file as the top-level workflow. The site is not
+   registry-published — GitHub Pages already deploys on every push to `main`.
 
 The manual `publish-crate` and `publish npm packages` workflows remain available via
 `workflow_dispatch` as a fallback (type `publish` to confirm). Both paths keep the same
