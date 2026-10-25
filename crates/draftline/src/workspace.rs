@@ -13534,7 +13534,10 @@ fn operation_lock_metadata_is_stale(metadata: &OperationLockMetadata) -> bool {
     same_host && process_is_running(metadata.process_id) == Some(false)
 }
 
+/// Names the process table a lock's process id belongs to. The OS family
+/// keeps Windows and WSL apart, which share a machine name by default.
 fn current_host() -> Option<String> {
+    let family = if cfg!(windows) { "windows" } else { "unix" };
     ["COMPUTERNAME", "HOSTNAME"]
         .iter()
         .find_map(|name| std::env::var(name).ok())
@@ -13542,6 +13545,7 @@ fn current_host() -> Option<String> {
         .or_else(|| fs::read_to_string("/proc/sys/kernel/hostname").ok())
         .map(|host| host.trim().to_string())
         .filter(|host| !host.is_empty())
+        .map(|host| format!("{family}:{host}"))
 }
 
 /// `Some(false)` only when the process is known to be gone.
@@ -17226,6 +17230,14 @@ mod tests {
 
         // Nor can a lock that never recorded its machine.
         metadata.host = None;
+        write_lock(&metadata);
+        assert!(!workspace.inspect_operation_lock().unwrap().is_stale);
+
+        // Same machine name, other OS (Windows vs WSL): other process ids.
+        let host = current_host().unwrap();
+        let (_, name) = host.split_once(':').unwrap();
+        let other = if cfg!(windows) { "unix" } else { "windows" };
+        metadata.host = Some(format!("{other}:{name}"));
         write_lock(&metadata);
         assert!(!workspace.inspect_operation_lock().unwrap().is_stale);
 
