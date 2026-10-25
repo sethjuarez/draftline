@@ -20,6 +20,9 @@ export interface DraftlineClientOptions {
 
 export interface DraftlineClient {
   openWorkspace(workspacePath: string): Promise<WorkspaceOpenResult>;
+  probeFolder(workspacePath: string): Promise<FolderProbe>;
+  applyFolderFix(workspacePath: string, fix: FolderFix): Promise<WorkspaceOpenResult>;
+  moveFolder(request: MoveFolderRequest): Promise<MoveFolderResult>;
   cloneWorkspace(request: CloneWorkspaceRequest): Promise<WorkspaceOpenResult>;
   adoptWorkspace(workspacePath: string): Promise<AdoptWorkspaceResult>;
   inspectWorkspace(workspacePath: string): Promise<WorkspaceDiagnostics>;
@@ -81,6 +84,7 @@ export interface DraftlineClient {
   createVariationFromVersionGuarded(
     request: GuardedCreateVariationFromVersionRequest,
   ): Promise<GuardedCreateVariationFromVersionResult>;
+  startVariationHere(request: StartVariationHereRequest): Promise<StartVariationHereResult>;
   save(request: SaveRequest): Promise<SaveResult>;
   listShelves(workspacePath: string): Promise<Shelf[]>;
   previewShelf(request: ShelfRequest): Promise<VersionPreview>;
@@ -91,6 +95,9 @@ export interface DraftlineClient {
   clearStaleLock(workspacePath: string): Promise<CommandPostconditions>;
   repairRecovery(request: RecoveryRequest): Promise<RecoveryRepairResult>;
   rollbackRecovery(request: RecoveryRequest): Promise<RecoveryRepairResult>;
+  acknowledgeRecovery(workspacePath: string): Promise<CommandPostconditions>;
+  filteredFiles(request: FilteredFilesRequest): Promise<FilteredFile[]>;
+  dismissLegacyHistoryCleanup(request: LegacyHistoryCleanupRequest): Promise<CommandPostconditions>;
   selectedSave(request: SelectedSaveRequest): Promise<SelectedSaveResult>;
   selectedShelve(request: SelectedShelveRequest): Promise<SelectedShelveResult>;
   selectedDiscard(request: SelectedDiscardRequest): Promise<SelectedDiscardResult>;
@@ -147,6 +154,15 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('inspect_workspace', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
+    probeFolder: (workspacePath) =>
+      run('probe_folder', {
+        request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
+      }),
+    applyFolderFix: (workspacePath, fix) =>
+      run('apply_folder_fix', {
+        request: { workspace_path: workspacePath, fix } satisfies ApplyFolderFixRequest,
+      }),
+    moveFolder: (request) => run('move_folder', { request }),
     verifyWorkspace: (workspacePath) =>
       run('verify_workspace', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
@@ -216,6 +232,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     createVariationFromVersion: (request) => run('create_variation_from_version', { request }),
     createVariationFromVersionGuarded: (request) =>
       run('create_variation_from_version_guarded', { request }),
+    startVariationHere: (request) => run('start_variation_here', { request }),
     save: (request) => run('save', { request }),
     listShelves: (workspacePath) =>
       run('list_shelves', {
@@ -235,6 +252,13 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       }),
     repairRecovery: (request) => run('repair_recovery', { request }),
     rollbackRecovery: (request) => run('rollback_recovery', { request }),
+    acknowledgeRecovery: (workspacePath) =>
+      run('acknowledge_recovery', {
+        request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
+      }),
+    dismissLegacyHistoryCleanup: (request) =>
+      run('dismiss_legacy_history_cleanup', { request }),
+    filteredFiles: (request) => run('filtered_files', { request }),
     selectedSave: (request) => run('selected_save', { request }),
     selectedShelve: (request) => run('selected_shelve', { request }),
     selectedDiscard: (request) => run('selected_discard', { request }),
@@ -285,7 +309,7 @@ export type SafeNextAction =
   | 'discard_changes'
   | 'repair_recovery'
   | 'configure_remote'
-  | 'finish_in_other_project';
+  | 'finish_in_other_folder';
 export type SharingMode = 'local_only' | 'shared_capable';
 export type SupportRefScope = 'local' | 'remote_tracking';
 export type SupportRefKind = 'deleted_variation' | 'rewrite' | 'history_cleanup_backup';
@@ -360,6 +384,8 @@ export interface HistoryEntry {
   variation_tips: string[];
   is_head: boolean;
   parent_ids: string[];
+  /** False for teammates' commits that don't change the folder. */
+  touches_folder: boolean;
 }
 
 export type WorkspaceGraphAction =
@@ -405,6 +431,8 @@ export interface WorkspaceGraphNode {
   parent_ids: string[];
   parent_version_ids: string[];
   variation_tips: string[];
+  /** False for teammates' commits that don't change the folder. */
+  touches_folder: boolean;
   is_head: boolean;
   is_current: boolean;
   is_tip: boolean;
@@ -645,6 +673,16 @@ export interface FileHazard {
   kind: string;
 }
 
+/** A file in the folder that Git stores through a filter driver such as Git LFS. */
+export interface FilteredFile {
+  path: string;
+  /** The `filter` attribute's driver, for example `lfs`. */
+  driver: string;
+  /** Git config defines the driver, so plain Git can run it here. */
+  driver_configured: boolean;
+  /** The file on disk is an LFS pointer: its content was never downloaded. */
+  content_missing: boolean;
+}
 export interface PreflightReport {
   operation: string;
   will_write_files: boolean;
@@ -674,6 +712,17 @@ export interface WorkspaceSummary {
   is_dirty: boolean;
   recovery?: RecoveryState | null;
   state_may_be_inconsistent: boolean;
+  /** History cleanups Draftline 0.5 left pending; dismiss each with `dismissLegacyHistoryCleanup`. */
+  legacy_history_cleanups?: LegacyHistoryCleanup[];
+}
+
+export interface LegacyHistoryCleanup {
+  plan_id: string;
+  variation: string;
+  original_head: string;
+  replacement_head: string;
+  /** Support refs holding the original history; restore one as a variation to bring it back. */
+  backup_refs: string[];
 }
 
 export interface RemoteEndpoint {
@@ -732,6 +781,7 @@ export interface OperationLockMetadata {
   process_id: number;
   owner?: string | null;
   created_at_seconds: number;
+  host?: string | null;
 }
 
 export interface WorkspaceDiagnostic {
@@ -781,6 +831,59 @@ export interface WorkspaceDiagnostics {
 }
 
 export interface WorkspaceOpenResult {
+  diagnostics: WorkspaceDiagnostics;
+}
+
+/** Where a folder stands before the host opens it. */
+export type FolderState =
+  | 'not_a_repository'
+  | 'unmanaged'
+  | 'ready'
+  | 'managed_elsewhere'
+  | 'folder_missing'
+  | 'invalid_marker'
+  | 'newer_format';
+
+/** A fix `probeFolder` offers; pass it back unchanged to `applyFolderFix`. */
+export type FolderFix =
+  | { action: 'open' }
+  | { action: 'manage_here' }
+  | { action: 'open_managed_folder'; folder: string }
+  | { action: 'move_folder_here'; from: string }
+  | { action: 'restore_folder'; folder: string }
+  | { action: 'switch_to_branch'; branch: string }
+  | { action: 'upgrade_draftline' };
+
+export type FolderSuggestion = FolderFix & { label: string };
+
+export interface FolderProbe {
+  state: FolderState;
+  requested: string;
+  repository: string | null;
+  /** The folder Draftline manages, relative to `repository` (empty for the root). */
+  folder: string | null;
+  detail: string | null;
+  suggestions: FolderSuggestion[];
+}
+
+export interface ApplyFolderFixRequest extends WorkspaceRequest {
+  fix: FolderFix;
+}
+
+export interface MoveFolderRequest extends WorkspaceRequest {
+  /** Absolute, or relative to the repository root. */
+  to: string;
+}
+
+export interface FolderMove {
+  from: string;
+  to: string;
+  version: Version;
+  left_behind: string[];
+}
+
+export interface MoveFolderResult {
+  moved: FolderMove;
   diagnostics: WorkspaceDiagnostics;
 }
 
@@ -863,6 +966,11 @@ export interface GuardedCreateVariationFromVersionResult {
   postconditions: CommandPostconditions;
 }
 
+export interface StartVariationHereResult {
+  variation: Variation;
+  postconditions: CommandPostconditions;
+}
+
 export interface SaveResult {
   version: Version;
   postconditions: CommandPostconditions;
@@ -918,6 +1026,10 @@ export interface SyncStatus {
   behind: number;
   state: SyncState;
   incoming: RemoteVersionSummary[];
+  /** Base status only: the remote's default branch was renamed from this
+   * name and a local branch still has it; move its saves with
+   * `startVariationHere`. */
+  base_renamed_from?: string;
 }
 
 export interface PublishPreflight {
@@ -927,9 +1039,20 @@ export interface PublishPreflight {
   local_oid: string;
   sync_status: SyncStatus;
   token: JsonValue;
+  /** Large files and Git LFS pointers in the commits publish would push. Reported only. */
+  outgoing_files: OutgoingFile[];
+  /** The scan stopped early; treat `outgoing_files` as incomplete. */
+  outgoing_files_truncated: boolean;
   can_publish: boolean;
 }
 
+/** A file in commits the remote doesn't have yet. `lfs_pointer`: Draftline's push never uploads LFS objects. */
+export interface OutgoingFile {
+  path: string;
+  commit: string;
+  size: number;
+  kind: 'large' | 'lfs_pointer' | (string & {});
+}
 export interface PublishResult {
   remote: string;
   variation: string;
@@ -1133,6 +1256,17 @@ export interface GuardedCreateVariationFromVersionRequest extends WorkspaceReque
   metadata?: VariationMetadata;
 }
 
+/** Lists the folder's filtered files, or probes `paths` (which need not exist). */
+export interface FilteredFilesRequest extends WorkspaceRequest {
+  paths?: string[];
+}
+
+/** Starts a variation at the current commit, keeping files and unsaved edits. */
+export interface StartVariationHereRequest extends WorkspaceRequest {
+  name: string;
+  metadata?: VariationMetadata;
+}
+
 export interface SaveRequest extends WorkspaceRequest {
   label: string;
 }
@@ -1143,6 +1277,10 @@ export interface ShelfRequest extends WorkspaceRequest {
 
 export interface RecoveryRequest extends WorkspaceRequest {
   operation_id: string;
+}
+
+export interface LegacyHistoryCleanupRequest extends WorkspaceRequest {
+  plan_id: string;
 }
 
 export interface SelectedSaveRequest extends WorkspaceRequest {
@@ -1194,8 +1332,21 @@ export interface DraftlineHostFacadeOptions {
 }
 
 export interface DraftlineHostFacade {
+  /** The folder this facade is bound to. It never changes; see `moveFolder`. */
   workspacePath: string;
   open(): Promise<WorkspaceOpenResult>;
+  probeFolder(): Promise<FolderProbe>;
+  /**
+   * Applies a fix `probeFolder` offered. When the fix names a `folder` other
+   * than this one, it opens that folder: create a new facade for it.
+   */
+  applyFolderFix(fix: FolderFix): Promise<WorkspaceOpenResult>;
+  /**
+   * Moves the managed folder to `to` (absolute, or relative to the repository
+   * root). This facade stays bound to the old path, which Draftline refuses
+   * from then on: create a new facade for the new folder.
+   */
+  moveFolder(to: string): Promise<MoveFolderResult>;
   inspect(): Promise<WorkspaceDiagnostics>;
   preflightSwitchVariation(variationId: string): Promise<PreflightReport>;
   switchVariation(variationId: string): Promise<SwitchVariationResult>;
@@ -1280,11 +1431,15 @@ export interface DraftlineHostFacade {
     token: VariationCreateToken,
     metadata?: VariationMetadata,
   ): Promise<GuardedCreateVariationFromVersionResult>;
+  startVariationHere(name: string, metadata?: VariationMetadata): Promise<StartVariationHereResult>;
   shelves(): Promise<Shelf[]>;
   previewShelf(shelfId: string): Promise<VersionPreview>;
   applyShelf(shelfId: string): Promise<ApplyShelfCommandResult>;
   repairRecovery(operationId: string): Promise<RecoveryRepairResult>;
   rollbackRecovery(operationId: string): Promise<RecoveryRepairResult>;
+  acknowledgeRecovery(): Promise<CommandPostconditions>;
+  filteredFiles(paths?: string[]): Promise<FilteredFile[]>;
+  dismissLegacyHistoryCleanup(planId: string): Promise<CommandPostconditions>;
   fetchRemote(remote?: string): Promise<FetchRemoteResult>;
   publishCurrentVariation(remote?: string): Promise<PublishCurrentVariationResult>;
   preflightApplyIncoming(remote?: string): Promise<ApplyIncomingReport>;
@@ -1320,6 +1475,9 @@ export function createDraftlineHostFacade({
   return {
     workspacePath,
     open: () => client.openWorkspace(workspacePath),
+    probeFolder: () => client.probeFolder(workspacePath),
+    applyFolderFix: (fix) => client.applyFolderFix(workspacePath, fix),
+    moveFolder: (to) => client.moveFolder({ ...workspaceRequest(), to }),
     inspect: () => client.inspectWorkspace(workspacePath),
     preflightSwitchVariation: (variationId) =>
       client.preflightSwitchVariation({ ...workspaceRequest(), variation_id: variationId }),
@@ -1423,6 +1581,8 @@ export function createDraftlineHostFacade({
       client.preflightCreateVariationFromVersion({ ...versionRequest(versionId), name, remote }),
     createVariationFromVersionGuarded: (token, metadata) =>
       client.createVariationFromVersionGuarded({ ...workspaceRequest(), token, metadata }),
+    startVariationHere: (name, metadata) =>
+      client.startVariationHere({ ...workspaceRequest(), name, metadata }),
     shelves: () => client.listShelves(workspacePath),
     previewShelf: (shelfId) => client.previewShelf({ ...workspaceRequest(), shelf_id: shelfId }),
     applyShelf: (shelfId) => client.applyShelf({ ...workspaceRequest(), shelf_id: shelfId }),
@@ -1430,6 +1590,10 @@ export function createDraftlineHostFacade({
       client.repairRecovery({ ...workspaceRequest(), operation_id: operationId }),
     rollbackRecovery: (operationId) =>
       client.rollbackRecovery({ ...workspaceRequest(), operation_id: operationId }),
+    acknowledgeRecovery: () => client.acknowledgeRecovery(workspacePath),
+    filteredFiles: (paths) => client.filteredFiles({ ...workspaceRequest(), paths }),
+    dismissLegacyHistoryCleanup: (planId) =>
+      client.dismissLegacyHistoryCleanup({ ...workspaceRequest(), plan_id: planId }),
     fetchRemote: (remote) => client.fetchRemote(remoteRequest(remote)),
     publishCurrentVariation: (remote) => client.publishCurrentVariation(remoteRequest(remote)),
     preflightApplyIncoming: (remote) => client.preflightApplyIncoming(remoteRequest(remote)),
@@ -1744,6 +1908,12 @@ export async function createVariationFromVersionGuarded(
   return createDraftlineClient().createVariationFromVersionGuarded(request);
 }
 
+export async function startVariationHere(
+  request: StartVariationHereRequest,
+): Promise<StartVariationHereResult> {
+  return createDraftlineClient().startVariationHere(request);
+}
+
 export async function save(request: SaveRequest): Promise<SaveResult> {
   return createDraftlineClient().save(request);
 }
@@ -1782,6 +1952,35 @@ export async function repairRecovery(request: RecoveryRequest): Promise<Recovery
 
 export async function rollbackRecovery(request: RecoveryRequest): Promise<RecoveryRepairResult> {
   return createDraftlineClient().rollbackRecovery(request);
+}
+
+export async function acknowledgeRecovery(workspacePath: string): Promise<CommandPostconditions> {
+  return createDraftlineClient().acknowledgeRecovery(workspacePath);
+}
+
+export async function probeFolder(workspacePath: string): Promise<FolderProbe> {
+  return createDraftlineClient().probeFolder(workspacePath);
+}
+
+export async function applyFolderFix(
+  workspacePath: string,
+  fix: FolderFix,
+): Promise<WorkspaceOpenResult> {
+  return createDraftlineClient().applyFolderFix(workspacePath, fix);
+}
+
+export async function moveFolder(request: MoveFolderRequest): Promise<MoveFolderResult> {
+  return createDraftlineClient().moveFolder(request);
+}
+
+export async function filteredFiles(request: FilteredFilesRequest): Promise<FilteredFile[]> {
+  return createDraftlineClient().filteredFiles(request);
+}
+
+export async function dismissLegacyHistoryCleanup(
+  request: LegacyHistoryCleanupRequest,
+): Promise<CommandPostconditions> {
+  return createDraftlineClient().dismissLegacyHistoryCleanup(request);
 }
 
 export async function selectedSave(request: SelectedSaveRequest): Promise<SelectedSaveResult> {

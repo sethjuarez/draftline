@@ -46,6 +46,26 @@ pub struct SendRequest {
     /// the variation namespace plus a slug of the title.
     #[serde(default)]
     pub branch: Option<String>,
+    /// [SendPreflight::token] the host approved. Send refuses with
+    /// local_state_changed if anything it names has changed since.
+    #[serde(default)]
+    pub expected: Option<SendToken>,
+}
+
+/// What a [SendPreflight] checked. Pass it back as [SendRequest::expected] so
+/// Send acts only on what the host approved. A token approves one attempt:
+/// a failed Send may have moved to its new branch, so preflight again before
+/// retrying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendToken {
+    pub remote: String,
+    pub base: String,
+    /// The branch checked out when the preflight ran.
+    pub branch: String,
+    /// The branch Send would push.
+    pub variation: String,
+    /// The commit checked.
+    pub head: Option<String>,
 }
 
 /// What [`crate::Workspace::send`] did.
@@ -61,4 +81,42 @@ pub struct SendResult {
     pub pull_request: PullRequest,
     /// `false` when an already-open pull request was reused.
     pub created_pull_request: bool,
+}
+
+/// A commit Send would push that changes files outside the project folder:
+/// a teammate's work or a hand-made merge resolution. Send carries it, like
+/// any teammate's commit on the branch; the host shows who else is in the
+/// pull request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeveloperCommit {
+    pub id: String,
+    pub summary: String,
+    /// Up to the first 20 paths it changes outside the project folder.
+    pub outside_paths: Vec<std::path::PathBuf>,
+}
+
+/// What [`crate::Workspace::send`] would do, checked without pushing,
+/// creating a branch, or moving the base.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendPreflight {
+    pub remote: String,
+    pub base: String,
+    /// The branch Send would push: the current one, or the one it would create.
+    pub variation: String,
+    pub creates_variation: bool,
+    /// What was checked; pass it as [SendRequest::expected].
+    pub token: SendToken,
+    /// Commits the base on the remote doesn't have yet.
+    pub outgoing_versions: usize,
+    /// Unsaved changes in the folder; Send refuses while there are any.
+    pub has_unsaved_changes: bool,
+    /// Developer commits Send would carry along.
+    pub developer_commits: Vec<DeveloperCommit>,
+    /// Large files and LFS pointers in the commits Send would push.
+    #[serde(default)]
+    pub outgoing_files: Vec<crate::OutgoingFile>,
+    /// The scan stopped early; treat `outgoing_files` as incomplete.
+    #[serde(default)]
+    pub outgoing_files_truncated: bool,
+    pub can_proceed: bool,
 }

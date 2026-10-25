@@ -283,6 +283,13 @@ describe('createDraftlineClient', () => {
     await client.clearStaleLock('C:\\repo');
     await client.repairRecovery(recoveryRequest);
     await client.rollbackRecovery(recoveryRequest);
+    await client.acknowledgeRecovery('C:\\repo');
+    await client.probeFolder('C:\\repo\\cutready');
+    await client.applyFolderFix('C:\\repo\\cutready', { action: 'switch_to_branch', branch: 'main' });
+    await client.moveFolder({ workspace_path: 'C:\\repo\\cutready', to: 'demos' });
+    await client.dismissLegacyHistoryCleanup({ workspace_path: 'C:\\repo', plan_id: 'plan-1' });
+    await client.startVariationHere({ workspace_path: 'C:\\repo', name: 'cutready/rescue' });
+    await client.filteredFiles({ workspace_path: 'C:\\repo', paths: ['cutready/shot.png'] });
 
     expect(invoke).toHaveBeenCalledWith('get_changes', {
       request: { workspace_path: 'C:\\repo' },
@@ -434,6 +441,30 @@ describe('createDraftlineClient', () => {
     });
     expect(invoke).toHaveBeenCalledWith('repair_recovery', { request: recoveryRequest });
     expect(invoke).toHaveBeenCalledWith('rollback_recovery', { request: recoveryRequest });
+    expect(invoke).toHaveBeenCalledWith('acknowledge_recovery', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('probe_folder', {
+      request: { workspace_path: 'C:\\repo\\cutready' },
+    });
+    expect(invoke).toHaveBeenCalledWith('apply_folder_fix', {
+      request: {
+        workspace_path: 'C:\\repo\\cutready',
+        fix: { action: 'switch_to_branch', branch: 'main' },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('move_folder', {
+      request: { workspace_path: 'C:\\repo\\cutready', to: 'demos' },
+    });
+    expect(invoke).toHaveBeenCalledWith('dismiss_legacy_history_cleanup', {
+      request: { workspace_path: 'C:\\repo', plan_id: 'plan-1' },
+    });
+    expect(invoke).toHaveBeenCalledWith('start_variation_here', {
+      request: { workspace_path: 'C:\\repo', name: 'cutready/rescue' },
+    });
+    expect(invoke).toHaveBeenCalledWith('filtered_files', {
+      request: { workspace_path: 'C:\\repo', paths: ['cutready/shot.png'] },
+    });
   });
 
   it('invokes reusable host setup, file preview, facade, and remote variation commands', async () => {
@@ -490,6 +521,18 @@ describe('createDraftlineClient', () => {
     await facade.preflightRenameVariation('master', 'main');
     await facade.renameVariation('master', 'main', renameToken);
     await facade.save('Facade save');
+    await facade.probeFolder();
+    await facade.applyFolderFix({ action: 'manage_here' });
+    await facade.moveFolder('decks');
+    expect(invoke).toHaveBeenCalledWith('probe_folder', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('apply_folder_fix', {
+      request: { workspace_path: 'C:\\repo', fix: { action: 'manage_here' } },
+    });
+    expect(invoke).toHaveBeenCalledWith('move_folder', {
+      request: { workspace_path: 'C:\\repo', to: 'decks' },
+    });
     expect(invoke).toHaveBeenCalledWith('open_workspace', {
       request: { workspace_path: 'C:\\repo' },
     });

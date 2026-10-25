@@ -11,19 +11,20 @@ use serde::{Deserialize, Serialize};
 use crate::{
     merge::MergeConflict, AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult,
     ChangeSet, ContentPolicy, ContentPolicyAudit, ContributorProfile, CurrentFileDiff,
-    CurrentFilePreview, DirtySummary, DraftlineError, HistoryEntry, MergeConflictResolution,
-    MergeIncomingReport, MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice,
-    OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight, PublishResult,
-    RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
-    RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result,
-    Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SwitchPolicy, SyncState, SyncStatus,
-    Variation, VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
-    VariationRenamePreflight, VariationRenameToken, VariationSummary, Version, VersionDiff,
-    VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
-    WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
-    WorkspaceGraphNodeDetail, WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
-    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
-    WorkspaceId, WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
+    CurrentFilePreview, DirtySummary, DraftlineError, FilteredFile, FolderFix, FolderMove,
+    FolderProbe, HistoryEntry, MergeConflictResolution, MergeIncomingReport, MergeIncomingResult,
+    MergeIncomingToken, MergeResolutionChoice, OperationLockInspection, PreflightReport,
+    PreviewFile, PublishPreflight, PublishResult, RecoveryRepairResult, RecoveryState,
+    RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVariation,
+    RemoteVariationDiagnostics, RestoreVersionTarget, Result, Shelf, ShelfApplyReport, SupportRef,
+    SupportRefScope, SwitchPolicy, SyncState, SyncStatus, Variation, VariationCreatePreflight,
+    VariationCreateToken, VariationId, VariationMetadata, VariationRenamePreflight,
+    VariationRenameToken, VariationSummary, Version, VersionDiff, VersionId, VersionPreview,
+    Workspace, WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary,
+    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail,
+    WorkspaceGraphOptions, WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRefs,
+    WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection,
+    WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -419,6 +420,24 @@ pub struct CreateVariationFromVersionRequest {
     pub metadata: VariationMetadata,
 }
 
+/// Request for starting a variation at the current commit, keeping every file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartVariationHereRequest {
+    pub workspace_path: PathBuf,
+    pub name: String,
+    #[serde(default)]
+    pub metadata: VariationMetadata,
+}
+
+/// Request for project files Git stores through a filter driver such as Git LFS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteredFilesRequest {
+    pub workspace_path: PathBuf,
+    /// Probe these paths, which need not exist, instead of every tracked file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<PathBuf>>,
+}
+
 /// Request for remote-aware variation creation preflight.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightCreateVariationFromVersionRequest {
@@ -456,6 +475,13 @@ pub struct TargetedRestoreVersionCommandResult {
 /// Variation creation result with postcondition state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateVariationFromVersionResult {
+    pub variation: Variation,
+    pub postconditions: CommandPostconditions,
+}
+
+/// Started variation with postcondition state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartVariationHereResult {
     pub variation: Variation,
     pub postconditions: CommandPostconditions,
 }
@@ -508,6 +534,13 @@ pub struct DeleteShelfResult {
 pub struct RecoveryRequest {
     pub workspace_path: PathBuf,
     pub operation_id: String,
+}
+
+/// Request to dismiss a history cleanup left pending by Draftline 0.5.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyHistoryCleanupRequest {
+    pub workspace_path: PathBuf,
+    pub plan_id: String,
 }
 
 /// Request for selected-file save operations.
@@ -733,6 +766,114 @@ pub fn open_workspace_with_context(
 ) -> Result<WorkspaceOpenResult> {
     Ok(WorkspaceOpenResult {
         diagnostics: inspect_workspace_with_context(context, request)?,
+    })
+}
+
+/// Request to apply a fix [`probe_folder`] offered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyFolderFixRequest {
+    pub workspace_path: PathBuf,
+    pub fix: FolderFix,
+}
+
+/// Request to move the managed folder; `to` is absolute or repository-relative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveFolderRequest {
+    pub workspace_path: PathBuf,
+    pub to: PathBuf,
+}
+
+/// Result of [`move_folder`]; diagnostics describe the folder at its new path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveFolderResult {
+    pub moved: FolderMove,
+    pub diagnostics: WorkspaceDiagnostics,
+}
+
+/// Reports a folder's state and suggested fixes before opening it. Read-only.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn probe_folder(request: WorkspaceRequest) -> Result<FolderProbe> {
+    probe_folder_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Probes a folder with the host-configured variation namespace, so only
+/// branches the host may switch to are offered.
+pub fn probe_folder_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: WorkspaceRequest,
+) -> Result<FolderProbe> {
+    match &context.variation_namespace {
+        Some(namespace) => Workspace::probe_with_namespace(&request.workspace_path, namespace),
+        None => Workspace::probe(&request.workspace_path),
+    }
+}
+
+/// Applies a fix [`probe_folder`] offered, then opens the resulting folder.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn apply_folder_fix(request: ApplyFolderFixRequest) -> Result<WorkspaceOpenResult> {
+    apply_folder_fix_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Applies a fix [`probe_folder`] offered through the host-configured context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn apply_folder_fix_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: ApplyFolderFixRequest,
+) -> Result<WorkspaceOpenResult> {
+    let workspace = match &context.variation_namespace {
+        Some(namespace) => Workspace::apply_folder_fix_with_namespace(
+            &request.workspace_path,
+            context.content_policy.clone(),
+            namespace,
+            &request.fix,
+        )?,
+        None => Workspace::apply_folder_fix(
+            &request.workspace_path,
+            context.content_policy.clone(),
+            &request.fix,
+        )?,
+    };
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(WorkspaceOpenResult {
+        diagnostics: workspace_diagnostics(&workspace)?,
+    })
+}
+
+/// Moves the managed folder as one save.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn move_folder(request: MoveFolderRequest) -> Result<MoveFolderResult> {
+    move_folder_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Moves the managed folder through the host-configured context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn move_folder_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: MoveFolderRequest,
+) -> Result<MoveFolderResult> {
+    let mut workspace = context.open_workspace(&request.workspace_path)?;
+    let moved = workspace.move_folder(&request.to)?;
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(MoveFolderResult {
+        moved,
+        diagnostics: workspace_diagnostics(&workspace)?,
     })
 }
 
@@ -1635,6 +1776,66 @@ pub fn create_variation_from_version_with_context(
     })
 }
 
+/// Starts a variation at the current commit and moves the checkout onto it,
+/// keeping files and unsaved edits, so a developer's branch stays theirs.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), variation = %request.name)
+)]
+pub fn start_variation_here(
+    request: StartVariationHereRequest,
+) -> Result<StartVariationHereResult> {
+    start_variation_here_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Starts a variation at the current commit using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), variation = %request.name)
+)]
+pub fn start_variation_here_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: StartVariationHereRequest,
+) -> Result<StartVariationHereResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let variation = workspace.start_variation_here_with_metadata(request.name, request.metadata)?;
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(StartVariationHereResult {
+        variation,
+        postconditions: collect_postconditions(&workspace, false),
+    })
+}
+
+/// Lists project files Git stores through a filter driver such as Git LFS,
+/// and whether their content is missing (an undownloaded LFS pointer).
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn filtered_files(request: FilteredFilesRequest) -> Result<Vec<FilteredFile>> {
+    filtered_files_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Lists filtered project files using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn filtered_files_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: FilteredFilesRequest,
+) -> Result<Vec<FilteredFile>> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    match request.paths {
+        Some(paths) => workspace.filtered_files_among(paths),
+        None => workspace.filtered_files(),
+    }
+}
+
 /// Preflights remote-aware local variation creation from a saved version.
 #[tracing::instrument(
     err,
@@ -1982,6 +2183,65 @@ pub fn rollback_recovery_with_context(
     let result = workspace.rollback_recovery(request.operation_id)?;
     context.emit(&workspace, DraftlineEventKind::RecoveryRequired, None);
     Ok(result)
+}
+
+/// Acknowledges an interrupted operation without repairing or rolling it back.
+///
+/// This is the supported exit for recovery records that cannot be repaired or
+/// rolled back, such as records left by operations older Draftline versions
+/// ran (milestone merge, squash, history cleanup). It clears only Draftline's
+/// record; refs and files stay as they are.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn acknowledge_recovery(request: WorkspaceRequest) -> Result<CommandPostconditions> {
+    acknowledge_recovery_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Acknowledges an interrupted operation using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn acknowledge_recovery_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: WorkspaceRequest,
+) -> Result<CommandPostconditions> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    workspace.acknowledge_recovery()?;
+    context.emit(&workspace, DraftlineEventKind::RecoveryRequired, None);
+    Ok(collect_postconditions(&workspace, false))
+}
+
+/// Dismisses a history cleanup left pending by Draftline 0.5; no branch moves.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn dismiss_legacy_history_cleanup(
+    request: LegacyHistoryCleanupRequest,
+) -> Result<CommandPostconditions> {
+    dismiss_legacy_history_cleanup_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Dismisses a legacy history cleanup using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn dismiss_legacy_history_cleanup_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: LegacyHistoryCleanupRequest,
+) -> Result<CommandPostconditions> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    workspace.dismiss_legacy_history_cleanup(&request.plan_id)?;
+    context.emit(&workspace, DraftlineEventKind::RecoveryRequired, None);
+    Ok(collect_postconditions(&workspace, false))
 }
 
 /// Saves selected files after preflighting the exact selection.
@@ -2728,7 +2988,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::VariationCreatePreflightFailed(_) => "variation_create_preflight_failed",
         DraftlineError::RecoveryRequired(_) => "recovery_required",
         DraftlineError::RecoveryNotFound(_) => "recovery_not_found",
-        DraftlineError::RecoveryInOtherProject(_) => "recovery_in_other_project",
+        DraftlineError::RecoveryInOtherFolder(_) => "recovery_in_other_folder",
         DraftlineError::InvalidVariationName(_) => "invalid_variation_name",
         DraftlineError::InvalidGraphOptions(_) => "invalid_graph_options",
         DraftlineError::VariationAlreadyExists(_) => "variation_already_exists",
@@ -2752,8 +3012,12 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidMergeResolution(_) => "invalid_merge_resolution",
         DraftlineError::SendBaseUnknown => "send_base_unknown",
         DraftlineError::SendBaseNotOnRemote(_) => "send_base_not_on_remote",
-        DraftlineError::WorkspaceAlreadyInCheckout(_) => "workspace_already_in_checkout",
-        DraftlineError::InvalidWorkspaceClaim(_) => "invalid_workspace_claim",
+        DraftlineError::FolderIsElsewhere(_) => "folder_is_elsewhere",
+        DraftlineError::FolderMissing(_) => "folder_missing",
+        DraftlineError::IncomingFolderElsewhere(_) => "incoming_folder_elsewhere",
+        DraftlineError::InvalidFolderMarker(_) => "invalid_folder_marker",
+        DraftlineError::FolderMoveRefused(_) => "folder_move_refused",
+        DraftlineError::FolderFixUnavailable(_) => "folder_fix_unavailable",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::VariationOutsideNamespace(_) => "variation_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
@@ -2786,11 +3050,21 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
                 "serialization_error": error.to_string(),
             })),
         },
-        DraftlineError::RecoveryInOtherProject(project) => {
-            Some(serde_json::json!({ "project": project }))
+        DraftlineError::RecoveryInOtherFolder(folder) => {
+            Some(serde_json::json!({ "folder": folder }))
         }
-        DraftlineError::WorkspaceAlreadyInCheckout(project) => {
-            Some(serde_json::json!({ "project": project }))
+        DraftlineError::FolderIsElsewhere(folder)
+        | DraftlineError::FolderMissing(folder)
+        | DraftlineError::IncomingFolderElsewhere(folder) => {
+            Some(serde_json::json!({ "folder": folder }))
+        }
+        DraftlineError::MergeNeedsDeveloper(paths)
+        | DraftlineError::OwnedWorktreeHasChanges(paths) => {
+            Some(serde_json::json!({ "paths": paths }))
+        }
+        DraftlineError::SendOutsideNamespace(branch)
+        | DraftlineError::VariationOutsideNamespace(branch) => {
+            Some(serde_json::json!({ "branch": branch }))
         }
         DraftlineError::SyncNeedsMerge(status) => match serde_json::to_value(status.as_ref()) {
             Ok(value) => Some(value),

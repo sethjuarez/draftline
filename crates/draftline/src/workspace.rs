@@ -12,14 +12,18 @@ use git2::{
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::merge::{MergeConflict, MergeInput, ResolverRegistry};
-use crate::pull_request::{PullRequestProvider, PullRequestRequest, SendRequest, SendResult};
+use crate::pull_request::{
+    DeveloperCommit, PullRequestProvider, PullRequestRequest, SendPreflight, SendRequest,
+    SendResult, SendToken,
+};
 use crate::recovery::RecoveryOperation;
 use crate::remote::{ensure_supported_remote_url, PushRefExpectation};
 use crate::worktree::{OwnedWorktree, WorktreeStart, OWNED_WORKTREE_PREFIX};
 use crate::{
     path::normalize_workspace_relative, ContentPolicy, Contributor, ContributorProfile,
-    DraftlineError, PublishPreflight, PublishResult, PublishToken, RecoveryState, RemoteEndpoint,
-    RemoteOptions, RemoteVersionSummary, Result, SyncState, SyncStatus,
+    DraftlineError, OutgoingFile, OutgoingFileKind, PublishPreflight, PublishResult, PublishToken,
+    RecoveryState, RemoteEndpoint, RemoteOptions, RemoteVersionSummary, Result, SyncState,
+    SyncStatus,
 };
 
 /// A folder-backed content workspace.
@@ -252,8 +256,26 @@ pub enum FileHazardKind {
     PolicyExcluded,
     /// Needs a Git filter driver (for example Git LFS) that Draftline cannot run.
     GitFilter,
+    /// A developer's file outside the folder needs a Git filter
+    /// driver; someone with the driver must make this update with Git.
+    GitFilterOutsideProject,
     /// Has uncommitted local edits that the operation would overwrite.
     LocalChanges,
+}
+
+/// A file in the folder that Git stores through a filter driver such as Git LFS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct FilteredFile {
+    #[serde(serialize_with = "serialize_workspace_path")]
+    pub path: PathBuf,
+    /// The `filter` attribute's driver, for example `lfs`.
+    pub driver: String,
+    /// Git config defines the driver (`filter.<driver>.*`), so plain Git can
+    /// run it here. Draftline still cannot.
+    pub driver_configured: bool,
+    /// The file on disk is a Git LFS pointer: its content was never downloaded.
+    pub content_missing: bool,
 }
 
 /// Read-only view of a version.
@@ -310,6 +332,39 @@ pub struct WorkspaceSummary {
     /// describe two different Git states simultaneously and should not be
     /// rendered as a coherent history view.
     pub state_may_be_inconsistent: bool,
+    /// History cleanups that Draftline 0.5 applied locally but never
+    /// published. Dismiss each with [`Workspace::dismiss_legacy_history_cleanup`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_history_cleanups: Vec<LegacyHistoryCleanup>,
+}
+
+/// A history cleanup (squash) that Draftline 0.5 applied to a local branch
+/// and recorded as pending publication. Current Draftline never moves a
+/// branch back, so the record is only reported and dismissed; the original
+/// history stays in the backup refs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct LegacyHistoryCleanup {
+    pub plan_id: String,
+    pub variation: String,
+    /// The branch tip before the cleanup rewrote it.
+    pub original_head: String,
+    /// The rewritten tip the cleanup left on the branch.
+    pub replacement_head: String,
+    /// Backup refs holding the original history. They stay listed as support
+    /// refs, so [`Workspace::restore_support_ref_as_variation`] can bring it
+    /// back as a variation.
+    pub backup_refs: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct LegacyPendingCleanupRecord {
+    plan_id: String,
+    target_variation: String,
+    expected_local_head: String,
+    replacement_head: String,
+    #[serde(default)]
+    backup_refs: Vec<String>,
 }
 
 /// Stable workspace identity returned by [`Workspace::inspect`].
@@ -338,8 +393,8 @@ pub enum SafeNextAction {
     DiscardChanges,
     RepairRecovery,
     ConfigureRemote,
-    /// Another project in this checkout must finish its interrupted operation.
-    FinishInOtherProject,
+    /// Another folder in this checkout must finish its interrupted operation.
+    FinishInOtherFolder,
 }
 
 /// Stable diagnostic codes for workspace inspection.
@@ -348,7 +403,7 @@ pub enum SafeNextAction {
 #[non_exhaustive]
 pub enum DiagnosticCode {
     RecoveryRequired,
-    RecoveryInOtherProject,
+    RecoveryInOtherFolder,
     WorkspaceLocked,
     DirtyWorkspace,
     LocalOnlyWorkspace,
@@ -356,6 +411,9 @@ pub enum DiagnosticCode {
     NoCurrentVariation,
     WorkspaceReadFailed,
     PolicyTrackedFileIgnored,
+    /// The folder's files that Git stores with LFS hold pointer text instead of
+    /// their content, because the clone never downloaded it.
+    LfsContentMissing,
 }
 
 /// Severity for a workspace diagnostic.
@@ -410,6 +468,9 @@ pub struct OperationLockMetadata {
     pub process_id: u32,
     pub owner: Option<String>,
     pub created_at_seconds: u64,
+    /// Machine that took the lock; absent in locks from older versions.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 /// Read-only report for the current operation lock file.
@@ -423,15 +484,156 @@ pub struct OperationLockInspection {
     pub diagnostics: Vec<WorkspaceDiagnostic>,
 }
 
-/// The folder a checkout's Draftline workspace manages, relative to the
-/// repository root (`""` for the root itself).
+/// The checkout's own record of the folder Draftline manages, relative to the
+/// repository root (`""` for the root itself). [`FOLDER_MARKER`] wins when the
+/// working tree has one; this covers branches without it.
 #[derive(Serialize, Deserialize)]
 struct WorkspaceClaim {
     project: String,
 }
 
-/// The recovery file on disk: the state plus the project that wrote it.
-/// Records from older versions have no project.
+/// The file at the repository root that names the folder Draftline manages.
+/// It is committed with saves, so every clone and branch agrees.
+const FOLDER_MARKER: &str = ".draftline";
+
+/// Files that describe the repository rather than a folder in it. They stay
+/// at the root when a root folder moves into a subfolder.
+const REPOSITORY_FILES: [&str; 5] = [
+    FOLDER_MARKER,
+    ".gitignore",
+    ".gitattributes",
+    ".gitmodules",
+    ".github",
+];
+
+/// Whether `path`'s first component is one of [`REPOSITORY_FILES`].
+fn is_repository_file(path: &[u8]) -> bool {
+    let first = path.split(|byte| *byte == b'/').next().unwrap_or_default();
+    REPOSITORY_FILES.iter().any(|name| name.as_bytes() == first)
+}
+
+/// [`is_repository_file`] for a repository-relative path.
+fn is_repository_path(path: &Path) -> bool {
+    path.components()
+        .next()
+        .is_some_and(|first| is_repository_file(first.as_os_str().as_encoded_bytes()))
+}
+
+/// The trailer on a folder move's commit naming where the folder was.
+const MOVED_FROM_TRAILER: &str = "Draftline-Moved-From";
+
+/// The contents of [`FOLDER_MARKER`]: `{ "format": 1, "folder": "cutready" }`,
+/// with `"."` for the whole repository.
+#[derive(Serialize, Deserialize)]
+struct FolderMarker {
+    format: u32,
+    folder: String,
+}
+
+/// Who manages the repository, as the marker or local record says.
+#[derive(PartialEq)]
+enum FolderOwner {
+    Nobody,
+    Folder(String),
+    Invalid(String),
+    Newer(String),
+}
+
+/// Where a folder stands before the host opens it; see [`Workspace::probe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FolderState {
+    /// The path isn't inside a Git repository.
+    NotARepository,
+    /// No folder in the repository is managed yet.
+    Unmanaged,
+    /// Draftline manages this folder; open it.
+    Ready,
+    /// Draftline manages another folder in this repository.
+    ManagedElsewhere,
+    /// The folder Draftline manages isn't on disk.
+    FolderMissing,
+    /// `.draftline`, or the checkout's local record of it, can't be read.
+    InvalidMarker,
+    /// `.draftline` was written by a newer Draftline.
+    NewerFormat,
+}
+
+/// A fix the host can offer for a probed folder. Pass it back unchanged to
+/// [`Workspace::apply_folder_fix`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FolderFix {
+    /// Open the requested folder.
+    Open,
+    /// Make the requested folder the one Draftline manages, creating it (and
+    /// a repository) when needed.
+    ManageHere,
+    /// Open the folder Draftline already manages.
+    OpenManagedFolder { folder: PathBuf },
+    /// Move the managed folder to the requested path, as a save.
+    MoveFolderHere { from: PathBuf },
+    /// Put the managed folder back from the current version.
+    RestoreFolder { folder: PathBuf },
+    /// Switch the checkout to a local branch that has the managed folder.
+    SwitchToBranch { branch: String },
+    /// Only a newer Draftline can read this repository.
+    UpgradeDraftline,
+}
+
+/// One fix with a plain-language label for a button.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSuggestion {
+    #[serde(flatten)]
+    pub fix: FolderFix,
+    pub label: String,
+}
+
+/// What [`Workspace::probe`] found. Folders are relative to `repository`,
+/// empty for the root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct FolderProbe {
+    pub state: FolderState,
+    pub requested: PathBuf,
+    pub repository: Option<PathBuf>,
+    /// The folder Draftline manages, when the repository names one.
+    pub folder: Option<PathBuf>,
+    /// Why the folder isn't ready, in plain language.
+    pub detail: Option<String>,
+    /// Fixes in recommended order.
+    pub suggestions: Vec<FolderSuggestion>,
+}
+
+/// Result of [`Workspace::move_folder`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct FolderMove {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    /// The save that records the move.
+    pub version: Version,
+    /// Untracked or ignored files that stayed put: the new folder already had
+    /// a file at that path, or the old folder was the repository root.
+    pub left_behind: Vec<PathBuf>,
+}
+
+/// A remote's default branch as it last advertised it, and the one it
+/// replaced. Plain fetches never refresh `refs/remotes/<remote>/HEAD`, and
+/// Draftline doesn't write it, so a renamed default lives here instead.
+#[derive(Clone, Serialize, Deserialize)]
+struct RemoteHead {
+    /// The remote's URL when recorded; a changed URL voids the entry.
+    url: String,
+    head: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<String>,
+}
+
+/// The recovery file on disk: the state plus the folder that wrote it.
+/// Records from older versions have no folder.
 #[derive(Serialize, Deserialize)]
 struct RecoveryLedger {
     #[serde(flatten)]
@@ -729,7 +931,8 @@ pub struct WorkspaceGraphBoundary {
     pub hidden_child_count: usize,
 }
 
-/// A graph-ready saved version node.
+/// A graph-ready commit node. In a folder, `touches_folder` is false
+/// for teammates' commits that don't change the folder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct WorkspaceGraphNode {
@@ -743,6 +946,10 @@ pub struct WorkspaceGraphNode {
     pub parent_ids: Vec<WorkspaceGraphNodeId>,
     pub parent_version_ids: Vec<VersionId>,
     pub variation_tips: Vec<VariationId>,
+    /// Whether this commit changes the folder; see
+    /// [`HistoryEntry::touches_folder`].
+    #[serde(default = "touches_folder_by_default")]
+    pub touches_folder: bool,
     pub is_head: bool,
     pub is_current: bool,
     pub is_tip: bool,
@@ -990,6 +1197,16 @@ pub struct HistoryEntry {
     /// parents.  Merge commits have multiple parents, but Draftline
     /// discourages merge commits in favour of sequential saves.
     pub parent_ids: Vec<VersionId>,
+    /// `true` when this commit changes the folder. In a folder
+    /// inside a larger repository, teammates' commits that only touch other
+    /// files are listed too, with `false`; standalone workspaces are always
+    /// `true`.
+    #[serde(default = "touches_folder_by_default")]
+    pub touches_folder: bool,
+}
+
+fn touches_folder_by_default() -> bool {
+    true
 }
 
 /// Per-variation snapshot with head version and total version count.
@@ -1222,6 +1439,20 @@ struct CleanMergePlan {
     conflicts: Vec<MergeConflict>,
 }
 
+struct SendTarget {
+    base: String,
+    advertised: HashSet<String>,
+    /// Commits the remote advertised just now: what a push won't upload.
+    advertised_oids: Vec<git2::Oid>,
+    current: String,
+}
+
+/// The branch and commit Send checked, which publishing must still find.
+struct SendGuard<'a> {
+    head: git2::Oid,
+    variation: &'a str,
+}
+
 struct MergeFileChange {
     path: PathBuf,
     content: Option<Vec<u8>>,
@@ -1384,21 +1615,40 @@ impl Workspace {
     /// repository and scopes itself to the folder instead of creating a nested
     /// repository.
     pub fn init_with_policy(path: impl AsRef<Path>, content_policy: ContentPolicy) -> Result<Self> {
-        let path = path.as_ref();
-        let created = create_missing_dirs(path)?;
-
-        let repo = match Repository::discover(path) {
-            Ok(repo) => repo,
-            Err(_) => {
-                let initial_head = default_initial_variation_name();
-                let mut options = RepositoryInitOptions::new();
-                options.initial_head(&initial_head);
-                Repository::init_opts(path, &options)?
-            }
+        let path = absolute_path(path.as_ref())?;
+        let path = path.as_path();
+        ensure_plain_or_missing(path)?;
+        let anchor = path
+            .ancestors()
+            .find(|ancestor| ancestor.exists())
+            .unwrap_or(path);
+        let mut created = Vec::new();
+        let result = match Repository::discover(anchor) {
+            // Inside a repository, create the folder only within it, never
+            // through a file, symlink, or junction.
+            Ok(repo) => match repo.workdir().map(Path::to_path_buf) {
+                Some(workdir) => folder_in(&workdir, path)
+                    .and_then(|folder| create_folder_tracking(&workdir, &folder, &mut created))
+                    .and_then(|_| Self::from_repository(repo, path, content_policy)),
+                None => create_missing_dirs(path)
+                    .map_err(DraftlineError::from)
+                    .and_then(|dirs| {
+                        created = dirs;
+                        Self::from_repository(repo, path, content_policy)
+                    }),
+            },
+            Err(_) => create_missing_dirs(path)
+                .map_err(DraftlineError::from)
+                .and_then(|dirs| {
+                    created = dirs;
+                    let initial_head = default_initial_variation_name();
+                    let mut options = RepositoryInitOptions::new();
+                    options.initial_head(&initial_head);
+                    Ok(Repository::init_opts(path, &options)?)
+                })
+                .and_then(|repo| Self::from_repository(repo, path, content_policy)),
         };
-
-        let result = Self::from_repository(repo, path, content_policy);
-        if let Err(DraftlineError::WorkspaceAlreadyInCheckout(_)) = &result {
+        if result.is_err() {
             // Leave no trace of a refused folder; `remove_dir` only removes empty ones.
             for dir in created.iter().rev() {
                 if fs::remove_dir(dir).is_err() {
@@ -1409,37 +1659,14 @@ impl Workspace {
         result
     }
 
-    /// Moves this checkout's Draftline workspace to the folder at `path`.
-    ///
-    /// A checkout holds one Draftline workspace (see
-    /// [`DraftlineError::WorkspaceAlreadyInCheckout`]); use this when the
-    /// project folder moved or the host deliberately manages a different one.
-    /// Refuses while a Draftline operation is running or left unfinished.
-    pub fn relocate(path: impl AsRef<Path>) -> Result<Self> {
-        Self::relocate_with_policy(path, ContentPolicy::default())
-    }
-
-    /// Moves this checkout's Draftline workspace with an explicit content
-    /// policy; see [`Workspace::relocate`].
-    pub fn relocate_with_policy(
-        path: impl AsRef<Path>,
-        content_policy: ContentPolicy,
-    ) -> Result<Self> {
-        let repo = Repository::discover(path.as_ref())?;
-        let workspace = Self::unclaimed(repo, path.as_ref(), content_policy)?;
-        let _lock = OperationLock::acquire(&workspace.lock_path(), "relocate workspace")?;
-        workspace.ensure_no_pending_recovery_in_checkout()?;
-        workspace.write_claim()?;
-        Ok(workspace)
-    }
-
     fn from_repository(
         repo: Repository,
         project_path: &Path,
         content_policy: ContentPolicy,
     ) -> Result<Self> {
+        ensure_plain_or_missing(project_path)?;
         let workspace = Self::unclaimed(repo, project_path, content_policy)?;
-        workspace.claim_checkout()?;
+        workspace.claim_checkout(true)?;
         Ok(workspace)
     }
 
@@ -1477,6 +1704,743 @@ impl Workspace {
     pub fn open_with_policy(path: impl AsRef<Path>, content_policy: ContentPolicy) -> Result<Self> {
         let repo = Repository::discover(path.as_ref())?;
         Self::from_repository(repo, path.as_ref(), content_policy)
+    }
+
+    /// Reports what opening `path` would find, without changing anything,
+    /// with fixes the host can offer. Call it before opening a folder and pass
+    /// the chosen fix to [`Workspace::apply_folder_fix`].
+    pub fn probe(path: impl AsRef<Path>) -> Result<FolderProbe> {
+        Self::probe_in(path.as_ref(), None)
+    }
+
+    /// [`Workspace::probe`] for a host that keeps its variations in
+    /// `namespace` (see [`Workspace::with_variation_namespace`]): only the
+    /// base branch and branches inside it are offered to switch to.
+    pub fn probe_with_namespace(
+        path: impl AsRef<Path>,
+        namespace: impl Into<String>,
+    ) -> Result<FolderProbe> {
+        Self::probe_in(path.as_ref(), Some(namespace.into()))
+    }
+
+    fn probe_in(path: &Path, namespace: Option<String>) -> Result<FolderProbe> {
+        let requested = absolute_path(path)?;
+        match Self::located_in(&requested, ContentPolicy::default(), namespace)? {
+            Some(located) => located.probe_located(requested),
+            None => Ok(FolderProbe {
+                state: FolderState::NotARepository,
+                requested,
+                repository: None,
+                folder: None,
+                detail: Some("This folder isn't inside a Git repository.".to_string()),
+                suggestions: vec![suggest(FolderFix::ManageHere, "Start managing this folder")],
+            }),
+        }
+    }
+
+    /// Applies a fix [`Workspace::probe`] offers for `path` now and opens the
+    /// result. A fix the probe doesn't offer is refused with
+    /// [`DraftlineError::FolderFixUnavailable`].
+    pub fn apply_folder_fix(
+        path: impl AsRef<Path>,
+        content_policy: ContentPolicy,
+        fix: &FolderFix,
+    ) -> Result<Self> {
+        Self::apply_folder_fix_in(path.as_ref(), content_policy, None, fix)
+    }
+
+    /// [`Workspace::apply_folder_fix`] for a fix
+    /// [`Workspace::probe_with_namespace`] offered. The result has the
+    /// namespace set.
+    pub fn apply_folder_fix_with_namespace(
+        path: impl AsRef<Path>,
+        content_policy: ContentPolicy,
+        namespace: impl Into<String>,
+        fix: &FolderFix,
+    ) -> Result<Self> {
+        Self::apply_folder_fix_in(path.as_ref(), content_policy, Some(namespace.into()), fix)
+    }
+
+    fn apply_folder_fix_in(
+        path: &Path,
+        content_policy: ContentPolicy,
+        namespace: Option<String>,
+        fix: &FolderFix,
+    ) -> Result<Self> {
+        let workspace = Self::apply_offered_fix(path, content_policy, namespace.clone(), fix)?;
+        match namespace {
+            Some(namespace) => workspace.with_variation_namespace(namespace),
+            None => Ok(workspace),
+        }
+    }
+
+    fn apply_offered_fix(
+        path: &Path,
+        content_policy: ContentPolicy,
+        namespace: Option<String>,
+        fix: &FolderFix,
+    ) -> Result<Self> {
+        let probe = Self::probe_in(path, namespace.clone())?;
+        if !probe.suggestions.iter().any(|offered| &offered.fix == fix) {
+            return Err(DraftlineError::FolderFixUnavailable(format!(
+                "{} is not offered for {}",
+                serde_json::to_string(fix)?,
+                probe.requested.display()
+            )));
+        }
+        let requested = probe.requested.clone();
+        let root = probe.repository.clone().unwrap_or_default();
+        match fix {
+            FolderFix::Open => Self::open_with_policy(&requested, content_policy),
+            FolderFix::ManageHere => {
+                if let Some(located) = Self::located(&requested, content_policy.clone())? {
+                    // Never claim a checkout while an operation is unfinished.
+                    located.ensure_no_pending_recovery_in_checkout()?;
+                    if probe.state != FolderState::Unmanaged {
+                        // Decide and publish under the lock, so two folders
+                        // can't both take over in a race.
+                        let _lock = OperationLock::acquire(&located.lock_path(), "manage_here")?;
+                        let now = located.probe_located(requested.clone())?;
+                        if !now
+                            .suggestions
+                            .iter()
+                            .any(|s| s.fix == FolderFix::ManageHere)
+                        {
+                            return Err(DraftlineError::FolderFixUnavailable(format!(
+                                "managing {} is no longer offered",
+                                requested.display()
+                            )));
+                        }
+                        located.ensure_no_pending_recovery_in_checkout()?;
+                        // The folder must be one Draftline can manage before
+                        // anything is written.
+                        create_folder_within(
+                            &located.root,
+                            &folder_in(&located.root, &requested)?,
+                        )?;
+                        // Marker first: if the claim then fails, opening
+                        // repairs it from the marker.
+                        located.write_marker()?;
+                        located.write_claim()?;
+                    }
+                }
+                Self::init_with_policy(&requested, content_policy)
+            }
+            FolderFix::OpenManagedFolder { folder } => {
+                Self::open_with_policy(root.join(folder), content_policy)
+            }
+            FolderFix::MoveFolderHere { from } => {
+                let mut workspace = Self::open_with_policy(root.join(from), content_policy)?;
+                workspace.move_folder(&requested)?;
+                Ok(workspace)
+            }
+            FolderFix::RestoreFolder { folder } => {
+                let managed =
+                    Self::located_in(&root.join(folder), content_policy.clone(), namespace)?
+                        .ok_or_else(|| DraftlineError::FolderMissing(folder.clone()))?;
+                managed.restore_missing_folder()?;
+                Self::open_with_policy(root.join(folder), content_policy)
+            }
+            FolderFix::SwitchToBranch { branch } => {
+                let folder = probe.folder.clone().unwrap_or_default();
+                let managed =
+                    Self::located_in(&root.join(&folder), content_policy.clone(), namespace)?
+                        .ok_or_else(|| DraftlineError::FolderMissing(folder.clone()))?;
+                managed.switch_to_folder_branch(branch)?;
+                Self::open_with_policy(root.join(folder), content_policy)
+            }
+            FolderFix::UpgradeDraftline => Err(DraftlineError::InvalidFolderMarker(
+                probe.detail.unwrap_or_default(),
+            )),
+        }
+    }
+
+    /// Moves the folder Draftline manages to `to` (absolute, or relative to the
+    /// repository root) as one save on the current variation, which also
+    /// rewrites `.draftline`. The folder may move from the root into a
+    /// subfolder, between subfolders, and to the root only when the
+    /// repository holds nothing else. Untracked and ignored files follow when
+    /// they can; see [`FolderMove::left_behind`]. Other handles on the old
+    /// folder are refused from then on.
+    pub fn move_folder(&mut self, to: impl AsRef<Path>) -> Result<FolderMove> {
+        let to = to.as_ref();
+        let to = if to.is_absolute() {
+            folder_in(&self.root, to)?
+        } else {
+            normalize_workspace_relative(to)?
+        };
+        self.ensure_no_pending_recovery()?;
+        let _lock = self.acquire_for_index("move_folder")?;
+        let branch = self.ensure_on_branch()?;
+        let from = self.scope().to_path_buf();
+        let head_commit = self.repo.head()?.peel_to_commit()?;
+        let head_tree = head_commit.tree()?;
+        if let Some(reason) = self.move_refusal(&head_tree, &from, &to)? {
+            return Err(DraftlineError::FolderMoveRefused(reason));
+        }
+        let moved = self
+            .repo
+            .find_tree(self.moved_tree(&head_tree, &from, &to)?)?;
+        let report = preflight_report(
+            "move_folder",
+            true,
+            self.changed_files_unchecked()?,
+            self.target_tree_hazards(&moved)?,
+            None,
+        );
+        if !report.can_proceed {
+            return Err(DraftlineError::PreflightFailed(Box::new(report)));
+        }
+        // Changes the policy skips still matter to Git's index.
+        if let Some(path) = self.move_blockers(&from)?.into_iter().next() {
+            return Err(DraftlineError::FolderMoveRefused(format!(
+                "{} has changes Git hasn't committed; commit or discard them first",
+                folder_key(&path)
+            )));
+        }
+
+        let (author, committer) = self.rewrite_signatures(None)?;
+        let operation_id = new_operation_id();
+        let target = format!(
+            "{} -> {}",
+            marker_folder(&folder_key(&from)),
+            marker_folder(&folder_key(&to))
+        );
+        self.write_recovery_state_for_checkout(
+            &RecoveryState {
+                operation_id: operation_id.clone(),
+                operation: RecoveryOperation::MoveFolder,
+                original_variation: Some(
+                    branch
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(&branch)
+                        .to_string(),
+                ),
+                target: Some(target.clone()),
+                completed: false,
+            },
+            &head_tree,
+            &moved,
+        )?;
+        self.checkout_or_keep_recovery(&moved)?;
+        test_hooks::fire("after_folder_move_checkout", self.repo.path());
+        // The trailer names where the folder was, so commits from before the
+        // marker existed still read at the right place after this move.
+        let message = format!(
+            "Move Draftline folder from {} to {}\n\n{MOVED_FROM_TRAILER}: {}\n",
+            folder_label(&from),
+            folder_label(&to),
+            marker_folder(&folder_key(&from))
+        );
+        let oid = self
+            .repo
+            .commit(None, &author, &committer, &message, &moved, &[&head_commit])?;
+        let commit = self.repo.find_commit(oid)?;
+        self.advance_head(&branch, &commit, Some(&head_commit), &committer)?;
+        test_hooks::fire("after_folder_move_commit", self.repo.path());
+
+        let (left_behind, _) = self.move_leftovers(&from, &to);
+        self.content_policy = self.content_policy.clone().scoped_to(&to)?;
+        self.write_claim()?;
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::MoveFolder,
+            original_variation: None,
+            target: Some(target),
+            completed: true,
+        })?;
+
+        Ok(FolderMove {
+            from,
+            to,
+            version: version_from_commit(&commit),
+            left_behind,
+        })
+    }
+
+    /// A handle on `path` (which need not exist) in the repository holding it,
+    /// without claiming or creating anything. `None` outside a repository with
+    /// a working tree.
+    fn located(path: &Path, content_policy: ContentPolicy) -> Result<Option<Self>> {
+        Self::located_in(path, content_policy, None)
+    }
+
+    fn located_in(
+        path: &Path,
+        content_policy: ContentPolicy,
+        namespace: Option<String>,
+    ) -> Result<Option<Self>> {
+        if let Some(namespace) = &namespace {
+            validate_variation_namespace(namespace)?;
+        }
+        let Some(existing) = path.ancestors().find(|ancestor| ancestor.exists()) else {
+            return Ok(None);
+        };
+        let Ok(repo) = Repository::discover(existing) else {
+            return Ok(None);
+        };
+        let Some(root) = repo.workdir().map(Path::to_path_buf) else {
+            return Ok(None);
+        };
+        let content_policy = content_policy.scoped_to(folder_in(&root, path)?)?;
+        Ok(Some(Self {
+            root,
+            repo,
+            content_policy,
+            resolver_registry: ResolverRegistry::with_default_resolvers(),
+            variation_namespace: namespace,
+        }))
+    }
+
+    fn probe_located(&self, requested: PathBuf) -> Result<FolderProbe> {
+        let mine = self.project_key();
+        let mut probe = FolderProbe {
+            state: FolderState::Ready,
+            requested,
+            repository: Some(self.root.clone()),
+            folder: None,
+            detail: None,
+            suggestions: Vec::new(),
+        };
+        if self.unfinished_operation_touches(&mine) {
+            probe.folder = Some(PathBuf::from(&mine));
+            probe.detail =
+                Some("An operation was interrupted; open to finish or acknowledge it.".to_string());
+            probe.suggestions = vec![suggest(FolderFix::Open, "Open and finish it")];
+            return Ok(probe);
+        }
+        let owner = match self.marker_owner()? {
+            FolderOwner::Nobody => self.claim_owner()?,
+            owner => owner,
+        };
+        let owner = match owner {
+            FolderOwner::Nobody => {
+                probe.state = FolderState::Unmanaged;
+                probe.suggestions =
+                    vec![suggest(FolderFix::ManageHere, "Start managing this folder")];
+                return Ok(probe);
+            }
+            FolderOwner::Newer(reason) => {
+                probe.state = FolderState::NewerFormat;
+                probe.detail = Some(reason);
+                probe.suggestions = vec![suggest(FolderFix::UpgradeDraftline, "Update Draftline")];
+                return Ok(probe);
+            }
+            FolderOwner::Invalid(reason) => {
+                probe.state = FolderState::InvalidMarker;
+                probe.detail = Some(reason);
+                // A folder named .draftline can't be replaced with the marker
+                // without deleting what's in it; someone has to move it.
+                if !self.marker_path().is_dir() {
+                    probe.suggestions =
+                        vec![suggest(FolderFix::ManageHere, "Manage this folder instead")];
+                }
+                return Ok(probe);
+            }
+            FolderOwner::Folder(owner) => owner,
+        };
+
+        let folder = PathBuf::from(&owner);
+        let label = folder_label(&folder);
+        probe.folder = Some(folder.clone());
+        let head = self.head_tree_or_empty()?;
+        if !self.claimed_folder_missing(&folder)? {
+            if owner == mine {
+                probe.suggestions = vec![suggest(FolderFix::Open, "Open")];
+            } else {
+                probe.state = FolderState::ManagedElsewhere;
+                probe.detail = Some(format!("Draftline manages {label} in this repository."));
+                probe.suggestions.push(suggest(
+                    FolderFix::OpenManagedFolder {
+                        folder: folder.clone(),
+                    },
+                    &format!("Open {label}"),
+                ));
+                if self.move_refusal(&head, &folder, self.scope())?.is_none()
+                    && self.move_blockers(&folder)?.is_empty()
+                {
+                    probe.suggestions.push(suggest(
+                        FolderFix::MoveFolderHere { from: folder },
+                        &format!("Move {label} here"),
+                    ));
+                }
+            }
+            return Ok(probe);
+        }
+
+        probe.state = FolderState::FolderMissing;
+        probe.detail = Some(format!("Draftline manages {label}, which isn't on disk."));
+        let tracked = tracks_folder(&head, &folder);
+        if tracked {
+            probe.suggestions.push(suggest(
+                FolderFix::RestoreFolder {
+                    folder: folder.clone(),
+                },
+                &format!("Restore {label}"),
+            ));
+        } else {
+            // A switch recreates only files that differ, so it can't bring
+            // back a folder the checked-out commit still tracks.
+            for branch in self.branches_with_folder(&folder, &owner)? {
+                let label = format!("Switch to {branch}, which has {label}");
+                probe
+                    .suggestions
+                    .push(suggest(FolderFix::SwitchToBranch { branch }, &label));
+            }
+        }
+        if owner == mine && !tracked {
+            probe
+                .suggestions
+                .push(suggest(FolderFix::ManageHere, "Create this folder"));
+        } else if owner != mine && self.can_take_over_from(&head, &folder)? {
+            probe
+                .suggestions
+                .push(suggest(FolderFix::ManageHere, "Manage this folder instead"));
+        }
+        Ok(probe)
+    }
+
+    /// Files under `folder` a move would lose or split from Git's index:
+    /// staged or edited tracked files, conflicts, and new files the folder
+    /// keeps. Untracked files it leaves out follow the move as leftovers.
+    fn move_blockers(&self, folder: &Path) -> Result<Vec<PathBuf>> {
+        let policy = self.content_policy.clone().scoped_to(folder)?;
+        let mut options = StatusOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(false);
+        limit_status_to_scope(&mut options, folder);
+        let mut blockers = Vec::new();
+        for entry in self.repo.statuses(Some(&mut options))?.iter() {
+            let status = entry.status();
+            let Ok(path) = entry.path() else {
+                continue;
+            };
+            if status == Status::CURRENT || (status == Status::WT_NEW && !policy.tracks(path)?) {
+                continue;
+            }
+            blockers.push(PathBuf::from(path));
+        }
+        Ok(blockers)
+    }
+
+    /// Managing this folder in place of a missing `old` one keeps the one
+    /// rule moves follow: the root only when the repository holds nothing else.
+    fn can_take_over_from(&self, head: &Tree<'_>, old: &Path) -> Result<bool> {
+        if !self.scope().as_os_str().is_empty() {
+            return Ok(true);
+        }
+        Ok(tracked_paths_under(head, Path::new(""))?
+            .iter()
+            .all(|path| path.starts_with(old) || path == Path::new(FOLDER_MARKER)))
+    }
+
+    /// Up to five local branches, newest first, whose tip has `folder` and
+    /// doesn't name another one.
+    fn branches_with_folder(&self, folder: &Path, key: &str) -> Result<Vec<String>> {
+        let current = self.current_variation_unchecked().ok();
+        let mut found = Vec::new();
+        for branch in self.repo.branches(Some(BranchType::Local))? {
+            let (branch, _) = branch?;
+            let Some(name) = branch.name()?.map(str::to_string) else {
+                continue;
+            };
+            if current.as_deref() == Some(name.as_str())
+                || self.ensure_variation_switchable(&name).is_err()
+            {
+                continue;
+            }
+            let commit = branch.get().peel_to_commit()?;
+            let tree = commit.tree()?;
+            let has_folder = tree
+                .get_path(folder)
+                .is_ok_and(|entry| entry.kind() == Some(ObjectType::Tree));
+            if has_folder && self.tree_marker_allows(&tree, key) {
+                found.push((commit.time().seconds(), name));
+            }
+        }
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(found.into_iter().take(5).map(|(_, name)| name).collect())
+    }
+
+    fn tree_marker_allows(&self, tree: &Tree<'_>, key: &str) -> bool {
+        let Some(entry) = tree.get_name(FOLDER_MARKER) else {
+            return true;
+        };
+        self.repo
+            .find_blob(entry.id())
+            .ok()
+            .and_then(|blob| serde_json::from_slice::<FolderMarker>(blob.content()).ok())
+            .is_some_and(|marker| marker.format == 1 && marker.folder == marker_folder(key))
+    }
+
+    /// Under the lock, refuses a folder fix once another folder took over
+    /// since the probe: the marker, or the claim when there is no marker,
+    /// must still name this folder.
+    fn ensure_still_managed(&self, doing: &str) -> Result<()> {
+        let owner = match self.marker_owner()? {
+            FolderOwner::Nobody => self.claim_owner()?,
+            owner => owner,
+        };
+        if owner == FolderOwner::Folder(self.project_key()) {
+            return Ok(());
+        }
+        Err(DraftlineError::FolderFixUnavailable(format!(
+            "{doing} {} is no longer offered: Draftline manages another folder now",
+            folder_label(self.scope())
+        )))
+    }
+
+    /// Puts this folder's files back from HEAD, leaving everything else alone.
+    fn restore_missing_folder(&self) -> Result<()> {
+        fs::create_dir_all(self.draftline_dir())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "restore_folder")?;
+        self.while_git_busy(|| self.ensure_git_index_unlocked())?;
+        self.ensure_no_pending_recovery_in_checkout()?;
+        self.ensure_still_managed("restoring")?;
+        // No early return if the folder reappeared: it may be back only in
+        // part, and a safe checkout only recreates what is still missing.
+        let head = self.repo.head()?.peel_to_tree()?;
+        let paths = if tracks_folder(&head, self.scope()) {
+            tracked_paths_under(&head, self.scope())?
+        } else {
+            Vec::new()
+        };
+        if paths.is_empty() {
+            return Err(DraftlineError::FolderFixUnavailable(format!(
+                "the checked-out commit has no {} to restore",
+                folder_label(self.scope())
+            )));
+        }
+        // From HEAD's tree, so files whose deletion is staged come back too.
+        let mut checkout = CheckoutBuilder::new();
+        checkout
+            .safe()
+            .recreate_missing(true)
+            .overwrite_ignored(false)
+            .disable_pathspec_match(true);
+        for path in &paths {
+            checkout.path(path);
+        }
+        let refused = RefCell::default();
+        self.checkout_refusing_filters(checkout, &refused, &head, |checkout| {
+            self.repo.checkout_tree(head.as_object(), Some(checkout))
+        })
+    }
+
+    /// Switches the checkout to `branch` for a folder that can't open yet,
+    /// recorded like any switch so an interruption is recoverable.
+    fn switch_to_folder_branch(&self, branch: &str) -> Result<()> {
+        let branch = validate_variation_name(branch)?;
+        fs::create_dir_all(self.draftline_dir())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "switch_to_folder_branch")?;
+        self.while_git_busy(|| self.ensure_git_index_unlocked())?;
+        self.ensure_no_pending_recovery_in_checkout()?;
+        self.ensure_still_managed("switching")?;
+        // Decide again under the lock: the folder may be back, or the branch
+        // may no longer have it.
+        let key = self.project_key();
+        if !self.claimed_folder_missing(self.scope())?
+            || tracks_folder(&self.head_tree_or_empty()?, self.scope())
+            || !self
+                .branches_with_folder(self.scope(), &key)?
+                .contains(&branch)
+        {
+            return Err(DraftlineError::FolderFixUnavailable(format!(
+                "switching to {branch} is no longer offered"
+            )));
+        }
+        let target = self.branch_tree(&branch)?;
+        let file_hazards = self.target_tree_hazards(&target)?;
+        if !file_hazards.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                "switch_variation",
+                true,
+                Vec::new(),
+                file_hazards,
+                Some(format!("current -> {branch}")),
+            ))));
+        }
+        let operation_id = new_operation_id();
+        self.write_recovery_state_for_checkout(
+            &RecoveryState {
+                operation_id: operation_id.clone(),
+                operation: RecoveryOperation::SwitchVariation,
+                original_variation: self.current_variation_unchecked().ok(),
+                target: Some(branch.clone()),
+                completed: false,
+            },
+            &self.head_tree_or_empty()?,
+            &target,
+        )?;
+        self.checkout_or_keep_recovery(&target)?;
+        self.point_head_at(&branch)?;
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::SwitchVariation,
+            original_variation: None,
+            target: Some(branch),
+            completed: true,
+        })
+    }
+
+    /// Why the folder can't move from `from` to `to`, if it can't.
+    fn move_refusal(&self, head: &Tree<'_>, from: &Path, to: &Path) -> Result<Option<String>> {
+        let to_label = folder_label(to);
+        if from == to {
+            return Ok(Some(format!("Draftline already manages {to_label}")));
+        }
+        if let Some(first) = to.components().next() {
+            let first = first.as_os_str();
+            if first == ".git" || is_repository_path(to) {
+                return Ok(Some(format!("{to_label} is reserved")));
+            }
+        }
+        // Files already saved under `to` would mix with the folder's own,
+        // except the folder itself when it moves up into `to`. The root's
+        // repository files stay put unless the folder brings its own.
+        let into_own_subfolder = to.starts_with(from);
+        let to_root = to.as_os_str().is_empty();
+        let brings = |path: &Path| {
+            path.components()
+                .next()
+                .is_some_and(|first| head.get_path(&from.join(first)).is_ok())
+        };
+        let blocking = tracked_paths_under(head, to)?.into_iter().find(|path| {
+            path != Path::new(FOLDER_MARKER)
+                && (into_own_subfolder || !path.starts_with(from))
+                && !(to_root && is_repository_path(path) && !brings(path))
+        });
+        if let Some(path) = blocking {
+            return Ok(Some(if to.as_os_str().is_empty() {
+                format!(
+                    "the repository holds other files, such as {}",
+                    folder_key(&path)
+                )
+            } else {
+                format!("{to_label} already has saved files")
+            }));
+        }
+        if to.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let mut walked = self.root.clone();
+        for component in to.components() {
+            walked.push(component);
+            if fs::symlink_metadata(&walked).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                return Ok(Some(format!("{to_label} is reached through a link")));
+            }
+        }
+        let dir = self.root.join(to);
+        if dir.is_file() {
+            return Ok(Some(format!("{to_label} is a file")));
+        }
+        if dir.is_dir() {
+            let own = from
+                .strip_prefix(to)
+                .ok()
+                .and_then(|inner| inner.components().next())
+                .map(|first| first.as_os_str().to_os_string());
+            let occupied = fs::read_dir(&dir)?
+                .flatten()
+                .any(|entry| Some(entry.file_name()) != own);
+            if occupied {
+                return Ok(Some(format!("{to_label} isn't empty")));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `head` with the folder's files moved from `from` to `to` and
+    /// [`FOLDER_MARKER`] naming `to`. From the root, [`REPOSITORY_FILES`] stay.
+    fn moved_tree(&self, head: &Tree<'_>, from: &Path, to: &Path) -> Result<Oid> {
+        let mut source = git2::Index::new()?;
+        source.read_tree(head)?;
+        let from = folder_key(from);
+        let to = folder_key(to);
+        let mut moved = git2::Index::new()?;
+        for mut entry in source.iter() {
+            if entry.path == FOLDER_MARKER.as_bytes() {
+                continue;
+            }
+            let stays = from.is_empty() && is_repository_file(&entry.path);
+            if let Some(rest) = strip_folder(&entry.path, from.as_bytes()).filter(|_| !stays) {
+                let mut path = to.as_bytes().to_vec();
+                if !path.is_empty() {
+                    path.push(b'/');
+                }
+                path.extend_from_slice(rest);
+                entry.path = path;
+            }
+            moved.add(&entry)?;
+        }
+        let tree = self.repo.find_tree(moved.write_tree_to(&self.repo)?)?;
+        let marker = self.repo.blob(&marker_bytes(&to)?)?;
+        let mut builder = self.repo.treebuilder(Some(&tree))?;
+        builder.insert(FOLDER_MARKER, marker, 0o100644)?;
+        Ok(builder.write()?)
+    }
+
+    /// Moves untracked and ignored files the checkout left in `from` into
+    /// `to`, returning those that stayed and whether any moved. Nothing
+    /// follows from the root: its untracked files are anyone's. Files Git's
+    /// index tracks are never moved.
+    fn move_leftovers(&self, from: &Path, to: &Path) -> (Vec<PathBuf>, bool) {
+        if from.as_os_str().is_empty() {
+            return (Vec::new(), false);
+        }
+        // Read fresh: another process may have committed since this opened.
+        let index = self
+            .repo
+            .index()
+            .and_then(|mut index| index.read(false).map(|()| index))
+            .ok();
+        let tracked = |relative: &Path| {
+            index.as_ref().is_none_or(|index| {
+                let key = folder_key(&from.join(relative));
+                index.get_path(Path::new(&key), 0).is_some()
+                    || index.find_prefix(format!("{key}/")).is_ok()
+            })
+        };
+        let source = self.root.join(from);
+        let destination = self.root.join(to);
+        let (mut files, mut dirs) = (Vec::new(), Vec::new());
+        collect_leftovers(&source, &destination, &mut files, &mut dirs);
+        let mut left_behind = Vec::new();
+        let mut moved_any = false;
+        for file in files {
+            let Ok(relative) = file.strip_prefix(&source) else {
+                continue;
+            };
+            if tracked(relative) {
+                continue;
+            }
+            let target = destination.join(relative);
+            let moved = target.symlink_metadata().is_err()
+                && target
+                    .parent()
+                    .is_none_or(|parent| fs::create_dir_all(parent).is_ok())
+                && fs::rename(&file, &target).is_ok();
+            if moved {
+                moved_any = true;
+            } else {
+                left_behind.push(from.join(relative));
+            }
+        }
+        for dir in dirs.iter().rev() {
+            let _ = fs::remove_dir(dir);
+        }
+        let _ = fs::remove_dir(&source);
+        (left_behind, moved_any)
+    }
+
+    /// Points the local record at the folder the marker on disk names.
+    fn sync_claim_to_marker(&self) -> Result<()> {
+        if let FolderOwner::Folder(folder) = self.marker_owner()? {
+            self.write_claim_for(&folder)?;
+        }
+        Ok(())
     }
 
     /// Clones a shared workspace from a remote endpoint.
@@ -1528,7 +2492,11 @@ impl Workspace {
             builder.fetch_options(fetch_options);
         }
         let repo = builder.clone(remote_url.as_ref(), path.as_ref())?;
-        Self::from_repository(repo, path.as_ref(), content_policy)
+        // Open the folder the repository's marker names, not its root.
+        // The folder may not exist on the cloned branch yet.
+        let folder = head_marker_folder(&repo).unwrap_or_default();
+        let project = create_folder_within(path.as_ref(), &folder)?;
+        Self::from_repository(repo, &project, content_policy)
     }
 
     /// Adds a semantic merge resolver ahead of Draftline's built-in resolvers.
@@ -1589,13 +2557,13 @@ impl Workspace {
     /// Returns the repository working-tree root.
     ///
     /// Paths accepted and returned by Draftline are relative to this root. For a
-    /// project folder inside a larger repository, see [`Workspace::scope`] and
+    /// folder inside a larger repository, see [`Workspace::scope`] and
     /// [`Workspace::project_root`].
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Returns the repository-relative project folder, or an empty path when
+    /// Returns the repository-relative folder, or an empty path when
     /// the project is the repository root.
     pub fn scope(&self) -> &Path {
         self.content_policy.scope()
@@ -1609,7 +2577,7 @@ impl Workspace {
         crate::profile::identity_from_config(&self.repo.config()?)
     }
 
-    /// Returns the absolute project folder.
+    /// Returns the absolute folder.
     pub fn project_root(&self) -> PathBuf {
         self.root.join(self.scope())
     }
@@ -1648,6 +2616,21 @@ impl Workspace {
             self.ensure_variation_in_namespace(name)?;
         }
         Ok(())
+    }
+
+    /// Saves and updates land on whatever branch is checked out, like a
+    /// teammate's would, but never on a detached `HEAD`, where the next switch
+    /// would strand them. Shelve and discard stay available. Returns the
+    /// branch's full ref name, which the write then pins.
+    fn ensure_on_branch(&self) -> Result<String> {
+        self.repo
+            .find_reference("HEAD")?
+            .symbolic_target()
+            .ok()
+            .flatten()
+            .filter(|target| target.starts_with("refs/heads/"))
+            .map(str::to_string)
+            .ok_or(DraftlineError::NoCurrentVariation)
     }
 
     /// Returns the current content policy.
@@ -1747,10 +2730,30 @@ impl Workspace {
             ));
         }
 
+        match self.missing_lfs_content() {
+            Ok(missing) if !missing.is_empty() => {
+                diagnostics.push(workspace_diagnostic(
+                    DiagnosticCode::LfsContentMissing,
+                    DiagnosticSeverity::Warning,
+                    format!(
+                        "{} project file(s), such as `{}`, are Git LFS pointers; a developer must install Git LFS and run `git lfs pull`",
+                        missing.len(),
+                        missing[0].display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => diagnostics.push(workspace_diagnostic(
+                DiagnosticCode::WorkspaceReadFailed,
+                DiagnosticSeverity::Warning,
+                format!("could not check for Git LFS pointers: {error}"),
+            )),
+        }
+
         if recovery.is_some() {
             diagnostics.push(match self.recovery_owner_elsewhere() {
                 Some(project) => workspace_diagnostic(
-                    DiagnosticCode::RecoveryInOtherProject,
+                    DiagnosticCode::RecoveryInOtherFolder,
                     DiagnosticSeverity::Blocking,
                     format!(
                         "project {} has an incomplete Draftline operation",
@@ -1863,11 +2866,11 @@ impl Workspace {
                 safe_next_actions: vec![SafeNextAction::RepairRecovery],
                 retry: RetryClass::RetryAfterRepair,
             },
-            DiagnosticCode::RecoveryInOtherProject => ErrorExplanation {
+            DiagnosticCode::RecoveryInOtherFolder => ErrorExplanation {
                 code,
-                message: "another project in this checkout has an incomplete Draftline operation"
+                message: "another folder in this checkout has an incomplete Draftline operation"
                     .to_string(),
-                safe_next_actions: vec![SafeNextAction::FinishInOtherProject],
+                safe_next_actions: vec![SafeNextAction::FinishInOtherFolder],
                 retry: RetryClass::RetryAfterRepair,
             },
             DiagnosticCode::WorkspaceLocked => ErrorExplanation {
@@ -1909,6 +2912,14 @@ impl Workspace {
             DiagnosticCode::PolicyTrackedFileIgnored => ErrorExplanation {
                 code,
                 message: "Git ignore rules hide content tracked by policy".to_string(),
+                safe_next_actions: Vec::new(),
+                retry: RetryClass::RetryAfterUserChoice,
+            },
+            DiagnosticCode::LfsContentMissing => ErrorExplanation {
+                code,
+                message:
+                    "some project files are Git LFS pointers; their content was never downloaded"
+                        .to_string(),
                 safe_next_actions: Vec::new(),
                 retry: RetryClass::RetryAfterUserChoice,
             },
@@ -2000,7 +3011,7 @@ impl Workspace {
 
     /// Clears an abandoned operation lock only when lock metadata marks it stale.
     pub fn clear_stale_lock(&self) -> Result<()> {
-        self.claim_checkout()?;
+        self.claim_checkout(false)?;
         let inspection = self.inspect_operation_lock()?;
         if inspection.state == OperationLockState::Unlocked {
             return Ok(());
@@ -2030,6 +3041,7 @@ impl Workspace {
         self.clear_stale_lock()?;
         let _lock = self.acquire_for_index("repair_recovery")?;
         let state = self.pending_recovery(operation_id.as_ref())?;
+        self.ensure_recovery_may_write()?;
 
         match state.operation {
             RecoveryOperation::SwitchVariation => {
@@ -2143,6 +3155,7 @@ impl Workspace {
             RecoveryOperation::DeleteRemoteVariation => {
                 self.repair_delete_remote_variation_recovery(state, options)
             }
+            RecoveryOperation::MoveFolder => self.settle_folder_move(state),
             RecoveryOperation::RestoreVersionAsNewSave
             | RecoveryOperation::MilestoneMerge
             | RecoveryOperation::SquashVersions
@@ -2156,6 +3169,7 @@ impl Workspace {
         self.clear_stale_lock()?;
         let _lock = self.acquire_for_index("rollback_recovery")?;
         let state = self.pending_recovery(operation_id.as_ref())?;
+        self.ensure_recovery_may_write()?;
 
         match state.operation {
             RecoveryOperation::SwitchVariation => {
@@ -2219,6 +3233,7 @@ impl Workspace {
                     None => Ok(self.recovery_unavailable(state)),
                 }
             }
+            RecoveryOperation::MoveFolder => self.settle_folder_move(state),
             RecoveryOperation::ApplyIncoming
             | RecoveryOperation::DeleteRemoteVariation
             | RecoveryOperation::ExpireSupportRefs
@@ -2227,6 +3242,36 @@ impl Workspace {
             | RecoveryOperation::SquashVersions
             | RecoveryOperation::HistoryCleanup => Ok(self.recovery_unavailable(state)),
         }
+    }
+
+    /// Settles an interrupted folder move on whatever its variation records:
+    /// the moved folder once the save landed, the original one before. Repair
+    /// and rollback are the same, since nothing else is safe to guess.
+    fn settle_folder_move(&self, state: RecoveryState) -> Result<RecoveryRepairResult> {
+        let Some(branch) = state.original_variation.clone() else {
+            return Ok(self.recovery_unavailable(state));
+        };
+        let changed_workspace = self.finish_switch_at(None, &branch)?;
+        self.sync_claim_to_marker()?;
+        let mut moved_leftovers = false;
+        if let Some((from, to)) = state.target.as_deref().and_then(|t| t.split_once(" -> ")) {
+            // Settled on the moved side: untracked files follow, as in a move
+            // that finished. Otherwise they never left.
+            if let FolderOwner::Folder(settled) = self.marker_owner()? {
+                if marker_folder(&settled) == to && from != to {
+                    let key = |side: &str| PathBuf::from(if side == "." { "" } else { side });
+                    moved_leftovers = self.move_leftovers(&key(from), &key(to)).1;
+                }
+            }
+            // The checkout leaves the abandoned side's folder behind when
+            // empty; its parents may predate the move, so they stay.
+            for side in [from, to] {
+                if side != "." {
+                    let _ = fs::remove_dir(self.root.join(side));
+                }
+            }
+        }
+        self.complete_recovery(state, changed_workspace || moved_leftovers)
     }
 
     /// Undoes an interrupted shelve. The shelf is deleted only while every
@@ -2284,7 +3329,7 @@ impl Workspace {
             None => {
                 // Older records: the restore built on its target's tip,
                 // whether or not its save landed.
-                let source = self.find_version_commit(&version)?.tree()?;
+                let source = self.relocated_tree(&self.find_version_commit(&version)?)?;
                 let base = match variation.map(|name| self.branch_tree(name)) {
                     Some(Ok(tree)) => tree,
                     _ => self.repo.head()?.peel_to_tree()?,
@@ -2339,7 +3384,7 @@ impl Workspace {
             if now.id() == tip.id() {
                 return Ok(changed);
             }
-            changed |= self.settle_paths(&tip, &now, &BTreeSet::new())?;
+            changed |= self.settle_paths(&tip, &now, &BTreeSet::new(), &BTreeSet::new())?;
             tip = now;
         }
         Err(DraftlineError::LocalStateChanged {
@@ -2356,6 +3401,16 @@ impl Workspace {
         before: Option<&Tree<'_>>,
         to: &Tree<'_>,
     ) -> Result<bool> {
+        // Half-written files go the way of `written`; read before anything moves.
+        // `written` → `to` covers an earlier recovery that died following a
+        // branch that moved.
+        let mut torn = match before {
+            Some(before) if before.id() != written.id() => self.torn_writes(before, written)?,
+            _ => BTreeSet::new(),
+        };
+        if written.id() != to.id() {
+            torn.extend(self.torn_writes(written, to)?);
+        }
         let before = before.filter(|before| ![written.id(), to.id()].contains(&before.id()));
         // Git writes the index last, so an entry already at `written` proves
         // the checkout wrote that file: one back at `before` is the
@@ -2380,20 +3435,97 @@ impl Workspace {
         }
         let mut changed = false;
         if written.id() != to.id() {
-            changed |= self.settle_paths(written, to, &BTreeSet::new())?;
+            changed |= self.settle_paths(written, to, &BTreeSet::new(), &torn)?;
+        } else {
+            changed |= self.write_torn(to, &torn)?;
         }
         if let Some(before) = before {
-            changed |= self.settle_paths(before, to, &proven)?;
+            changed |= self.settle_paths(before, to, &proven, &BTreeSet::new())?;
         }
         Ok(changed)
+    }
+
+    /// Paths an interrupted checkout from `before` toward `written` left
+    /// half-written: missing, or holding only the start of `written`'s
+    /// content. Rewriting them loses nothing, since both are in `written`.
+    /// Git writes the index last, so a path already staged at `written` was
+    /// finished and anything since is the developer's.
+    fn torn_writes(&self, before: &Tree<'_>, written: &Tree<'_>) -> Result<BTreeSet<PathBuf>> {
+        let paths = self.paths_changed_between(Some(before), written)?;
+        self.while_git_busy(|| self.ensure_git_index_unlocked())?;
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        let settled: BTreeSet<PathBuf> = self
+            .workdir_matches(written, &paths)?
+            .into_iter()
+            .chain(self.workdir_matches(before, &paths)?)
+            .collect();
+        let mut torn = BTreeSet::new();
+        for path in paths.into_iter().filter(|path| !settled.contains(path)) {
+            let Ok(entry) = written.get_path(&path) else {
+                continue;
+            };
+            let staged = index
+                .get_path(&path, 0)
+                .map(|staged| (staged.id, staged.mode));
+            if staged == Some((entry.id(), entry.filemode() as u32)) {
+                continue;
+            }
+            let on_disk = match fs::symlink_metadata(self.root.join(&path)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    torn.insert(path);
+                    continue;
+                }
+                Ok(metadata) if metadata.is_file() => fs::read(self.root.join(&path))?,
+                _ => continue,
+            };
+            let Ok(blob) = self.repo.find_blob(entry.id()) else {
+                continue;
+            };
+            if is_start_of(&on_disk, blob.content()) {
+                torn.insert(path);
+            }
+        }
+        Ok(torn)
+    }
+
+    /// Writes `paths` from `tree` over whatever is on disk.
+    fn write_torn(&self, tree: &Tree<'_>, paths: &BTreeSet<PathBuf>) -> Result<bool> {
+        if paths.is_empty() {
+            return Ok(false);
+        }
+        let (present, gone): (Vec<&PathBuf>, Vec<&PathBuf>) =
+            paths.iter().partition(|path| tree.get_path(path).is_ok());
+        for path in gone {
+            remove_workspace_path_if_exists(&self.root.join(path))?;
+        }
+        if !present.is_empty() {
+            let mut checkout = CheckoutBuilder::new();
+            checkout
+                .force()
+                .update_index(false)
+                .disable_pathspec_match(true);
+            for path in &present {
+                checkout.path(path.to_string_lossy().replace('\\', "/"));
+            }
+            let refused = RefCell::default();
+            self.checkout_refusing_filters(checkout, &refused, tree, |checkout| {
+                self.repo.checkout_tree(tree.as_object(), Some(checkout))
+            })?;
+        }
+        Ok(true)
     }
 
     /// HEAD's tree, or the empty tree while HEAD is unborn (a fresh clone).
     fn head_tree_or_empty(&self) -> Result<Tree<'_>> {
         match self.repo.head().and_then(|head| head.peel_to_tree()) {
             Ok(tree) => Ok(tree),
-            Err(_) => Ok(self.repo.find_tree(self.repo.treebuilder(None)?.write()?)?),
+            Err(_) => Ok(self.repo.find_tree(self.empty_tree_id()?)?),
         }
+    }
+
+    fn empty_tree_id(&self) -> Result<Oid> {
+        Ok(self.repo.treebuilder(None)?.write()?)
     }
 
     fn branch_tree(&self, variation: &str) -> Result<Tree<'_>> {
@@ -2420,7 +3552,8 @@ impl Workspace {
     /// as they are (showing as unsaved changes) and entries a developer
     /// staged differently are left alone, so rerunning it is safe.
     ///
-    /// Working files at `kept` are the developer's and stay as they are. Like
+    /// Working files at `kept` are the developer's and stay as they are;
+    /// those at `torn` count as still at `from`. Like
     /// Git, this writes files first and the index last. Returns whether any
     /// file was rewritten.
     fn settle_paths(
@@ -2428,6 +3561,7 @@ impl Workspace {
         from: &Tree<'_>,
         to: &Tree<'_>,
         kept: &BTreeSet<PathBuf>,
+        torn: &BTreeSet<PathBuf>,
     ) -> Result<bool> {
         let paths = self.paths_changed_between(Some(from), to)?;
         // Blob and mode, so a staged mode-only change counts as the developer's.
@@ -2447,7 +3581,10 @@ impl Workspace {
         let at_from: Vec<PathBuf> = self
             .workdir_matches(from, &paths)?
             .into_iter()
+            .chain(paths.iter().filter(|path| torn.contains(*path)).cloned())
             .filter(|path| !kept.contains(path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         let (in_to, gone): (Vec<_>, Vec<_>) = at_from
             .iter()
@@ -2550,6 +3687,84 @@ impl Workspace {
         self.clear_recovery_records()
     }
 
+    fn legacy_pending_cleanup_path(&self) -> PathBuf {
+        self.draftline_dir()
+            .join("history-cleanup")
+            .join("pending.json")
+    }
+
+    /// Reads 0.5's pending history cleanups, skipping any it can't parse:
+    /// they are informational, so a damaged file never blocks the folder.
+    fn read_legacy_pending_cleanups(&self) -> Result<Vec<LegacyPendingCleanupRecord>> {
+        let bytes = match fs::read(self.legacy_pending_cleanup_path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let Ok(raw) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) else {
+            tracing::warn!("skipping unreadable 0.5 history cleanup records");
+            return Ok(Vec::new());
+        };
+        Ok(raw
+            .into_iter()
+            .filter_map(|value| {
+                serde_json::from_value(value)
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, "skipping unreadable 0.5 history cleanup record")
+                    })
+                    .ok()
+            })
+            .collect())
+    }
+
+    /// Lists history cleanups that Draftline 0.5 applied locally but never
+    /// published. Current Draftline ignores them otherwise: the branch keeps
+    /// its rewritten history and the next publish merges the remote in.
+    pub fn legacy_history_cleanups(&self) -> Result<Vec<LegacyHistoryCleanup>> {
+        Ok(self
+            .read_legacy_pending_cleanups()?
+            .into_iter()
+            .map(|record| LegacyHistoryCleanup {
+                plan_id: record.plan_id,
+                variation: record.target_variation,
+                original_head: record.expected_local_head,
+                replacement_head: record.replacement_head,
+                backup_refs: record.backup_refs,
+            })
+            .collect())
+    }
+
+    /// Dismisses a history cleanup left pending by Draftline 0.5. Only the
+    /// record is dropped: no branch moves and no file changes. The original
+    /// history stays in the cleanup's backup refs, which remain listed as
+    /// support refs.
+    pub fn dismiss_legacy_history_cleanup(&self, plan_id: impl AsRef<str>) -> Result<()> {
+        let plan_id = plan_id.as_ref();
+        let _lock = self.acquire_operation_lock("dismiss_legacy_history_cleanup")?;
+        self.ensure_no_pending_recovery()?;
+        if !self
+            .read_legacy_pending_cleanups()?
+            .iter()
+            .any(|record| record.plan_id == plan_id)
+        {
+            return Err(DraftlineError::RecoveryNotFound(plan_id.to_string()));
+        }
+        let path = self.legacy_pending_cleanup_path();
+        let raw: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(&path)?)?;
+        let remaining = raw
+            .into_iter()
+            .filter(|value| value.get("plan_id").and_then(|id| id.as_str()) != Some(plan_id))
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            fs::remove_file(&path)?;
+        } else {
+            let temp = unique_claim_temp(&path);
+            fs::write(&temp, serde_json::to_vec_pretty(&remaining)?)?;
+            replace_file(&temp, &path)?;
+        }
+        Ok(())
+    }
+
     /// Deletes recovery records; the caller holds the operation lock.
     fn clear_recovery_records(&self) -> Result<()> {
         if self.draftline_dir().exists() {
@@ -2597,13 +3812,21 @@ impl Workspace {
         label: impl AsRef<str>,
         profile: Option<&ContributorProfile>,
     ) -> Result<Version> {
+        let branch = self.ensure_on_branch()?;
+        test_hooks::fire("after_branch_pinned", self.repo.path());
         self.while_head_moves_forward(|retrying| {
             let changed_files = self.changed_files_unchecked()?;
             if retrying && changed_files.is_empty() {
                 return Ok(None);
             }
-            self.commit_content_changes(&changed_files, "save_version", label.as_ref(), profile)
-                .map(Some)
+            self.commit_content_changes(
+                &branch,
+                &changed_files,
+                "save_version",
+                label.as_ref(),
+                profile,
+            )
+            .map(Some)
         })
     }
 
@@ -2614,6 +3837,7 @@ impl Workspace {
         P: AsRef<Path>,
     {
         self.ensure_no_pending_recovery()?;
+        self.ensure_on_branch()?;
         let changed_files = self.selected_changed_files(paths)?;
         Ok(selected_files_preflight_report(
             "save_files",
@@ -2657,6 +3881,7 @@ impl Workspace {
     {
         let _lock = self.acquire_for_index("save_files")?;
         self.ensure_no_pending_recovery()?;
+        let branch = self.ensure_on_branch()?;
         let paths = paths
             .into_iter()
             .map(|path| path.as_ref().to_path_buf())
@@ -2671,8 +3896,14 @@ impl Workspace {
                     selected_files_preflight_report("save_files", false, changed_files),
                 )));
             }
-            self.commit_content_changes(&changed_files, "save_files", label.as_ref(), profile)
-                .map(Some)
+            self.commit_content_changes(
+                &branch,
+                &changed_files,
+                "save_files",
+                label.as_ref(),
+                profile,
+            )
+            .map(Some)
         })
     }
 
@@ -2730,7 +3961,7 @@ impl Workspace {
 
     /// Lists versions reachable from the current variation, newest first.
     ///
-    /// In a project folder inside a larger repository, only commits that change
+    /// In a folder inside a larger repository, only commits that change
     /// the folder are versions (like `git log -- <folder>`); developers' other
     /// commits are skipped.
     pub fn versions(&self) -> Result<Vec<Version>> {
@@ -2890,6 +4121,10 @@ impl Workspace {
             let Ok(path) = entry.path() else {
                 continue;
             };
+            // Draftline owns its marker; checkout handles an unsaved one.
+            if path == FOLDER_MARKER {
+                continue;
+            }
             let path_ref = Path::new(path);
             let status = entry.status();
 
@@ -2940,6 +4175,7 @@ impl Workspace {
         // cannot see, so flag those up front instead of failing mid-operation.
         for path in self.obstructed_paths(head_tree.as_ref(), target_tree, &target_paths)? {
             if hazards.iter().any(|hazard| hazard.path == path)
+                || path == Path::new(FOLDER_MARKER)
                 || self.content_policy.tracks(&path)?
             {
                 continue;
@@ -3222,6 +4458,157 @@ impl Workspace {
         ))
     }
 
+    /// Starts a variation at the current commit and moves this checkout onto
+    /// it without touching any file or the index, like `git switch -c`.
+    /// Unsaved edits come along. This is the way out when a developer
+    /// switched the shared checkout to their own branch: their branch keeps
+    /// its commits, and later saves land on the new variation instead.
+    pub fn start_variation_here(&self, name: impl AsRef<str>) -> Result<Variation> {
+        self.start_variation_here_with_metadata(name, VariationMetadata::default())
+    }
+
+    /// [`Self::start_variation_here`] with display metadata.
+    pub fn start_variation_here_with_metadata(
+        &self,
+        name: impl AsRef<str>,
+        metadata: VariationMetadata,
+    ) -> Result<Variation> {
+        let _lock = self.acquire_operation_lock("start_variation_here")?;
+        self.ensure_no_pending_recovery()?;
+        let name = validate_variation_name(name.as_ref())?;
+        self.ensure_variation_in_namespace(&name)?;
+        let branch_ref = format!("refs/heads/{name}");
+        if self.repo.find_reference(&branch_ref).is_ok() {
+            return Err(DraftlineError::VariationAlreadyExists(name));
+        }
+        self.write_variation_metadata(&name, &metadata)?;
+        if let Err(error) = self.branch_here_and_switch(&name, None) {
+            self.clear_unowned_variation_metadata(&name);
+            return Err(error);
+        }
+        Ok(variation_from_name(name.clone(), Some(&name), metadata))
+    }
+
+    /// Undoes metadata written for a branch this operation failed to create,
+    /// unless someone else created that branch meanwhile.
+    fn clear_unowned_variation_metadata(&self, name: &str) {
+        if self
+            .repo
+            .find_reference(&format!("refs/heads/{name}"))
+            .is_err()
+        {
+            let _ = self.clear_variation_metadata(name);
+        }
+    }
+
+    /// Creates `name` at HEAD's commit and points HEAD at it, like
+    /// `git switch -c`, without touching files. HEAD, the old branch, and the
+    /// new one stay locked while HEAD is rechecked, so a developer's commit or
+    /// switch meanwhile refuses and nothing is left behind. With `expected`,
+    /// also refuses unless HEAD is still at that commit.
+    fn branch_here_and_switch(&self, name: &str, expected: Option<Oid>) -> Result<()> {
+        let branch_ref = format!("refs/heads/{name}");
+        let read_head = || -> Result<(Option<String>, Option<Oid>)> {
+            let head = self.repo.find_reference("HEAD")?;
+            let symbolic = head.symbolic_target().ok().flatten().map(str::to_string);
+            let commit = head.resolve().ok().and_then(|head| head.target());
+            Ok((symbolic, commit))
+        };
+        let (previous, commit) = read_head()?;
+        if expected.is_some() && commit != expected {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{expected:?}"),
+                actual: format!("{commit:?}"),
+            });
+        }
+        test_hooks::fire("before_branch_switch", self.repo.path());
+        let mut committing = false;
+        let message = format!("draftline: start variation {name} here");
+        let recheck = || -> Result<()> {
+            let now = read_head()?;
+            if now != (previous.clone(), commit) {
+                return Err(DraftlineError::LocalStateChanged {
+                    expected: format!("{previous:?}@{commit:?}"),
+                    actual: format!("{:?}@{:?}", now.0, now.1),
+                });
+            }
+            Ok(())
+        };
+        let lock_head = |transaction: &mut git2::Transaction<'_>| -> Result<()> {
+            transaction.lock_ref("HEAD")?;
+            if let Some(previous) = previous.as_deref() {
+                transaction.lock_ref(previous)?;
+            }
+            transaction.lock_ref(&branch_ref)?;
+            Ok(())
+        };
+        let switched = (|| -> Result<()> {
+            // libgit2 applies a transaction's refs in no set order, so create
+            // the branch first and move HEAD after: a crash in between leaves
+            // a spare branch, never HEAD on a branch that doesn't exist.
+            let mut transaction = self.repo.transaction()?;
+            lock_head(&mut transaction)?;
+            recheck()?;
+            if self.repo.find_reference(&branch_ref).is_ok() {
+                return Err(DraftlineError::VariationAlreadyExists(name.to_string()));
+            }
+            if let Some(commit) = commit {
+                transaction.set_target(&branch_ref, commit, None, &message)?;
+                committing = true;
+                transaction.commit()?;
+                test_hooks::fire("between_branch_and_switch", self.repo.path());
+                transaction = self.repo.transaction()?;
+                lock_head(&mut transaction)?;
+                recheck()?;
+                if self.repo.refname_to_id(&branch_ref).ok() != Some(commit) {
+                    return Err(DraftlineError::LocalStateChanged {
+                        expected: format!("{branch_ref}@{commit}"),
+                        actual: format!("{branch_ref} moved"),
+                    });
+                }
+            }
+            transaction.set_symbolic_target("HEAD", &branch_ref, None, &message)?;
+            committing = true;
+            transaction.commit()?;
+            Ok(())
+        })();
+        let Err(error) = switched else {
+            return Ok(());
+        };
+        if !committing {
+            // Refused before writing anything; the refs aren't ours to touch.
+            return Err(error);
+        }
+        // libgit2 applies a transaction's refs one by one, so a failed
+        // commit may have applied some. Finish or undo what landed.
+        let head_on_new = self
+            .repo
+            .find_reference("HEAD")
+            .ok()
+            .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string))
+            .as_deref()
+            == Some(branch_ref.as_str());
+        let new_tip = self.repo.refname_to_id(&branch_ref).ok();
+        if head_on_new && new_tip == commit {
+            return Ok(());
+        }
+        if head_on_new {
+            if let Some(previous) = previous.as_deref() {
+                let _ = self.repo.reference_symbolic(
+                    "HEAD",
+                    previous,
+                    true,
+                    "draftline: undo start variation",
+                );
+            }
+        } else if new_tip.is_some() && new_tip == commit {
+            if let Ok(mut reference) = self.repo.find_reference(&branch_ref) {
+                let _ = reference.delete();
+            }
+        }
+        Err(error)
+    }
+
     /// Creates a new variation from the current version.
     pub fn create_variation(&self, name: impl AsRef<str>) -> Result<Variation> {
         self.create_variation_with_metadata(name, VariationMetadata::default())
@@ -3435,6 +4822,7 @@ impl Workspace {
             remote.fetch(&refspec_refs, Some(&mut fetch_options), None)
         };
         options.map_git_result("fetch_all_variations", fetch_result)?;
+        self.record_remote_head(&remote)?;
         Ok(())
     }
 
@@ -4714,9 +6102,10 @@ impl Workspace {
     ) -> Result<Version> {
         self.ensure_no_pending_recovery()?;
         let _lock = self.acquire_for_index("restore_version_as_new_save")?;
+        let branch = self.ensure_on_branch()?;
         let head_commit = self.repo.head()?.peel_to_commit()?;
         let restored_tree = {
-            let source = self.find_version_commit(version)?.tree()?;
+            let source = self.relocated_tree(&self.find_version_commit(version)?)?;
             let tree_id = self.compose_scoped_tree(&head_commit.tree()?, &source)?;
             self.repo.find_tree(tree_id)?
         };
@@ -4747,12 +6136,18 @@ impl Workspace {
 
         self.checkout_or_keep_recovery(&restored_tree)?;
         let oid = self.repo.commit(
-            Some("HEAD"),
+            None,
             &author,
             &committer,
             label.as_ref(),
             &restored_tree,
             &[&head_commit],
+        )?;
+        self.advance_head(
+            &branch,
+            &self.repo.find_commit(oid)?,
+            Some(&head_commit),
+            &committer,
         )?;
 
         self.write_recovery_state(&RecoveryState {
@@ -4811,11 +6206,17 @@ impl Workspace {
         let _lock = self.acquire_for_index("restore_version_as_new_save_to_variation")?;
 
         let source_commit = self.find_version_commit(version)?;
-        let source_tree = source_commit.tree()?;
+        let source_tree = self.relocated_tree(&source_commit)?;
         let current_variation = self.current_variation_unchecked()?;
         let (target_name, target_metadata, parent_oid) =
             self.resolve_restore_version_target(target, &current_variation)?;
         let parent = self.repo.find_commit(parent_oid)?;
+        // A target from before a move keeps the folder elsewhere; restoring
+        // into it would leave the folder in two places.
+        let target_folder = FolderChanges::new(&self.repo, self.scope()).folder_at(&parent)?;
+        if target_folder != self.scope() {
+            return Err(DraftlineError::FolderIsElsewhere(target_folder));
+        }
         let restored_tree = {
             let tree_id = self.compose_scoped_tree(&parent.tree()?, &source_tree)?;
             self.repo.find_tree(tree_id)?
@@ -4886,7 +6287,7 @@ impl Workspace {
     pub fn preview_version(&self, version: &VersionId) -> Result<VersionPreview> {
         self.ensure_no_pending_recovery()?;
         let commit = self.find_version_commit(version)?;
-        let tree = commit.tree()?;
+        let tree = self.relocated_tree(&commit)?;
         let mut files = Vec::new();
         collect_preview_files(
             &self.repo,
@@ -4915,7 +6316,7 @@ impl Workspace {
         }
 
         let commit = self.find_version_commit(version)?;
-        let tree = commit.tree()?;
+        let tree = self.relocated_tree(&commit)?;
         let entry = match tree.get_path(&path) {
             Ok(entry) => entry,
             Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
@@ -5002,6 +6403,7 @@ impl Workspace {
         let dirty_files = self.changed_files_unchecked().unwrap_or_default();
         let is_dirty = !dirty_files.is_empty();
         let state_may_be_inconsistent = recovery.is_some();
+        let legacy_history_cleanups = self.legacy_history_cleanups().unwrap_or_default();
 
         Ok(WorkspaceSummary {
             active_variation,
@@ -5011,10 +6413,16 @@ impl Workspace {
             is_dirty,
             recovery,
             state_may_be_inconsistent,
+            legacy_history_cleanups,
         })
     }
 
     /// Returns the version history for the current variation with variation-tip annotations.
+    ///
+    /// Like `git log`, this lists every commit on the branch, including
+    /// teammates' commits that don't change the folder; check
+    /// [`HistoryEntry::touches_folder`]. [`Workspace::versions`] lists only
+    /// the commits that change the folder.
     ///
     /// Each entry carries the version metadata plus the list of variation IDs
     /// whose tip commit is exactly that version — useful for rendering a branch
@@ -5039,16 +6447,14 @@ impl Workspace {
             return Ok(Vec::new());
         }
 
-        let mut history = self.scoped_history(&tips);
+        let mut project = FolderChanges::new(&self.repo, self.scope());
         let mut entries = Vec::new();
         for oid in walk {
             let commit = self.repo.find_commit(oid?)?;
-            if history.shows(&commit)? {
-                let parents = history.parents(&commit)?;
-                entries.push(history_entry_from_commit(
-                    &commit, &parents, &tips, head_oid,
-                )?);
-            }
+            let touches = project.touches(&commit)?;
+            entries.push(history_entry_from_commit(
+                &commit, touches, &tips, head_oid,
+            )?);
         }
         Ok(entries)
     }
@@ -5087,16 +6493,14 @@ impl Workspace {
             walk.push(tip)?;
         }
 
-        let mut history = self.scoped_history(&tips);
+        let mut project = FolderChanges::new(&self.repo, self.scope());
         let mut entries = Vec::new();
         for oid in walk {
             let commit = self.repo.find_commit(oid?)?;
-            if history.shows(&commit)? {
-                let parents = history.parents(&commit)?;
-                entries.push(history_entry_from_commit(
-                    &commit, &parents, &tips, head_oid,
-                )?);
-            }
+            let touches = project.touches(&commit)?;
+            entries.push(history_entry_from_commit(
+                &commit, touches, &tips, head_oid,
+            )?);
         }
         Ok(entries)
     }
@@ -5214,25 +6618,18 @@ impl Workspace {
         let walk_result = (|| -> Result<()> {
             let mut walk = self.repo.revwalk()?;
             walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
-            let mut history = ScopedHistory::new(
-                &self.repo,
-                self.scope(),
-                push_oids.iter().copied().chain(head_oid),
-            );
+            let mut project = FolderChanges::new(&self.repo, self.scope());
             for oid in push_oids {
                 walk.push(oid)?;
             }
             for oid in walk {
                 let oid = oid?;
                 let commit = self.repo.find_commit(oid)?;
-                if !history.shows(&commit)? {
-                    continue;
-                }
                 if total >= start && total < end {
-                    let parents = history.parents(&commit)?;
+                    let touches = project.touches(&commit)?;
                     nodes.push(workspace_graph_node_from_commit(
                         &commit,
-                        history_entry_from_commit(&commit, &parents, &tips, head_oid)?,
+                        history_entry_from_commit(&commit, touches, &tips, head_oid)?,
                         &local_reachable,
                         &remote_reachable,
                         &support_reachable,
@@ -5796,19 +7193,7 @@ impl Workspace {
             Err(error) if error.code() == git2::ErrorCode::NotFound => None,
             Err(error) => return Err(error.into()),
         };
-        // In a scoped workspace the merge base may be a hidden developer-only
-        // commit; report the nearest version the graph actually shows.
-        let common_ancestor = match merge_base {
-            Some(oid) => {
-                let mut tips = self.variation_tips_map()?;
-                tips.entry(left_oid).or_default();
-                tips.entry(right_oid).or_default();
-                self.scoped_history(&tips)
-                    .nearest_shown(oid)?
-                    .map(VersionId::from)
-            }
-            None => None,
-        };
+        let common_ancestor = merge_base.map(VersionId::from);
         Ok(WorkspaceGraphCommonAncestor {
             left_version: left.clone(),
             right_version: right.clone(),
@@ -5841,7 +7226,11 @@ impl Workspace {
             .filter(|graph_ref| graph_ref.target == node.id)
             .cloned()
             .collect::<Vec<_>>();
-        let changed_files = if let Some(parent) = node.parent_version_ids.first() {
+        // A commit that doesn't touch the project matches some parent's project
+        // tree, so it has no project changes even when it is a merge.
+        let changed_files = if !node.touches_folder {
+            Vec::new()
+        } else if let Some(parent) = node.parent_version_ids.first() {
             self.diff_versions(parent, version)?.files
         } else {
             Vec::new()
@@ -5918,12 +7307,10 @@ impl Workspace {
                     let head_version = Some(version_from_commit(&tip));
                     let mut walk = self.repo.revwalk()?;
                     walk.push(tip.id())?;
-                    let mut history = ScopedHistory::new(&self.repo, self.scope(), [tip.id()]);
                     let mut count = 0;
                     for oid in walk {
-                        if history.shows(&self.repo.find_commit(oid?)?)? {
-                            count += 1;
-                        }
+                        oid?;
+                        count += 1;
                     }
                     (head_version, count)
                 }
@@ -5964,6 +7351,7 @@ impl Workspace {
     /// ```
     pub fn preflight_apply_incoming(&self, remote: impl AsRef<str>) -> Result<ApplyIncomingReport> {
         self.ensure_no_pending_recovery()?;
+        self.ensure_on_branch()?;
         let sync_status = self.sync_status(remote)?;
         let dirty_files = self.changed_files_unchecked()?;
 
@@ -6035,6 +7423,7 @@ impl Workspace {
                 behind: 0,
                 state: SyncState::NoRemoteVersion,
                 incoming: Vec::new(),
+                base_renamed_from: self.base_renamed_from(remote, base),
             });
         };
         let (ahead, behind) = self.repo.graph_ahead_behind(local, remote_oid)?;
@@ -6051,6 +7440,7 @@ impl Workspace {
             behind,
             state,
             incoming: self.incoming_versions(local, remote_oid)?,
+            base_renamed_from: self.base_renamed_from(remote, base),
         })
     }
 
@@ -6063,6 +7453,7 @@ impl Workspace {
         sync_status: SyncStatus,
         source: Option<String>,
     ) -> Result<MergeIncomingReport> {
+        self.ensure_on_branch()?;
         let dirty_files = self.changed_files_unchecked()?;
         let mut file_hazards = Vec::new();
         let mut conflicts = Vec::new();
@@ -6071,14 +7462,17 @@ impl Workspace {
 
         if Self::mergeable_state(&sync_status.state, source.is_some()) {
             let merge_input = self.merge_input_for_status(&sync_status)?;
-            let plan = self.plan_clean_merge(
-                &merge_input.base_commit.tree()?,
-                &merge_input.local_commit.tree()?,
-                &merge_input.remote_commit.tree()?,
-            )?;
-            match self.merged_tree(&merge_input, &plan.files)? {
-                Ok(tree) => file_hazards = self.target_tree_hazards(&self.repo.find_tree(tree)?)?,
-                Err(paths) => developer_conflicts = paths,
+            let (trees, dropped) = self.merge_trees_for(&merge_input)?;
+            let plan = self.plan_clean_merge(&trees[0], &trees[1], &trees[2])?;
+            if !dropped.is_empty() {
+                developer_conflicts = dropped;
+            } else {
+                match self.merged_tree(&trees, &plan.files)? {
+                    Ok(tree) => {
+                        file_hazards = self.target_tree_hazards(&self.repo.find_tree(tree)?)?
+                    }
+                    Err(paths) => developer_conflicts = paths,
+                }
             }
             conflicts = plan.conflicts;
             if dirty_files.is_empty() && file_hazards.is_empty() && developer_conflicts.is_empty() {
@@ -6208,6 +7602,7 @@ impl Workspace {
     ) -> Result<MergeIncomingResult> {
         self.ensure_no_pending_recovery()?;
         let _lock = self.acquire_for_index(operation)?;
+        self.ensure_on_branch()?;
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
@@ -6264,11 +7659,11 @@ impl Workspace {
             });
         }
 
-        let plan = self.plan_clean_merge(
-            &merge_input.base_commit.tree()?,
-            &merge_input.local_commit.tree()?,
-            &merge_input.remote_commit.tree()?,
-        )?;
+        let (trees, dropped) = self.merge_trees_for(&merge_input)?;
+        if !dropped.is_empty() {
+            return Err(DraftlineError::MergeNeedsDeveloper(dropped));
+        }
+        let plan = self.plan_clean_merge(&trees[0], &trees[1], &trees[2])?;
         let files = match resolutions {
             Some(resolutions) => self.resolve_merge_plan(plan, resolutions)?,
             None if !plan.conflicts.is_empty() => {
@@ -6282,7 +7677,7 @@ impl Workspace {
             }
             None => plan.files,
         };
-        let tree = match self.merged_tree(&merge_input, &files)? {
+        let tree = match self.merged_tree(&trees, &files)? {
             Ok(tree) => self.repo.find_tree(tree)?,
             Err(paths) => return Err(DraftlineError::MergeNeedsDeveloper(paths)),
         };
@@ -6298,6 +7693,18 @@ impl Workspace {
         }
 
         self.write_incoming_merge_version(variation, &merge_input, label, &tree, files, profile)
+    }
+
+    fn ensure_head_unchanged(&self, variation: &str, oid: git2::Oid) -> Result<()> {
+        let now_variation = self.current_variation_unchecked()?;
+        let now_oid = self.repo.head()?.peel_to_commit()?.id();
+        if now_variation != variation || now_oid != oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{variation}@{oid}"),
+                actual: format!("{now_variation}@{now_oid}"),
+            });
+        }
+        Ok(())
     }
 
     /// Applies incoming changes from a remote using a fast-forward when possible.
@@ -6328,6 +7735,7 @@ impl Workspace {
     ) -> Result<ApplyIncomingResult> {
         self.ensure_no_pending_recovery()?;
         let _lock = self.acquire_for_index("apply_incoming")?;
+        self.ensure_on_branch()?;
 
         let dirty_files = self.changed_files_unchecked()?;
         if !dirty_files.is_empty() {
@@ -6340,9 +7748,15 @@ impl Workspace {
             ))));
         }
 
+        // Pin the branch and commit the guard approved: a developer may switch
+        // branches in the shared checkout while the fetch runs.
+        let variation = self.current_variation_unchecked()?;
+        let local_oid = self.repo.head()?.peel_to_commit()?.id();
         let remote_name = remote.as_ref().to_string();
         self.fetch_remote_unchecked(&remote_name, options)?;
         self.fetch_support_refs_with_options(&remote_name, options)?;
+        test_hooks::fire("after_apply_fetch", self.repo.path());
+        self.ensure_head_unchanged(&variation, local_oid)?;
         let status = self.sync_status(&remote_name)?;
 
         match status.state {
@@ -6356,7 +7770,6 @@ impl Workspace {
         }
 
         let applied_count = status.behind;
-        let variation = self.current_variation_unchecked()?;
         let remote_ref = format!("refs/remotes/{remote_name}/{variation}");
         let remote_oid = self.repo.refname_to_id(&remote_ref)?;
         let hazard_commit = self.repo.find_commit(remote_oid)?;
@@ -6384,12 +7797,15 @@ impl Workspace {
             completed: false,
         })?;
 
+        // Git has no lock against an external `git switch`; recheck right
+        // before touching files to keep that window as small as possible.
+        self.ensure_head_unchanged(&variation, local_oid)?;
         // Bring files up to the incoming tree like `git merge --ff-only`: local
         // edits are never overwritten. This runs before the ref moves so HEAD
         // is still the checkout baseline.
         self.checkout_or_keep_recovery(&checkout_commit.tree()?)?;
         self.repo
-            .reference(&branch_ref, target_oid, true, "apply_incoming")?;
+            .reference_matching(&branch_ref, target_oid, true, local_oid, "apply_incoming")?;
 
         self.repo.set_head(&branch_ref)?;
 
@@ -6424,8 +7840,8 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let from_commit = self.find_version_commit(from)?;
         let to_commit = self.find_version_commit(to)?;
-        let from_tree = from_commit.tree()?;
-        let to_tree = to_commit.tree()?;
+        let from_tree = self.relocated_tree(&from_commit)?;
+        let to_tree = self.relocated_tree(&to_commit)?;
 
         let mut opts = DiffOptions::new();
         limit_diff_to_scope(&mut opts, self.scope());
@@ -6464,7 +7880,7 @@ impl Workspace {
     pub fn diff_version_to_workspace(&self, version: &VersionId) -> Result<VersionDiff> {
         self.ensure_no_pending_recovery()?;
         let commit = self.find_version_commit(version)?;
-        let tree = commit.tree()?;
+        let tree = self.relocated_tree(&commit)?;
 
         let mut opts = DiffOptions::new();
         opts.include_untracked(true).recurse_untracked_dirs(true);
@@ -6570,6 +7986,7 @@ impl Workspace {
     ) -> Result<(String, VariationMetadata, Oid)> {
         match target {
             RestoreVersionTarget::Current => {
+                self.ensure_on_branch()?;
                 let parent_oid = self.repo.head()?.peel_to_commit()?.id();
                 let metadata = self.read_variation_metadata(current_variation)?;
                 Ok((current_variation.to_string(), metadata, parent_oid))
@@ -6577,6 +7994,8 @@ impl Workspace {
             RestoreVersionTarget::Existing { variation } => {
                 if variation.as_str() != current_variation {
                     self.ensure_variation_in_namespace(variation.as_str())?;
+                } else {
+                    self.ensure_on_branch()?;
                 }
                 let branch = self
                     .repo
@@ -7004,6 +8423,23 @@ impl Workspace {
         options: &mut RemoteOptions<'_>,
     ) -> Result<()> {
         let variation = self.current_variation_unchecked()?;
+        self.push_variation_with_lease(
+            remote_name,
+            &variation,
+            expected_old_oid,
+            expected_new_oid,
+            options,
+        )
+    }
+
+    fn push_variation_with_lease(
+        &self,
+        remote_name: &str,
+        variation: &str,
+        expected_old_oid: Option<String>,
+        expected_new_oid: String,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<()> {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
         let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
@@ -7285,7 +8721,7 @@ impl Workspace {
                 return options.map_git_result("fetch_remote", Err(error));
             }
         }
-        Ok(())
+        self.record_remote_head(&remote)
     }
 
     /// Returns collaboration status for the current variation.
@@ -7305,6 +8741,7 @@ impl Workspace {
                 behind: 0,
                 state: SyncState::NoRemoteVersion,
                 incoming: Vec::new(),
+                base_renamed_from: None,
             });
         };
 
@@ -7323,16 +8760,20 @@ impl Workspace {
             behind,
             state,
             incoming: self.incoming_versions(local, remote_oid)?,
+            base_renamed_from: None,
         })
     }
 
     /// Shares saved work the way the Copilot app does: push the current branch
     /// (never forced) and open a pull request, or reuse the one already open.
     ///
-    /// On the base branch, Send first moves the work onto a new branch named
-    /// from the variation namespace and title, then hands the local base back
-    /// to its upstream so it never diverges. Retrying after a failure is safe:
-    /// the push becomes a no-op and the open pull request is found.
+    /// On the base branch, or on a branch outside the variation namespace,
+    /// Send first moves the work onto a new branch named from the namespace
+    /// and title, so it only ever pushes branches it owns. The base itself is
+    /// never moved or rewound. Teammates' commits on the branch go along:
+    /// [`Self::preflight_send`] lists them so the host can say so. Retrying
+    /// after a failure is safe: the push becomes a no-op and the open pull
+    /// request is found.
     pub fn send(
         &self,
         remote: impl AsRef<str>,
@@ -7340,77 +8781,79 @@ impl Workspace {
         provider: &mut dyn PullRequestProvider,
         options: &mut RemoteOptions<'_>,
     ) -> Result<SendResult> {
+        // Held through the push; the pull request is the host's, outside it.
+        let lock = self.acquire_operation_lock("send")?;
         self.ensure_no_pending_recovery()?;
         let remote = remote.as_ref();
-        let explicit = match &request.base {
-            Some(base) => Some(validate_variation_name(base)?),
-            None => None,
-        };
-        let advertised = self.remote_advertised_branches(remote, options)?;
-        let base = match explicit {
-            Some(base) => base,
-            None => match self.default_branch_on(remote) {
-                Some(base) if advertised.contains(&base) => base,
-                inferred => self
-                    .default_branch_candidates()
-                    .into_iter()
-                    .find(|name| advertised.contains(name))
-                    .or(inferred)
-                    .ok_or(DraftlineError::SendBaseUnknown)?,
-            },
-        };
-        if !advertised.contains(&base) {
-            return Err(DraftlineError::SendBaseNotOnRemote(base));
+        let target = self.resolve_send_target(remote, request, options)?;
+        let SendTarget {
+            base,
+            advertised,
+            current,
+            ..
+        } = target;
+        // Every later step works on this exact commit, so a teammate's commit
+        // landing mid-send never goes out unapproved.
+        let scanned = self.repo.head().ok().and_then(|head| head.target());
+        let creates_variation = self.send_creates_variation(&current, &base);
+        // Unsaved edits would silently stay behind; the host saves first.
+        let report = preflight_report(
+            "send",
+            false,
+            self.changed_files_unchecked()?,
+            Vec::new(),
+            None,
+        );
+        if !report.can_proceed {
+            return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
-        let current = self.current_variation_unchecked()?;
-        if let Some(namespace) = &self.variation_namespace {
-            if current != base && !current.starts_with(namespace.as_str()) {
-                return Err(DraftlineError::SendOutsideNamespace(current));
+        let planned = if creates_variation {
+            self.new_send_branch_name(request, &advertised)?
+        } else {
+            current.clone()
+        };
+        if let Some(expected) = &request.expected {
+            let actual = SendToken {
+                remote: remote.to_string(),
+                base: base.clone(),
+                branch: current.clone(),
+                variation: planned.clone(),
+                head: scanned.map(|oid| oid.to_string()),
+            };
+            if *expected != actual {
+                return Err(DraftlineError::LocalStateChanged {
+                    expected: Self::send_token_label(expected),
+                    actual: Self::send_token_label(&actual),
+                });
             }
         }
-        self.fetch_remote_variation_ref(remote, &base, options)?;
+        let ensure_unmoved = || -> Result<git2::Oid> {
+            let actual = self.repo.head().ok().and_then(|head| head.target());
+            match (scanned, actual) {
+                (Some(expected), Some(actual)) if expected == actual => Ok(expected),
+                _ => Err(DraftlineError::LocalStateChanged {
+                    expected: scanned.map(|oid| oid.to_string()).unwrap_or_default(),
+                    actual: actual.map(|oid| oid.to_string()).unwrap_or_default(),
+                }),
+            }
+        };
 
         let mut created_variation = false;
-        let variation = if current == base {
-            let report = preflight_report(
-                "send",
-                false,
-                self.changed_files_unchecked()?,
-                Vec::new(),
-                None,
-            );
-            if !report.can_proceed {
-                return Err(DraftlineError::PreflightFailed(Box::new(report)));
+        let variation = if creates_variation {
+            let name = planned;
+            let labeled = !request.title.trim().is_empty();
+            if labeled {
+                self.write_variation_metadata(
+                    &name,
+                    &VariationMetadata::default().with_label(request.title.trim()),
+                )?;
             }
-            let taken = |name: &str| {
-                self.repo.find_branch(name, BranchType::Local).is_ok() || advertised.contains(name)
-            };
-            let name = match &request.branch {
-                Some(name) => validate_variation_name(name)?,
-                None => self.unused_send_branch_name(&request.title, taken)?,
-            };
-            if let Some(namespace) = &self.variation_namespace {
-                if !name.starts_with(namespace.as_str()) {
-                    return Err(DraftlineError::SendOutsideNamespace(name));
+            // Creating the branch and moving HEAD together means a crash
+            // can't strand a branch that the retry would then avoid.
+            if let Err(error) = self.branch_here_and_switch(&name, Some(ensure_unmoved()?)) {
+                if labeled {
+                    self.clear_unowned_variation_metadata(&name);
                 }
-            }
-            if taken(&name) {
-                return Err(DraftlineError::VariationAlreadyExists(name));
-            }
-            let head = self.repo.head()?.peel_to_commit()?;
-            let mut branch = self.repo.branch(&name, &head, false)?;
-            let switched = (|| -> Result<()> {
-                if !request.title.trim().is_empty() {
-                    self.write_variation_metadata(
-                        &name,
-                        &VariationMetadata::default().with_label(request.title.trim()),
-                    )?;
-                }
-                self.repo.set_head(&format!("refs/heads/{name}"))?;
-                Ok(())
-            })();
-            if let Err(error) = switched {
-                let _ = branch.delete();
                 return Err(error);
             }
             created_variation = true;
@@ -7418,7 +8861,6 @@ impl Workspace {
         } else {
             current
         };
-        self.hand_base_back_to_upstream(&base, remote)?;
 
         let base_ahead = match (
             advertised.contains(&variation),
@@ -7431,7 +8873,14 @@ impl Workspace {
             }
             _ => None,
         };
-        let published = self.publish_changes_with_options(remote, options)?;
+        let published = self.publish_changes_expecting(
+            remote,
+            options,
+            Some(SendGuard {
+                head: ensure_unmoved()?,
+                variation: &variation,
+            }),
+        )?;
         let published_versions = base_ahead.unwrap_or(published.published_versions);
         if self
             .repo
@@ -7442,6 +8891,7 @@ impl Workspace {
                 .find_branch(&variation, BranchType::Local)?
                 .set_upstream(Some(&format!("{remote}/{variation}")))?;
         }
+        drop(lock);
 
         let pull_request_request = PullRequestRequest {
             remote: remote.to_string(),
@@ -7467,6 +8917,318 @@ impl Workspace {
         })
     }
 
+    /// Checks what [`Self::send`] would do without pushing, creating a branch,
+    /// or moving the base. It refreshes the base's remote-tracking ref. Lists
+    /// teammates' commits that change files outside the project, which Send
+    /// carries too, so the host can tell the user before they confirm.
+    pub fn preflight_send(
+        &self,
+        remote: impl AsRef<str>,
+        request: &SendRequest,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<SendPreflight> {
+        self.ensure_no_pending_recovery()?;
+        let remote = remote.as_ref();
+        let SendTarget {
+            base,
+            advertised,
+            advertised_oids,
+            current,
+        } = self.resolve_send_target(remote, request, options)?;
+        let creates_variation = self.send_creates_variation(&current, &base);
+        let variation = if creates_variation {
+            self.new_send_branch_name(request, &advertised)?
+        } else {
+            current.clone()
+        };
+        let head = self.repo.head().ok().and_then(|head| head.target());
+        let developer_commits = self.developer_commits_to_send(remote, &base, head)?;
+        let has_unsaved_changes = !self.changed_files_unchecked()?.is_empty();
+        let outgoing_versions = match self
+            .repo
+            .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
+        {
+            Ok(base_oid) => match head {
+                Some(head) => self.repo.graph_ahead_behind(head, base_oid)?.0,
+                None => 0,
+            },
+            Err(_) => 0,
+        };
+        let (outgoing_files, outgoing_files_truncated) =
+            self.outgoing_files(head, &advertised_oids)?;
+        let can_proceed = !has_unsaved_changes;
+        let token = SendToken {
+            remote: remote.to_string(),
+            base: base.clone(),
+            branch: current,
+            variation: variation.clone(),
+            head: head.map(|oid| oid.to_string()),
+        };
+        Ok(SendPreflight {
+            remote: remote.to_string(),
+            base,
+            variation,
+            token,
+            creates_variation,
+            outgoing_versions,
+            has_unsaved_changes,
+            developer_commits,
+            outgoing_files,
+            outgoing_files_truncated,
+            can_proceed,
+        })
+    }
+
+    fn send_token_label(token: &SendToken) -> String {
+        format!(
+            "{}/{} from {} as {}@{}",
+            token.remote,
+            token.base,
+            token.branch,
+            token.variation,
+            token.head.as_deref().unwrap_or("none")
+        )
+    }
+
+    /// Resolves Send's base and refreshes the base's and current variation's
+    /// remote-tracking refs.
+    fn resolve_send_target(
+        &self,
+        remote: &str,
+        request: &SendRequest,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<SendTarget> {
+        let explicit = match &request.base {
+            Some(base) => Some(validate_variation_name(base)?),
+            None => None,
+        };
+        let advertised_heads = self.remote_advertised_heads(remote, options)?;
+        let advertised_oids = advertised_heads.values().copied().collect::<Vec<_>>();
+        let advertised = advertised_heads.into_keys().collect::<HashSet<_>>();
+        let base = match explicit {
+            Some(base) => base,
+            None => match self.default_branch_on(remote) {
+                Some(base) if advertised.contains(&base) => base,
+                inferred => self
+                    .default_branch_candidates()
+                    .into_iter()
+                    .find(|name| advertised.contains(name))
+                    .or(inferred)
+                    .ok_or(DraftlineError::SendBaseUnknown)?,
+            },
+        };
+        if !advertised.contains(&base) {
+            return Err(DraftlineError::SendBaseNotOnRemote(base));
+        }
+        let current = self.current_variation_unchecked()?;
+        self.fetch_remote_variation_ref(remote, &base, options)?;
+        if current != base && advertised.contains(&current) {
+            self.fetch_remote_variation_ref(remote, &current, options)?;
+        }
+        Ok(SendTarget {
+            base,
+            advertised,
+            advertised_oids,
+            current,
+        })
+    }
+
+    /// Send pushes only branches Draftline owns: from the base, or from a
+    /// developer's branch outside the namespace, it starts a new one.
+    fn send_creates_variation(&self, current: &str, base: &str) -> bool {
+        current == base
+            || self
+                .variation_namespace
+                .as_deref()
+                .is_some_and(|namespace| !current.starts_with(namespace))
+    }
+
+    /// The branch Send creates when run on the base or a developer's branch.
+    fn new_send_branch_name(
+        &self,
+        request: &SendRequest,
+        advertised: &HashSet<String>,
+    ) -> Result<String> {
+        let taken = |name: &str| {
+            self.repo.find_branch(name, BranchType::Local).is_ok() || advertised.contains(name)
+        };
+        let name = match &request.branch {
+            Some(name) => validate_variation_name(name)?,
+            None => self.unused_send_branch_name(&request.title, taken)?,
+        };
+        if let Some(namespace) = &self.variation_namespace {
+            if !name.starts_with(namespace.as_str()) {
+                return Err(DraftlineError::SendOutsideNamespace(name));
+            }
+        }
+        if taken(&name) {
+            return Err(DraftlineError::VariationAlreadyExists(name));
+        }
+        Ok(name)
+    }
+
+    /// Large files and Git LFS pointers in commits reachable from `head`
+    /// that the remote doesn't advertise: what a push would upload. Reports a
+    /// path once, at its newest outgoing version. `true` when it stopped at
+    /// 2000 commits or 100 files, so the list may be incomplete.
+    fn outgoing_files(
+        &self,
+        head: Option<git2::Oid>,
+        advertised: &[git2::Oid],
+    ) -> Result<(Vec<OutgoingFile>, bool)> {
+        const MAX_COMMITS: usize = 2000;
+        const MAX_FILES: usize = 100;
+        const MAX_POINTER: usize = 1024;
+        let Some(head) = head else {
+            return Ok((Vec::new(), false));
+        };
+        let threshold = self.content_policy.large_file_threshold_bytes();
+        let odb = self.repo.odb()?;
+        let mut walk = self.repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+        walk.push(head)?;
+        for oid in advertised {
+            if self.repo.find_commit(*oid).is_ok() {
+                walk.hide(*oid)?;
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let mut files = Vec::new();
+        for (scanned, oid) in walk.enumerate() {
+            if scanned == MAX_COMMITS {
+                return Ok((files, true));
+            }
+            let commit = self.repo.find_commit(oid?)?;
+            let parent = commit
+                .parents()
+                .next()
+                .map(|parent| parent.tree())
+                .transpose()?;
+            let diff = self
+                .repo
+                .diff_tree_to_tree(parent.as_ref(), Some(&commit.tree()?), None)?;
+            for delta in diff.deltas() {
+                let new = delta.new_file();
+                let (Some(path), true) = (new.path(), new.exists()) else {
+                    continue;
+                };
+                if new.mode() == git2::FileMode::Commit || seen.contains(path) {
+                    continue;
+                }
+                let (size, _) = odb.read_header(new.id())?;
+                let size = size as u64;
+                let kind = if size <= MAX_POINTER as u64
+                    && is_lfs_pointer(self.repo.find_blob(new.id())?.content())
+                {
+                    OutgoingFileKind::LfsPointer
+                } else if size >= threshold {
+                    OutgoingFileKind::Large
+                } else {
+                    continue;
+                };
+                seen.insert(path.to_path_buf());
+                files.push(OutgoingFile {
+                    path: path.to_path_buf(),
+                    commit: commit.id().to_string(),
+                    size,
+                    kind,
+                });
+                if files.len() == MAX_FILES {
+                    return Ok((files, true));
+                }
+            }
+        }
+        Ok((files, false))
+    }
+
+    /// Commits Send would push that change files outside the folder.
+    /// Outgoing means reachable from `head` but not from the remote base. Draftline saves only touch the
+    /// folder. A merge is listed only for outside paths that match none of its
+    /// parents (a hand-made resolution), so Draftline's merges of the base
+    /// pass. Anything listed is a developer's work. Standalone projects own
+    /// the whole repository.
+    fn developer_commits_to_send(
+        &self,
+        remote: &str,
+        base: &str,
+        head: Option<git2::Oid>,
+    ) -> Result<Vec<DeveloperCommit>> {
+        const MAX_PATHS: usize = 20;
+        let scope = self.scope();
+        if scope.as_os_str().is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(head) = head else {
+            return Ok(Vec::new());
+        };
+        let mut walk = self.repo.revwalk()?;
+        walk.push(head)?;
+        // Only the base proves a commit isn't new to the pull request; the
+        // variation's own remote branch may already hold published developer
+        // commits.
+        if let Ok(oid) = self
+            .repo
+            .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
+        {
+            walk.hide(oid)?;
+        }
+        // Inside means inside the folder where the commit or its parent kept
+        // it, so Draftline's own saves from before a move and the move itself
+        // aren't developer work.
+        let outside_changes = |from: Option<&git2::Tree<'_>>,
+                               to: &git2::Tree<'_>,
+                               folders: &[&Path]|
+         -> Result<BTreeSet<PathBuf>> {
+            if folders.iter().any(|folder| folder.as_os_str().is_empty()) {
+                return Ok(BTreeSet::new());
+            }
+            let diff = self.repo.diff_tree_to_tree(from, Some(to), None)?;
+            Ok(diff
+                .deltas()
+                .flat_map(|delta| [delta.old_file().path(), delta.new_file().path()])
+                .flatten()
+                .filter(|path| {
+                    *path != Path::new(FOLDER_MARKER)
+                        && !folders.iter().any(|folder| path.starts_with(folder))
+                })
+                .map(Path::to_path_buf)
+                .collect())
+        };
+        let mut folders = FolderChanges::new(&self.repo, scope);
+        let mut found = Vec::new();
+        for oid in walk {
+            let commit = self.repo.find_commit(oid?)?;
+            let tree = commit.tree()?;
+            let own = folders.folder_at(&commit)?;
+            let mut outside: Option<BTreeSet<PathBuf>> = None;
+            if commit.parent_count() == 0 {
+                outside = Some(outside_changes(None, &tree, &[&own])?);
+            }
+            for parent in commit.parents() {
+                let theirs = folders.folder_at(&parent)?;
+                let changed = outside_changes(Some(&parent.tree()?), &tree, &[&own, &theirs])?;
+                outside = Some(match outside {
+                    None => changed,
+                    Some(previous) => previous.intersection(&changed).cloned().collect(),
+                });
+            }
+            let outside = outside.unwrap_or_default();
+            if !outside.is_empty() {
+                found.push(DeveloperCommit {
+                    id: commit.id().to_string(),
+                    summary: commit
+                        .summary()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        .to_string(),
+                    outside_paths: outside.into_iter().take(MAX_PATHS).collect(),
+                });
+            }
+        }
+        Ok(found)
+    }
+
     /// Creates a separate checkout under `worktrees_dir` on a new branch named
     /// after `title` (inside the variation namespace), like the Copilot app's
     /// per-task worktrees. This checkout, its index, and its branch are left
@@ -7479,6 +9241,7 @@ impl Workspace {
         remote: impl AsRef<str>,
         start: WorktreeStart,
     ) -> Result<OwnedWorktree> {
+        let _lock = self.acquire_operation_lock("create_owned_worktree")?;
         self.ensure_no_pending_recovery()?;
         let remote = remote.as_ref();
         let start_commit = match start {
@@ -7508,6 +9271,9 @@ impl Workspace {
         })?;
         let name = worktree_name(&variation);
         let path = worktrees_dir.join(&name);
+        // The folder lives where the starting commit's marker says.
+        let folder = tree_marker_folder(&self.repo, &start_commit.tree()?)
+            .unwrap_or_else(|| self.scope().to_path_buf());
         fs::create_dir_all(worktrees_dir)?;
 
         let reference = self
@@ -7516,13 +9282,12 @@ impl Workspace {
             .into_reference();
         let mut options = git2::WorktreeAddOptions::new();
         options.reference(Some(&reference));
-        // The project may not exist yet where the branch starts.
-        let project_path = path.join(self.scope());
+        // The folder may not exist yet where the branch starts.
         let added = self
             .repo
             .worktree(&name, &path, Some(&options))
             .map_err(DraftlineError::from)
-            .and_then(|_| fs::create_dir_all(&project_path).map_err(DraftlineError::from));
+            .and_then(|_| create_folder_within(&path, &folder));
         if let Err(error) = added {
             drop(reference);
             self.roll_back_owned_worktree(&name, &path, &variation)?;
@@ -7537,7 +9302,7 @@ impl Workspace {
             .unwrap_or(path);
         Ok(OwnedWorktree {
             name,
-            project_path: path.join(self.scope()),
+            project_path: path.join(folder),
             path,
             variation: Some(variation),
         })
@@ -7558,16 +9323,19 @@ impl Workspace {
             }
             let worktree = self.repo.find_worktree(name)?;
             let path = worktree.path().components().collect::<PathBuf>();
-            let variation = Repository::open_from_worktree(&worktree)
-                .ok()
-                .and_then(|repo| {
-                    repo.head()
-                        .ok()
-                        .and_then(|head| head.shorthand().ok().map(str::to_string))
-                });
+            let checkout = Repository::open_from_worktree(&worktree).ok();
+            let variation = checkout.as_ref().and_then(|repo| {
+                repo.head()
+                    .ok()
+                    .and_then(|head| head.shorthand().ok().map(str::to_string))
+            });
+            let folder = checkout
+                .as_ref()
+                .and_then(head_marker_folder)
+                .unwrap_or_else(|| self.scope().to_path_buf());
             owned.push(OwnedWorktree {
                 name: name.to_string(),
-                project_path: path.join(self.scope()),
+                project_path: path.join(folder),
                 path,
                 variation,
             });
@@ -7587,6 +9355,8 @@ impl Workspace {
         if !name.starts_with(OWNED_WORKTREE_PREFIX) {
             return Err(DraftlineError::NotOwnedWorktree(name.to_string()));
         }
+        let _lock = self.acquire_operation_lock("remove_owned_worktree")?;
+        self.ensure_no_pending_recovery()?;
         let worktree = self.repo.find_worktree(name)?;
         let path = worktree.path().to_path_buf();
         let in_use = match (fs::canonicalize(&path), fs::canonicalize(&self.root)) {
@@ -7595,6 +9365,28 @@ impl Workspace {
         };
         if in_use {
             return Err(DraftlineError::OwnedWorktreeInUse(name.to_string()));
+        }
+        // Draftline running there, or an operation it must still finish,
+        // keeps the checkout unless the caller discards it. Its lock is held
+        // through the prune so nothing starts there meanwhile.
+        let mut _target_lock = None;
+        if let Ok(checkout) = Repository::open_from_worktree(&worktree) {
+            let draftline = checkout.path().join("draftline");
+            _target_lock = Some(OperationLock::acquire(
+                &draftline.join("operation.lock"),
+                "remove_owned_worktree",
+            )?);
+            let ledger = draftline.join("recovery.json");
+            // A finished operation leaves its record behind marked completed;
+            // only an unfinished (or unreadable) one keeps the checkout.
+            let pending = ledger.exists()
+                && fs::read(&ledger)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<RecoveryLedger>(&bytes).ok())
+                    .is_none_or(|ledger| !ledger.state.completed);
+            if !discard_changes && pending {
+                return Err(DraftlineError::OwnedWorktreeHasChanges(vec![ledger]));
+            }
         }
         if !discard_changes && path.exists() {
             // Damaged metadata means its changes can't be checked; keep it.
@@ -7673,56 +9465,36 @@ impl Workspace {
         validate_variation_name(&name)
     }
 
-    /// Moves the local base to its freshly fetched remote-tracking ref when the
-    /// current branch carries every local base commit, so nothing is lost and
-    /// the base never diverges from upstream. The worktree is untouched. Runs on every send, which also repairs a send
-    /// that failed after switching branches.
-    fn hand_base_back_to_upstream(&self, base: &str, remote: &str) -> Result<()> {
-        let Ok(upstream) = self
-            .repo
-            .refname_to_id(&format!("refs/remotes/{remote}/{base}"))
-        else {
-            return Ok(());
-        };
-        let Ok(mut local) = self.repo.find_branch(base, BranchType::Local) else {
-            return Ok(());
-        };
-        let Some(local_oid) = local.get().target() else {
-            return Ok(());
-        };
-        let head = self.repo.head()?.peel_to_commit()?.id();
-        let carried = head == local_oid || self.repo.graph_descendant_of(head, local_oid)?;
-        if local_oid != upstream && carried {
-            local.get_mut().set_target(
-                upstream,
-                &format!("draftline: send moved local work off {base}"),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn remote_advertised_branches(
+    /// Branches the remote advertises right now, with their commits.
+    fn remote_advertised_heads(
         &self,
         remote_name: &str,
         options: &mut RemoteOptions<'_>,
-    ) -> Result<HashSet<String>> {
+    ) -> Result<HashMap<String, git2::Oid>> {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
         let _timeout_guard = options.server_timeout_guard()?;
         let branches = |heads: &[git2::RemoteHead<'_>]| {
             heads
                 .iter()
-                .filter_map(|head| head.name().strip_prefix("refs/heads/"))
-                .map(str::to_string)
-                .collect::<HashSet<_>>()
+                .filter_map(|head| {
+                    head.name()
+                        .strip_prefix("refs/heads/")
+                        .map(|name| (name.to_string(), head.oid()))
+                })
+                .collect::<HashMap<_, _>>()
         };
         if options.has_network_callbacks() {
-            let callbacks = options.remote_callbacks("remote_advertised_branches");
-            let connection = remote.connect_auth(Direction::Fetch, Some(callbacks), None)?;
-            Ok(branches(connection.list()?))
+            let callbacks = options.remote_callbacks("remote_advertised_heads");
+            let mut connection = remote.connect_auth(Direction::Fetch, Some(callbacks), None)?;
+            let advertised = branches(connection.list()?);
+            self.record_remote_head(connection.remote())?;
+            Ok(advertised)
         } else {
             remote.connect(Direction::Fetch)?;
-            Ok(branches(remote.list()?))
+            let advertised = branches(remote.list()?);
+            self.record_remote_head(&remote)?;
+            Ok(advertised)
         }
     }
 
@@ -7770,6 +9542,12 @@ impl Workspace {
         let variation = self.current_variation_unchecked()?;
         let local_oid = self.repo.head()?.peel_to_commit()?.id().to_string();
         let expected_remote_oid = remote_tracking_oid(&self.repo, &remote, &variation);
+        let advertised_oids = self
+            .remote_advertised_heads(&remote, options)?
+            .into_values()
+            .collect::<Vec<_>>();
+        let (outgoing_files, outgoing_files_truncated) =
+            self.outgoing_files(self.repo.head()?.target(), &advertised_oids)?;
         let token = PublishToken {
             remote: remote.clone(),
             variation: variation.clone(),
@@ -7784,6 +9562,8 @@ impl Workspace {
             local_oid,
             sync_status,
             token,
+            outgoing_files,
+            outgoing_files_truncated,
             can_publish: true,
         })
     }
@@ -7863,6 +9643,19 @@ impl Workspace {
         remote: impl AsRef<str>,
         options: &mut RemoteOptions<'_>,
     ) -> Result<PublishResult> {
+        let _lock = self.acquire_operation_lock("publish_changes")?;
+        self.publish_changes_expecting(remote.as_ref(), options, None)
+    }
+
+    /// Publishes. Send passes a [`SendGuard`]: the branch and commit it checked
+    /// must still be checked out after this fetch, and exactly that commit is
+    /// pushed to that branch.
+    fn publish_changes_expecting(
+        &self,
+        remote: &str,
+        options: &mut RemoteOptions<'_>,
+        send_guard: Option<SendGuard<'_>>,
+    ) -> Result<PublishResult> {
         self.ensure_no_pending_recovery()?;
         let report = preflight_report(
             "publish_changes",
@@ -7876,8 +9669,24 @@ impl Workspace {
             return Err(DraftlineError::PreflightFailed(Box::new(report)));
         }
 
-        let remote_name = remote.as_ref().to_string();
+        let remote_name = remote.to_string();
         self.fetch_remote_unchecked(&remote_name, options)?;
+        if let Some(guard) = &send_guard {
+            let current = self.current_variation_unchecked()?;
+            let actual = self
+                .repo
+                .refname_to_id(&format!("refs/heads/{current}"))
+                .ok();
+            if current != guard.variation || actual != Some(guard.head) {
+                return Err(DraftlineError::LocalStateChanged {
+                    expected: format!("{}@{}", guard.variation, guard.head),
+                    actual: format!(
+                        "{current}@{}",
+                        actual.map(|oid| oid.to_string()).unwrap_or_default()
+                    ),
+                });
+            }
+        }
         let status = self.sync_status(&remote_name)?;
         if matches!(
             status.state,
@@ -7886,9 +9695,21 @@ impl Workspace {
             return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
         }
 
-        let variation = self.current_variation_unchecked()?;
+        let variation = match &send_guard {
+            Some(guard) => guard.variation.to_string(),
+            None => self.current_variation_unchecked()?,
+        };
         if status.ahead > 0 {
-            let push_result = self.push_current_variation_with_options(&remote_name, options);
+            let push_result = match &send_guard {
+                None => self.push_current_variation_with_options(&remote_name, options),
+                Some(guard) => self.push_variation_with_lease(
+                    &remote_name,
+                    guard.variation,
+                    remote_tracking_oid(&self.repo, &remote_name, guard.variation),
+                    guard.head.to_string(),
+                    options,
+                ),
+            };
             if let Err(error) = push_result {
                 self.fetch_remote_unchecked(&remote_name, options)?;
                 let refreshed = self.sync_status(&remote_name)?;
@@ -8059,11 +9880,11 @@ impl Workspace {
         Ok(())
     }
 
-    /// Takes the Draftline lock, then confirms this workspace still holds the
-    /// checkout, so a handle opened before a relocate can't keep writing.
+    /// Takes the Draftline lock, then confirms Draftline still manages this
+    /// folder, so a handle on a folder that was moved can't keep writing.
     fn acquire_operation_lock(&self, operation: &str) -> Result<OperationLock> {
         let lock = OperationLock::acquire(&self.lock_path(), operation)?;
-        self.claim_checkout()?;
+        self.claim_checkout(false)?;
         Ok(lock)
     }
 
@@ -8161,27 +9982,193 @@ impl Workspace {
         self.draftline_dir().join("workspace.json")
     }
 
-    /// A checkout has one current branch, and variations, sends, merges, the
-    /// operation lock and recovery all act on it, so it holds one Draftline
-    /// workspace. The first workspace opened in a checkout claims it; any other
-    /// folder is refused until [`Workspace::relocate`] moves the claim.
-    fn claim_checkout(&self) -> Result<()> {
-        let path = self.claim_path();
-        if !path.exists() {
-            match self.publish_new_claim(&path) {
-                Ok(()) => return Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+    /// Draftline manages one folder per repository: the one [`FOLDER_MARKER`]
+    /// names. A branch without the file falls back to the checkout's local
+    /// record, and the first folder opened claims a repository with neither.
+    /// Opening writes the marker when the working tree lacks it, and the next
+    /// save commits it. Any other folder is refused.
+    fn claim_checkout(&self, opening: bool) -> Result<()> {
+        let mine = self.project_key();
+        // Either end of an interrupted move may open, so recovery can finish it.
+        if self.unfinished_operation_touches(&mine) {
+            return Ok(());
+        }
+        let owner = match self.read_marker()? {
+            Some(folder) => {
+                if opening && folder == mine {
+                    self.record_local_claim()?;
+                }
+                folder
+            }
+            None => {
+                let path = self.claim_path();
+                let mut published = false;
+                if !path.exists() {
+                    match self.publish_new_claim(&path) {
+                        Ok(()) => published = true,
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                let folder = if published {
+                    mine.clone()
+                } else {
+                    folder_key(&claimed_project(&self.read_claim(&path)?, &path)?)
+                };
+                if opening && folder == mine {
+                    self.write_marker()?;
+                }
+                folder
+            }
+        };
+
+        let folder = PathBuf::from(&owner);
+        let missing = self.claimed_folder_missing(&folder)?;
+        if owner == mine {
+            // Our own folder vanished while HEAD still tracks it (renamed or
+            // deleted outside Draftline): refuse, or a save would record
+            // every file as deleted. A branch that lacks the folder is fine,
+            // so the host can still switch back.
+            if missing && self.head_tree_or_empty()?.get_path(&folder).is_ok() {
+                return Err(DraftlineError::FolderMissing(folder));
+            }
+            Ok(())
+        } else if missing {
+            Err(DraftlineError::FolderMissing(folder))
+        } else {
+            Err(DraftlineError::FolderIsElsewhere(folder))
+        }
+    }
+
+    fn marker_path(&self) -> PathBuf {
+        self.root.join(FOLDER_MARKER)
+    }
+
+    /// The folder the working tree's [`FOLDER_MARKER`] names, if it has one.
+    fn read_marker(&self) -> Result<Option<String>> {
+        match self.marker_owner()? {
+            FolderOwner::Nobody => Ok(None),
+            FolderOwner::Folder(folder) => Ok(Some(folder)),
+            FolderOwner::Invalid(reason) | FolderOwner::Newer(reason) => {
+                Err(DraftlineError::InvalidFolderMarker(reason))
             }
         }
+    }
 
-        let claimed = self.read_claim(&path)?;
-        if claimed.project == self.project_key() {
-            Ok(())
-        } else {
-            Err(DraftlineError::WorkspaceAlreadyInCheckout(PathBuf::from(
-                claimed.project,
-            )))
+    fn marker_owner(&self) -> Result<FolderOwner> {
+        let path = self.marker_path();
+        let invalid =
+            |reason: String| FolderOwner::Invalid(format!("{}: {reason}", path.display()));
+        if path.is_dir() {
+            return Ok(invalid("is a folder, not a file".to_string()));
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FolderOwner::Nobody)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // Read the format alone first: a newer one may change everything else.
+        let format = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value.get("format").and_then(serde_json::Value::as_u64));
+        if let Some(format) = format.filter(|format| *format > 1) {
+            return Ok(FolderOwner::Newer(format!(
+                "{}: format {format} needs a newer Draftline",
+                path.display()
+            )));
+        }
+        let marker: FolderMarker = match serde_json::from_slice(&bytes) {
+            Ok(marker) => marker,
+            Err(error) => return Ok(invalid(error.to_string())),
+        };
+        if marker.format != 1 {
+            return Ok(invalid(format!("format {} is not valid", marker.format)));
+        }
+        if marker.folder == "." {
+            return Ok(FolderOwner::Folder(String::new()));
+        }
+        Ok(canonical_folder(&marker.folder)
+            .filter(|folder| !folder.as_os_str().is_empty())
+            .map(|folder| FolderOwner::Folder(folder_key(&folder)))
+            .unwrap_or_else(|| {
+                invalid(format!(
+                    "folder {:?} is not a folder inside this repository",
+                    marker.folder
+                ))
+            }))
+    }
+
+    /// The checkout's local record, read without claiming anything.
+    fn claim_owner(&self) -> Result<FolderOwner> {
+        let path = self.claim_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FolderOwner::Nobody)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let claim = match serde_json::from_slice::<WorkspaceClaim>(&bytes) {
+            Ok(claim) => claim,
+            Err(error) => return Ok(FolderOwner::Invalid(format!("{}: {error}", path.display()))),
+        };
+        Ok(match claimed_project(&claim, &path) {
+            Ok(folder) => FolderOwner::Folder(folder_key(&folder)),
+            Err(error) => FolderOwner::Invalid(error.to_string()),
+        })
+    }
+
+    /// Writes [`FOLDER_MARKER`] for this folder; a rename keeps readers from
+    /// ever seeing a partial file.
+    fn write_marker(&self) -> Result<()> {
+        let bytes = marker_bytes(&self.project_key())?;
+        let path = self.marker_path();
+        let temp = unique_claim_temp(&path);
+        fs::write(&temp, bytes)?;
+        replace_file(&temp, &path)?;
+        Ok(())
+    }
+
+    /// Points the local record at this folder once the marker agrees, so
+    /// branches without the marker keep the same owner.
+    fn record_local_claim(&self) -> Result<()> {
+        let path = self.claim_path();
+        let current = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<WorkspaceClaim>(&bytes).ok());
+        if current.is_some_and(|claim| claim.project == self.project_key()) {
+            return Ok(());
+        }
+        self.write_claim()
+    }
+
+    /// A marker no commit has yet would block checking out a branch that has
+    /// one, as any untracked file would; the branch's own marker wins.
+    fn drop_unsaved_marker_for(&self, target: &Tree<'_>) -> Result<()> {
+        if target.get_name(FOLDER_MARKER).is_none() || !self.marker_path().is_file() {
+            return Ok(());
+        }
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        if index.get_path(Path::new(FOLDER_MARKER), 0).is_some() {
+            return Ok(());
+        }
+        match fs::remove_file(self.marker_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Whether the claimed folder is absent; other filesystem errors surface
+    /// rather than inviting a relocate.
+    fn claimed_folder_missing(&self, project: &Path) -> Result<bool> {
+        match fs::metadata(self.root.join(project)) {
+            Ok(metadata) => Ok(!metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -8221,8 +10208,8 @@ impl Workspace {
             let bytes = fs::read(path)?;
             if !bytes.is_empty() || std::time::Instant::now() >= deadline {
                 return serde_json::from_slice(&bytes).map_err(|error| {
-                    DraftlineError::InvalidWorkspaceClaim(format!(
-                        "{}: {error}; use Workspace::relocate to reset it",
+                    DraftlineError::InvalidFolderMarker(format!(
+                        "{}: {error}; delete it to reset it",
                         path.display()
                     ))
                 });
@@ -8232,14 +10219,20 @@ impl Workspace {
     }
 
     fn write_claim(&self) -> Result<()> {
+        self.write_claim_for(&self.project_key())
+    }
+
+    fn write_claim_for(&self, folder: &str) -> Result<()> {
         fs::create_dir_all(self.draftline_dir())?;
         let path = self.claim_path();
         let temp = unique_claim_temp(&path);
-        fs::write(&temp, self.claim_bytes()?)?;
-        if let Err(error) = fs::rename(&temp, &path) {
-            let _ = fs::remove_file(&temp);
-            return Err(error.into());
-        }
+        fs::write(
+            &temp,
+            serde_json::to_vec_pretty(&WorkspaceClaim {
+                project: folder.to_string(),
+            })?,
+        )?;
+        replace_file(&temp, &path)?;
         Ok(())
     }
 
@@ -8252,7 +10245,7 @@ impl Workspace {
     /// Every operation that reads or writes the checkout passes here, so a
     /// handle whose folder no longer holds the checkout's claim is refused.
     fn ensure_no_pending_recovery(&self) -> Result<()> {
-        self.claim_checkout()?;
+        self.claim_checkout(false)?;
         self.ensure_no_pending_recovery_in_checkout()
     }
 
@@ -8265,30 +10258,123 @@ impl Workspace {
         Ok(())
     }
 
-    /// Projects in one checkout share its branch, so one project's unfinished
-    /// operation blocks the others, but only that project may finish it.
+    /// Folders in one checkout share its branch, so one folder's unfinished
+    /// operation blocks the others, but only that folder may finish it.
     fn ensure_recovery_is_ours(&self) -> Result<()> {
         match self.recovery_owner_elsewhere() {
-            Some(project) => Err(DraftlineError::RecoveryInOtherProject(project)),
+            Some(project) => Err(DraftlineError::RecoveryInOtherFolder(project)),
             None => Ok(()),
         }
     }
 
-    /// The other project that owns the incomplete recovery record, if any. An
+    /// The other folder that owns the incomplete recovery record, if any. An
     /// unreadable record is reported by `recovery_state` and stays clearable.
     fn recovery_owner_elsewhere(&self) -> Option<PathBuf> {
         let bytes = fs::read(self.ledger_path()).ok()?;
         let ledger = serde_json::from_slice::<RecoveryLedger>(&bytes).ok()?;
         let project = ledger.project?;
-        (!ledger.state.completed && project != self.project_key()).then(|| PathBuf::from(project))
+        (!ledger.state.completed
+            && project != self.project_key()
+            && !self.unfinished_operation_touches(&self.project_key())
+            && !self.marked_by_recovery())
+        .then(|| PathBuf::from(project))
     }
 
+    /// Whether the checkout's marker names this folder because the interrupted
+    /// operation checked out one of its recorded commits, so this folder (the
+    /// one now on disk) may finish it.
+    fn marked_by_recovery(&self) -> bool {
+        let mine = self.project_key();
+        self.read_marker().ok().flatten().as_deref() == Some(mine.as_str())
+            && self.recorded_markers().contains(&mine)
+    }
+
+    /// Whether `folder` recorded an unfinished operation, or is either end of
+    /// an unfinished move. That folder may always open to finish it, even when
+    /// the interrupted checkout left a marker naming another folder.
+    fn unfinished_operation_touches(&self, folder: &str) -> bool {
+        let Ok(bytes) = fs::read(self.ledger_path()) else {
+            return false;
+        };
+        let Ok(ledger) = serde_json::from_slice::<RecoveryLedger>(&bytes) else {
+            return false;
+        };
+        let state = ledger.state;
+        if state.completed {
+            return false;
+        }
+        ledger.project.as_deref() == Some(folder) || self.pending_move_touches(folder)
+    }
+
+    /// Whether an unfinished folder move has `folder` at either end.
+    fn pending_move_touches(&self, folder: &str) -> bool {
+        let Ok(bytes) = fs::read(self.ledger_path()) else {
+            return false;
+        };
+        let Ok(ledger) = serde_json::from_slice::<RecoveryLedger>(&bytes) else {
+            return false;
+        };
+        let state = ledger.state;
+        if state.completed || state.operation != RecoveryOperation::MoveFolder {
+            return false;
+        }
+        let folder = marker_folder(folder);
+        state.target.as_deref().is_some_and(|target| {
+            target
+                .split_once(" -> ")
+                .is_some_and(|(from, to)| from == folder || to == folder)
+        })
+    }
+
+    /// Repair and rollback write files, the index, HEAD or refs, so outside an
+    /// interrupted move they run only while this is still the managed folder.
+    /// The operation itself may have checked out a tree whose marker names
+    /// another folder (for example a switch interrupted before HEAD moved), so
+    /// a marker from one of its recorded checkout trees still allows it. After a
+    /// developer checks out some other branch naming another folder, the
+    /// recording folder can only acknowledge (drop) the record.
+    fn ensure_recovery_may_write(&self) -> Result<()> {
+        let mine = self.project_key();
+        if self.pending_move_touches(&mine) {
+            return Ok(());
+        }
+        let owner = match self.read_marker()? {
+            Some(folder) => folder,
+            None => {
+                // With neither, this folder claims the checkout as the first
+                // one opened would; a folder that claimed it first wins.
+                let path = self.claim_path();
+                match self.publish_new_claim(&path) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                folder_key(&claimed_project(&self.read_claim(&path)?, &path)?)
+            }
+        };
+        if owner == mine || self.recorded_markers().contains(&owner) {
+            Ok(())
+        } else {
+            Err(DraftlineError::FolderIsElsewhere(PathBuf::from(owner)))
+        }
+    }
+
+    /// The folders named by the markers of the trees the pending checkout was
+    /// moving between. Only these immutable recorded trees count, never
+    /// branch tips that may have moved since.
+    fn recorded_markers(&self) -> Vec<String> {
+        self.recorded_checkout()
+            .map(|(from, to)| {
+                [from, to]
+                    .iter()
+                    .filter_map(|tree| tree_marker_folder(&self.repo, tree))
+                    .map(|folder| folder_key(&folder))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     fn project_key(&self) -> String {
-        self.scope()
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/")
+        folder_key(self.scope())
     }
 
     fn normalize_tracked_content_path(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -8350,6 +10436,11 @@ impl Workspace {
                 _ => additions.push(changed.path.clone()),
             }
         }
+        // The marker is committed with every save, so clones and other
+        // branches learn which folder Draftline manages.
+        if self.marker_path().is_file() {
+            additions.push(PathBuf::from(FOLDER_MARKER));
+        }
         self.ensure_no_filtered_content(&additions, operation)?;
 
         // A second handle owns its own index object; it is never written to disk.
@@ -8374,13 +10465,23 @@ impl Workspace {
 
     /// Commits `changed_files` on top of HEAD, then syncs only the saved paths
     /// in the real index so `git status` stays clean for them.
+    /// Commits onto `branch`, the branch the save started on; a switch to
+    /// another branch at any point refuses with `LocalStateChanged`.
     fn commit_content_changes(
         &self,
+        branch: &str,
         changed_files: &[ChangedFile],
         operation: &str,
         label: &str,
         profile: Option<&ContributorProfile>,
     ) -> Result<Version> {
+        let now = self.ensure_on_branch()?;
+        if now != branch {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: branch.to_string(),
+                actual: now,
+            });
+        }
         let parent = self
             .repo
             .head()
@@ -8402,7 +10503,7 @@ impl Workspace {
         let commit = self.repo.find_commit(oid)?;
         let previous = self.while_git_busy(|| self.stage_from(&commit, &affected_paths))?;
         if let Err(error) =
-            self.while_git_busy(|| self.advance_head(&commit, parent.as_ref(), &committer))
+            self.while_git_busy(|| self.advance_head(branch, &commit, parent.as_ref(), &committer))
         {
             self.restore_index_entries(&affected_paths, previous)?;
             return Err(error);
@@ -8460,23 +10561,30 @@ impl Workspace {
         write_index_or_reload(&mut index)
     }
 
-    /// Moves HEAD's branch (or a detached HEAD) to `commit` only if it still
-    /// points at `parent`, holding the ref's lock as `git commit` does.
+    /// Moves `branch`, the one checked out when the save began, to `commit`
+    /// only if `HEAD` is still on it and it still points at `parent`, holding
+    /// the refs' locks as `git commit` does.
     fn advance_head(
         &self,
+        branch: &str,
         commit: &Commit<'_>,
         parent: Option<&Commit<'_>>,
         committer: &Signature<'_>,
     ) -> Result<()> {
-        let head = self.repo.find_reference("HEAD")?;
-        let name = head
-            .symbolic_target()
-            .ok()
-            .flatten()
-            .unwrap_or("HEAD")
-            .to_string();
+        let name = branch.to_string();
         let mut transaction = self.repo.transaction()?;
+        transaction.lock_ref("HEAD")?;
         transaction.lock_ref(&name)?;
+        // A switch to another branch at the same commit after the save began
+        // must not land the save there.
+        let now = self.repo.find_reference("HEAD")?;
+        let now = now.symbolic_target().ok().flatten().unwrap_or("HEAD");
+        if now != name {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: name,
+                actual: now.to_string(),
+            });
+        }
         let current = self.repo.refname_to_id(&name).ok();
         let expected = parent.map(Commit::id);
         if current != expected {
@@ -8556,13 +10664,21 @@ impl Workspace {
         let mut hazards = Vec::new();
         for path in paths {
             if self.needs_filter(attributes.as_ref(), path)? {
-                hazards.push(FileHazard {
-                    path: path.clone(),
-                    kind: FileHazardKind::GitFilter,
-                });
+                hazards.push(self.filter_hazard(path.clone()));
             }
         }
         Ok(hazards)
+    }
+
+    /// A filter refusal, naming whether the file is the project's or a
+    /// developer's outside the folder.
+    fn filter_hazard(&self, path: PathBuf) -> FileHazard {
+        let kind = if path.starts_with(self.scope()) {
+            FileHazardKind::GitFilter
+        } else {
+            FileHazardKind::GitFilterOutsideProject
+        };
+        FileHazard { path, kind }
     }
 
     /// A second handle whose index is `tree`, so attribute lookups see the
@@ -8620,19 +10736,100 @@ impl Workspace {
             Vec::new(),
             refused
                 .into_iter()
-                .map(|path| FileHazard {
-                    path,
-                    kind: FileHazardKind::GitFilter,
-                })
+                .map(|path| self.filter_hazard(path))
                 .collect(),
             None,
         ))))
+    }
+
+    /// Tracked files in the folder that Git stores through a filter driver, such as
+    /// Git LFS, with whether their content is missing from disk.
+    pub fn filtered_files(&self) -> Result<Vec<FilteredFile>> {
+        let paths = self.tracked_project_paths()?;
+        self.filtered_among(paths)
+    }
+
+    /// Tracked files in the folder under a filter whose disk content is a Git LFS
+    /// pointer. Cheap enough for `inspect`: only files of at most 1 KiB are read.
+    fn missing_lfs_content(&self) -> Result<Vec<PathBuf>> {
+        let mut missing = Vec::new();
+        for path in self.tracked_project_paths()? {
+            if is_lfs_pointer_file(&self.root.join(&path))
+                && needs_git_filter(&self.repo, &path, git2::AttrCheckFlags::FILE_THEN_INDEX)?
+            {
+                missing.push(path);
+            }
+        }
+        Ok(missing)
+    }
+
+    /// Stage-0 regular-file index paths in the project that the content
+    /// policy tracks.
+    fn tracked_project_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut index = self.repo.index()?;
+        index.read(false)?;
+        let scope = self.scope().to_path_buf();
+        let mut paths = Vec::new();
+        for entry in index.iter() {
+            if (entry.flags >> 12) & 0x3 != 0 || entry.mode & 0o170000 != 0o100000 {
+                continue;
+            }
+            let path = PathBuf::from(String::from_utf8_lossy(&entry.path).into_owned());
+            if path.starts_with(&scope) && self.content_policy.tracks(&path)? {
+                paths.push(path);
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Which of `paths` Git would store through a filter driver. Paths need
+    /// not exist, so a host can check where it is about to write.
+    pub fn filtered_files_among<I, P>(&self, paths: I) -> Result<Vec<FilteredFile>>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let paths = paths
+            .into_iter()
+            .map(|path| self.normalize_tracked_content_path(path))
+            .collect::<Result<BTreeSet<_>>>()?;
+        self.filtered_among(paths)
+    }
+
+    fn filtered_among(
+        &self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Vec<FilteredFile>> {
+        let config = self.repo.config()?;
+        let mut files = Vec::new();
+        for path in paths {
+            let Some(driver) =
+                git_filter_driver(&self.repo, &path, git2::AttrCheckFlags::FILE_THEN_INDEX)?
+            else {
+                continue;
+            };
+            let command = |key: &str| {
+                config
+                    .get_string(&format!("filter.{driver}.{key}"))
+                    .is_ok_and(|value| !value.trim().is_empty())
+            };
+            let driver_configured = command("process") || (command("clean") && command("smudge"));
+            let content_missing = is_lfs_pointer_file(&self.root.join(&path));
+            files.push(FilteredFile {
+                path,
+                driver,
+                driver_configured,
+                content_missing,
+            });
+        }
+        Ok(files)
     }
 
     /// Moves working files from the current HEAD tree to `target` the way
     /// `git checkout` does: files with local edits are never overwritten.
     /// Must run before HEAD or its branch moves, since HEAD is the baseline.
     fn checkout_tree_safely(&self, target: &Tree<'_>) -> Result<()> {
+        self.drop_unsaved_marker_for(target)?;
         let baseline = self.repo.head().and_then(|head| head.peel_to_tree()).ok();
         let position = self.head_position();
         let mut checkout = CheckoutBuilder::new();
@@ -8727,7 +10924,7 @@ impl Workspace {
         result
     }
 
-    /// Forces only the project folder to `target`; paths outside it are untouched.
+    /// Forces only the folder to `target`; paths outside it are untouched.
     fn checkout_scope_forced(&self, target: &Tree<'_>) -> Result<()> {
         let mut checkout = CheckoutBuilder::new();
         checkout.force();
@@ -8751,7 +10948,7 @@ impl Workspace {
         })
     }
 
-    /// Every path in the project folder that `target` or the index has.
+    /// Every path in the folder that `target` or the index has.
     fn scope_index_paths(&self, target: &Tree<'_>) -> Result<Vec<PathBuf>> {
         let scope = scope_pathspec(self.scope());
         let in_scope = |path: &str| {
@@ -8783,11 +10980,89 @@ impl Workspace {
         Ok(paths.into_iter().map(PathBuf::from).collect())
     }
 
-    /// `base` with its project folder replaced by `source`'s project folder.
+    /// `base` with its folder replaced by `source`'s folder.
     /// Unscoped workspaces use `source` as-is.
+    /// `commit`'s tree with Draftline's folder where the folder is now, so a
+    /// version saved before a move reads, diffs and restores as this folder's.
+    fn relocated_tree(&self, commit: &Commit<'_>) -> Result<Tree<'_>> {
+        let tree = commit.tree()?;
+        let from = FolderChanges::new(&self.repo, self.scope()).folder_at(commit)?;
+        if from == self.scope() {
+            return Ok(self.repo.find_tree(tree.id())?);
+        }
+        // The folder's content as it was: a root folder is everything but the
+        // repository files.
+        let content = if from.as_os_str().is_empty() {
+            Some(split_root(&self.repo, &tree)?.0)
+        } else {
+            optional_tree_entry(&tree, &from)?
+        };
+        let id = match scope_pathspec(self.scope()) {
+            // Now the root: the folder's content is the whole tree, beside
+            // today's repository files.
+            None => {
+                let content = match content {
+                    Some(content) => content,
+                    None => self.empty_tree_id()?,
+                };
+                let content = self.repo.find_tree(content)?;
+                let head = self.head_tree_or_empty()?;
+                let mut update = git2::build::TreeUpdateBuilder::new();
+                for entry in head.iter() {
+                    if is_repository_file(entry.name_bytes()) {
+                        if let Ok(name) = entry.name() {
+                            update.upsert(name, entry.id(), entry_file_mode(&entry));
+                        }
+                    }
+                }
+                update.create_updated(&self.repo, &content)?
+            }
+            Some(pathspec) => {
+                // The folder leaves its old place; a root folder leaves only
+                // the repository files behind.
+                let base = if from.as_os_str().is_empty() {
+                    split_root(&self.repo, &tree)?.1
+                } else {
+                    tree_without(&self.repo, &tree, &folder_key(&from))?
+                };
+                let base = self.repo.find_tree(base)?;
+                match content {
+                    Some(content) => {
+                        let mut update = git2::build::TreeUpdateBuilder::new();
+                        update.upsert(pathspec.as_str(), content, git2::FileMode::Tree);
+                        update.create_updated(&self.repo, &base)?
+                    }
+                    None => tree_without(&self.repo, &base, pathspec.as_str())?,
+                }
+            }
+        };
+        Ok(self.repo.find_tree(id)?)
+    }
+
     fn compose_scoped_tree(&self, base: &Tree<'_>, source: &Tree<'_>) -> Result<Oid> {
         let Some(pathspec) = scope_pathspec(self.scope()) else {
-            return Ok(source.id());
+            // Repository files describe the repository, not a version of the
+            // folder, so restoring never changes them.
+            let mut update = git2::build::TreeUpdateBuilder::new();
+            let mut changed = false;
+            for name in REPOSITORY_FILES {
+                let wanted = base.get_name(name);
+                let have = source.get_name(name);
+                if wanted.as_ref().map(|entry| (entry.id(), entry.filemode()))
+                    == have.as_ref().map(|entry| (entry.id(), entry.filemode()))
+                {
+                    continue;
+                }
+                changed = true;
+                match wanted {
+                    Some(entry) => update.upsert(name, entry.id(), entry_file_mode(&entry)),
+                    None => update.remove(name),
+                };
+            }
+            if !changed {
+                return Ok(source.id());
+            }
+            return Ok(update.create_updated(&self.repo, source)?);
         };
         let source_entry = optional_tree_entry(source, self.scope())?;
         let base_entry = optional_tree_entry(base, self.scope())?;
@@ -9058,6 +11333,68 @@ impl Workspace {
         })
     }
 
+    /// The merge's base, local and remote trees, with the folder where the
+    /// local side keeps it, so a move on one side doesn't drop the other
+    /// side's edits. Refuses when the remote moved the folder somewhere else:
+    /// the host moves it there too, then merges.
+    ///
+    /// Relocating replaces whatever the other trees hold where the folder is
+    /// now (everything outside it, when it is now the root). Files the
+    /// incoming side changed there would vanish from the merge, so they come
+    /// back as developer conflicts instead.
+    fn merge_trees_for(
+        &self,
+        input: &IncomingMergeInput<'_>,
+    ) -> Result<([Tree<'_>; 3], Vec<PathBuf>)> {
+        let mut folders = FolderChanges::new(&self.repo, self.scope());
+        let ours = folders.folder_at(&input.local_commit)?;
+        let base = folders.folder_at(&input.base_commit)?;
+        let theirs = folders.folder_at(&input.remote_commit)?;
+        if theirs != ours && theirs != base {
+            return Err(DraftlineError::IncomingFolderElsewhere(theirs));
+        }
+        let mut dropped = Vec::new();
+        if theirs != ours && !theirs.as_os_str().is_empty() {
+            let remote = input.remote_commit.tree()?;
+            let original = input.base_commit.tree()?;
+            let blob =
+                |tree: &Tree<'_>, path: &Path| tree.get_path(path).ok().map(|entry| entry.id());
+            for path in tracked_paths_under(&remote, &ours)? {
+                if !path.starts_with(&theirs)
+                    && path != Path::new(FOLDER_MARKER)
+                    && blob(&remote, &path) != blob(&original, &path)
+                {
+                    dropped.push(path);
+                }
+            }
+        }
+        let local = self.repo.find_tree(input.local_commit.tree_id())?;
+        let marker = local.get_name(FOLDER_MARKER).map(|entry| entry.id());
+        let fit = |commit: &Commit<'_>, folder: &Path| -> Result<Tree<'_>> {
+            if folder == ours {
+                return Ok(self.repo.find_tree(commit.tree_id())?);
+            }
+            let tree = self.relocated_tree(commit)?;
+            let id = match marker {
+                Some(marker) => {
+                    let mut update = git2::build::TreeUpdateBuilder::new();
+                    update.upsert(FOLDER_MARKER, marker, git2::FileMode::Blob);
+                    update.create_updated(&self.repo, &tree)?
+                }
+                None => tree_without(&self.repo, &tree, FOLDER_MARKER)?,
+            };
+            Ok(self.repo.find_tree(id)?)
+        };
+        Ok((
+            [
+                fit(&input.base_commit, &base)?,
+                local,
+                fit(&input.remote_commit, &theirs)?,
+            ],
+            dropped,
+        ))
+    }
+
     fn plan_clean_merge(
         &self,
         base_tree: &Tree<'_>,
@@ -9158,15 +11495,13 @@ impl Workspace {
     /// instead: they belong to a developer.
     fn merged_tree(
         &self,
-        input: &IncomingMergeInput<'_>,
+        trees: &[Tree<'_>; 3],
         files: &[MergeFileChange],
     ) -> Result<std::result::Result<Oid, Vec<PathBuf>>> {
-        let base_tree = input.base_commit.tree()?;
-        let local_tree = input.local_commit.tree()?;
-        let remote_tree = input.remote_commit.tree()?;
+        let [base_tree, local_tree, remote_tree] = trees;
         let mut index = self
             .repo
-            .merge_trees(&base_tree, &local_tree, &remote_tree, None)?;
+            .merge_trees(base_tree, local_tree, remote_tree, None)?;
 
         let mut developer_conflicts = BTreeSet::new();
         let mut content_conflicts = BTreeSet::new();
@@ -9193,7 +11528,7 @@ impl Workspace {
         let merged = self.repo.find_tree(index.write_tree_to(&self.repo)?)?;
 
         let mut paths = BTreeSet::new();
-        for tree in [&base_tree, &local_tree, &remote_tree, &merged] {
+        for tree in [base_tree, local_tree, remote_tree, &merged] {
             self.collect_tracked_tree_paths(tree, Path::new(""), &mut paths)?;
         }
         let planned = files
@@ -9391,22 +11726,15 @@ impl Workspace {
         if walk.push_head().is_err() {
             return Ok(Vec::new());
         }
-        let mut history = ScopedHistory::new(&self.repo, self.scope(), []);
+        let mut project = FolderChanges::new(&self.repo, self.scope());
         let mut versions = Vec::new();
         for oid in walk {
             let commit = self.repo.find_commit(oid?)?;
-            if history.shows(&commit)? {
+            if project.touches(&commit)? {
                 versions.push(version_from_commit(&commit));
             }
         }
         Ok(versions)
-    }
-
-    /// Path-limited history pinned to HEAD and every listed tip so labels stay
-    /// anchored even when a tip is a developer-only commit.
-    fn scoped_history(&self, tips: &HashMap<Oid, Vec<VariationId>>) -> ScopedHistory<'_> {
-        let head = self.repo.head().ok().and_then(|head| head.target());
-        ScopedHistory::new(&self.repo, self.scope(), tips.keys().copied().chain(head))
     }
 
     fn lists_variation(&self, name: &str, current: Option<&str>) -> bool {
@@ -9428,6 +11756,9 @@ impl Workspace {
     }
 
     fn default_branch_on(&self, remote: &str) -> Option<String> {
+        if let Some(head) = self.remote_head(remote) {
+            return Some(head.head);
+        }
         let prefix = format!("refs/remotes/{remote}/");
         if let Ok(reference) = self.repo.find_reference(&format!("{prefix}HEAD")) {
             if let Some(name) = reference
@@ -9469,6 +11800,131 @@ impl Workspace {
             }
         }
         names
+    }
+
+    /// Where a remote's advertised default branch is cached: one file per
+    /// remote, shared by every worktree of the repository.
+    fn remote_head_path(&self, remote: &str) -> PathBuf {
+        let key: String = remote.bytes().map(|byte| format!("{byte:02x}")).collect();
+        self.repo
+            .commondir()
+            .join("draftline")
+            .join("remotes")
+            .join(format!("{key}.json"))
+    }
+
+    fn remote_head(&self, remote: &str) -> Option<RemoteHead> {
+        let url = self.repo.find_remote(remote).ok()?.url().ok()?.to_string();
+        let bytes = fs::read(self.remote_head_path(remote)).ok()?;
+        serde_json::from_slice::<RemoteHead>(&bytes)
+            .ok()
+            .filter(|entry| entry.url == url)
+    }
+
+    /// Records the default branch a remote advertised during the fetch that
+    /// just ran, keeping the one it replaced so hosts can spot a rename.
+    fn record_remote_head(&self, remote: &git2::Remote<'_>) -> Result<()> {
+        let (Some(name), Ok(url), Ok(advertised)) = (
+            remote.name().ok().flatten(),
+            remote.url(),
+            remote.default_branch(),
+        ) else {
+            return Ok(());
+        };
+        let Some(head) = advertised
+            .as_str()
+            .ok()
+            .and_then(|target| target.strip_prefix("refs/heads/"))
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+        let existing = self.remote_head(name);
+        let known = existing
+            .as_ref()
+            .map(|entry| entry.head.clone())
+            .or_else(|| {
+                let prefix = format!("refs/remotes/{name}/");
+                self.repo
+                    .find_reference(&format!("{prefix}HEAD"))
+                    .ok()?
+                    .symbolic_target()
+                    .ok()
+                    .flatten()?
+                    .strip_prefix(prefix.as_str())
+                    .map(str::to_string)
+            })
+            .or_else(|| self.vanished_default_branch(remote, name, &head));
+        let previous = match known {
+            Some(old) if old != head => Some(old),
+            _ => existing.as_ref().and_then(|entry| entry.previous.clone()),
+        }
+        .filter(|previous| *previous != head);
+        if existing
+            .as_ref()
+            .is_some_and(|entry| entry.head == head && entry.previous == previous)
+        {
+            return Ok(());
+        }
+        let entry = RemoteHead {
+            url: url.to_string(),
+            head,
+            previous,
+        };
+        let path = self.remote_head_path(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temp = unique_claim_temp(&path);
+        fs::write(&temp, serde_json::to_vec_pretty(&entry)?)?;
+        replace_file(&temp, &path)?;
+        Ok(())
+    }
+
+    /// With no earlier record of the remote's default, the old name is a
+    /// local default-named branch that tracks a branch of the same name the
+    /// remote no longer advertises.
+    fn vanished_default_branch(
+        &self,
+        remote: &git2::Remote<'_>,
+        name: &str,
+        head: &str,
+    ) -> Option<String> {
+        let advertised: BTreeSet<String> = remote
+            .list()
+            .ok()?
+            .iter()
+            .map(|entry| entry.name().to_string())
+            .collect();
+        self.default_branch_candidates().into_iter().find(|old| {
+            let merge = format!("refs/heads/{old}");
+            old != head
+                && !advertised.contains(&merge)
+                && self.repo.find_branch(old, BranchType::Local).is_ok()
+                && self
+                    .repo
+                    .branch_upstream_remote(&merge)
+                    .ok()
+                    .and_then(|buf| buf.as_str().map(str::to_string).ok())
+                    .as_deref()
+                    == Some(name)
+                && self
+                    .repo
+                    .branch_upstream_merge(&merge)
+                    .ok()
+                    .and_then(|buf| buf.as_str().map(str::to_string).ok())
+                    .as_deref()
+                    == Some(merge.as_str())
+        })
+    }
+
+    /// The base's old name when the remote renamed its default branch and a
+    /// local branch still carries the old name, so saves there can be moved.
+    fn base_renamed_from(&self, remote: &str, base: &str) -> Option<String> {
+        self.remote_head(remote)?
+            .previous
+            .filter(|previous| previous != base)
+            .filter(|previous| self.repo.find_branch(previous, BranchType::Local).is_ok())
     }
 
     fn listed_variation_tip_oids(&self) -> Result<Vec<(VariationId, Oid)>> {
@@ -9914,11 +12370,50 @@ fn preflight_report(
 
 /// Whether Git would run a filter driver (for example Git LFS) for `path`.
 fn needs_git_filter(repo: &Repository, path: &Path, flags: git2::AttrCheckFlags) -> Result<bool> {
+    Ok(git_filter_driver(repo, path, flags)?.is_some())
+}
+
+/// The filter driver Git would run for `path`, if any.
+fn git_filter_driver(
+    repo: &Repository,
+    path: &Path,
+    flags: git2::AttrCheckFlags,
+) -> Result<Option<String>> {
     let filter = repo.get_attr(path, "filter", flags)?;
-    Ok(matches!(
-        git2::AttrValue::from_string(filter),
-        git2::AttrValue::True | git2::AttrValue::String(_)
-    ))
+    Ok(match git2::AttrValue::from_string(filter) {
+        git2::AttrValue::True => Some(String::new()),
+        git2::AttrValue::String(driver) => Some(driver.to_string()),
+        _ => None,
+    })
+}
+
+/// Whether the file is a Git LFS pointer (spec v1: at most 1024 bytes, a
+/// `version` line first, then `oid` and `size` lines), meaning its content
+/// was never downloaded.
+fn is_lfs_pointer_file(path: &Path) -> bool {
+    const MAX: u64 = 1024;
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > MAX {
+        return false;
+    }
+    fs::read(path).is_ok_and(|bytes| is_lfs_pointer(&bytes))
+}
+
+fn is_lfs_pointer(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let versioned = lines.next().is_some_and(|line| {
+        line == "version https://git-lfs.github.com/spec/v1"
+            || line == "version https://hawser.github.com/spec/v1"
+    });
+    let rest: Vec<&str> = lines.collect();
+    versioned
+        && rest.iter().any(|line| line.starts_with("oid sha256:"))
+        && rest.iter().any(|line| line.starts_with("size "))
 }
 
 fn discard_preflight_report(
@@ -9986,6 +12481,103 @@ fn write_index_or_reload(index: &mut git2::Index) -> Result<()> {
         return Err(error.into());
     }
     Ok(())
+}
+
+/// Creates `root/folder` one level at a time, refusing to pass through a
+/// file, symlink, or junction, so a checked-out link can't place it outside
+/// `root`.
+fn create_folder_within(root: &Path, folder: &Path) -> Result<PathBuf> {
+    create_folder_tracking(root, folder, &mut Vec::new())
+}
+
+/// [`create_folder_within`], recording each folder it creates in `created`.
+fn create_folder_tracking(
+    root: &Path,
+    folder: &Path,
+    created: &mut Vec<PathBuf>,
+) -> Result<PathBuf> {
+    let canonical_root = fs::canonicalize(root)?;
+    let mut path = root.to_path_buf();
+    for component in folder.components() {
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(not_a_plain_folder(&path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&path)?;
+                created.push(path.clone());
+                // A parent swapped for a link after it was checked would put
+                // the new folder outside the repository. Deleting by path
+                // would follow that link too, so leave the empty folders and
+                // forget them rather than risk removing someone else's.
+                let inside = fs::canonicalize(&path)
+                    .map(|resolved| resolved.starts_with(&canonical_root))
+                    .unwrap_or(false);
+                if !inside {
+                    created.clear();
+                    return Err(not_a_plain_folder(&path));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(path)
+}
+
+/// Whether `on_disk` is the start of `content` as Git would write it, with
+/// or without CRLF line endings: what a write cut short leaves behind.
+fn is_start_of(on_disk: &[u8], content: &[u8]) -> bool {
+    if content.starts_with(on_disk) {
+        return true;
+    }
+    let mut converted = Vec::with_capacity(content.len() + content.len() / 16);
+    let mut previous = 0u8;
+    for &byte in content {
+        if byte == b'\n' && previous != b'\r' {
+            converted.push(b'\r');
+        }
+        converted.push(byte);
+        previous = byte;
+    }
+    converted.starts_with(on_disk)
+}
+
+/// Refuses a path that exists but isn't a real directory (a file, symlink, or junction).
+fn ensure_plain_or_missing(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(not_a_plain_folder(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Atomically replaces `path` with `temp`, removing `temp` on failure. On
+/// Windows, a scanner or indexer briefly holding `path` makes the rename fail
+/// with access denied, so it retries for a moment as Git for Windows does.
+fn replace_file(temp: &Path, path: &Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match fs::rename(temp, path) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
+                    && attempt < 10 =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
+            }
+            Err(error) => {
+                let _ = fs::remove_file(temp);
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn not_a_plain_folder(path: &Path) -> DraftlineError {
+    DraftlineError::InvalidFolderMarker(format!("{} is not a plain folder", path.display()))
 }
 
 fn remove_workspace_path_if_exists(path: &Path) -> Result<()> {
@@ -10082,107 +12674,156 @@ fn signature_from_contributor(contributor: &Contributor) -> Result<Signature<'st
     Ok(Signature::now(name, email)?)
 }
 
-/// Path-limited history like `git log --parents -- <scope>`: in a scoped
-/// workspace only commits that change the project folder are shown (plus
-/// pinned ref tips), and parents are rewritten to the nearest shown ancestor,
-/// following the parent whose project folder is unchanged through merges.
-/// Unscoped workspaces show every commit with its real parents.
-struct ScopedHistory<'r> {
+/// Tells which commits change Draftline's folder, like `git log -- <folder>`,
+/// following the folder through moves: each commit's own [`FOLDER_MARKER`]
+/// says where the folder was. Commits from before the marker existed use the
+/// first folder one recorded.
+struct FolderChanges<'r> {
     repo: &'r Repository,
-    scope: Option<PathBuf>,
-    pinned: HashSet<Oid>,
-    scope_trees: HashMap<Oid, Option<Oid>>,
-    nearest: HashMap<Oid, Option<Oid>>,
+    current: PathBuf,
+    first: Option<PathBuf>,
+    /// Per commit: where the folder was, and its tree there.
+    seen: HashMap<Oid, (PathBuf, Option<Oid>)>,
 }
 
-impl<'r> ScopedHistory<'r> {
-    fn new(repo: &'r Repository, scope: &Path, pinned: impl IntoIterator<Item = Oid>) -> Self {
+impl<'r> FolderChanges<'r> {
+    fn new(repo: &'r Repository, current: &Path) -> Self {
         Self {
             repo,
-            scope: (!scope.as_os_str().is_empty()).then(|| scope.to_path_buf()),
-            pinned: pinned.into_iter().collect(),
-            scope_trees: HashMap::new(),
-            nearest: HashMap::new(),
+            current: current.to_path_buf(),
+            first: None,
+            seen: HashMap::new(),
         }
     }
 
-    fn scope_tree(&mut self, scope: &Path, oid: Oid) -> Result<Option<Oid>> {
-        if let Some(cached) = self.scope_trees.get(&oid) {
-            return Ok(*cached);
+    /// Where the folder was in `commit`.
+    fn folder_at(&mut self, commit: &Commit<'_>) -> Result<PathBuf> {
+        Ok(self.at(commit)?.0)
+    }
+
+    fn at(&mut self, commit: &Commit<'_>) -> Result<(PathBuf, Option<Oid>)> {
+        if let Some(cached) = self.seen.get(&commit.id()) {
+            return Ok(cached.clone());
         }
-        let tree = self.repo.find_commit(oid)?.tree()?;
-        let id = match tree.get_path(scope) {
-            Ok(entry) => Some(entry.id()),
-            Err(error) if error.code() == git2::ErrorCode::NotFound => None,
-            Err(error) => return Err(error.into()),
+        let tree = commit.tree()?;
+        let folder = match tree_marker_folder(self.repo, &tree) {
+            Some(folder) => folder,
+            None => self.first_folder()?,
         };
-        self.scope_trees.insert(oid, id);
-        Ok(id)
-    }
-
-    /// The first parent whose project folder is identical to `commit`'s.
-    fn unchanged_parent(&mut self, scope: &Path, commit: &Commit<'_>) -> Result<Option<Oid>> {
-        let own = self.scope_tree(scope, commit.id())?;
-        for parent in commit.parent_ids() {
-            if self.scope_tree(scope, parent)? == own {
-                return Ok(Some(parent));
-            }
-        }
-        Ok(None)
-    }
-
-    fn shows(&mut self, commit: &Commit<'_>) -> Result<bool> {
-        let Some(scope) = self.scope.clone() else {
-            return Ok(true);
+        let id = if folder.as_os_str().is_empty() {
+            Some(tree.id())
+        } else {
+            optional_tree_entry(&tree, &folder)?
         };
-        if self.pinned.contains(&commit.id()) {
-            return Ok(true);
-        }
-        if commit.parent_count() == 0 {
-            return Ok(self.scope_tree(&scope, commit.id())?.is_some());
-        }
-        Ok(self.unchanged_parent(&scope, commit)?.is_none())
+        self.seen.insert(commit.id(), (folder.clone(), id));
+        Ok((folder, id))
     }
 
-    /// The nearest shown commit at or below `oid`, iteratively so long runs of
-    /// developer-only commits cannot overflow the stack.
-    fn nearest_shown(&mut self, oid: Oid) -> Result<Option<Oid>> {
-        let Some(scope) = self.scope.clone() else {
-            return Ok(Some(oid));
-        };
-        let mut hidden = Vec::new();
-        let mut current = Some(oid);
-        let found = loop {
-            let Some(oid) = current else {
-                break None;
-            };
-            if let Some(cached) = self.nearest.get(&oid) {
-                break *cached;
-            }
-            let commit = self.repo.find_commit(oid)?;
-            if self.shows(&commit)? {
-                break Some(oid);
-            }
-            hidden.push(oid);
-            current = self.unchanged_parent(&scope, &commit)?;
-        };
-        for oid in hidden {
-            self.nearest.insert(oid, found);
+    /// The folder commits from before the marker existed used: the oldest
+    /// marker on HEAD's history, or where the folder was moved from when that
+    /// marker came with a move. Else the current folder.
+    fn first_folder(&mut self) -> Result<PathBuf> {
+        if let Some(first) = &self.first {
+            return Ok(first.clone());
         }
-        Ok(found)
-    }
-
-    fn parents(&mut self, commit: &Commit<'_>) -> Result<Vec<Oid>> {
-        let mut parents = Vec::new();
-        for parent in commit.parent_ids() {
-            if let Some(shown) = self.nearest_shown(parent)? {
-                if !parents.contains(&shown) {
-                    parents.push(shown);
+        let mut first = self.current.clone();
+        let mut walk = self.repo.revwalk()?;
+        if walk.push_head().is_ok() {
+            walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+            for oid in walk {
+                let commit = self.repo.find_commit(oid?)?;
+                if let Some(folder) = tree_marker_folder(self.repo, &commit.tree()?) {
+                    first = moved_from(&commit).unwrap_or(folder);
+                    break;
                 }
             }
         }
-        Ok(parents)
+        self.first = Some(first.clone());
+        Ok(first)
     }
+
+    /// A commit touches the folder unless some parent has the same folder in
+    /// the same place; a merge that only takes one side's folder does not,
+    /// and a move does. Every commit touches a folder that is the root.
+    fn touches(&mut self, commit: &Commit<'_>) -> Result<bool> {
+        let own = self.at(commit)?;
+        if own.0.as_os_str().is_empty() {
+            return Ok(true);
+        }
+        if commit.parent_count() == 0 {
+            return Ok(own.1.is_some());
+        }
+        for parent in commit.parents() {
+            if self.at(&parent)? == own {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// `tree` without the entry at `path`, if it has one.
+/// A root folder's tree split into its content and the
+/// [`REPOSITORY_FILES`] beside it, the marker in neither.
+fn split_root(repo: &Repository, tree: &Tree<'_>) -> Result<(Oid, Oid)> {
+    let mut content = git2::build::TreeUpdateBuilder::new();
+    let mut repository = git2::build::TreeUpdateBuilder::new();
+    for entry in tree.iter() {
+        let name = String::from_utf8_lossy(entry.name_bytes()).into_owned();
+        if is_repository_file(entry.name_bytes()) {
+            content.remove(&name);
+        }
+        if !is_repository_file(entry.name_bytes()) || name == FOLDER_MARKER {
+            repository.remove(&name);
+        }
+    }
+    Ok((
+        content.create_updated(repo, tree)?,
+        repository.create_updated(repo, tree)?,
+    ))
+}
+
+fn tree_without(repo: &Repository, tree: &Tree<'_>, path: &str) -> Result<Oid> {
+    if tree.get_path(Path::new(path)).is_err() {
+        return Ok(tree.id());
+    }
+    let mut update = git2::build::TreeUpdateBuilder::new();
+    update.remove(path);
+    Ok(update.create_updated(repo, tree)?)
+}
+
+/// Where a folder move's commit says the folder was.
+fn moved_from(commit: &Commit<'_>) -> Option<PathBuf> {
+    let prefix = format!("{MOVED_FROM_TRAILER}: ");
+    let value = std::str::from_utf8(commit.message_bytes())
+        .ok()?
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(&prefix))?
+        .trim();
+    if value == "." {
+        return Some(PathBuf::new());
+    }
+    canonical_folder(value).filter(|folder| !folder.as_os_str().is_empty())
+}
+
+/// The folder the checked-out commit's [`FOLDER_MARKER`] names, if any.
+fn head_marker_folder(repo: &Repository) -> Option<PathBuf> {
+    let tree = repo.head().ok()?.peel_to_tree().ok()?;
+    tree_marker_folder(repo, &tree)
+}
+
+/// The folder `tree`'s own [`FOLDER_MARKER`] names, if it is a valid one.
+fn tree_marker_folder(repo: &Repository, tree: &Tree<'_>) -> Option<PathBuf> {
+    let blob = repo.find_blob(tree.get_name(FOLDER_MARKER)?.id()).ok()?;
+    let marker = serde_json::from_slice::<FolderMarker>(blob.content()).ok()?;
+    if marker.format != 1 {
+        return None;
+    }
+    if marker.folder == "." {
+        return Some(PathBuf::new());
+    }
+    canonical_folder(&marker.folder).filter(|folder| !folder.as_os_str().is_empty())
 }
 
 fn version_from_commit(commit: &Commit<'_>) -> Version {
@@ -10202,7 +12843,7 @@ fn version_from_commit(commit: &Commit<'_>) -> Version {
 
 fn history_entry_from_commit(
     commit: &Commit<'_>,
-    parents: &[Oid],
+    touches_folder: bool,
     tips: &HashMap<Oid, Vec<VariationId>>,
     head_oid: Option<Oid>,
 ) -> Result<HistoryEntry> {
@@ -10211,12 +12852,13 @@ fn history_entry_from_commit(
     let mut variation_tips = tips.get(&oid).cloned().unwrap_or_default();
     variation_tips.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     let is_head = head_oid == Some(oid);
-    let parent_ids = parents.iter().copied().map(VersionId::from).collect();
+    let parent_ids = commit.parent_ids().map(VersionId::from).collect();
     Ok(HistoryEntry {
         version,
         variation_tips,
         is_head,
         parent_ids,
+        touches_folder,
     })
 }
 
@@ -10291,6 +12933,7 @@ fn workspace_graph_node_from_commit(
         parent_ids,
         parent_version_ids: history_entry.parent_ids,
         variation_tips: history_entry.variation_tips,
+        touches_folder: history_entry.touches_folder,
         is_head,
         is_current: is_head,
         is_tip,
@@ -10846,9 +13489,9 @@ fn safe_next_actions_for_inspection(
 ) -> Vec<SafeNextAction> {
     if diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == DiagnosticCode::RecoveryInOtherProject)
+        .any(|diagnostic| diagnostic.code == DiagnosticCode::RecoveryInOtherFolder)
     {
-        return vec![SafeNextAction::FinishInOtherProject];
+        return vec![SafeNextAction::FinishInOtherFolder];
     }
     if recovery.is_some()
         || operation_lock.state == OperationLockState::Locked
@@ -10912,9 +13555,82 @@ fn inspect_operation_lock_path(path: &Path) -> Result<OperationLockInspection> {
     })
 }
 
+/// A lock is stale once its process is gone on this machine, or after
+/// `STALE_LOCK_SECONDS` when that can't be known (another machine, or an
+/// unsupported platform). A reused process id only delays clearing.
 fn operation_lock_metadata_is_stale(metadata: &OperationLockMetadata) -> bool {
-    metadata.process_id != std::process::id()
-        && now_seconds().saturating_sub(metadata.created_at_seconds) >= STALE_LOCK_SECONDS
+    if metadata.process_id == std::process::id() {
+        return false;
+    }
+    if now_seconds().saturating_sub(metadata.created_at_seconds) >= STALE_LOCK_SECONDS {
+        return true;
+    }
+    let same_host = match (&metadata.host, current_host()) {
+        (Some(recorded), Some(current)) => recorded.eq_ignore_ascii_case(&current),
+        _ => false,
+    };
+    same_host && process_is_running(metadata.process_id) == Some(false)
+}
+
+/// Names the process table a lock's process id belongs to. The OS family
+/// keeps Windows and WSL apart, which share a machine name by default.
+fn current_host() -> Option<String> {
+    let family = if cfg!(windows) { "windows" } else { "unix" };
+    ["COMPUTERNAME", "HOSTNAME"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .or_else(|| fs::read_to_string("/etc/hostname").ok())
+        .or_else(|| fs::read_to_string("/proc/sys/kernel/hostname").ok())
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+        .map(|host| format!("{family}:{host}"))
+}
+
+/// `Some(false)` only when the process is known to be gone.
+#[cfg(windows)]
+fn process_is_running(process_id: u32) -> Option<bool> {
+    type Handle = *mut std::ffi::c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> Handle;
+        fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+    // SAFETY: plain Win32 calls; the handle is closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error().raw_os_error();
+            return Some(error != Some(ERROR_INVALID_PARAMETER));
+        }
+        let mut exit_code = 0u32;
+        let read = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        (read != 0).then_some(exit_code == STILL_ACTIVE)
+    }
+}
+
+/// `Some(false)` only when the process is known to be gone.
+#[cfg(unix)]
+fn process_is_running(process_id: u32) -> Option<bool> {
+    const ESRCH: i32 = 3;
+    extern "C" {
+        fn kill(process_id: i32, signal: i32) -> i32;
+    }
+    let process_id = i32::try_from(process_id).ok().filter(|id| *id > 0)?;
+    // SAFETY: signal 0 only checks that the process exists.
+    if unsafe { kill(process_id, 0) } == 0 {
+        return Some(true);
+    }
+    Some(std::io::Error::last_os_error().raw_os_error() != Some(ESRCH))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn process_is_running(_process_id: u32) -> Option<bool> {
+    None
 }
 
 fn new_operation_lock_metadata(operation: impl Into<String>) -> OperationLockMetadata {
@@ -10926,6 +13642,7 @@ fn new_operation_lock_metadata(operation: impl Into<String>) -> OperationLockMet
             .ok()
             .or_else(|| std::env::var("USERNAME").ok()),
         created_at_seconds: now_seconds(),
+        host: current_host(),
     }
 }
 
@@ -11160,6 +13877,14 @@ fn blob_file_mode(mode: i32) -> git2::FileMode {
     }
 }
 
+fn entry_file_mode(entry: &git2::TreeEntry<'_>) -> git2::FileMode {
+    match entry.filemode() {
+        0o040000 => git2::FileMode::Tree,
+        0o160000 => git2::FileMode::Commit,
+        mode => blob_file_mode(mode),
+    }
+}
+
 fn optional_tree_entry(tree: &Tree<'_>, path: &Path) -> Result<Option<Oid>> {
     match tree.get_path(path) {
         Ok(entry) => Ok(Some(entry.id())),
@@ -11168,7 +13893,7 @@ fn optional_tree_entry(tree: &Tree<'_>, path: &Path) -> Result<Option<Oid>> {
     }
 }
 
-/// Literal (non-glob) pathspec for the project folder, or `None` when unscoped.
+/// Literal (non-glob) pathspec for the folder, or `None` when unscoped.
 fn scope_pathspec(scope: &Path) -> Option<String> {
     if scope.as_os_str().is_empty() {
         return None;
@@ -11176,7 +13901,7 @@ fn scope_pathspec(scope: &Path) -> Option<String> {
     Some(scope.to_string_lossy().replace('\\', "/"))
 }
 
-/// Restricts a status scan to the project folder so large code repositories
+/// Restricts a status scan to the folder so large code repositories
 /// are not walked in full.
 fn limit_status_to_scope(options: &mut StatusOptions, scope: &Path) {
     if let Some(pathspec) = scope_pathspec(scope) {
@@ -11184,20 +13909,20 @@ fn limit_status_to_scope(options: &mut StatusOptions, scope: &Path) {
     }
 }
 
-/// Restricts a diff to the project folder.
+/// Restricts a diff to the folder.
 fn limit_diff_to_scope(options: &mut DiffOptions, scope: &Path) {
     if let Some(pathspec) = scope_pathspec(scope) {
         options.disable_pathspec_match(true).pathspec(pathspec);
     }
 }
 
-/// Computes the repository-relative project folder for `project_path`.
+/// Computes the repository-relative folder for `project_path`.
 fn project_scope(workdir: &Path, project_path: &Path) -> Result<PathBuf> {
     let workdir = fs::canonicalize(workdir)?;
     let project = fs::canonicalize(project_path)?;
     match project.strip_prefix(&workdir) {
         Ok(relative) => normalize_workspace_relative(relative),
-        // e.g. a symlinked project folder that resolves outside the repository.
+        // e.g. a symlinked folder that resolves outside the repository.
         Err(_) => Err(DraftlineError::PathEscapesWorkspace(project)),
     }
 }
@@ -11290,6 +14015,142 @@ fn create_missing_dirs(path: &Path) -> std::io::Result<Vec<PathBuf>> {
         }
     }
     Ok(created)
+}
+
+/// A claim's folder must be a canonical path inside the checkout, so a
+/// tampered claim can't point the host at a folder elsewhere.
+fn claimed_project(claim: &WorkspaceClaim, path: &Path) -> Result<PathBuf> {
+    canonical_folder(&claim.project).ok_or_else(|| {
+        DraftlineError::InvalidFolderMarker(format!(
+            "{}: folder {:?} is not a folder inside this checkout; delete it to reset it",
+            path.display(),
+            claim.project
+        ))
+    })
+}
+
+/// `raw` as a repository-relative folder, only if it is already written the
+/// canonical way (`a/b`, no `.`/`..`, no trailing slash; `""` for the root).
+fn canonical_folder(raw: &str) -> Option<PathBuf> {
+    let folder = normalize_workspace_relative(raw).ok()?;
+    (folder_key(&folder) == raw).then_some(folder)
+}
+
+/// A repository-relative folder written with `/`, `""` for the root.
+fn folder_key(folder: &Path) -> String {
+    folder
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// A folder key as [`FOLDER_MARKER`] writes it: `"."` for the root.
+fn marker_folder(key: &str) -> String {
+    if key.is_empty() {
+        ".".to_string()
+    } else {
+        key.to_string()
+    }
+}
+
+/// A folder for people to read: "the repository root" or `cutready`.
+fn folder_label(folder: &Path) -> String {
+    if folder.as_os_str().is_empty() {
+        "the repository root".to_string()
+    } else {
+        folder_key(folder)
+    }
+}
+
+fn marker_bytes(key: &str) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(&FolderMarker {
+        format: 1,
+        folder: marker_folder(key),
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// `path` made absolute against the current directory, without resolving it,
+/// so a folder that doesn't exist yet still has a place.
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    Ok(std::path::absolute(path)?)
+}
+
+/// The repository-relative folder for `path`, which need not exist: its
+/// nearest existing ancestor anchors it inside `root`.
+fn folder_in(root: &Path, path: &Path) -> Result<PathBuf> {
+    let existing = path
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or_else(|| DraftlineError::PathEscapesWorkspace(path.to_path_buf()))?;
+    let tail = path
+        .strip_prefix(existing)
+        .map_err(|_| DraftlineError::PathEscapesWorkspace(path.to_path_buf()))?;
+    normalize_workspace_relative(project_scope(root, existing)?.join(tail))
+}
+
+/// Every tracked path in `tree` at or below `prefix` (all of them for the root).
+/// Whether `tree` has `folder` as a directory (a file at that path isn't it).
+fn tracks_folder(tree: &Tree<'_>, folder: &Path) -> bool {
+    folder.as_os_str().is_empty()
+        || tree
+            .get_path(folder)
+            .is_ok_and(|entry| entry.kind() == Some(ObjectType::Tree))
+}
+
+fn tracked_paths_under(tree: &Tree<'_>, prefix: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+        if entry.kind() != Some(ObjectType::Tree) {
+            let path = PathBuf::from(format!("{dir}{}", entry.name().unwrap_or_default()));
+            if path.starts_with(prefix) {
+                paths.push(path);
+            }
+        }
+        git2::TreeWalkResult::Ok
+    })?;
+    Ok(paths)
+}
+
+/// `path` with the folder `prefix` removed, when it is inside it.
+fn strip_folder<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    if prefix.is_empty() {
+        return Some(path);
+    }
+    path.strip_prefix(prefix)?.strip_prefix(b"/")
+}
+
+fn suggest(fix: FolderFix, label: &str) -> FolderSuggestion {
+    FolderSuggestion {
+        fix,
+        label: label.to_string(),
+    }
+}
+
+/// Files and folders under `dir`, without following links or entering `skip`
+/// or a nested repository.
+fn collect_leftovers(dir: &Path, skip: &Path, files: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == skip || entry.file_name() == ".git" {
+            continue;
+        }
+        match entry.file_type() {
+            // A nested repository moves whole or not at all.
+            Ok(kind) if kind.is_dir() && path.join(".git").exists() => files.push(path),
+            Ok(kind) if kind.is_dir() => {
+                dirs.push(path.clone());
+                collect_leftovers(&path, skip, files, dirs);
+            }
+            Ok(_) => files.push(path),
+            Err(_) => {}
+        }
+    }
 }
 
 fn unique_claim_temp(path: &Path) -> PathBuf {
@@ -12077,6 +14938,99 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_repair_finishes_a_file_the_checkout_left_missing() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        interrupted_switch(&workspace, &original);
+        // Killed after removing the old file, before writing the new one.
+        fs::remove_file(workspace.root().join("code.rs")).unwrap();
+
+        workspace.repair_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert_eq!(content(&workspace, "code.rs"), "v1");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_rollback_rewrites_a_half_written_file() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        interrupted_switch(&workspace, &original);
+        fs::write(workspace.root().join("code.rs"), "v").unwrap();
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "code.rs"), "v2");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_repair_finishes_a_file_an_earlier_repair_left_missing() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        workspace.repo.checkout_tree(alt.as_object(), None).unwrap();
+        interrupted_switch(&workspace, &original);
+        move_branch(&workspace, "alt", "v3");
+        // A repair following alt died after removing the file, before writing it.
+        fs::remove_file(workspace.root().join("code.rs")).unwrap();
+
+        workspace.repair_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert_eq!(content(&workspace, "code.rs"), "v3");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_repair_keeps_a_file_deleted_after_the_checkout_finished() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        let mut checkout = CheckoutBuilder::new();
+        workspace
+            .repo
+            .checkout_tree(alt.as_object(), Some(checkout.force()))
+            .unwrap();
+        interrupted_switch(&workspace, &original);
+        fs::remove_file(workspace.root().join("code.rs")).unwrap();
+
+        workspace.repair_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert!(!workspace.root().join("code.rs").exists());
+    }
+
+    #[test]
+    fn a_restore_rollback_puts_back_a_file_the_checkout_left_missing() {
+        let (_temp, workspace, first) = two_saves();
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        let source = workspace
+            .relocated_tree(&workspace.find_version_commit(&first.id).unwrap())
+            .unwrap();
+        let restored = workspace
+            .compose_scoped_tree(&head.tree().unwrap(), &source)
+            .unwrap();
+        workspace
+            .write_recovery_state_for_checkout(
+                &RecoveryState {
+                    operation_id: "interrupted".to_string(),
+                    operation: RecoveryOperation::RestoreVersionAsNewSave,
+                    original_variation: workspace.current_variation().ok(),
+                    target: Some(first.id.as_str().to_string()),
+                    completed: false,
+                },
+                &head.tree().unwrap(),
+                &workspace.repo.find_tree(restored).unwrap(),
+            )
+            .unwrap();
+        fs::remove_file(workspace.root().join("plan.sk")).unwrap();
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert!(workspace.changed_files().unwrap().is_empty());
+    }
+
+    #[test]
     fn a_switch_rollback_ignores_a_target_that_moved_since() {
         let (_temp, workspace, original, _) = branches_with_different_code();
         let alt = workspace.branch_tree("alt").unwrap();
@@ -12423,6 +15377,64 @@ mod tests {
     }
 
     #[test]
+    fn a_save_refuses_a_switch_to_another_branch_at_the_same_commit() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        workspace.repo.branch("feature/x", &head, false).unwrap();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_parent_read", move |_| {
+            Repository::open(&root)
+                .unwrap()
+                .set_head("refs/heads/feature/x")
+                .unwrap();
+        });
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { ref actual, .. } if actual == "refs/heads/feature/x"),
+            "{error:?}"
+        );
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id("refs/heads/feature/x")
+                .unwrap(),
+            head.id()
+        );
+    }
+
+    #[test]
+    fn a_save_refuses_a_switch_to_another_branch_while_it_scans_changes() {
+        let (_temp, workspace, _) = two_saves();
+        write_file(workspace.root(), "plan.sk", b"edit");
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        workspace.repo.branch("feature/x", &head, false).unwrap();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("after_branch_pinned", move |_| {
+            Repository::open(&root)
+                .unwrap()
+                .set_head("refs/heads/feature/x")
+                .unwrap();
+        });
+
+        let error = workspace.save_version("Third").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { ref actual, .. } if actual == "refs/heads/feature/x"),
+            "{error:?}"
+        );
+        assert_eq!(
+            workspace
+                .repo
+                .refname_to_id("refs/heads/feature/x")
+                .unwrap(),
+            head.id()
+        );
+    }
+
+    #[test]
     fn a_save_refuses_when_a_developer_rewinds_the_branch_mid_save() {
         let (_temp, workspace, first) = two_saves();
         write_file(workspace.root(), "plan.sk", b"edit");
@@ -12644,7 +15656,8 @@ mod tests {
             )
             .unwrap();
 
-        let moved = workspace.advance_head(&saved, Some(&base), &signature);
+        let branch = workspace.repo.head().unwrap().name().unwrap().to_string();
+        let moved = workspace.advance_head(&branch, &saved, Some(&base), &signature);
         assert!(matches!(
             moved,
             Err(DraftlineError::LocalStateChanged { .. })
@@ -14191,6 +17204,7 @@ mod tests {
             process_id: u32::MAX,
             owner: None,
             created_at_seconds: 1,
+            host: None,
         };
         fs::create_dir_all(workspace.draftline_dir()).unwrap();
         fs::write(
@@ -14210,6 +17224,65 @@ mod tests {
         let err = workspace.clear_stale_lock().unwrap_err();
         assert!(matches!(err, DraftlineError::WorkspaceLocked));
         assert!(workspace.lock_path().exists());
+    }
+
+    #[test]
+    fn a_lock_from_a_crashed_process_clears_right_away() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd")
+        } else {
+            std::process::Command::new("cat")
+        }
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+        let mut metadata = new_operation_lock_metadata("crash_test");
+        metadata.process_id = child.id();
+        fs::create_dir_all(workspace.draftline_dir()).unwrap();
+        let write_lock = |metadata: &OperationLockMetadata| {
+            fs::write(
+                workspace.lock_path(),
+                serde_json::to_vec_pretty(metadata).unwrap(),
+            )
+            .unwrap()
+        };
+        write_lock(&metadata);
+
+        assert!(!workspace.inspect_operation_lock().unwrap().is_stale);
+        assert!(matches!(
+            workspace.clear_stale_lock().unwrap_err(),
+            DraftlineError::WorkspaceLocked
+        ));
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(workspace.inspect_operation_lock().unwrap().is_stale);
+
+        // Another machine's lock can't be judged by process id.
+        metadata.host = Some("another-machine".to_string());
+        write_lock(&metadata);
+        assert!(!workspace.inspect_operation_lock().unwrap().is_stale);
+
+        // Nor can a lock that never recorded its machine.
+        metadata.host = None;
+        write_lock(&metadata);
+        assert!(!workspace.inspect_operation_lock().unwrap().is_stale);
+
+        // Same machine name, other OS (Windows vs WSL): other process ids.
+        let host = current_host().unwrap();
+        let (_, name) = host.split_once(':').unwrap();
+        let other = if cfg!(windows) { "unix" } else { "windows" };
+        metadata.host = Some(format!("{other}:{name}"));
+        write_lock(&metadata);
+        assert!(!workspace.inspect_operation_lock().unwrap().is_stale);
+
+        metadata.host = current_host();
+        write_lock(&metadata);
+        workspace.clear_stale_lock().unwrap();
+        assert!(!workspace.lock_path().exists());
     }
 
     #[test]
@@ -14300,6 +17373,380 @@ mod tests {
             fs::read_to_string(workspace.root().join("post.md")).unwrap(),
             "incoming"
         );
+    }
+
+    /// A root folder whose move to `deck` crashes at `point`.
+    fn interrupted_move(point: &'static str) -> (tempfile::TempDir, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        test_hooks::once(point, |_| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workspace.move_folder("deck").map(|_| ())
+        }));
+        assert!(crashed.is_err());
+        let operation = workspace.recovery_state().unwrap().unwrap().operation_id;
+        (temp, operation)
+    }
+
+    #[test]
+    fn a_move_interrupted_before_its_save_goes_back_to_the_old_folder() {
+        let (temp, operation) = interrupted_move("after_folder_move_checkout");
+        assert!(temp.path().join("deck").join("plan.sk").is_file());
+        let probe = Workspace::probe(temp.path().join("deck")).unwrap();
+        assert_eq!(probe.state, FolderState::Ready);
+        assert_eq!(probe.suggestions[0].fix, FolderFix::Open);
+
+        let workspace = Workspace::open(temp.path().join("deck")).unwrap();
+        let repair = workspace.repair_recovery(&operation).unwrap();
+        assert!(repair.completed);
+        assert!(temp.path().join("plan.sk").is_file());
+        assert!(!temp.path().join("deck").exists());
+        let root = Workspace::open(temp.path()).unwrap();
+        assert!(root.recovery_state().unwrap().is_none());
+        assert_eq!(
+            Workspace::probe(temp.path()).unwrap().state,
+            FolderState::Ready
+        );
+    }
+
+    #[test]
+    fn a_move_interrupted_after_its_save_finishes_in_the_new_folder() {
+        let (temp, operation) = interrupted_move("after_folder_move_commit");
+        let workspace = Workspace::open(temp.path()).unwrap();
+        workspace.rollback_recovery(&operation).unwrap();
+        assert!(temp.path().join("deck").join("plan.sk").is_file());
+        let probe = Workspace::probe(temp.path()).unwrap();
+        assert_eq!(probe.state, FolderState::ManagedElsewhere);
+        assert_eq!(probe.folder.as_deref(), Some(Path::new("deck")));
+        let deck = Workspace::open(temp.path().join("deck")).unwrap();
+        assert!(deck.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_folder_is_created_inside_its_root_and_never_through_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let made = create_folder_within(temp.path(), Path::new("a/b")).unwrap();
+        assert_eq!(made, temp.path().join("a").join("b"));
+        assert!(made.is_dir());
+        create_folder_within(temp.path(), Path::new("a/b")).unwrap();
+
+        write_file(temp.path(), "file", b"x");
+        assert!(matches!(
+            create_folder_within(temp.path(), Path::new("file/inner")),
+            Err(DraftlineError::InvalidFolderMarker(_))
+        ));
+        assert!(!temp.path().join("file").join("inner").exists());
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), temp.path().join("link")).unwrap();
+            assert!(create_folder_within(temp.path(), Path::new("link/inner")).is_err());
+            assert!(!outside.path().join("inner").exists());
+        }
+    }
+
+    #[test]
+    fn folder_fixes_stop_once_another_folder_took_over() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        write_file(temp.path(), "README.md", b"app");
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        index.write().unwrap();
+        let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "App", &tree, &[])
+            .unwrap();
+        let workspace = Workspace::init(temp.path().join("deck")).unwrap();
+        write_file(workspace.root(), "deck/plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        let branch = workspace.current_variation().unwrap();
+        fs::remove_dir_all(temp.path().join("deck")).unwrap();
+        // The handle a fix would use, taken before the race.
+        let managed =
+            Workspace::located_in(&temp.path().join("deck"), ContentPolicy::default(), None)
+                .unwrap()
+                .unwrap();
+
+        // Meanwhile another folder takes over.
+        let marker = fs::read(temp.path().join(FOLDER_MARKER)).unwrap();
+        write_file(temp.path(), FOLDER_MARKER, &marker_bytes("other").unwrap());
+        for result in [
+            managed.restore_missing_folder(),
+            managed.switch_to_folder_branch(&branch),
+        ] {
+            assert!(
+                matches!(&result, Err(DraftlineError::FolderFixUnavailable(reason))
+                    if reason.contains("another folder")),
+                "{:?}",
+                result.err()
+            );
+        }
+        assert!(!temp.path().join("deck").exists());
+
+        fs::write(temp.path().join(FOLDER_MARKER), marker).unwrap();
+        managed.restore_missing_folder().unwrap();
+        assert_eq!(fs::read(temp.path().join("deck/plan.sk")).unwrap(), b"base");
+    }
+
+    #[test]
+    fn a_recovered_move_brings_ignored_leftovers_along() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        write_file(temp.path(), "README.md", b"app");
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        index.write().unwrap();
+        let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "App", &tree, &[])
+            .unwrap();
+        let mut workspace = Workspace::init(temp.path().join("deck")).unwrap();
+        write_file(workspace.root(), "deck/plan.sk", b"base");
+        write_file(workspace.root(), "deck/.gitignore", b"cache/\n");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "deck/cache/thumb.bin", b"cache");
+        test_hooks::once("after_folder_move_commit", |_| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workspace.move_folder("pitch").map(|_| ())
+        }));
+        assert!(crashed.is_err());
+        let operation = workspace.recovery_state().unwrap().unwrap().operation_id;
+        assert!(temp.path().join("deck/cache/thumb.bin").is_file());
+        // A developer commits a file into the old folder after the crash.
+        write_file(temp.path(), "deck/dev.txt", b"dev");
+        let mut index = repo.index().unwrap();
+        index.read(false).unwrap();
+        index.add_path(Path::new("deck/dev.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "Dev", &tree, &[&head])
+            .unwrap();
+
+        let pitch = Workspace::open(temp.path().join("pitch")).unwrap();
+        pitch.rollback_recovery(&operation).unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("pitch/cache/thumb.bin")).unwrap(),
+            b"cache"
+        );
+        assert!(!temp.path().join("deck/cache").exists());
+        assert_eq!(fs::read(temp.path().join("deck/dev.txt")).unwrap(), b"dev");
+        assert!(!temp.path().join("pitch/dev.txt").exists());
+    }
+
+    /// A developer commits on the checked-out branch from another process.
+    fn developer_commits_at(point: &'static str) {
+        test_hooks::once(point, |git_dir| {
+            let repo = Repository::open(git_dir).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "Developer",
+                &head.tree().unwrap(),
+                &[&head],
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn start_variation_here_keeps_metadata_of_a_branch_created_meanwhile() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        let theirs = VariationMetadata::default().with_label("Theirs");
+        let expected = theirs.clone();
+        let root = workspace.root().to_path_buf();
+        test_hooks::once("before_branch_switch", move |_| {
+            let other = Workspace::open(&root).unwrap();
+            other.create_variation("idea").unwrap();
+            other.write_variation_metadata("idea", &theirs).unwrap();
+        });
+
+        let error = workspace
+            .start_variation_here_with_metadata(
+                "idea",
+                VariationMetadata::default().with_label("Mine"),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::VariationAlreadyExists(_)),
+            "{error:?}"
+        );
+        assert!(workspace
+            .repo
+            .find_branch("idea", BranchType::Local)
+            .is_ok());
+        assert_eq!(workspace.read_variation_metadata("idea").unwrap(), expected);
+    }
+
+    #[test]
+    fn start_variation_here_refuses_and_leaves_nothing_when_head_moves() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        let main = workspace.current_variation().unwrap();
+        developer_commits_at("before_branch_switch");
+
+        let error = workspace.start_variation_here("idea").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(workspace.current_variation().unwrap(), main);
+        assert!(workspace
+            .repo
+            .find_branch("idea", BranchType::Local)
+            .is_err());
+        assert_eq!(
+            workspace.read_variation_metadata("idea").unwrap(),
+            VariationMetadata::default()
+        );
+    }
+
+    #[test]
+    fn start_variation_here_removes_its_branch_when_head_moves_before_the_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        let main = workspace.current_variation().unwrap();
+        developer_commits_at("between_branch_and_switch");
+
+        let error = workspace.start_variation_here("idea").unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(workspace.current_variation().unwrap(), main);
+        assert!(workspace
+            .repo
+            .find_branch("idea", BranchType::Local)
+            .is_err());
+    }
+
+    struct UnreachableHost;
+
+    impl PullRequestProvider for UnreachableHost {
+        fn find_open(
+            &mut self,
+            _: &crate::PullRequestRequest,
+        ) -> Result<Option<crate::PullRequest>> {
+            panic!("Send must stop before the host")
+        }
+        fn create(&mut self, _: &crate::PullRequestRequest) -> Result<crate::PullRequest> {
+            panic!("Send must stop before the host")
+        }
+    }
+
+    #[test]
+    fn send_leaves_no_branch_behind_when_head_moves_as_it_branches() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        configure_identity(&workspace, "Seth", "seth@example.com");
+        workspace
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        workspace.publish_changes("origin").unwrap();
+        write_file(workspace.root(), "plan.sk", b"pitch");
+        workspace.save_version("Pitch").unwrap();
+        let main = workspace.current_variation().unwrap();
+        let request = SendRequest {
+            title: "Pitch".to_string(),
+            base: Some(main.clone()),
+            ..Default::default()
+        };
+        developer_commits_at("before_branch_switch");
+
+        let error = workspace
+            .send(
+                "origin",
+                &request,
+                &mut UnreachableHost,
+                &mut RemoteOptions::new(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert_eq!(workspace.current_variation().unwrap(), main);
+        let branches = workspace
+            .repo
+            .branches(Some(BranchType::Local))
+            .unwrap()
+            .map(|branch| branch.unwrap().0.name().unwrap().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(branches, vec![main.clone()]);
+        assert_eq!(
+            workspace.read_variation_metadata("pitch").unwrap(),
+            VariationMetadata::default()
+        );
+    }
+
+    #[test]
+    fn apply_incoming_refuses_when_the_branch_switches_during_the_fetch() {
+        let remote = tempfile::tempdir().unwrap();
+        init_bare_remote(remote.path());
+        let author_dir = tempfile::tempdir().unwrap();
+        let author = Workspace::init(author_dir.path()).unwrap();
+        configure_identity(&author, "Seth", "seth@example.com");
+        author
+            .add_remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_file(author.root(), "plan.sk", b"base");
+        author.save_version("Base").unwrap();
+        author.publish_changes("origin").unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer =
+            Workspace::clone_workspace(remote.path().to_str().unwrap(), peer_dir.path()).unwrap();
+        write_file(author.root(), "plan.sk", b"remote");
+        author.save_version("Remote").unwrap();
+        author.publish_changes("origin").unwrap();
+
+        let main = peer.current_variation().unwrap();
+        let head = peer.repo.head().unwrap().peel_to_commit().unwrap();
+        peer.repo.branch("feature/x", &head, false).unwrap();
+        test_hooks::once("after_apply_fetch", |git_dir| {
+            let repo = Repository::open(git_dir).unwrap();
+            repo.set_head("refs/heads/feature/x").unwrap();
+        });
+
+        let error = peer
+            .apply_incoming("origin", &mut RemoteOptions::new())
+            .unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::LocalStateChanged { .. }),
+            "{error:?}"
+        );
+        assert!(peer.recovery_state().unwrap().is_none());
+        for branch in [main.as_str(), "feature/x"] {
+            assert_eq!(
+                peer.repo
+                    .refname_to_id(&format!("refs/heads/{branch}"))
+                    .unwrap(),
+                head.id()
+            );
+        }
+        assert_eq!(fs::read(peer.root().join("plan.sk")).unwrap(), b"base");
     }
 
     #[test]

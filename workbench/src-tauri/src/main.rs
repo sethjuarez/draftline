@@ -3,15 +3,16 @@ use draftline::tauri_contract::{
     AdoptRemoteVariationResult, AdoptWorkspaceResult, ApplyIncomingCommandResult,
     ApplyShelfCommandResult, CloneWorkspaceRequest, CommandPostconditions,
     CreateVariationFromVersionRequest, CreateVariationFromVersionResult, CurrentFileRequest,
-    DeleteShelfResult, DiffVersionsRequest, FetchRemoteResult,
+    DeleteShelfResult, DiffVersionsRequest, FetchRemoteResult, FilteredFilesRequest,
     GuardedCreateVariationFromVersionRequest, GuardedCreateVariationFromVersionResult,
-    ListSupportRefsRequest, MergeIncomingCommandResult, MergeIncomingRequest,
-    MergeIncomingWithResolutionsRequest, PreflightCreateVariationFromVersionRequest,
-    PreviewVersionFileRequest, PublishCurrentVariationRequest, PublishCurrentVariationResult,
-    RecoveryRequest, RemoteRequest, RemoteVariationRequest, RestoreVersionRequest,
-    RestoreVersionResult, SaveRequest, SaveResult, SelectedDiscardRequest, SelectedDiscardResult,
-    SelectedSaveRequest, SelectedSaveResult, SelectedShelveRequest, SelectedShelveResult,
-    ShelfRequest, SwitchVariationRequest, SwitchVariationResult,
+    LegacyHistoryCleanupRequest, ListSupportRefsRequest,
+    MergeIncomingCommandResult, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
+    PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
+    PublishCurrentVariationRequest, PublishCurrentVariationResult, RecoveryRequest, RemoteRequest,
+    RemoteVariationRequest, RestoreVersionRequest, RestoreVersionResult, SaveRequest, SaveResult,
+    SelectedDiscardRequest, SelectedDiscardResult, SelectedSaveRequest, SelectedSaveResult,
+    SelectedShelveRequest, SelectedShelveResult, ShelfRequest, StartVariationHereRequest,
+    StartVariationHereResult, SwitchVariationRequest, SwitchVariationResult,
     TargetedRestoreVersionCommandResult, TargetedRestoreVersionRequest, TauriCommandError,
     TauriCommandResult, VersionRequest, WorkspaceDiagnostics, WorkspaceGraphAroundVersionRequest,
     WorkspaceGraphNeighborhoodRequest, WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest,
@@ -20,10 +21,10 @@ use draftline::tauri_contract::{
 };
 use draftline::{
     ApplyIncomingReport, ChangeSet, ContentPolicyAudit, CurrentFileDiff, CurrentFilePreview,
-    HistoryEntry, MergeIncomingReport, PreflightReport, PreviewFile, RecoveryRepairResult,
-    RemoteEndpoint, RemoteVariation, RemoteVariationDiagnostics, Shelf, ShelfApplyReport,
-    SupportRef, VariationCreatePreflight, VariationSummary, VersionDiff, VersionPreview,
-    WorkspaceGraph, WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor,
+    FilteredFile, HistoryEntry, MergeIncomingReport, PreflightReport, PreviewFile,
+    RecoveryRepairResult, RemoteEndpoint, RemoteVariation, RemoteVariationDiagnostics, Shelf,
+    ShelfApplyReport, SupportRef, VariationCreatePreflight, VariationSummary, VersionDiff,
+    VersionPreview, WorkspaceGraph, WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor,
     WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail, WorkspaceGraphPath, WorkspaceGraphRefs,
     WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceVerification,
 };
@@ -448,6 +449,27 @@ fn create_variation_from_version(
 }
 
 #[tauri_plugin_auditaur::auditaur_command]
+fn start_variation_here(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: StartVariationHereRequest,
+) -> TauriCommandResult<StartVariationHereResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::start_variation_here_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
+fn filtered_files(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: FilteredFilesRequest,
+) -> TauriCommandResult<Vec<FilteredFile>> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::filtered_files_with_context(&mut context, request))
+}
+
+#[tauri_plugin_auditaur::auditaur_command]
 fn preflight_create_variation_from_version(
     state: tauri::State<'_, DraftlineContextState>,
     request: PreflightCreateVariationFromVersionRequest,
@@ -567,6 +589,60 @@ fn rollback_recovery(
 ) -> TauriCommandResult<RecoveryRepairResult> {
     let mut context = lock_context(state.inner())?;
     contract::into_tauri_result(contract::rollback_recovery_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn acknowledge_recovery(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<CommandPostconditions> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::acknowledge_recovery_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn probe_folder(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: WorkspaceRequest,
+) -> TauriCommandResult<draftline::FolderProbe> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::probe_folder_with_context(&context, request))
+}
+
+#[tauri::command]
+fn apply_folder_fix(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: contract::ApplyFolderFixRequest,
+) -> TauriCommandResult<WorkspaceOpenResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::apply_folder_fix_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn move_folder(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: contract::MoveFolderRequest,
+) -> TauriCommandResult<contract::MoveFolderResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::move_folder_with_context(&mut context, request))
+}
+
+#[tauri::command]
+fn dismiss_legacy_history_cleanup(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: LegacyHistoryCleanupRequest,
+) -> TauriCommandResult<CommandPostconditions> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::dismiss_legacy_history_cleanup_with_context(
         &mut context,
         request,
     ))
@@ -748,6 +824,8 @@ fn main() {
             create_variation_from_version,
             preflight_create_variation_from_version,
             create_variation_from_version_guarded,
+            start_variation_here,
+            filtered_files,
             save,
             list_shelves,
             preview_shelf,
@@ -758,6 +836,11 @@ fn main() {
             clear_stale_lock,
             repair_recovery,
             rollback_recovery,
+            acknowledge_recovery,
+            probe_folder,
+            apply_folder_fix,
+            move_folder,
+            dismiss_legacy_history_cleanup,
             selected_save,
             selected_shelve,
             selected_discard,

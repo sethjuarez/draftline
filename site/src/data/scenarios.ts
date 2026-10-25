@@ -448,7 +448,7 @@ export const flowMatrix: Flow[] = [
     title: "Developers commit with plain Git",
     group: "Hybrid projects",
     status: "Covered",
-    outcome: "Show developer commits that touch the project as versions; hide code-only ones.",
+    outcome: "History shows teammates' commits, flagged when they don't touch the project; versions list only project changes.",
   },
   {
     id: "15c",
@@ -473,10 +473,10 @@ export const flowMatrix: Flow[] = [
   },
   {
     id: "15f",
-    title: "One workspace per checkout",
+    title: "Draftline manages one folder",
     group: "Hybrid projects",
     status: "Covered",
-    outcome: "Keep many projects in one workspace folder; refuse a second folder until it is relocated.",
+    outcome: "A committed root .draftline file names the one folder Draftline manages; a probe reports its state with fixes, and moving it is one tracked save.",
   },
 ];
 

@@ -40,8 +40,8 @@ pub enum DraftlineError {
     #[error("recovery operation was not found: {0}")]
     RecoveryNotFound(String),
 
-    #[error("another project in this checkout has an incomplete Draftline operation: {0}")]
-    RecoveryInOtherProject(PathBuf),
+    #[error("another folder in this checkout has an incomplete Draftline operation: {0}")]
+    RecoveryInOtherFolder(PathBuf),
 
     #[error("invalid variation name: {0}")]
     InvalidVariationName(String),
@@ -128,16 +128,41 @@ pub enum DraftlineError {
     #[error("the remote has no branch `{0}` to send to; publish it first or pass a base branch")]
     SendBaseNotOnRemote(String),
 
+    /// Draftline manages a different folder in this repository.
     #[error(
-        "this checkout's Draftline workspace is {}; open that folder, or relocate the workspace",
+        "Draftline manages {} in this repository; open that folder instead",
         workspace_folder(.0)
     )]
-    WorkspaceAlreadyInCheckout(std::path::PathBuf),
+    FolderIsElsewhere(std::path::PathBuf),
 
-    #[error("unreadable Draftline workspace record: {0}")]
-    InvalidWorkspaceClaim(String),
+    /// The incoming version keeps Draftline's folder somewhere else: move the
+    /// folder there, then merge.
+    #[error(
+        "the incoming version keeps Draftline's folder at {}; move the folder there, then merge",
+        workspace_folder(.0)
+    )]
+    IncomingFolderElsewhere(std::path::PathBuf),
 
-    #[error("branch `{0}` is not a variation; switch to one or to the base branch to send")]
+    /// The folder Draftline manages isn't here: it was renamed or deleted
+    /// outside Draftline, or the current branch doesn't have it.
+    #[error(
+        "Draftline manages {}, which is missing here; switch back to a branch that has it, or fix `.draftline`",
+        workspace_folder(.0)
+    )]
+    FolderMissing(std::path::PathBuf),
+
+    #[error("unreadable Draftline folder record: {0}")]
+    InvalidFolderMarker(String),
+
+    /// The folder can't move there; the text says why.
+    #[error("cannot move the Draftline folder: {0}")]
+    FolderMoveRefused(String),
+
+    /// The fix isn't one [`crate::Workspace::probe`] offers for the folder now.
+    #[error("that fix isn't available for this folder: {0}")]
+    FolderFixUnavailable(String),
+
+    #[error("Send branch `{0}` is outside this project's variation namespace")]
     SendOutsideNamespace(String),
 
     #[error("branch `{0}` is outside this project's variations")]

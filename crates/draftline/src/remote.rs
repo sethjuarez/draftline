@@ -28,6 +28,11 @@ pub struct SyncStatus {
     pub behind: usize,
     pub state: SyncState,
     pub incoming: Vec<RemoteVersionSummary>,
+    /// Set only by base status: the remote renamed its default branch from
+    /// this name, and a local branch still has it. Saves made there can be
+    /// moved with `start_variation_here`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_renamed_from: Option<String>,
 }
 
 /// High-level sync state for product workflows.
@@ -57,6 +62,30 @@ pub struct PublishResult {
     pub published_versions: usize,
 }
 
+/// A file in commits the remote doesn't have yet that a host may want to
+/// stop before pushing. Reported only; preflights don't refuse because of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct OutgoingFile {
+    pub path: std::path::PathBuf,
+    /// The first outgoing commit (newest first) that adds or changes it.
+    pub commit: String,
+    pub size: u64,
+    pub kind: OutgoingFileKind,
+}
+
+/// Why an [OutgoingFile] is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OutgoingFileKind {
+    /// At least the content policy's large-file threshold.
+    Large,
+    /// A Git LFS pointer. Draftline's push never uploads LFS objects, so the
+    /// content reaches the remote only if someone ran `git lfs push`.
+    LfsPointer,
+}
+
 /// Read-only publish preflight with the expected remote state captured.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishPreflight {
@@ -66,6 +95,12 @@ pub struct PublishPreflight {
     pub local_oid: String,
     pub sync_status: SyncStatus,
     pub token: PublishToken,
+    /// Large files and LFS pointers in the commits publish would push.
+    #[serde(default)]
+    pub outgoing_files: Vec<OutgoingFile>,
+    /// The scan stopped early; treat `outgoing_files` as incomplete.
+    #[serde(default)]
+    pub outgoing_files_truncated: bool,
     pub can_publish: bool,
 }
 

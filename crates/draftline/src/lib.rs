@@ -96,25 +96,27 @@ pub use profile::{
     default_git_identity, AttributionOperation, ContributorProfile, ContributorProvider,
 };
 pub use pull_request::{
-    PullRequest, PullRequestProvider, PullRequestRequest, SendRequest, SendResult,
+    DeveloperCommit, PullRequest, PullRequestProvider, PullRequestRequest, SendPreflight,
+    SendRequest, SendResult, SendToken,
 };
 pub use recovery::{RecoveryOperation, RecoveryState};
 pub use remote::{
-    Contributor, PublishPreflight, PublishResult, PublishToken, RemoteCredential,
-    RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVersionSummary, SyncState,
-    SyncStatus,
+    Contributor, OutgoingFile, OutgoingFileKind, PublishPreflight, PublishResult, PublishToken,
+    RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVersionSummary,
+    SyncState, SyncStatus,
 };
 pub use workspace::{
     AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult, ChangeKind, ChangeSet,
     ChangedFile, ContentPolicyAudit, CurrentFileDiff, CurrentFilePreview, DiagnosticCode,
-    DiagnosticSeverity, DirtySummary, ErrorExplanation, FileHazard, FileHazardKind, HistoryEntry,
-    MergeConflictResolution, MergeIncomingReport, MergeIncomingResult, MergeIncomingToken,
-    MergeResolutionChoice, OperationLockInspection, OperationLockMetadata, OperationLockState,
-    OperationLockSummary, PreflightReport, PreviewFile, PurgePreflight, PurgeToken,
-    PurgeVerification, RecoveryRepairResult, RemoteVariation, RemoteVariationDeletePreflight,
-    RemoteVariationDeleteToken, RemoteVariationDiagnostics, RestoreVersionTarget, RetryClass,
-    SafeNextAction, SharingMode, Shelf, ShelfApplyReport, SupportRef,
-    SupportRefExpirationPreflight, SupportRefExpirationToken, SupportRefKind,
+    DiagnosticSeverity, DirtySummary, ErrorExplanation, FileHazard, FileHazardKind, FilteredFile,
+    FolderFix, FolderMove, FolderProbe, FolderState, FolderSuggestion, HistoryEntry,
+    LegacyHistoryCleanup, MergeConflictResolution, MergeIncomingReport, MergeIncomingResult,
+    MergeIncomingToken, MergeResolutionChoice, OperationLockInspection, OperationLockMetadata,
+    OperationLockState, OperationLockSummary, PreflightReport, PreviewFile, PurgePreflight,
+    PurgeToken, PurgeVerification, RecoveryRepairResult, RemoteVariation,
+    RemoteVariationDeletePreflight, RemoteVariationDeleteToken, RemoteVariationDiagnostics,
+    RestoreVersionTarget, RetryClass, SafeNextAction, SharingMode, Shelf, ShelfApplyReport,
+    SupportRef, SupportRefExpirationPreflight, SupportRefExpirationToken, SupportRefKind,
     SupportRefPublishItem, SupportRefPublishPreflight, SupportRefPublishToken,
     SupportRefRestorePreflight, SupportRefRestoreToken, SupportRefScope, SupportRefSummary,
     SwitchPolicy, TargetedRestoreVersionResult, Variation, VariationCreatePreflight,

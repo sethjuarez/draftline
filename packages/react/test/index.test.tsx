@@ -767,6 +767,9 @@ function fakeClient(overrides: Partial<DraftlineClient> = {}): DraftlineClient {
       operation_id: 'op-1',
       safe_next_actions: ['normal_work'],
     })),
+    acknowledgeRecovery: vi.fn(async () => ({ errors: [] }) as never),
+    dismissLegacyHistoryCleanup: vi.fn(async () => ({}) as never),
+    startVariationHere: vi.fn(async () => ({}) as never),
     save: vi.fn(async () => ({
       postconditions: { errors: [] },
       version,

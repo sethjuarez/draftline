@@ -2,22 +2,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use draftline::tauri_contract::{
-    adopt_remote_variation, adopt_workspace, apply_incoming, apply_shelf, audit_content_policy,
-    clone_workspace, create_variation_from_version, create_variation_from_version_guarded,
-    diff_version_to_workspace, diff_versions, diff_workspace_file, fetch_remote, get_changes,
-    get_full_history, get_history, get_workspace_graph, get_workspace_graph_agent_summary,
-    get_workspace_graph_around_version, get_workspace_graph_common_ancestor,
-    get_workspace_graph_compare_summary, get_workspace_graph_for_variation,
-    get_workspace_graph_neighborhood, get_workspace_graph_node, get_workspace_graph_overview,
-    get_workspace_graph_path, get_workspace_graph_refs, get_workspace_graph_summary,
-    inspect_workspace, into_tauri_result, list_remote_variations, list_remotes, list_shelves,
-    list_support_refs, list_variations, merge_conflict_view_model, merge_incoming,
-    merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context, open_workspace,
-    preflight_apply_incoming, preflight_apply_shelf, preflight_create_variation_from_version,
-    preflight_merge_incoming, preflight_rename_variation, preflight_switch_variation,
-    preview_shelf, preview_version, preview_version_file, preview_workspace_file,
-    publish_current_variation, rename_variation, restore_version_as_new_save,
-    restore_version_as_new_save_to_variation,
+    acknowledge_recovery, adopt_remote_variation, adopt_workspace, apply_incoming, apply_shelf,
+    audit_content_policy, clone_workspace, create_variation_from_version,
+    create_variation_from_version_guarded, diff_version_to_workspace, diff_versions,
+    diff_workspace_file, fetch_remote, get_changes, get_full_history, get_history,
+    get_workspace_graph, get_workspace_graph_agent_summary, get_workspace_graph_around_version,
+    get_workspace_graph_common_ancestor, get_workspace_graph_compare_summary,
+    get_workspace_graph_for_variation, get_workspace_graph_neighborhood, get_workspace_graph_node,
+    get_workspace_graph_overview, get_workspace_graph_path, get_workspace_graph_refs,
+    get_workspace_graph_summary, inspect_workspace, into_tauri_result, list_remote_variations,
+    list_remotes, list_shelves, list_support_refs, list_variations, merge_conflict_view_model,
+    merge_incoming, merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
+    open_workspace, preflight_apply_incoming, preflight_apply_shelf,
+    preflight_create_variation_from_version, preflight_merge_incoming, preflight_rename_variation,
+    preflight_switch_variation, preview_shelf, preview_version, preview_version_file,
+    preview_workspace_file, publish_current_variation, rename_variation,
+    restore_version_as_new_save, restore_version_as_new_save_to_variation,
     restore_version_as_new_save_to_variation_with_context,
     restore_version_as_new_save_with_context, save, search_workspace_graph, selected_discard,
     selected_save, selected_save_with_context, selected_shelve, selected_shelve_with_context,
@@ -250,6 +250,38 @@ fn tauri_contract_renders_workspace_diagnostics() {
     })
     .unwrap();
     assert_eq!(support_refs.len(), 1);
+}
+
+#[test]
+fn tauri_contract_acknowledges_recovery_that_cannot_be_repaired() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"# Hello");
+    workspace.save_version("Initial draft").unwrap();
+    fs::write(
+        temp.path().join(".git/draftline/recovery.json"),
+        r#"{"operation_id":"old","operation":"HistoryCleanup","original_variation":"main","target":null,"completed":false}"#,
+    )
+    .unwrap();
+    let request = WorkspaceRequest {
+        workspace_path: temp.path().to_path_buf(),
+    };
+    assert!(
+        !inspect_workspace(request.clone())
+            .unwrap()
+            .verification
+            .recovery_clear
+    );
+
+    let postconditions = acknowledge_recovery(request.clone()).unwrap();
+    assert!(postconditions.verification.unwrap().recovery_clear);
+    assert!(
+        inspect_workspace(request)
+            .unwrap()
+            .verification
+            .recovery_clear
+    );
 }
 
 #[test]
