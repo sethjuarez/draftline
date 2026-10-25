@@ -40,8 +40,8 @@ pub enum DraftlineError {
     #[error("recovery operation was not found: {0}")]
     RecoveryNotFound(String),
 
-    #[error("another project in this checkout has an incomplete Draftline operation: {0}")]
-    RecoveryInOtherProject(PathBuf),
+    #[error("another folder in this checkout has an incomplete Draftline operation: {0}")]
+    RecoveryInOtherFolder(PathBuf),
 
     #[error("invalid variation name: {0}")]
     InvalidVariationName(String),

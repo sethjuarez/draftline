@@ -1358,7 +1358,7 @@ fn scoped_history_lists_teammates_commits_and_flags_project_changes() {
     assert_eq!(
         history
             .iter()
-            .map(|entry| entry.touches_project)
+            .map(|entry| entry.touches_folder)
             .collect::<Vec<_>>(),
         [false, true, false, true]
     );
@@ -1383,7 +1383,7 @@ fn scoped_history_lists_teammates_commits_and_flags_project_changes() {
         .iter()
         .find(|node| node.version.id().to_string() == save.to_string())
         .unwrap();
-    assert!(save_node.touches_project);
+    assert!(save_node.touches_folder);
     assert_eq!(
         save_node
             .parent_version_ids
@@ -1473,7 +1473,7 @@ fn a_merge_that_only_brings_one_sides_project_changes_does_not_touch_the_project
             .collect::<Vec<_>>(),
         [code.id().to_string(), feature.id().to_string()]
     );
-    assert!(!head.touches_project);
+    assert!(!head.touches_folder);
 }
 
 #[test]
@@ -3566,7 +3566,7 @@ fn only_the_project_that_was_interrupted_can_finish_its_recovery() {
     write_file(temp.path(), "deck/slide.sk", "slide\n");
     let error = moved.save_version("Slide").unwrap_err();
     assert!(
-        matches!(&error, DraftlineError::RecoveryInOtherProject(project) if project == Path::new("cutready")),
+        matches!(&error, DraftlineError::RecoveryInOtherFolder(project) if project == Path::new("cutready")),
         "{error:?}"
     );
     assert_eq!(
@@ -4382,6 +4382,133 @@ fn the_root_folder_moves_into_a_subfolder_and_back() {
     assert_eq!(root.scope(), Path::new(""));
     assert_eq!(read(temp.path(), "src/main.rs"), "fn main() {}\n");
     assert!(!temp.path().join("business").exists());
+}
+
+#[test]
+fn history_and_restore_follow_the_folder_through_a_move() {
+    let (temp, repo) = code_repo();
+    let mut pitch = scoped(&temp);
+    write_file(temp.path(), "cutready/intro.sk", "intro\n");
+    let intro = pitch.save_version("Intro").unwrap();
+    pitch.move_folder("demos/pitch").unwrap();
+    write_file(temp.path(), "demos/pitch/intro.sk", "after\n");
+    let after = pitch.save_version("After").unwrap();
+    write_file(temp.path(), "src/lib.rs", "pub fn x() {}\n");
+    commit_all(&repo, "Developer change");
+
+    let labels: Vec<_> = pitch
+        .versions()
+        .unwrap()
+        .into_iter()
+        .map(|v| v.label)
+        .collect();
+    assert_eq!(
+        labels[..3],
+        [
+            "After",
+            "Move Draftline folder from cutready to demos/pitch",
+            "Intro"
+        ],
+        "{labels:?}"
+    );
+    let history = pitch.history().unwrap();
+    let touches = |label: &str| {
+        history
+            .iter()
+            .find(|entry| entry.version.label == label)
+            .unwrap()
+            .touches_folder
+    };
+    assert!(touches("Intro") && touches("After"));
+    assert!(!touches("Developer change"));
+
+    // A version from before the move reads as the folder's own.
+    let diff = pitch.diff_versions(intro.id(), after.id()).unwrap();
+    let paths: Vec<_> = diff.files.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(paths, [PathBuf::from("demos/pitch/intro.sk")]);
+    let preview = pitch.preview_version(intro.id()).unwrap();
+    assert!(preview
+        .files
+        .iter()
+        .all(|file| !file.path.starts_with("cutready")));
+    let file = pitch
+        .preview_version_file(intro.id(), "demos/pitch/intro.sk")
+        .unwrap()
+        .unwrap();
+    assert_eq!(file.content.as_deref(), Some("intro\n"));
+    let to_workspace = pitch.diff_version_to_workspace(intro.id()).unwrap();
+    assert_eq!(to_workspace.files.len(), 1);
+
+    pitch
+        .restore_version_as_new_save(intro.id(), "Back")
+        .unwrap();
+    assert_eq!(read(temp.path(), "demos/pitch/intro.sk"), "intro\n");
+    assert!(!temp.path().join("cutready").exists());
+    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+    assert!(tree.get_path(Path::new("cutready")).is_err());
+    assert!(tree.get_path(Path::new("src/lib.rs")).is_ok());
+    let marker = repo.find_blob(head_marker(&repo)).unwrap();
+    assert!(String::from_utf8_lossy(marker.content()).contains("\"demos/pitch\""));
+}
+
+#[test]
+fn restoring_onto_a_variation_from_before_a_move_is_refused() {
+    let (temp, repo) = code_repo();
+    let mut pitch = scoped(&temp);
+    write_file(temp.path(), "cutready/intro.sk", "intro\n");
+    let intro = pitch.save_version("Intro").unwrap();
+    let old = pitch.create_variation("cutready/old").unwrap();
+    pitch.move_folder("demos/pitch").unwrap();
+    let tip = repo
+        .find_reference("refs/heads/cutready/old")
+        .unwrap()
+        .target();
+
+    let err = pitch
+        .restore_version_as_new_save_to_variation(
+            intro.id(),
+            "Back",
+            draftline::RestoreVersionTarget::Existing {
+                variation: old.id().clone(),
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, DraftlineError::FolderIsElsewhere(folder) if folder == Path::new("cutready")),
+        "{err:?}"
+    );
+    assert_eq!(
+        repo.find_reference("refs/heads/cutready/old")
+            .unwrap()
+            .target(),
+        tip
+    );
+}
+
+#[test]
+fn a_root_folder_keeps_its_history_after_moving_into_a_subfolder() {
+    let (temp, repo) = code_repo();
+    let mut root = Workspace::open_with_policy(temp.path(), cutready_policy()).unwrap();
+    write_file(temp.path(), "notes.md", "first\n");
+    let first = root.save_version("First").unwrap();
+    root.move_folder("business").unwrap();
+    write_file(temp.path(), "business/notes.md", "second\n");
+    root.save_version("Second").unwrap();
+
+    let labels: Vec<_> = root
+        .versions()
+        .unwrap()
+        .into_iter()
+        .map(|v| v.label)
+        .collect();
+    assert!(labels.contains(&"First".to_string()), "{labels:?}");
+
+    root.restore_version_as_new_save(first.id(), "Back")
+        .unwrap();
+    assert_eq!(read(temp.path(), "business/notes.md"), "first\n");
+    let tree = repo.head().unwrap().peel_to_tree().unwrap();
+    let names: Vec<_> = tree.iter().map(|e| e.name().unwrap().to_string()).collect();
+    assert_eq!(names, [".draftline", "business"]);
 }
 
 #[test]

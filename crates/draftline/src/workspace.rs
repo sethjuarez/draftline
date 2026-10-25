@@ -256,14 +256,14 @@ pub enum FileHazardKind {
     PolicyExcluded,
     /// Needs a Git filter driver (for example Git LFS) that Draftline cannot run.
     GitFilter,
-    /// A developer's file outside the project folder needs a Git filter
+    /// A developer's file outside the folder needs a Git filter
     /// driver; someone with the driver must make this update with Git.
     GitFilterOutsideProject,
     /// Has uncommitted local edits that the operation would overwrite.
     LocalChanges,
 }
 
-/// A project file that Git stores through a filter driver such as Git LFS.
+/// A file in the folder that Git stores through a filter driver such as Git LFS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FilteredFile {
@@ -406,8 +406,8 @@ pub enum SafeNextAction {
     DiscardChanges,
     RepairRecovery,
     ConfigureRemote,
-    /// Another project in this checkout must finish its interrupted operation.
-    FinishInOtherProject,
+    /// Another folder in this checkout must finish its interrupted operation.
+    FinishInOtherFolder,
 }
 
 /// Stable diagnostic codes for workspace inspection.
@@ -416,7 +416,7 @@ pub enum SafeNextAction {
 #[non_exhaustive]
 pub enum DiagnosticCode {
     RecoveryRequired,
-    RecoveryInOtherProject,
+    RecoveryInOtherFolder,
     WorkspaceLocked,
     DirtyWorkspace,
     LocalOnlyWorkspace,
@@ -424,7 +424,7 @@ pub enum DiagnosticCode {
     NoCurrentVariation,
     WorkspaceReadFailed,
     PolicyTrackedFileIgnored,
-    /// Project files that Git stores with LFS hold pointer text instead of
+    /// The folder's files that Git stores with LFS hold pointer text instead of
     /// their content, because the clone never downloaded it.
     LfsContentMissing,
 }
@@ -615,8 +615,8 @@ struct RemoteHead {
     previous: Option<String>,
 }
 
-/// The recovery file on disk: the state plus the project that wrote it.
-/// Records from older versions have no project.
+/// The recovery file on disk: the state plus the folder that wrote it.
+/// Records from older versions have no folder.
 #[derive(Serialize, Deserialize)]
 struct RecoveryLedger {
     #[serde(flatten)]
@@ -914,7 +914,7 @@ pub struct WorkspaceGraphBoundary {
     pub hidden_child_count: usize,
 }
 
-/// A graph-ready commit node. In a project folder, `touches_project` is false
+/// A graph-ready commit node. In a folder, `touches_folder` is false
 /// for teammates' commits that don't change the folder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -929,10 +929,10 @@ pub struct WorkspaceGraphNode {
     pub parent_ids: Vec<WorkspaceGraphNodeId>,
     pub parent_version_ids: Vec<VersionId>,
     pub variation_tips: Vec<VariationId>,
-    /// Whether this commit changes the project folder; see
-    /// [`HistoryEntry::touches_project`].
-    #[serde(default = "touches_project_by_default")]
-    pub touches_project: bool,
+    /// Whether this commit changes the folder; see
+    /// [`HistoryEntry::touches_folder`].
+    #[serde(default = "touches_folder_by_default")]
+    pub touches_folder: bool,
     pub is_head: bool,
     pub is_current: bool,
     pub is_tip: bool,
@@ -1180,15 +1180,15 @@ pub struct HistoryEntry {
     /// parents.  Merge commits have multiple parents, but Draftline
     /// discourages merge commits in favour of sequential saves.
     pub parent_ids: Vec<VersionId>,
-    /// `true` when this commit changes the project folder. In a project folder
+    /// `true` when this commit changes the folder. In a folder
     /// inside a larger repository, teammates' commits that only touch other
     /// files are listed too, with `false`; standalone workspaces are always
     /// `true`.
-    #[serde(default = "touches_project_by_default")]
-    pub touches_project: bool,
+    #[serde(default = "touches_folder_by_default")]
+    pub touches_folder: bool,
 }
 
-fn touches_project_by_default() -> bool {
+fn touches_folder_by_default() -> bool {
     true
 }
 
@@ -2322,13 +2322,13 @@ impl Workspace {
     /// Returns the repository working-tree root.
     ///
     /// Paths accepted and returned by Draftline are relative to this root. For a
-    /// project folder inside a larger repository, see [`Workspace::scope`] and
+    /// folder inside a larger repository, see [`Workspace::scope`] and
     /// [`Workspace::project_root`].
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Returns the repository-relative project folder, or an empty path when
+    /// Returns the repository-relative folder, or an empty path when
     /// the project is the repository root.
     pub fn scope(&self) -> &Path {
         self.content_policy.scope()
@@ -2342,7 +2342,7 @@ impl Workspace {
         crate::profile::identity_from_config(&self.repo.config()?)
     }
 
-    /// Returns the absolute project folder.
+    /// Returns the absolute folder.
     pub fn project_root(&self) -> PathBuf {
         self.root.join(self.scope())
     }
@@ -2518,7 +2518,7 @@ impl Workspace {
         if recovery.is_some() {
             diagnostics.push(match self.recovery_owner_elsewhere() {
                 Some(project) => workspace_diagnostic(
-                    DiagnosticCode::RecoveryInOtherProject,
+                    DiagnosticCode::RecoveryInOtherFolder,
                     DiagnosticSeverity::Blocking,
                     format!(
                         "project {} has an incomplete Draftline operation",
@@ -2631,11 +2631,11 @@ impl Workspace {
                 safe_next_actions: vec![SafeNextAction::RepairRecovery],
                 retry: RetryClass::RetryAfterRepair,
             },
-            DiagnosticCode::RecoveryInOtherProject => ErrorExplanation {
+            DiagnosticCode::RecoveryInOtherFolder => ErrorExplanation {
                 code,
-                message: "another project in this checkout has an incomplete Draftline operation"
+                message: "another folder in this checkout has an incomplete Draftline operation"
                     .to_string(),
-                safe_next_actions: vec![SafeNextAction::FinishInOtherProject],
+                safe_next_actions: vec![SafeNextAction::FinishInOtherFolder],
                 retry: RetryClass::RetryAfterRepair,
             },
             DiagnosticCode::WorkspaceLocked => ErrorExplanation {
@@ -3083,7 +3083,7 @@ impl Workspace {
             None => {
                 // Older records: the restore built on its target's tip,
                 // whether or not its save landed.
-                let source = self.find_version_commit(&version)?.tree()?;
+                let source = self.relocated_tree(&self.find_version_commit(&version)?)?;
                 let base = match variation.map(|name| self.branch_tree(name)) {
                     Some(Ok(tree)) => tree,
                     _ => self.repo.head()?.peel_to_tree()?,
@@ -3191,8 +3191,12 @@ impl Workspace {
     fn head_tree_or_empty(&self) -> Result<Tree<'_>> {
         match self.repo.head().and_then(|head| head.peel_to_tree()) {
             Ok(tree) => Ok(tree),
-            Err(_) => Ok(self.repo.find_tree(self.repo.treebuilder(None)?.write()?)?),
+            Err(_) => Ok(self.repo.find_tree(self.empty_tree_id()?)?),
         }
+    }
+
+    fn empty_tree_id(&self) -> Result<Oid> {
+        Ok(self.repo.treebuilder(None)?.write()?)
     }
 
     fn branch_tree(&self, variation: &str) -> Result<Tree<'_>> {
@@ -3655,7 +3659,7 @@ impl Workspace {
 
     /// Lists versions reachable from the current variation, newest first.
     ///
-    /// In a project folder inside a larger repository, only commits that change
+    /// In a folder inside a larger repository, only commits that change
     /// the folder are versions (like `git log -- <folder>`); developers' other
     /// commits are skipped.
     pub fn versions(&self) -> Result<Vec<Version>> {
@@ -5776,7 +5780,7 @@ impl Workspace {
         let branch = self.ensure_on_branch()?;
         let head_commit = self.repo.head()?.peel_to_commit()?;
         let restored_tree = {
-            let source = self.find_version_commit(version)?.tree()?;
+            let source = self.relocated_tree(&self.find_version_commit(version)?)?;
             let tree_id = self.compose_scoped_tree(&head_commit.tree()?, &source)?;
             self.repo.find_tree(tree_id)?
         };
@@ -5877,11 +5881,17 @@ impl Workspace {
         let _lock = self.acquire_for_index("restore_version_as_new_save_to_variation")?;
 
         let source_commit = self.find_version_commit(version)?;
-        let source_tree = source_commit.tree()?;
+        let source_tree = self.relocated_tree(&source_commit)?;
         let current_variation = self.current_variation_unchecked()?;
         let (target_name, target_metadata, parent_oid) =
             self.resolve_restore_version_target(target, &current_variation)?;
         let parent = self.repo.find_commit(parent_oid)?;
+        // A target from before a move keeps the folder elsewhere; restoring
+        // into it would leave the folder in two places.
+        let target_folder = FolderChanges::new(&self.repo, self.scope()).folder_at(&parent)?;
+        if target_folder != self.scope() {
+            return Err(DraftlineError::FolderIsElsewhere(target_folder));
+        }
         let restored_tree = {
             let tree_id = self.compose_scoped_tree(&parent.tree()?, &source_tree)?;
             self.repo.find_tree(tree_id)?
@@ -5952,7 +5962,7 @@ impl Workspace {
     pub fn preview_version(&self, version: &VersionId) -> Result<VersionPreview> {
         self.ensure_no_pending_recovery()?;
         let commit = self.find_version_commit(version)?;
-        let tree = commit.tree()?;
+        let tree = self.relocated_tree(&commit)?;
         let mut files = Vec::new();
         collect_preview_files(
             &self.repo,
@@ -5981,7 +5991,7 @@ impl Workspace {
         }
 
         let commit = self.find_version_commit(version)?;
-        let tree = commit.tree()?;
+        let tree = self.relocated_tree(&commit)?;
         let entry = match tree.get_path(&path) {
             Ok(entry) => entry,
             Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
@@ -6085,8 +6095,8 @@ impl Workspace {
     /// Returns the version history for the current variation with variation-tip annotations.
     ///
     /// Like `git log`, this lists every commit on the branch, including
-    /// teammates' commits that don't change the project folder; check
-    /// [`HistoryEntry::touches_project`]. [`Workspace::versions`] lists only
+    /// teammates' commits that don't change the folder; check
+    /// [`HistoryEntry::touches_folder`]. [`Workspace::versions`] lists only
     /// the commits that change the folder.
     ///
     /// Each entry carries the version metadata plus the list of variation IDs
@@ -6112,7 +6122,7 @@ impl Workspace {
             return Ok(Vec::new());
         }
 
-        let mut project = ProjectChanges::new(&self.repo, self.scope());
+        let mut project = FolderChanges::new(&self.repo, self.scope());
         let mut entries = Vec::new();
         for oid in walk {
             let commit = self.repo.find_commit(oid?)?;
@@ -6158,7 +6168,7 @@ impl Workspace {
             walk.push(tip)?;
         }
 
-        let mut project = ProjectChanges::new(&self.repo, self.scope());
+        let mut project = FolderChanges::new(&self.repo, self.scope());
         let mut entries = Vec::new();
         for oid in walk {
             let commit = self.repo.find_commit(oid?)?;
@@ -6283,7 +6293,7 @@ impl Workspace {
         let walk_result = (|| -> Result<()> {
             let mut walk = self.repo.revwalk()?;
             walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
-            let mut project = ProjectChanges::new(&self.repo, self.scope());
+            let mut project = FolderChanges::new(&self.repo, self.scope());
             for oid in push_oids {
                 walk.push(oid)?;
             }
@@ -6893,7 +6903,7 @@ impl Workspace {
             .collect::<Vec<_>>();
         // A commit that doesn't touch the project matches some parent's project
         // tree, so it has no project changes even when it is a merge.
-        let changed_files = if !node.touches_project {
+        let changed_files = if !node.touches_folder {
             Vec::new()
         } else if let Some(parent) = node.parent_version_ids.first() {
             self.diff_versions(parent, version)?.files
@@ -7502,8 +7512,8 @@ impl Workspace {
         self.ensure_no_pending_recovery()?;
         let from_commit = self.find_version_commit(from)?;
         let to_commit = self.find_version_commit(to)?;
-        let from_tree = from_commit.tree()?;
-        let to_tree = to_commit.tree()?;
+        let from_tree = self.relocated_tree(&from_commit)?;
+        let to_tree = self.relocated_tree(&to_commit)?;
 
         let mut opts = DiffOptions::new();
         limit_diff_to_scope(&mut opts, self.scope());
@@ -7542,7 +7552,7 @@ impl Workspace {
     pub fn diff_version_to_workspace(&self, version: &VersionId) -> Result<VersionDiff> {
         self.ensure_no_pending_recovery()?;
         let commit = self.find_version_commit(version)?;
-        let tree = commit.tree()?;
+        let tree = self.relocated_tree(&commit)?;
 
         let mut opts = DiffOptions::new();
         opts.include_untracked(true).recurse_untracked_dirs(true);
@@ -8803,7 +8813,7 @@ impl Workspace {
         Ok((files, false))
     }
 
-    /// Commits Send would push that change files outside the project folder.
+    /// Commits Send would push that change files outside the folder.
     /// Outgoing means reachable from `head` but not from the remote base. Draftline saves only touch the
     /// folder. A merge is listed only for outside paths that match none of its
     /// parents (a hand-made resolution), so Draftline's merges of the base
@@ -9916,16 +9926,16 @@ impl Workspace {
         Ok(())
     }
 
-    /// Projects in one checkout share its branch, so one project's unfinished
-    /// operation blocks the others, but only that project may finish it.
+    /// Folders in one checkout share its branch, so one folder's unfinished
+    /// operation blocks the others, but only that folder may finish it.
     fn ensure_recovery_is_ours(&self) -> Result<()> {
         match self.recovery_owner_elsewhere() {
-            Some(project) => Err(DraftlineError::RecoveryInOtherProject(project)),
+            Some(project) => Err(DraftlineError::RecoveryInOtherFolder(project)),
             None => Ok(()),
         }
     }
 
-    /// The other project that owns the incomplete recovery record, if any. An
+    /// The other folder that owns the incomplete recovery record, if any. An
     /// unreadable record is reported by `recovery_state` and stays clearable.
     fn recovery_owner_elsewhere(&self) -> Option<PathBuf> {
         let bytes = fs::read(self.ledger_path()).ok()?;
@@ -10255,7 +10265,7 @@ impl Workspace {
     }
 
     /// A filter refusal, naming whether the file is the project's or a
-    /// developer's outside the project folder.
+    /// developer's outside the folder.
     fn filter_hazard(&self, path: PathBuf) -> FileHazard {
         let kind = if path.starts_with(self.scope()) {
             FileHazardKind::GitFilter
@@ -10326,14 +10336,14 @@ impl Workspace {
         ))))
     }
 
-    /// Tracked project files that Git stores through a filter driver, such as
+    /// Tracked files in the folder that Git stores through a filter driver, such as
     /// Git LFS, with whether their content is missing from disk.
     pub fn filtered_files(&self) -> Result<Vec<FilteredFile>> {
         let paths = self.tracked_project_paths()?;
         self.filtered_among(paths)
     }
 
-    /// Tracked project files under a filter whose disk content is a Git LFS
+    /// Tracked files in the folder under a filter whose disk content is a Git LFS
     /// pointer. Cheap enough for `inspect`: only files of at most 1 KiB are read.
     fn missing_lfs_content(&self) -> Result<Vec<PathBuf>> {
         let mut missing = Vec::new();
@@ -10508,7 +10518,7 @@ impl Workspace {
         result
     }
 
-    /// Forces only the project folder to `target`; paths outside it are untouched.
+    /// Forces only the folder to `target`; paths outside it are untouched.
     fn checkout_scope_forced(&self, target: &Tree<'_>) -> Result<()> {
         let mut checkout = CheckoutBuilder::new();
         checkout.force();
@@ -10532,7 +10542,7 @@ impl Workspace {
         })
     }
 
-    /// Every path in the project folder that `target` or the index has.
+    /// Every path in the folder that `target` or the index has.
     fn scope_index_paths(&self, target: &Tree<'_>) -> Result<Vec<PathBuf>> {
         let scope = scope_pathspec(self.scope());
         let in_scope = |path: &str| {
@@ -10564,8 +10574,65 @@ impl Workspace {
         Ok(paths.into_iter().map(PathBuf::from).collect())
     }
 
-    /// `base` with its project folder replaced by `source`'s project folder.
+    /// `base` with its folder replaced by `source`'s folder.
     /// Unscoped workspaces use `source` as-is.
+    /// `commit`'s tree with Draftline's folder where the folder is now, so a
+    /// version saved before a move reads, diffs and restores as this folder's.
+    fn relocated_tree(&self, commit: &Commit<'_>) -> Result<Tree<'_>> {
+        let tree = commit.tree()?;
+        let from = FolderChanges::new(&self.repo, self.scope()).folder_at(commit)?;
+        if from == self.scope() {
+            return Ok(self.repo.find_tree(tree.id())?);
+        }
+        // The folder's content as it was: a root folder is everything but the marker.
+        let content = if from.as_os_str().is_empty() {
+            let mut update = git2::build::TreeUpdateBuilder::new();
+            update.remove(FOLDER_MARKER);
+            Some(update.create_updated(&self.repo, &tree)?)
+        } else {
+            optional_tree_entry(&tree, &from)?
+        };
+        let id = match scope_pathspec(self.scope()) {
+            // Now the root: the folder's content is the whole tree, under today's marker.
+            None => {
+                let content = match content {
+                    Some(content) => content,
+                    None => self.empty_tree_id()?,
+                };
+                let content = self.repo.find_tree(content)?;
+                match self.head_tree_or_empty()?.get_name(FOLDER_MARKER) {
+                    Some(marker) => {
+                        let mut update = git2::build::TreeUpdateBuilder::new();
+                        update.upsert(FOLDER_MARKER, marker.id(), git2::FileMode::Blob);
+                        update.create_updated(&self.repo, &content)?
+                    }
+                    None => content.id(),
+                }
+            }
+            Some(pathspec) => {
+                // The folder leaves its old place; a root folder held nothing
+                // else, so nothing else carries over.
+                let base = if from.as_os_str().is_empty() {
+                    self.empty_tree_id()?
+                } else {
+                    let mut update = git2::build::TreeUpdateBuilder::new();
+                    update.remove(folder_key(&from));
+                    update.create_updated(&self.repo, &tree)?
+                };
+                let base = self.repo.find_tree(base)?;
+                let mut update = git2::build::TreeUpdateBuilder::new();
+                match content {
+                    Some(content) => {
+                        update.upsert(pathspec.as_str(), content, git2::FileMode::Tree)
+                    }
+                    None => update.remove(pathspec.as_str()),
+                };
+                update.create_updated(&self.repo, &base)?
+            }
+        };
+        Ok(self.repo.find_tree(id)?)
+    }
+
     fn compose_scoped_tree(&self, base: &Tree<'_>, source: &Tree<'_>) -> Result<Oid> {
         let Some(pathspec) = scope_pathspec(self.scope()) else {
             // The marker describes the repository, not a version of the
@@ -11183,7 +11250,7 @@ impl Workspace {
         if walk.push_head().is_err() {
             return Ok(Vec::new());
         }
-        let mut project = ProjectChanges::new(&self.repo, self.scope());
+        let mut project = FolderChanges::new(&self.repo, self.scope());
         let mut versions = Vec::new();
         for oid in walk {
             let commit = self.repo.find_commit(oid?)?;
@@ -11999,54 +12066,103 @@ fn signature_from_contributor(contributor: &Contributor) -> Result<Signature<'st
     Ok(Signature::now(name, email)?)
 }
 
-/// Tells which commits change the project folder, like
-/// `git log -- <scope>`. In an unscoped workspace every commit does.
-struct ProjectChanges<'r> {
+/// Tells which commits change Draftline's folder, like `git log -- <folder>`,
+/// following the folder through moves: each commit's own [`FOLDER_MARKER`]
+/// says where the folder was. Commits from before the marker existed use the
+/// first folder one recorded.
+struct FolderChanges<'r> {
     repo: &'r Repository,
-    scope: Option<PathBuf>,
-    scope_trees: HashMap<Oid, Option<Oid>>,
+    current: PathBuf,
+    first: Option<PathBuf>,
+    /// Per commit: where the folder was, and its tree there.
+    seen: HashMap<Oid, (PathBuf, Option<Oid>)>,
 }
 
-impl<'r> ProjectChanges<'r> {
-    fn new(repo: &'r Repository, scope: &Path) -> Self {
+impl<'r> FolderChanges<'r> {
+    fn new(repo: &'r Repository, current: &Path) -> Self {
         Self {
             repo,
-            scope: (!scope.as_os_str().is_empty()).then(|| scope.to_path_buf()),
-            scope_trees: HashMap::new(),
+            current: current.to_path_buf(),
+            first: None,
+            seen: HashMap::new(),
         }
     }
 
-    fn scope_tree(&mut self, scope: &Path, oid: Oid) -> Result<Option<Oid>> {
-        if let Some(cached) = self.scope_trees.get(&oid) {
-            return Ok(*cached);
+    /// Where the folder was in `commit`.
+    fn folder_at(&mut self, commit: &Commit<'_>) -> Result<PathBuf> {
+        Ok(self.at(commit)?.0)
+    }
+
+    fn at(&mut self, commit: &Commit<'_>) -> Result<(PathBuf, Option<Oid>)> {
+        if let Some(cached) = self.seen.get(&commit.id()) {
+            return Ok(cached.clone());
         }
-        let tree = self.repo.find_commit(oid)?.tree()?;
-        let id = match tree.get_path(scope) {
-            Ok(entry) => Some(entry.id()),
-            Err(error) if error.code() == git2::ErrorCode::NotFound => None,
-            Err(error) => return Err(error.into()),
+        let tree = commit.tree()?;
+        let folder = match tree_marker_folder(self.repo, &tree) {
+            Some(folder) => folder,
+            None => self.first_folder()?,
         };
-        self.scope_trees.insert(oid, id);
-        Ok(id)
+        let id = if folder.as_os_str().is_empty() {
+            Some(tree.id())
+        } else {
+            optional_tree_entry(&tree, &folder)?
+        };
+        self.seen.insert(commit.id(), (folder.clone(), id));
+        Ok((folder, id))
     }
 
-    /// A commit touches the folder unless some parent has an identical
-    /// folder; a merge that only takes one side's folder does not.
+    /// The oldest folder a marker on HEAD's history names, else the current one.
+    fn first_folder(&mut self) -> Result<PathBuf> {
+        if let Some(first) = &self.first {
+            return Ok(first.clone());
+        }
+        let mut first = self.current.clone();
+        let mut walk = self.repo.revwalk()?;
+        if walk.push_head().is_ok() {
+            walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+            for oid in walk {
+                let tree = self.repo.find_commit(oid?)?.tree()?;
+                if let Some(folder) = tree_marker_folder(self.repo, &tree) {
+                    first = folder;
+                    break;
+                }
+            }
+        }
+        self.first = Some(first.clone());
+        Ok(first)
+    }
+
+    /// A commit touches the folder unless some parent has the same folder in
+    /// the same place; a merge that only takes one side's folder does not,
+    /// and a move does. Every commit touches a folder that is the root.
     fn touches(&mut self, commit: &Commit<'_>) -> Result<bool> {
-        let Some(scope) = self.scope.clone() else {
+        let own = self.at(commit)?;
+        if own.0.as_os_str().is_empty() {
             return Ok(true);
-        };
-        let own = self.scope_tree(&scope, commit.id())?;
-        if commit.parent_count() == 0 {
-            return Ok(own.is_some());
         }
-        for parent in commit.parent_ids() {
-            if self.scope_tree(&scope, parent)? == own {
+        if commit.parent_count() == 0 {
+            return Ok(own.1.is_some());
+        }
+        for parent in commit.parents() {
+            if self.at(&parent)? == own {
                 return Ok(false);
             }
         }
         Ok(true)
     }
+}
+
+/// The folder `tree`'s own [`FOLDER_MARKER`] names, if it is a valid one.
+fn tree_marker_folder(repo: &Repository, tree: &Tree<'_>) -> Option<PathBuf> {
+    let blob = repo.find_blob(tree.get_name(FOLDER_MARKER)?.id()).ok()?;
+    let marker = serde_json::from_slice::<FolderMarker>(blob.content()).ok()?;
+    if marker.format != 1 {
+        return None;
+    }
+    if marker.folder == "." {
+        return Some(PathBuf::new());
+    }
+    canonical_folder(&marker.folder).filter(|folder| !folder.as_os_str().is_empty())
 }
 
 fn version_from_commit(commit: &Commit<'_>) -> Version {
@@ -12066,7 +12182,7 @@ fn version_from_commit(commit: &Commit<'_>) -> Version {
 
 fn history_entry_from_commit(
     commit: &Commit<'_>,
-    touches_project: bool,
+    touches_folder: bool,
     tips: &HashMap<Oid, Vec<VariationId>>,
     head_oid: Option<Oid>,
 ) -> Result<HistoryEntry> {
@@ -12081,7 +12197,7 @@ fn history_entry_from_commit(
         variation_tips,
         is_head,
         parent_ids,
-        touches_project,
+        touches_folder,
     })
 }
 
@@ -12156,7 +12272,7 @@ fn workspace_graph_node_from_commit(
         parent_ids,
         parent_version_ids: history_entry.parent_ids,
         variation_tips: history_entry.variation_tips,
-        touches_project: history_entry.touches_project,
+        touches_folder: history_entry.touches_folder,
         is_head,
         is_current: is_head,
         is_tip,
@@ -12712,9 +12828,9 @@ fn safe_next_actions_for_inspection(
 ) -> Vec<SafeNextAction> {
     if diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == DiagnosticCode::RecoveryInOtherProject)
+        .any(|diagnostic| diagnostic.code == DiagnosticCode::RecoveryInOtherFolder)
     {
-        return vec![SafeNextAction::FinishInOtherProject];
+        return vec![SafeNextAction::FinishInOtherFolder];
     }
     if recovery.is_some()
         || operation_lock.state == OperationLockState::Locked
@@ -13034,7 +13150,7 @@ fn optional_tree_entry(tree: &Tree<'_>, path: &Path) -> Result<Option<Oid>> {
     }
 }
 
-/// Literal (non-glob) pathspec for the project folder, or `None` when unscoped.
+/// Literal (non-glob) pathspec for the folder, or `None` when unscoped.
 fn scope_pathspec(scope: &Path) -> Option<String> {
     if scope.as_os_str().is_empty() {
         return None;
@@ -13042,7 +13158,7 @@ fn scope_pathspec(scope: &Path) -> Option<String> {
     Some(scope.to_string_lossy().replace('\\', "/"))
 }
 
-/// Restricts a status scan to the project folder so large code repositories
+/// Restricts a status scan to the folder so large code repositories
 /// are not walked in full.
 fn limit_status_to_scope(options: &mut StatusOptions, scope: &Path) {
     if let Some(pathspec) = scope_pathspec(scope) {
@@ -13050,20 +13166,20 @@ fn limit_status_to_scope(options: &mut StatusOptions, scope: &Path) {
     }
 }
 
-/// Restricts a diff to the project folder.
+/// Restricts a diff to the folder.
 fn limit_diff_to_scope(options: &mut DiffOptions, scope: &Path) {
     if let Some(pathspec) = scope_pathspec(scope) {
         options.disable_pathspec_match(true).pathspec(pathspec);
     }
 }
 
-/// Computes the repository-relative project folder for `project_path`.
+/// Computes the repository-relative folder for `project_path`.
 fn project_scope(workdir: &Path, project_path: &Path) -> Result<PathBuf> {
     let workdir = fs::canonicalize(workdir)?;
     let project = fs::canonicalize(project_path)?;
     match project.strip_prefix(&workdir) {
         Ok(relative) => normalize_workspace_relative(relative),
-        // e.g. a symlinked project folder that resolves outside the repository.
+        // e.g. a symlinked folder that resolves outside the repository.
         Err(_) => Err(DraftlineError::PathEscapesWorkspace(project)),
     }
 }

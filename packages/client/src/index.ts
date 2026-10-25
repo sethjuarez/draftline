@@ -311,7 +311,7 @@ export type SafeNextAction =
   | 'discard_changes'
   | 'repair_recovery'
   | 'configure_remote'
-  | 'finish_in_other_project';
+  | 'finish_in_other_folder';
 export type SharingMode = 'local_only' | 'shared_capable';
 export type SupportRefScope = 'local' | 'remote_tracking';
 export type SupportRefKind = 'deleted_variation' | 'rewrite' | 'history_cleanup_backup';
@@ -386,8 +386,8 @@ export interface HistoryEntry {
   variation_tips: string[];
   is_head: boolean;
   parent_ids: string[];
-  /** False for teammates' commits that don't change the project folder. */
-  touches_project: boolean;
+  /** False for teammates' commits that don't change the folder. */
+  touches_folder: boolean;
 }
 
 export type WorkspaceGraphAction =
@@ -433,8 +433,8 @@ export interface WorkspaceGraphNode {
   parent_ids: string[];
   parent_version_ids: string[];
   variation_tips: string[];
-  /** False for teammates' commits that don't change the project folder. */
-  touches_project: boolean;
+  /** False for teammates' commits that don't change the folder. */
+  touches_folder: boolean;
   is_head: boolean;
   is_current: boolean;
   is_tip: boolean;
@@ -675,7 +675,7 @@ export interface FileHazard {
   kind: string;
 }
 
-/** A project file Git stores through a filter driver such as Git LFS. */
+/** A file in the folder that Git stores through a filter driver such as Git LFS. */
 export interface FilteredFile {
   path: string;
   /** The `filter` attribute's driver, for example `lfs`. */
@@ -1265,7 +1265,7 @@ export interface GuardedCreateVariationFromVersionRequest extends WorkspaceReque
   metadata?: VariationMetadata;
 }
 
-/** Lists filtered project files, or probes `paths` (which need not exist). */
+/** Lists the folder's filtered files, or probes `paths` (which need not exist). */
 export interface FilteredFilesRequest extends WorkspaceRequest {
   paths?: string[];
 }
