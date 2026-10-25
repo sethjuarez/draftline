@@ -506,6 +506,9 @@ struct WorkspaceClaim {
 /// It is committed with saves, so every clone and branch agrees.
 const FOLDER_MARKER: &str = ".draftline";
 
+/// The trailer on a folder move's commit naming where the folder was.
+const MOVED_FROM_TRAILER: &str = "Draftline-Moved-From";
+
 /// The contents of [`FOLDER_MARKER`]: `{ "format": 1, "folder": "cutready" }`,
 /// with `"."` for the whole repository.
 #[derive(Serialize, Deserialize)]
@@ -1821,10 +1824,13 @@ impl Workspace {
         )?;
         self.checkout_or_keep_recovery(&moved)?;
         test_hooks::fire("after_folder_move_checkout", self.repo.path());
+        // The trailer names where the folder was, so commits from before the
+        // marker existed still read at the right place after this move.
         let message = format!(
-            "Move Draftline folder from {} to {}",
+            "Move Draftline folder from {} to {}\n\n{MOVED_FROM_TRAILER}: {}\n",
             folder_label(&from),
-            folder_label(&to)
+            folder_label(&to),
+            marker_folder(&folder_key(&from))
         );
         let oid = self
             .repo
@@ -8844,27 +8850,41 @@ impl Workspace {
         {
             walk.hide(oid)?;
         }
-        let outside_changes =
-            |from: Option<&git2::Tree<'_>>, to: &git2::Tree<'_>| -> Result<BTreeSet<PathBuf>> {
-                let diff = self.repo.diff_tree_to_tree(from, Some(to), None)?;
-                Ok(diff
-                    .deltas()
-                    .flat_map(|delta| [delta.old_file().path(), delta.new_file().path()])
-                    .flatten()
-                    .filter(|path| !path.starts_with(scope) && *path != Path::new(FOLDER_MARKER))
-                    .map(Path::to_path_buf)
-                    .collect())
-            };
+        // Inside means inside the folder where the commit or its parent kept
+        // it, so Draftline's own saves from before a move and the move itself
+        // aren't developer work.
+        let outside_changes = |from: Option<&git2::Tree<'_>>,
+                               to: &git2::Tree<'_>,
+                               folders: &[&Path]|
+         -> Result<BTreeSet<PathBuf>> {
+            if folders.iter().any(|folder| folder.as_os_str().is_empty()) {
+                return Ok(BTreeSet::new());
+            }
+            let diff = self.repo.diff_tree_to_tree(from, Some(to), None)?;
+            Ok(diff
+                .deltas()
+                .flat_map(|delta| [delta.old_file().path(), delta.new_file().path()])
+                .flatten()
+                .filter(|path| {
+                    *path != Path::new(FOLDER_MARKER)
+                        && !folders.iter().any(|folder| path.starts_with(folder))
+                })
+                .map(Path::to_path_buf)
+                .collect())
+        };
+        let mut folders = FolderChanges::new(&self.repo, scope);
         let mut found = Vec::new();
         for oid in walk {
             let commit = self.repo.find_commit(oid?)?;
             let tree = commit.tree()?;
+            let own = folders.folder_at(&commit)?;
             let mut outside: Option<BTreeSet<PathBuf>> = None;
             if commit.parent_count() == 0 {
-                outside = Some(outside_changes(None, &tree)?);
+                outside = Some(outside_changes(None, &tree, &[&own])?);
             }
             for parent in commit.parents() {
-                let changed = outside_changes(Some(&parent.tree()?), &tree)?;
+                let theirs = folders.folder_at(&parent)?;
+                let changed = outside_changes(Some(&parent.tree()?), &tree, &[&own, &theirs])?;
                 outside = Some(match outside {
                     None => changed,
                     Some(previous) => previous.intersection(&changed).cloned().collect(),
@@ -10586,9 +10606,7 @@ impl Workspace {
         }
         // The folder's content as it was: a root folder is everything but the marker.
         let content = if from.as_os_str().is_empty() {
-            let mut update = git2::build::TreeUpdateBuilder::new();
-            update.remove(FOLDER_MARKER);
-            Some(update.create_updated(&self.repo, &tree)?)
+            Some(tree_without(&self.repo, &tree, FOLDER_MARKER)?)
         } else {
             optional_tree_entry(&tree, &from)?
         };
@@ -10615,19 +10633,17 @@ impl Workspace {
                 let base = if from.as_os_str().is_empty() {
                     self.empty_tree_id()?
                 } else {
-                    let mut update = git2::build::TreeUpdateBuilder::new();
-                    update.remove(folder_key(&from));
-                    update.create_updated(&self.repo, &tree)?
+                    tree_without(&self.repo, &tree, &folder_key(&from))?
                 };
                 let base = self.repo.find_tree(base)?;
-                let mut update = git2::build::TreeUpdateBuilder::new();
                 match content {
                     Some(content) => {
-                        update.upsert(pathspec.as_str(), content, git2::FileMode::Tree)
+                        let mut update = git2::build::TreeUpdateBuilder::new();
+                        update.upsert(pathspec.as_str(), content, git2::FileMode::Tree);
+                        update.create_updated(&self.repo, &base)?
                     }
-                    None => update.remove(pathspec.as_str()),
-                };
-                update.create_updated(&self.repo, &base)?
+                    None => tree_without(&self.repo, &base, pathspec.as_str())?,
+                }
             }
         };
         Ok(self.repo.find_tree(id)?)
@@ -12111,7 +12127,9 @@ impl<'r> FolderChanges<'r> {
         Ok((folder, id))
     }
 
-    /// The oldest folder a marker on HEAD's history names, else the current one.
+    /// The folder commits from before the marker existed used: the oldest
+    /// marker on HEAD's history, or where the folder was moved from when that
+    /// marker came with a move. Else the current folder.
     fn first_folder(&mut self) -> Result<PathBuf> {
         if let Some(first) = &self.first {
             return Ok(first.clone());
@@ -12121,9 +12139,9 @@ impl<'r> FolderChanges<'r> {
         if walk.push_head().is_ok() {
             walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
             for oid in walk {
-                let tree = self.repo.find_commit(oid?)?.tree()?;
-                if let Some(folder) = tree_marker_folder(self.repo, &tree) {
-                    first = folder;
+                let commit = self.repo.find_commit(oid?)?;
+                if let Some(folder) = tree_marker_folder(self.repo, &commit.tree()?) {
+                    first = moved_from(&commit).unwrap_or(folder);
                     break;
                 }
             }
@@ -12150,6 +12168,31 @@ impl<'r> FolderChanges<'r> {
         }
         Ok(true)
     }
+}
+
+/// `tree` without the entry at `path`, if it has one.
+fn tree_without(repo: &Repository, tree: &Tree<'_>, path: &str) -> Result<Oid> {
+    if tree.get_path(Path::new(path)).is_err() {
+        return Ok(tree.id());
+    }
+    let mut update = git2::build::TreeUpdateBuilder::new();
+    update.remove(path);
+    Ok(update.create_updated(repo, tree)?)
+}
+
+/// Where a folder move's commit says the folder was.
+fn moved_from(commit: &Commit<'_>) -> Option<PathBuf> {
+    let prefix = format!("{MOVED_FROM_TRAILER}: ");
+    let value = std::str::from_utf8(commit.message_bytes())
+        .ok()?
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(&prefix))?
+        .trim();
+    if value == "." {
+        return Some(PathBuf::new());
+    }
+    canonical_folder(value).filter(|folder| !folder.as_os_str().is_empty())
 }
 
 /// The folder `tree`'s own [`FOLDER_MARKER`] names, if it is a valid one.

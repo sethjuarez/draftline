@@ -2416,6 +2416,22 @@ fn send_hands_a_stale_local_base_back_to_the_fresh_upstream() {
 }
 
 #[test]
+fn a_folder_move_and_older_saves_are_not_developer_commits() {
+    let (temp, repo) = code_repo();
+    let (_bare, _other_dir, _other) = with_remote(&repo);
+    let mut workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "pitch\n");
+    workspace.save_version("Pitch").unwrap();
+    workspace.move_folder("demos/pitch").unwrap();
+    write_file(temp.path(), "demos/pitch/intro.sk", "pitch, moved\n");
+    workspace.save_version("Moved pitch").unwrap();
+
+    let preflight = workspace
+        .preflight_send("origin", &send_request("Pitch"), &mut RemoteOptions::new())
+        .unwrap();
+    assert!(preflight.developer_commits.is_empty(), "{preflight:?}");
+}
+#[test]
 fn send_carries_a_teammates_unpushed_base_commits_and_leaves_their_base_alone() {
     let (temp, repo) = code_repo();
     let (bare, _other_dir, _other) = with_remote(&repo);
@@ -4449,6 +4465,77 @@ fn history_and_restore_follow_the_folder_through_a_move() {
     assert!(tree.get_path(Path::new("src/lib.rs")).is_ok());
     let marker = repo.find_blob(head_marker(&repo)).unwrap();
     assert!(String::from_utf8_lossy(marker.content()).contains("\"demos/pitch\""));
+}
+
+#[test]
+fn a_move_before_the_first_save_keeps_older_versions() {
+    let (temp, repo) = code_repo();
+    let initial = repo.head().unwrap().peel_to_commit().unwrap().id();
+    let initial = draftline::VersionId::from(initial);
+    let mut pitch = scoped(&temp);
+    pitch.move_folder("demos/pitch").unwrap();
+
+    let labels: Vec<_> = pitch
+        .versions()
+        .unwrap()
+        .into_iter()
+        .map(|v| v.label)
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "Move Draftline folder from cutready to demos/pitch",
+            "Initial app"
+        ]
+    );
+    let file = pitch
+        .preview_version_file(&initial, "demos/pitch/intro.sk")
+        .unwrap()
+        .unwrap();
+    assert_eq!(file.content.as_deref(), Some("scene one\n"));
+    write_file(temp.path(), "demos/pitch/intro.sk", "changed\n");
+    pitch.save_version("Changed").unwrap();
+    pitch.restore_version_as_new_save(&initial, "Back").unwrap();
+    assert_eq!(read(temp.path(), "demos/pitch/intro.sk"), "scene one\n");
+}
+
+#[test]
+fn versions_from_before_the_folder_existed_read_as_empty_after_a_move() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut options = git2::RepositoryInitOptions::new();
+    options.initial_head("main");
+    let repo = git2::Repository::init_opts(temp.path(), &options).unwrap();
+    write_file(temp.path(), "src/main.rs", "fn main() {}\n");
+    let before = draftline::VersionId::from(commit_all(&repo, "Code only"));
+    let mut pitch = scoped(&temp);
+    write_file(temp.path(), "cutready/intro.sk", "intro\n");
+    pitch.save_version("Intro").unwrap();
+    pitch.move_folder("demos/pitch").unwrap();
+
+    assert!(pitch.preview_version(&before).unwrap().files.is_empty());
+    let diff = pitch.diff_version_to_workspace(&before).unwrap();
+    let paths: Vec<_> = diff.files.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(paths, [PathBuf::from("demos/pitch/intro.sk")]);
+}
+
+#[test]
+fn a_root_folder_reads_versions_from_before_its_marker_after_moving() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut options = git2::RepositoryInitOptions::new();
+    options.initial_head("main");
+    let repo = git2::Repository::init_opts(temp.path(), &options).unwrap();
+    write_file(temp.path(), "notes.md", "first\n");
+    let before = draftline::VersionId::from(commit_all(&repo, "First"));
+    let mut root = Workspace::open_with_policy(temp.path(), cutready_policy()).unwrap();
+    write_file(temp.path(), "notes.md", "second\n");
+    root.save_version("Second").unwrap();
+    root.move_folder("business").unwrap();
+
+    let file = root
+        .preview_version_file(&before, "business/notes.md")
+        .unwrap()
+        .unwrap();
+    assert_eq!(file.content.as_deref(), Some("first\n"));
 }
 
 #[test]
