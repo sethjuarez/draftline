@@ -3384,7 +3384,7 @@ impl Workspace {
             if now.id() == tip.id() {
                 return Ok(changed);
             }
-            changed |= self.settle_paths(&tip, &now, &BTreeSet::new())?;
+            changed |= self.settle_paths(&tip, &now, &BTreeSet::new(), &BTreeSet::new())?;
             tip = now;
         }
         Err(DraftlineError::LocalStateChanged {
@@ -3401,6 +3401,16 @@ impl Workspace {
         before: Option<&Tree<'_>>,
         to: &Tree<'_>,
     ) -> Result<bool> {
+        // Half-written files go the way of `written`; read before anything moves.
+        // `written` → `to` covers an earlier recovery that died following a
+        // branch that moved.
+        let mut torn = match before {
+            Some(before) if before.id() != written.id() => self.torn_writes(before, written)?,
+            _ => BTreeSet::new(),
+        };
+        if written.id() != to.id() {
+            torn.extend(self.torn_writes(written, to)?);
+        }
         let before = before.filter(|before| ![written.id(), to.id()].contains(&before.id()));
         // Git writes the index last, so an entry already at `written` proves
         // the checkout wrote that file: one back at `before` is the
@@ -3425,12 +3435,85 @@ impl Workspace {
         }
         let mut changed = false;
         if written.id() != to.id() {
-            changed |= self.settle_paths(written, to, &BTreeSet::new())?;
+            changed |= self.settle_paths(written, to, &BTreeSet::new(), &torn)?;
+        } else {
+            changed |= self.write_torn(to, &torn)?;
         }
         if let Some(before) = before {
-            changed |= self.settle_paths(before, to, &proven)?;
+            changed |= self.settle_paths(before, to, &proven, &BTreeSet::new())?;
         }
         Ok(changed)
+    }
+
+    /// Paths an interrupted checkout from `before` toward `written` left
+    /// half-written: missing, or holding only the start of `written`'s
+    /// content. Rewriting them loses nothing, since both are in `written`.
+    /// Git writes the index last, so a path already staged at `written` was
+    /// finished and anything since is the developer's.
+    fn torn_writes(&self, before: &Tree<'_>, written: &Tree<'_>) -> Result<BTreeSet<PathBuf>> {
+        let paths = self.paths_changed_between(Some(before), written)?;
+        self.while_git_busy(|| self.ensure_git_index_unlocked())?;
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        let settled: BTreeSet<PathBuf> = self
+            .workdir_matches(written, &paths)?
+            .into_iter()
+            .chain(self.workdir_matches(before, &paths)?)
+            .collect();
+        let mut torn = BTreeSet::new();
+        for path in paths.into_iter().filter(|path| !settled.contains(path)) {
+            let Ok(entry) = written.get_path(&path) else {
+                continue;
+            };
+            let staged = index
+                .get_path(&path, 0)
+                .map(|staged| (staged.id, staged.mode));
+            if staged == Some((entry.id(), entry.filemode() as u32)) {
+                continue;
+            }
+            let on_disk = match fs::symlink_metadata(self.root.join(&path)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    torn.insert(path);
+                    continue;
+                }
+                Ok(metadata) if metadata.is_file() => fs::read(self.root.join(&path))?,
+                _ => continue,
+            };
+            let Ok(blob) = self.repo.find_blob(entry.id()) else {
+                continue;
+            };
+            if is_start_of(&on_disk, blob.content()) {
+                torn.insert(path);
+            }
+        }
+        Ok(torn)
+    }
+
+    /// Writes `paths` from `tree` over whatever is on disk.
+    fn write_torn(&self, tree: &Tree<'_>, paths: &BTreeSet<PathBuf>) -> Result<bool> {
+        if paths.is_empty() {
+            return Ok(false);
+        }
+        let (present, gone): (Vec<&PathBuf>, Vec<&PathBuf>) =
+            paths.iter().partition(|path| tree.get_path(path).is_ok());
+        for path in gone {
+            remove_workspace_path_if_exists(&self.root.join(path))?;
+        }
+        if !present.is_empty() {
+            let mut checkout = CheckoutBuilder::new();
+            checkout
+                .force()
+                .update_index(false)
+                .disable_pathspec_match(true);
+            for path in &present {
+                checkout.path(path.to_string_lossy().replace('\\', "/"));
+            }
+            let refused = RefCell::default();
+            self.checkout_refusing_filters(checkout, &refused, tree, |checkout| {
+                self.repo.checkout_tree(tree.as_object(), Some(checkout))
+            })?;
+        }
+        Ok(true)
     }
 
     /// HEAD's tree, or the empty tree while HEAD is unborn (a fresh clone).
@@ -3469,7 +3552,8 @@ impl Workspace {
     /// as they are (showing as unsaved changes) and entries a developer
     /// staged differently are left alone, so rerunning it is safe.
     ///
-    /// Working files at `kept` are the developer's and stay as they are. Like
+    /// Working files at `kept` are the developer's and stay as they are;
+    /// those at `torn` count as still at `from`. Like
     /// Git, this writes files first and the index last. Returns whether any
     /// file was rewritten.
     fn settle_paths(
@@ -3477,6 +3561,7 @@ impl Workspace {
         from: &Tree<'_>,
         to: &Tree<'_>,
         kept: &BTreeSet<PathBuf>,
+        torn: &BTreeSet<PathBuf>,
     ) -> Result<bool> {
         let paths = self.paths_changed_between(Some(from), to)?;
         // Blob and mode, so a staged mode-only change counts as the developer's.
@@ -3496,7 +3581,10 @@ impl Workspace {
         let at_from: Vec<PathBuf> = self
             .workdir_matches(from, &paths)?
             .into_iter()
+            .chain(paths.iter().filter(|path| torn.contains(*path)).cloned())
             .filter(|path| !kept.contains(path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         let (in_to, gone): (Vec<_>, Vec<_>) = at_from
             .iter()
@@ -12382,6 +12470,24 @@ fn create_folder_tracking(
     Ok(path)
 }
 
+/// Whether `on_disk` is the start of `content` as Git would write it, with
+/// or without CRLF line endings: what a write cut short leaves behind.
+fn is_start_of(on_disk: &[u8], content: &[u8]) -> bool {
+    if content.starts_with(on_disk) {
+        return true;
+    }
+    let mut converted = Vec::with_capacity(content.len() + content.len() / 16);
+    let mut previous = 0u8;
+    for &byte in content {
+        if byte == b'\n' && previous != b'\r' {
+            converted.push(b'\r');
+        }
+        converted.push(byte);
+        previous = byte;
+    }
+    converted.starts_with(on_disk)
+}
+
 /// Refuses a path that exists but isn't a real directory (a file, symlink, or junction).
 fn ensure_plain_or_missing(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
@@ -13407,7 +13513,7 @@ fn operation_lock_metadata_is_stale(metadata: &OperationLockMetadata) -> bool {
     }
     let same_host = match (&metadata.host, current_host()) {
         (Some(recorded), Some(current)) => recorded.eq_ignore_ascii_case(&current),
-        _ => true,
+        _ => false,
     };
     same_host && process_is_running(metadata.process_id) == Some(false)
 }
@@ -14771,6 +14877,99 @@ mod tests {
         assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
         assert_eq!(content(&workspace, "code.rs"), "v4");
         assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_repair_finishes_a_file_the_checkout_left_missing() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        interrupted_switch(&workspace, &original);
+        // Killed after removing the old file, before writing the new one.
+        fs::remove_file(workspace.root().join("code.rs")).unwrap();
+
+        workspace.repair_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert_eq!(content(&workspace, "code.rs"), "v1");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_rollback_rewrites_a_half_written_file() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        interrupted_switch(&workspace, &original);
+        fs::write(workspace.root().join("code.rs"), "v").unwrap();
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), original);
+        assert_eq!(content(&workspace, "code.rs"), "v2");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_repair_finishes_a_file_an_earlier_repair_left_missing() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        workspace.repo.checkout_tree(alt.as_object(), None).unwrap();
+        interrupted_switch(&workspace, &original);
+        move_branch(&workspace, "alt", "v3");
+        // A repair following alt died after removing the file, before writing it.
+        fs::remove_file(workspace.root().join("code.rs")).unwrap();
+
+        workspace.repair_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert_eq!(content(&workspace, "code.rs"), "v3");
+        assert_clean(&workspace);
+    }
+
+    #[test]
+    fn a_switch_repair_keeps_a_file_deleted_after_the_checkout_finished() {
+        let (_temp, workspace, original, _) = branches_with_different_code();
+        let alt = workspace.branch_tree("alt").unwrap();
+        let mut checkout = CheckoutBuilder::new();
+        workspace
+            .repo
+            .checkout_tree(alt.as_object(), Some(checkout.force()))
+            .unwrap();
+        interrupted_switch(&workspace, &original);
+        fs::remove_file(workspace.root().join("code.rs")).unwrap();
+
+        workspace.repair_recovery("interrupted").unwrap();
+
+        assert_eq!(workspace.current_variation_unchecked().unwrap(), "alt");
+        assert!(!workspace.root().join("code.rs").exists());
+    }
+
+    #[test]
+    fn a_restore_rollback_puts_back_a_file_the_checkout_left_missing() {
+        let (_temp, workspace, first) = two_saves();
+        let head = workspace.repo.head().unwrap().peel_to_commit().unwrap();
+        let source = workspace
+            .relocated_tree(&workspace.find_version_commit(&first.id).unwrap())
+            .unwrap();
+        let restored = workspace
+            .compose_scoped_tree(&head.tree().unwrap(), &source)
+            .unwrap();
+        workspace
+            .write_recovery_state_for_checkout(
+                &RecoveryState {
+                    operation_id: "interrupted".to_string(),
+                    operation: RecoveryOperation::RestoreVersionAsNewSave,
+                    original_variation: workspace.current_variation().ok(),
+                    target: Some(first.id.as_str().to_string()),
+                    completed: false,
+                },
+                &head.tree().unwrap(),
+                &workspace.repo.find_tree(restored).unwrap(),
+            )
+            .unwrap();
+        fs::remove_file(workspace.root().join("plan.sk")).unwrap();
+
+        workspace.rollback_recovery("interrupted").unwrap();
+
+        assert_eq!(content(&workspace, "plan.sk"), "v2");
+        assert!(workspace.changed_files().unwrap().is_empty());
     }
 
     #[test]
@@ -17006,6 +17205,11 @@ mod tests {
 
         // Another machine's lock can't be judged by process id.
         metadata.host = Some("another-machine".to_string());
+        write_lock(&metadata);
+        assert!(!workspace.inspect_operation_lock().unwrap().is_stale);
+
+        // Nor can a lock that never recorded its machine.
+        metadata.host = None;
         write_lock(&metadata);
         assert!(!workspace.inspect_operation_lock().unwrap().is_stale);
 

@@ -270,7 +270,7 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | `WorkspaceLocked` blocks mutating operations. `inspect_operation_lock` distinguishes active, stale, and legacy/unknown locks. `clear_stale_lock` clears only metadata locks deemed stale: the locking process is gone on this machine, or 30 minutes have passed (another machine, or the process can't be checked). `RecoveryState` may also exist, but acknowledgment does not repair refs/files. |
+| Current support | `WorkspaceLocked` blocks mutating operations. `inspect_operation_lock` distinguishes active, stale, and legacy/unknown locks. `clear_stale_lock` clears only metadata locks deemed stale: the locking process is gone on this machine, or 30 minutes have passed (another machine, a lock that never recorded its machine, or the process can't be checked). `RecoveryState` may also exist, but acknowledgment does not repair refs/files. |
 | Safety behavior | A host must distinguish an active operation from a stale lock. Clearing a lock should be a guarded recovery action, not a blind retry loop or automatic delete. |
 | Edge cases | A crash can leave both recovery metadata and an operation lock. Multiple host instances may race on the same workspace. Lock metadata needs owner, PID/process identity, timestamp, and enough context to decide stale vs active. |
 | Tests | `clear_stale_lock_removes_only_stale_metadata_lock`, `a_lock_from_a_crashed_process_clears_right_away`. |
