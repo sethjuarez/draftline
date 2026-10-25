@@ -514,6 +514,95 @@ struct FolderMarker {
     folder: String,
 }
 
+/// Who manages the repository, as the marker or local record says.
+enum FolderOwner {
+    Nobody,
+    Folder(String),
+    Invalid(String),
+    Newer(String),
+}
+
+/// Where a folder stands before the host opens it; see [`Workspace::probe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FolderState {
+    /// The path isn't inside a Git repository.
+    NotARepository,
+    /// No folder in the repository is managed yet.
+    Unmanaged,
+    /// Draftline manages this folder; open it.
+    Ready,
+    /// Draftline manages another folder in this repository.
+    ManagedElsewhere,
+    /// The folder Draftline manages isn't on disk.
+    FolderMissing,
+    /// `.draftline`, or the checkout's local record of it, can't be read.
+    InvalidMarker,
+    /// `.draftline` was written by a newer Draftline.
+    NewerFormat,
+}
+
+/// A fix the host can offer for a probed folder. Pass it back unchanged to
+/// [`Workspace::apply_folder_fix`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FolderFix {
+    /// Open the requested folder.
+    Open,
+    /// Make the requested folder the one Draftline manages, creating it (and
+    /// a repository) when needed.
+    ManageHere,
+    /// Open the folder Draftline already manages.
+    OpenManagedFolder { folder: PathBuf },
+    /// Move the managed folder to the requested path, as a save.
+    MoveFolderHere { from: PathBuf },
+    /// Put the managed folder back from the current version.
+    RestoreFolder { folder: PathBuf },
+    /// Switch the checkout to a local branch that has the managed folder.
+    SwitchToBranch { branch: String },
+    /// Only a newer Draftline can read this repository.
+    UpgradeDraftline,
+}
+
+/// One fix with a plain-language label for a button.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSuggestion {
+    #[serde(flatten)]
+    pub fix: FolderFix,
+    pub label: String,
+}
+
+/// What [`Workspace::probe`] found. Folders are relative to `repository`,
+/// empty for the root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct FolderProbe {
+    pub state: FolderState,
+    pub requested: PathBuf,
+    pub repository: Option<PathBuf>,
+    /// The folder Draftline manages, when the repository names one.
+    pub folder: Option<PathBuf>,
+    /// Why the folder isn't ready, in plain language.
+    pub detail: Option<String>,
+    /// Fixes in recommended order.
+    pub suggestions: Vec<FolderSuggestion>,
+}
+
+/// Result of [`Workspace::move_folder`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct FolderMove {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    /// The save that records the move.
+    pub version: Version,
+    /// Untracked or ignored files that stayed put: the new folder already had
+    /// a file at that path, or the old folder was the repository root.
+    pub left_behind: Vec<PathBuf>,
+}
+
 /// A remote's default branch as it last advertised it, and the one it
 /// replaced. Plain fetches never refresh `refs/remotes/<remote>/HEAD`, and
 /// Draftline doesn't write it, so a renamed default lives here instead.
@@ -1582,6 +1671,547 @@ impl Workspace {
         Self::from_repository(repo, path.as_ref(), content_policy)
     }
 
+    /// Reports what opening `path` would find, without changing anything,
+    /// with fixes the host can offer. Call it before opening a folder and pass
+    /// the chosen fix to [`Workspace::apply_folder_fix`].
+    pub fn probe(path: impl AsRef<Path>) -> Result<FolderProbe> {
+        let requested = absolute_path(path.as_ref())?;
+        match Self::located(&requested, ContentPolicy::default())? {
+            Some(located) => located.probe_located(requested),
+            None => Ok(FolderProbe {
+                state: FolderState::NotARepository,
+                requested,
+                repository: None,
+                folder: None,
+                detail: Some("This folder isn't inside a Git repository.".to_string()),
+                suggestions: vec![suggest(FolderFix::ManageHere, "Start managing this folder")],
+            }),
+        }
+    }
+
+    /// Applies a fix [`Workspace::probe`] offers for `path` now and opens the
+    /// result. A fix the probe doesn't offer is refused with
+    /// [`DraftlineError::FolderFixUnavailable`].
+    pub fn apply_folder_fix(
+        path: impl AsRef<Path>,
+        content_policy: ContentPolicy,
+        fix: &FolderFix,
+    ) -> Result<Self> {
+        let probe = Self::probe(path)?;
+        if !probe.suggestions.iter().any(|offered| &offered.fix == fix) {
+            return Err(DraftlineError::FolderFixUnavailable(format!(
+                "{} is not offered for {}",
+                serde_json::to_string(fix)?,
+                probe.requested.display()
+            )));
+        }
+        let requested = probe.requested.clone();
+        let root = probe.repository.clone().unwrap_or_default();
+        match fix {
+            FolderFix::Open => Self::open_with_policy(&requested, content_policy),
+            FolderFix::ManageHere => {
+                if let Some(located) = Self::located(&requested, content_policy.clone())? {
+                    if probe.state != FolderState::Unmanaged {
+                        // Decide and publish under the lock, so two folders
+                        // can't both take over in a race.
+                        let _lock = OperationLock::acquire(&located.lock_path(), "manage_here")?;
+                        let now = located.probe_located(requested.clone())?;
+                        if !now
+                            .suggestions
+                            .iter()
+                            .any(|s| s.fix == FolderFix::ManageHere)
+                        {
+                            return Err(DraftlineError::FolderFixUnavailable(format!(
+                                "managing {} is no longer offered",
+                                requested.display()
+                            )));
+                        }
+                        located.write_claim()?;
+                        located.write_marker()?;
+                    }
+                }
+                Self::init_with_policy(&requested, content_policy)
+            }
+            FolderFix::OpenManagedFolder { folder } => {
+                Self::open_with_policy(root.join(folder), content_policy)
+            }
+            FolderFix::MoveFolderHere { from } => {
+                let mut workspace = Self::open_with_policy(root.join(from), content_policy)?;
+                workspace.move_folder(&requested)?;
+                Ok(workspace)
+            }
+            FolderFix::RestoreFolder { folder } => {
+                let managed = Self::located(&root.join(folder), content_policy.clone())?
+                    .ok_or_else(|| DraftlineError::FolderMissing(folder.clone()))?;
+                managed.restore_missing_folder()?;
+                Self::open_with_policy(root.join(folder), content_policy)
+            }
+            FolderFix::SwitchToBranch { branch } => {
+                let folder = probe.folder.clone().unwrap_or_default();
+                let managed = Self::located(&root.join(&folder), content_policy.clone())?
+                    .ok_or_else(|| DraftlineError::FolderMissing(folder.clone()))?;
+                managed.switch_to_folder_branch(branch)?;
+                Self::open_with_policy(root.join(folder), content_policy)
+            }
+            FolderFix::UpgradeDraftline => Err(DraftlineError::InvalidFolderMarker(
+                probe.detail.unwrap_or_default(),
+            )),
+        }
+    }
+
+    /// Moves the folder Draftline manages to `to` (absolute, or relative to the
+    /// repository root) as one save on the current variation, which also
+    /// rewrites `.draftline`. The folder may move from the root into a
+    /// subfolder, between subfolders, and to the root only when the
+    /// repository holds nothing else. Untracked and ignored files follow when
+    /// they can; see [`FolderMove::left_behind`]. Other handles on the old
+    /// folder are refused from then on.
+    pub fn move_folder(&mut self, to: impl AsRef<Path>) -> Result<FolderMove> {
+        let to = to.as_ref();
+        let to = if to.is_absolute() {
+            folder_in(&self.root, to)?
+        } else {
+            normalize_workspace_relative(to)?
+        };
+        self.ensure_no_pending_recovery()?;
+        let _lock = self.acquire_for_index("move_folder")?;
+        let branch = self.ensure_on_branch()?;
+        let from = self.scope().to_path_buf();
+        let head_commit = self.repo.head()?.peel_to_commit()?;
+        let head_tree = head_commit.tree()?;
+        if let Some(reason) = self.move_refusal(&head_tree, &from, &to)? {
+            return Err(DraftlineError::FolderMoveRefused(reason));
+        }
+        let moved = self
+            .repo
+            .find_tree(self.moved_tree(&head_tree, &from, &to)?)?;
+        let report = preflight_report(
+            "move_folder",
+            true,
+            self.changed_files_unchecked()?,
+            self.target_tree_hazards(&moved)?,
+            None,
+        );
+        if !report.can_proceed {
+            return Err(DraftlineError::PreflightFailed(Box::new(report)));
+        }
+
+        let (author, committer) = self.rewrite_signatures(None)?;
+        let operation_id = new_operation_id();
+        let target = format!(
+            "{} -> {}",
+            marker_folder(&folder_key(&from)),
+            marker_folder(&folder_key(&to))
+        );
+        self.write_recovery_state_for_checkout(
+            &RecoveryState {
+                operation_id: operation_id.clone(),
+                operation: RecoveryOperation::MoveFolder,
+                original_variation: Some(
+                    branch
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(&branch)
+                        .to_string(),
+                ),
+                target: Some(target.clone()),
+                completed: false,
+            },
+            &head_tree,
+            &moved,
+        )?;
+        self.checkout_or_keep_recovery(&moved)?;
+        test_hooks::fire("after_folder_move_checkout", self.repo.path());
+        let message = format!(
+            "Move Draftline folder from {} to {}",
+            folder_label(&from),
+            folder_label(&to)
+        );
+        let oid = self
+            .repo
+            .commit(None, &author, &committer, &message, &moved, &[&head_commit])?;
+        let commit = self.repo.find_commit(oid)?;
+        self.advance_head(&branch, &commit, Some(&head_commit), &committer)?;
+        test_hooks::fire("after_folder_move_commit", self.repo.path());
+
+        let left_behind = self.move_leftovers(&from, &to);
+        self.content_policy = self.content_policy.clone().scoped_to(&to)?;
+        self.write_claim()?;
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::MoveFolder,
+            original_variation: None,
+            target: Some(target),
+            completed: true,
+        })?;
+
+        Ok(FolderMove {
+            from,
+            to,
+            version: version_from_commit(&commit),
+            left_behind,
+        })
+    }
+
+    /// A handle on `path` (which need not exist) in the repository holding it,
+    /// without claiming or creating anything. `None` outside a repository with
+    /// a working tree.
+    fn located(path: &Path, content_policy: ContentPolicy) -> Result<Option<Self>> {
+        let Some(existing) = path.ancestors().find(|ancestor| ancestor.exists()) else {
+            return Ok(None);
+        };
+        let Ok(repo) = Repository::discover(existing) else {
+            return Ok(None);
+        };
+        let Some(root) = repo.workdir().map(Path::to_path_buf) else {
+            return Ok(None);
+        };
+        let content_policy = content_policy.scoped_to(folder_in(&root, path)?)?;
+        Ok(Some(Self {
+            root,
+            repo,
+            content_policy,
+            resolver_registry: ResolverRegistry::with_default_resolvers(),
+            variation_namespace: None,
+        }))
+    }
+
+    fn probe_located(&self, requested: PathBuf) -> Result<FolderProbe> {
+        let mine = self.project_key();
+        let mut probe = FolderProbe {
+            state: FolderState::Ready,
+            requested,
+            repository: Some(self.root.clone()),
+            folder: None,
+            detail: None,
+            suggestions: Vec::new(),
+        };
+        if self.pending_move_touches(&mine) {
+            probe.folder = Some(PathBuf::from(&mine));
+            probe.detail = Some("A folder move was interrupted; open to finish it.".to_string());
+            probe.suggestions = vec![suggest(FolderFix::Open, "Open and finish the move")];
+            return Ok(probe);
+        }
+        let owner = match self.marker_owner()? {
+            FolderOwner::Nobody => self.claim_owner()?,
+            owner => owner,
+        };
+        let owner = match owner {
+            FolderOwner::Nobody => {
+                probe.state = FolderState::Unmanaged;
+                probe.suggestions =
+                    vec![suggest(FolderFix::ManageHere, "Start managing this folder")];
+                return Ok(probe);
+            }
+            FolderOwner::Newer(reason) => {
+                probe.state = FolderState::NewerFormat;
+                probe.detail = Some(reason);
+                probe.suggestions = vec![suggest(FolderFix::UpgradeDraftline, "Update Draftline")];
+                return Ok(probe);
+            }
+            FolderOwner::Invalid(reason) => {
+                probe.state = FolderState::InvalidMarker;
+                probe.detail = Some(reason);
+                probe.suggestions =
+                    vec![suggest(FolderFix::ManageHere, "Manage this folder instead")];
+                return Ok(probe);
+            }
+            FolderOwner::Folder(owner) => owner,
+        };
+
+        let folder = PathBuf::from(&owner);
+        let label = folder_label(&folder);
+        probe.folder = Some(folder.clone());
+        let head = self.head_tree_or_empty()?;
+        if !self.claimed_folder_missing(&folder)? {
+            if owner == mine {
+                probe.suggestions = vec![suggest(FolderFix::Open, "Open")];
+            } else {
+                probe.state = FolderState::ManagedElsewhere;
+                probe.detail = Some(format!("Draftline manages {label} in this repository."));
+                probe.suggestions.push(suggest(
+                    FolderFix::OpenManagedFolder {
+                        folder: folder.clone(),
+                    },
+                    &format!("Open {label}"),
+                ));
+                if self.move_refusal(&head, &folder, self.scope())?.is_none()
+                    && !self.has_tracked_edits_under(&folder)?
+                {
+                    probe.suggestions.push(suggest(
+                        FolderFix::MoveFolderHere { from: folder },
+                        &format!("Move {label} here"),
+                    ));
+                }
+            }
+            return Ok(probe);
+        }
+
+        probe.state = FolderState::FolderMissing;
+        probe.detail = Some(format!("Draftline manages {label}, which isn't on disk."));
+        let tracked = head.get_path(&folder).is_ok();
+        if tracked {
+            probe.suggestions.push(suggest(
+                FolderFix::RestoreFolder {
+                    folder: folder.clone(),
+                },
+                &format!("Restore {label}"),
+            ));
+        }
+        for branch in self.branches_with_folder(&folder, &owner)? {
+            let label = format!("Switch to {branch}, which has {label}");
+            probe
+                .suggestions
+                .push(suggest(FolderFix::SwitchToBranch { branch }, &label));
+        }
+        if owner == mine && !tracked {
+            probe
+                .suggestions
+                .push(suggest(FolderFix::ManageHere, "Create this folder"));
+        } else if owner != mine && self.can_take_over_from(&head, &folder)? {
+            probe
+                .suggestions
+                .push(suggest(FolderFix::ManageHere, "Manage this folder instead"));
+        }
+        Ok(probe)
+    }
+
+    /// Whether a file Git tracks under `folder` differs from the last save.
+    fn has_tracked_edits_under(&self, folder: &Path) -> Result<bool> {
+        let mut options = StatusOptions::new();
+        options.include_untracked(false).include_ignored(false);
+        if !folder.as_os_str().is_empty() {
+            options
+                .pathspec(folder_key(folder))
+                .disable_pathspec_match(true);
+        }
+        Ok(self
+            .repo
+            .statuses(Some(&mut options))?
+            .iter()
+            .any(|entry| entry.status() != Status::CURRENT))
+    }
+
+    /// Managing this folder in place of a missing `old` one keeps the one
+    /// rule moves follow: the root only when the repository holds nothing else.
+    fn can_take_over_from(&self, head: &Tree<'_>, old: &Path) -> Result<bool> {
+        if !self.scope().as_os_str().is_empty() {
+            return Ok(true);
+        }
+        Ok(tracked_paths_under(head, Path::new(""))?
+            .iter()
+            .all(|path| path.starts_with(old) || path == Path::new(FOLDER_MARKER)))
+    }
+
+    /// Up to five local branches, newest first, whose tip has `folder` and
+    /// doesn't name another one.
+    fn branches_with_folder(&self, folder: &Path, key: &str) -> Result<Vec<String>> {
+        let current = self.current_variation_unchecked().ok();
+        let mut found = Vec::new();
+        for branch in self.repo.branches(Some(BranchType::Local))? {
+            let (branch, _) = branch?;
+            let Some(name) = branch.name()?.map(str::to_string) else {
+                continue;
+            };
+            if current.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            let commit = branch.get().peel_to_commit()?;
+            let tree = commit.tree()?;
+            let has_folder = tree
+                .get_path(folder)
+                .is_ok_and(|entry| entry.kind() == Some(ObjectType::Tree));
+            if has_folder && self.tree_marker_allows(&tree, key) {
+                found.push((commit.time().seconds(), name));
+            }
+        }
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(found.into_iter().take(5).map(|(_, name)| name).collect())
+    }
+
+    fn tree_marker_allows(&self, tree: &Tree<'_>, key: &str) -> bool {
+        let Some(entry) = tree.get_name(FOLDER_MARKER) else {
+            return true;
+        };
+        self.repo
+            .find_blob(entry.id())
+            .ok()
+            .and_then(|blob| serde_json::from_slice::<FolderMarker>(blob.content()).ok())
+            .is_some_and(|marker| marker.format == 1 && marker.folder == marker_folder(key))
+    }
+
+    /// Puts this folder's files back from HEAD, leaving everything else alone.
+    fn restore_missing_folder(&self) -> Result<()> {
+        let _lock = OperationLock::acquire(&self.lock_path(), "restore_folder")?;
+        self.while_git_busy(|| self.ensure_git_index_unlocked())?;
+        let paths = tracked_paths_under(&self.repo.head()?.peel_to_tree()?, self.scope())?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut checkout = CheckoutBuilder::new();
+        checkout
+            .safe()
+            .recreate_missing(true)
+            .disable_pathspec_match(true);
+        for path in &paths {
+            checkout.path(path);
+        }
+        self.repo.checkout_head(Some(&mut checkout))?;
+        Ok(())
+    }
+
+    /// Switches the checkout to `branch` for a folder that can't open yet,
+    /// recorded like any switch so an interruption is recoverable.
+    fn switch_to_folder_branch(&self, branch: &str) -> Result<()> {
+        let branch = validate_variation_name(branch)?;
+        fs::create_dir_all(self.draftline_dir())?;
+        let _lock = OperationLock::acquire(&self.lock_path(), "switch_to_folder_branch")?;
+        self.while_git_busy(|| self.ensure_git_index_unlocked())?;
+        self.ensure_no_pending_recovery_in_checkout()?;
+        let target = self.branch_tree(&branch)?;
+        let operation_id = new_operation_id();
+        self.write_recovery_state_for_checkout(
+            &RecoveryState {
+                operation_id: operation_id.clone(),
+                operation: RecoveryOperation::SwitchVariation,
+                original_variation: self.current_variation_unchecked().ok(),
+                target: Some(branch.clone()),
+                completed: false,
+            },
+            &self.head_tree_or_empty()?,
+            &target,
+        )?;
+        self.checkout_or_keep_recovery(&target)?;
+        self.point_head_at(&branch)?;
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::SwitchVariation,
+            original_variation: None,
+            target: Some(branch),
+            completed: true,
+        })
+    }
+
+    /// Why the folder can't move from `from` to `to`, if it can't.
+    fn move_refusal(&self, head: &Tree<'_>, from: &Path, to: &Path) -> Result<Option<String>> {
+        let to_label = folder_label(to);
+        if from == to {
+            return Ok(Some(format!("Draftline already manages {to_label}")));
+        }
+        if let Some(first) = to.components().next() {
+            let first = first.as_os_str();
+            if first == ".git" || first == FOLDER_MARKER {
+                return Ok(Some(format!("{to_label} is reserved")));
+            }
+        }
+        // Files already saved under `to` would mix with the folder's own,
+        // except the folder itself when it moves up into `to`.
+        let into_own_subfolder = to.starts_with(from);
+        let blocking = tracked_paths_under(head, to)?.into_iter().find(|path| {
+            path != Path::new(FOLDER_MARKER) && (into_own_subfolder || !path.starts_with(from))
+        });
+        if let Some(path) = blocking {
+            return Ok(Some(if to.as_os_str().is_empty() {
+                format!(
+                    "the repository holds other files, such as {}",
+                    folder_key(&path)
+                )
+            } else {
+                format!("{to_label} already has saved files")
+            }));
+        }
+        if to.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let dir = self.root.join(to);
+        if dir.is_file() {
+            return Ok(Some(format!("{to_label} is a file")));
+        }
+        if dir.is_dir() {
+            let own = from
+                .strip_prefix(to)
+                .ok()
+                .and_then(|inner| inner.components().next())
+                .map(|first| first.as_os_str().to_os_string());
+            let occupied = fs::read_dir(&dir)?
+                .flatten()
+                .any(|entry| Some(entry.file_name()) != own);
+            if occupied {
+                return Ok(Some(format!("{to_label} isn't empty")));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `head` with the folder's files moved from `from` to `to` and
+    /// [`FOLDER_MARKER`] naming `to`.
+    fn moved_tree(&self, head: &Tree<'_>, from: &Path, to: &Path) -> Result<Oid> {
+        let mut source = git2::Index::new()?;
+        source.read_tree(head)?;
+        let from = folder_key(from);
+        let to = folder_key(to);
+        let mut moved = git2::Index::new()?;
+        for mut entry in source.iter() {
+            if entry.path == FOLDER_MARKER.as_bytes() {
+                continue;
+            }
+            if let Some(rest) = strip_folder(&entry.path, from.as_bytes()) {
+                let mut path = to.as_bytes().to_vec();
+                if !path.is_empty() {
+                    path.push(b'/');
+                }
+                path.extend_from_slice(rest);
+                entry.path = path;
+            }
+            moved.add(&entry)?;
+        }
+        let tree = self.repo.find_tree(moved.write_tree_to(&self.repo)?)?;
+        let marker = self.repo.blob(&marker_bytes(&to)?)?;
+        let mut builder = self.repo.treebuilder(Some(&tree))?;
+        builder.insert(FOLDER_MARKER, marker, 0o100644)?;
+        Ok(builder.write()?)
+    }
+
+    /// Moves untracked and ignored files the checkout left in `from` into
+    /// `to`, returning those that stayed. Nothing follows from the root: its
+    /// untracked files are anyone's.
+    fn move_leftovers(&self, from: &Path, to: &Path) -> Vec<PathBuf> {
+        if from.as_os_str().is_empty() {
+            return Vec::new();
+        }
+        let source = self.root.join(from);
+        let destination = self.root.join(to);
+        let (mut files, mut dirs) = (Vec::new(), Vec::new());
+        collect_leftovers(&source, &destination, &mut files, &mut dirs);
+        let mut left_behind = Vec::new();
+        for file in files {
+            let Ok(relative) = file.strip_prefix(&source) else {
+                continue;
+            };
+            let target = destination.join(relative);
+            let moved = target.symlink_metadata().is_err()
+                && target
+                    .parent()
+                    .is_none_or(|parent| fs::create_dir_all(parent).is_ok())
+                && fs::rename(&file, &target).is_ok();
+            if !moved {
+                left_behind.push(from.join(relative));
+            }
+        }
+        for dir in dirs.iter().rev() {
+            let _ = fs::remove_dir(dir);
+        }
+        let _ = fs::remove_dir(&source);
+        left_behind
+    }
+
+    /// Points the local record at the folder the marker on disk names.
+    fn sync_claim_to_marker(&self) -> Result<()> {
+        if let FolderOwner::Folder(folder) = self.marker_owner()? {
+            self.write_claim_for(&folder)?;
+        }
+        Ok(())
+    }
+
     /// Clones a shared workspace from a remote endpoint.
     pub fn clone_workspace(remote_url: impl AsRef<str>, path: impl AsRef<Path>) -> Result<Self> {
         Self::clone_workspace_with_policy(remote_url, path, ContentPolicy::default())
@@ -2289,6 +2919,7 @@ impl Workspace {
             RecoveryOperation::DeleteRemoteVariation => {
                 self.repair_delete_remote_variation_recovery(state, options)
             }
+            RecoveryOperation::MoveFolder => self.settle_folder_move(state),
             RecoveryOperation::RestoreVersionAsNewSave
             | RecoveryOperation::MilestoneMerge
             | RecoveryOperation::SquashVersions
@@ -2365,6 +2996,7 @@ impl Workspace {
                     None => Ok(self.recovery_unavailable(state)),
                 }
             }
+            RecoveryOperation::MoveFolder => self.settle_folder_move(state),
             RecoveryOperation::ApplyIncoming
             | RecoveryOperation::DeleteRemoteVariation
             | RecoveryOperation::ExpireSupportRefs
@@ -2373,6 +3005,27 @@ impl Workspace {
             | RecoveryOperation::SquashVersions
             | RecoveryOperation::HistoryCleanup => Ok(self.recovery_unavailable(state)),
         }
+    }
+
+    /// Settles an interrupted folder move on whatever its variation records:
+    /// the moved folder once the save landed, the original one before. Repair
+    /// and rollback are the same, since nothing else is safe to guess.
+    fn settle_folder_move(&self, state: RecoveryState) -> Result<RecoveryRepairResult> {
+        let Some(branch) = state.original_variation.clone() else {
+            return Ok(self.recovery_unavailable(state));
+        };
+        let changed_workspace = self.finish_switch_at(None, &branch)?;
+        self.sync_claim_to_marker()?;
+        // The checkout leaves the abandoned side's folder behind when empty;
+        // its parents may predate the move, so they stay.
+        if let Some((from, to)) = state.target.as_deref().and_then(|t| t.split_once(" -> ")) {
+            for side in [from, to] {
+                if side != "." {
+                    let _ = fs::remove_dir(self.root.join(side));
+                }
+            }
+        }
+        self.complete_recovery(state, changed_workspace)
     }
 
     /// Undoes an interrupted shelve. The shelf is deleted only while every
@@ -8988,6 +9641,10 @@ impl Workspace {
     /// save commits it. Any other folder is refused.
     fn claim_checkout(&self, opening: bool) -> Result<()> {
         let mine = self.project_key();
+        // Either end of an interrupted move may open, so recovery can finish it.
+        if self.pending_move_touches(&mine) {
+            return Ok(());
+        }
         let owner = match self.read_marker()? {
             Some(folder) => {
                 if opening && folder == mine {
@@ -9041,49 +9698,84 @@ impl Workspace {
 
     /// The folder the working tree's [`FOLDER_MARKER`] names, if it has one.
     fn read_marker(&self) -> Result<Option<String>> {
+        match self.marker_owner()? {
+            FolderOwner::Nobody => Ok(None),
+            FolderOwner::Folder(folder) => Ok(Some(folder)),
+            FolderOwner::Invalid(reason) | FolderOwner::Newer(reason) => {
+                Err(DraftlineError::InvalidFolderMarker(reason))
+            }
+        }
+    }
+
+    fn marker_owner(&self) -> Result<FolderOwner> {
         let path = self.marker_path();
-        let invalid = |reason: String| {
-            DraftlineError::InvalidFolderMarker(format!("{}: {reason}", path.display()))
-        };
+        let invalid =
+            |reason: String| FolderOwner::Invalid(format!("{}: {reason}", path.display()));
         if path.is_dir() {
-            return Err(invalid("is a folder, not a file".to_string()));
+            return Ok(invalid("is a folder, not a file".to_string()));
         }
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FolderOwner::Nobody)
+            }
             Err(error) => return Err(error.into()),
         };
-        let marker: FolderMarker =
-            serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
-        if marker.format != 1 {
-            return Err(invalid(format!(
-                "format {} needs a newer Draftline",
-                marker.format
+        // Read the format alone first: a newer one may change everything else.
+        let format = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value.get("format").and_then(serde_json::Value::as_u64));
+        if let Some(format) = format.filter(|format| *format > 1) {
+            return Ok(FolderOwner::Newer(format!(
+                "{}: format {format} needs a newer Draftline",
+                path.display()
             )));
         }
-        if marker.folder == "." {
-            return Ok(Some(String::new()));
+        let marker: FolderMarker = match serde_json::from_slice(&bytes) {
+            Ok(marker) => marker,
+            Err(error) => return Ok(invalid(error.to_string())),
+        };
+        if marker.format != 1 {
+            return Ok(invalid(format!("format {} is not valid", marker.format)));
         }
-        canonical_folder(&marker.folder)
+        if marker.folder == "." {
+            return Ok(FolderOwner::Folder(String::new()));
+        }
+        Ok(canonical_folder(&marker.folder)
             .filter(|folder| !folder.as_os_str().is_empty())
-            .map(|folder| Some(folder_key(&folder)))
-            .ok_or_else(|| {
+            .map(|folder| FolderOwner::Folder(folder_key(&folder)))
+            .unwrap_or_else(|| {
                 invalid(format!(
                     "folder {:?} is not a folder inside this repository",
                     marker.folder
                 ))
-            })
+            }))
+    }
+
+    /// The checkout's local record, read without claiming anything.
+    fn claim_owner(&self) -> Result<FolderOwner> {
+        let path = self.claim_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FolderOwner::Nobody)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let claim = match serde_json::from_slice::<WorkspaceClaim>(&bytes) {
+            Ok(claim) => claim,
+            Err(error) => return Ok(FolderOwner::Invalid(format!("{}: {error}", path.display()))),
+        };
+        Ok(match claimed_project(&claim, &path) {
+            Ok(folder) => FolderOwner::Folder(folder_key(&folder)),
+            Err(error) => FolderOwner::Invalid(error.to_string()),
+        })
     }
 
     /// Writes [`FOLDER_MARKER`] for this folder; a rename keeps readers from
     /// ever seeing a partial file.
     fn write_marker(&self) -> Result<()> {
-        let folder = match self.project_key() {
-            key if key.is_empty() => ".".to_string(),
-            key => key,
-        };
-        let mut bytes = serde_json::to_vec_pretty(&FolderMarker { format: 1, folder })?;
-        bytes.push(b'\n');
+        let bytes = marker_bytes(&self.project_key())?;
         let path = self.marker_path();
         let temp = unique_claim_temp(&path);
         fs::write(&temp, bytes)?;
@@ -9182,10 +9874,19 @@ impl Workspace {
     }
 
     fn write_claim(&self) -> Result<()> {
+        self.write_claim_for(&self.project_key())
+    }
+
+    fn write_claim_for(&self, folder: &str) -> Result<()> {
         fs::create_dir_all(self.draftline_dir())?;
         let path = self.claim_path();
         let temp = unique_claim_temp(&path);
-        fs::write(&temp, self.claim_bytes()?)?;
+        fs::write(
+            &temp,
+            serde_json::to_vec_pretty(&WorkspaceClaim {
+                project: folder.to_string(),
+            })?,
+        )?;
         if let Err(error) = fs::rename(&temp, &path) {
             let _ = fs::remove_file(&temp);
             return Err(error.into());
@@ -9230,7 +9931,30 @@ impl Workspace {
         let bytes = fs::read(self.ledger_path()).ok()?;
         let ledger = serde_json::from_slice::<RecoveryLedger>(&bytes).ok()?;
         let project = ledger.project?;
-        (!ledger.state.completed && project != self.project_key()).then(|| PathBuf::from(project))
+        (!ledger.state.completed
+            && project != self.project_key()
+            && !self.pending_move_touches(&self.project_key()))
+        .then(|| PathBuf::from(project))
+    }
+
+    /// Whether an unfinished folder move has `folder` at either end.
+    fn pending_move_touches(&self, folder: &str) -> bool {
+        let Ok(bytes) = fs::read(self.ledger_path()) else {
+            return false;
+        };
+        let Ok(ledger) = serde_json::from_slice::<RecoveryLedger>(&bytes) else {
+            return false;
+        };
+        let state = ledger.state;
+        if state.completed || state.operation != RecoveryOperation::MoveFolder {
+            return false;
+        }
+        let folder = marker_folder(folder);
+        state.target.as_deref().is_some_and(|target| {
+            target
+                .split_once(" -> ")
+                .is_some_and(|(from, to)| from == folder || to == folder)
+        })
     }
 
     fn project_key(&self) -> String {
@@ -12462,6 +13186,106 @@ fn folder_key(folder: &Path) -> String {
         .join("/")
 }
 
+/// A folder key as [`FOLDER_MARKER`] writes it: `"."` for the root.
+fn marker_folder(key: &str) -> String {
+    if key.is_empty() {
+        ".".to_string()
+    } else {
+        key.to_string()
+    }
+}
+
+/// A folder for people to read: "the repository root" or `cutready`.
+fn folder_label(folder: &Path) -> String {
+    if folder.as_os_str().is_empty() {
+        "the repository root".to_string()
+    } else {
+        folder_key(folder)
+    }
+}
+
+fn marker_bytes(key: &str) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(&FolderMarker {
+        format: 1,
+        folder: marker_folder(key),
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// `path` made absolute against the current directory, without resolving it,
+/// so a folder that doesn't exist yet still has a place.
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    Ok(std::path::absolute(path)?)
+}
+
+/// The repository-relative folder for `path`, which need not exist: its
+/// nearest existing ancestor anchors it inside `root`.
+fn folder_in(root: &Path, path: &Path) -> Result<PathBuf> {
+    let existing = path
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or_else(|| DraftlineError::PathEscapesWorkspace(path.to_path_buf()))?;
+    let tail = path
+        .strip_prefix(existing)
+        .map_err(|_| DraftlineError::PathEscapesWorkspace(path.to_path_buf()))?;
+    normalize_workspace_relative(project_scope(root, existing)?.join(tail))
+}
+
+/// Every tracked path in `tree` at or below `prefix` (all of them for the root).
+fn tracked_paths_under(tree: &Tree<'_>, prefix: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+        if entry.kind() != Some(ObjectType::Tree) {
+            let path = PathBuf::from(format!("{dir}{}", entry.name().unwrap_or_default()));
+            if path.starts_with(prefix) {
+                paths.push(path);
+            }
+        }
+        git2::TreeWalkResult::Ok
+    })?;
+    Ok(paths)
+}
+
+/// `path` with the folder `prefix` removed, when it is inside it.
+fn strip_folder<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    if prefix.is_empty() {
+        return Some(path);
+    }
+    path.strip_prefix(prefix)?.strip_prefix(b"/")
+}
+
+fn suggest(fix: FolderFix, label: &str) -> FolderSuggestion {
+    FolderSuggestion {
+        fix,
+        label: label.to_string(),
+    }
+}
+
+/// Files and folders under `dir`, without following links or entering `skip`
+/// or a nested repository.
+fn collect_leftovers(dir: &Path, skip: &Path, files: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == skip || entry.file_name() == ".git" {
+            continue;
+        }
+        match entry.file_type() {
+            // A nested repository moves whole or not at all.
+            Ok(kind) if kind.is_dir() && path.join(".git").exists() => files.push(path),
+            Ok(kind) if kind.is_dir() => {
+                dirs.push(path.clone());
+                collect_leftovers(&path, skip, files, dirs);
+            }
+            Ok(_) => files.push(path),
+            Err(_) => {}
+        }
+    }
+}
+
 fn unique_claim_temp(path: &Path) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -15529,6 +16353,55 @@ mod tests {
             fs::read_to_string(workspace.root().join("post.md")).unwrap(),
             "incoming"
         );
+    }
+
+    /// A root folder whose move to `deck` crashes at `point`.
+    fn interrupted_move(point: &'static str) -> (tempfile::TempDir, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "plan.sk", b"base");
+        workspace.save_version("Base").unwrap();
+        test_hooks::once(point, |_| panic!("crash"));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workspace.move_folder("deck").map(|_| ())
+        }));
+        assert!(crashed.is_err());
+        let operation = workspace.recovery_state().unwrap().unwrap().operation_id;
+        (temp, operation)
+    }
+
+    #[test]
+    fn a_move_interrupted_before_its_save_goes_back_to_the_old_folder() {
+        let (temp, operation) = interrupted_move("after_folder_move_checkout");
+        assert!(temp.path().join("deck").join("plan.sk").is_file());
+        let probe = Workspace::probe(temp.path().join("deck")).unwrap();
+        assert_eq!(probe.state, FolderState::Ready);
+        assert_eq!(probe.suggestions[0].fix, FolderFix::Open);
+
+        let workspace = Workspace::open(temp.path().join("deck")).unwrap();
+        let repair = workspace.repair_recovery(&operation).unwrap();
+        assert!(repair.completed);
+        assert!(temp.path().join("plan.sk").is_file());
+        assert!(!temp.path().join("deck").exists());
+        let root = Workspace::open(temp.path()).unwrap();
+        assert!(root.recovery_state().unwrap().is_none());
+        assert_eq!(
+            Workspace::probe(temp.path()).unwrap().state,
+            FolderState::Ready
+        );
+    }
+
+    #[test]
+    fn a_move_interrupted_after_its_save_finishes_in_the_new_folder() {
+        let (temp, operation) = interrupted_move("after_folder_move_commit");
+        let workspace = Workspace::open(temp.path()).unwrap();
+        workspace.rollback_recovery(&operation).unwrap();
+        assert!(temp.path().join("deck").join("plan.sk").is_file());
+        let probe = Workspace::probe(temp.path()).unwrap();
+        assert_eq!(probe.state, FolderState::ManagedElsewhere);
+        assert_eq!(probe.folder.as_deref(), Some(Path::new("deck")));
+        let deck = Workspace::open(temp.path().join("deck")).unwrap();
+        assert!(deck.recovery_state().unwrap().is_none());
     }
 
     /// A developer commits on the checked-out branch from another process.

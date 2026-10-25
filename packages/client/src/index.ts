@@ -20,6 +20,9 @@ export interface DraftlineClientOptions {
 
 export interface DraftlineClient {
   openWorkspace(workspacePath: string): Promise<WorkspaceOpenResult>;
+  probeFolder(workspacePath: string): Promise<FolderProbe>;
+  applyFolderFix(workspacePath: string, fix: FolderFix): Promise<WorkspaceOpenResult>;
+  moveFolder(request: MoveFolderRequest): Promise<MoveFolderResult>;
   cloneWorkspace(request: CloneWorkspaceRequest): Promise<WorkspaceOpenResult>;
   adoptWorkspace(workspacePath: string): Promise<AdoptWorkspaceResult>;
   inspectWorkspace(workspacePath: string): Promise<WorkspaceDiagnostics>;
@@ -153,6 +156,15 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('inspect_workspace', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
+    probeFolder: (workspacePath) =>
+      run('probe_folder', {
+        request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
+      }),
+    applyFolderFix: (workspacePath, fix) =>
+      run('apply_folder_fix', {
+        request: { workspace_path: workspacePath, fix } satisfies ApplyFolderFixRequest,
+      }),
+    moveFolder: (request) => run('move_folder', { request }),
     verifyWorkspace: (workspacePath) =>
       run('verify_workspace', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
@@ -828,6 +840,59 @@ export interface WorkspaceDiagnostics {
 }
 
 export interface WorkspaceOpenResult {
+  diagnostics: WorkspaceDiagnostics;
+}
+
+/** Where a folder stands before the host opens it. */
+export type FolderState =
+  | 'not_a_repository'
+  | 'unmanaged'
+  | 'ready'
+  | 'managed_elsewhere'
+  | 'folder_missing'
+  | 'invalid_marker'
+  | 'newer_format';
+
+/** A fix `probeFolder` offers; pass it back unchanged to `applyFolderFix`. */
+export type FolderFix =
+  | { action: 'open' }
+  | { action: 'manage_here' }
+  | { action: 'open_managed_folder'; folder: string }
+  | { action: 'move_folder_here'; from: string }
+  | { action: 'restore_folder'; folder: string }
+  | { action: 'switch_to_branch'; branch: string }
+  | { action: 'upgrade_draftline' };
+
+export type FolderSuggestion = FolderFix & { label: string };
+
+export interface FolderProbe {
+  state: FolderState;
+  requested: string;
+  repository: string | null;
+  /** The folder Draftline manages, relative to `repository` (empty for the root). */
+  folder: string | null;
+  detail: string | null;
+  suggestions: FolderSuggestion[];
+}
+
+export interface ApplyFolderFixRequest extends WorkspaceRequest {
+  fix: FolderFix;
+}
+
+export interface MoveFolderRequest extends WorkspaceRequest {
+  /** Absolute, or relative to the repository root. */
+  to: string;
+}
+
+export interface FolderMove {
+  from: string;
+  to: string;
+  version: Version;
+  left_behind: string[];
+}
+
+export interface MoveFolderResult {
+  moved: FolderMove;
   diagnostics: WorkspaceDiagnostics;
 }
 
@@ -1884,6 +1949,21 @@ export async function rollbackRecovery(request: RecoveryRequest): Promise<Recove
 
 export async function acknowledgeRecovery(workspacePath: string): Promise<CommandPostconditions> {
   return createDraftlineClient().acknowledgeRecovery(workspacePath);
+}
+
+export async function probeFolder(workspacePath: string): Promise<FolderProbe> {
+  return createDraftlineClient().probeFolder(workspacePath);
+}
+
+export async function applyFolderFix(
+  workspacePath: string,
+  fix: FolderFix,
+): Promise<WorkspaceOpenResult> {
+  return createDraftlineClient().applyFolderFix(workspacePath, fix);
+}
+
+export async function moveFolder(request: MoveFolderRequest): Promise<MoveFolderResult> {
+  return createDraftlineClient().moveFolder(request);
 }
 
 export async function filteredFiles(request: FilteredFilesRequest): Promise<FilteredFile[]> {

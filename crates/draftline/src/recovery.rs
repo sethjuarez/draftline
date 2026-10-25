@@ -25,6 +25,8 @@ pub enum RecoveryOperation {
     DeleteRemoteVariation,
     ExpireSupportRefs,
     RenameVariation,
+    /// Moving the folder Draftline manages to another path.
+    MoveFolder,
     /// Recorded by older versions for features that no longer exist. Still
     /// read so those workspaces open; repair reports them unavailable.
     MilestoneMerge,

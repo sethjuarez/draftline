@@ -607,6 +607,32 @@ fn acknowledge_recovery(
 }
 
 #[tauri::command]
+fn probe_folder(request: WorkspaceRequest) -> TauriCommandResult<draftline::FolderProbe> {
+    contract::into_tauri_result(contract::probe_folder(request))
+}
+
+#[tauri::command]
+fn apply_folder_fix(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: contract::ApplyFolderFixRequest,
+) -> TauriCommandResult<WorkspaceOpenResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::apply_folder_fix_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn move_folder(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: contract::MoveFolderRequest,
+) -> TauriCommandResult<contract::MoveFolderResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::move_folder_with_context(&mut context, request))
+}
+
+#[tauri::command]
 fn resolve_legacy_history_cleanup(
     state: tauri::State<'_, DraftlineContextState>,
     request: LegacyHistoryCleanupRequest,
@@ -807,6 +833,9 @@ fn main() {
             repair_recovery,
             rollback_recovery,
             acknowledge_recovery,
+            probe_folder,
+            apply_folder_fix,
+            move_folder,
             resolve_legacy_history_cleanup,
             selected_save,
             selected_shelve,

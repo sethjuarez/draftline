@@ -284,6 +284,9 @@ describe('createDraftlineClient', () => {
     await client.repairRecovery(recoveryRequest);
     await client.rollbackRecovery(recoveryRequest);
     await client.acknowledgeRecovery('C:\\repo');
+    await client.probeFolder('C:\\repo\\cutready');
+    await client.applyFolderFix('C:\\repo\\cutready', { action: 'switch_to_branch', branch: 'main' });
+    await client.moveFolder({ workspace_path: 'C:\\repo\\cutready', to: 'demos' });
     await client.resolveLegacyHistoryCleanup({ workspace_path: 'C:\\repo', plan_id: 'plan-1' });
     await client.startVariationHere({ workspace_path: 'C:\\repo', name: 'cutready/rescue' });
     await client.filteredFiles({ workspace_path: 'C:\\repo', paths: ['cutready/shot.png'] });
@@ -440,6 +443,18 @@ describe('createDraftlineClient', () => {
     expect(invoke).toHaveBeenCalledWith('rollback_recovery', { request: recoveryRequest });
     expect(invoke).toHaveBeenCalledWith('acknowledge_recovery', {
       request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('probe_folder', {
+      request: { workspace_path: 'C:\\repo\\cutready' },
+    });
+    expect(invoke).toHaveBeenCalledWith('apply_folder_fix', {
+      request: {
+        workspace_path: 'C:\\repo\\cutready',
+        fix: { action: 'switch_to_branch', branch: 'main' },
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('move_folder', {
+      request: { workspace_path: 'C:\\repo\\cutready', to: 'demos' },
     });
     expect(invoke).toHaveBeenCalledWith('resolve_legacy_history_cleanup', {
       request: { workspace_path: 'C:\\repo', plan_id: 'plan-1' },

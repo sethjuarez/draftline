@@ -146,6 +146,14 @@ pub enum DraftlineError {
     #[error("unreadable Draftline folder record: {0}")]
     InvalidFolderMarker(String),
 
+    /// The folder can't move there; the text says why.
+    #[error("cannot move the Draftline folder: {0}")]
+    FolderMoveRefused(String),
+
+    /// The fix isn't one [`crate::Workspace::probe`] offers for the folder now.
+    #[error("that fix isn't available for this folder: {0}")]
+    FolderFixUnavailable(String),
+
     #[error("Send branch `{0}` is outside this project's variation namespace")]
     SendOutsideNamespace(String),
 

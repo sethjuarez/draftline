@@ -11,18 +11,18 @@ use serde::{Deserialize, Serialize};
 use crate::{
     merge::MergeConflict, AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult,
     ChangeSet, ContentPolicy, ContentPolicyAudit, ContributorProfile, CurrentFileDiff,
-    CurrentFilePreview, DirtySummary, DraftlineError, FilteredFile, HistoryEntry,
-    MergeConflictResolution, MergeIncomingReport, MergeIncomingResult, MergeIncomingToken,
-    MergeResolutionChoice, OperationLockInspection, PreflightReport, PreviewFile, PublishPreflight,
-    PublishResult, RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest,
-    RemoteEndpoint, RemoteOptions, RemoteVariation, RemoteVariationDiagnostics,
-    RestoreVersionTarget, Result, Shelf, ShelfApplyReport, SupportRef, SupportRefScope,
-    SwitchPolicy, SyncState, SyncStatus, Variation, VariationCreatePreflight, VariationCreateToken,
-    VariationId, VariationMetadata, VariationRenamePreflight, VariationRenameToken,
-    VariationSummary, Version, VersionDiff, VersionId, VersionPreview, Workspace,
-    WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor,
-    WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail, WorkspaceGraphOptions,
-    WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRefs,
+    CurrentFilePreview, DirtySummary, DraftlineError, FilteredFile, FolderFix, FolderMove,
+    FolderProbe, HistoryEntry, MergeConflictResolution, MergeIncomingReport, MergeIncomingResult,
+    MergeIncomingToken, MergeResolutionChoice, OperationLockInspection, PreflightReport,
+    PreviewFile, PublishPreflight, PublishResult, RecoveryRepairResult, RecoveryState,
+    RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVariation,
+    RemoteVariationDiagnostics, RestoreVersionTarget, Result, Shelf, ShelfApplyReport, SupportRef,
+    SupportRefScope, SwitchPolicy, SyncState, SyncStatus, Variation, VariationCreatePreflight,
+    VariationCreateToken, VariationId, VariationMetadata, VariationRenamePreflight,
+    VariationRenameToken, VariationSummary, Version, VersionDiff, VersionId, VersionPreview,
+    Workspace, WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary,
+    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail,
+    WorkspaceGraphOptions, WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRefs,
     WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection,
     WorkspaceSummary, WorkspaceVerification,
 };
@@ -773,6 +773,94 @@ pub fn open_workspace_with_context(
 ) -> Result<WorkspaceOpenResult> {
     Ok(WorkspaceOpenResult {
         diagnostics: inspect_workspace_with_context(context, request)?,
+    })
+}
+
+/// Request to apply a fix [`probe_folder`] offered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyFolderFixRequest {
+    pub workspace_path: PathBuf,
+    pub fix: FolderFix,
+}
+
+/// Request to move the managed folder; `to` is absolute or repository-relative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveFolderRequest {
+    pub workspace_path: PathBuf,
+    pub to: PathBuf,
+}
+
+/// Result of [`move_folder`]; diagnostics describe the folder at its new path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveFolderResult {
+    pub moved: FolderMove,
+    pub diagnostics: WorkspaceDiagnostics,
+}
+
+/// Reports a folder's state and suggested fixes before opening it. Read-only.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn probe_folder(request: WorkspaceRequest) -> Result<FolderProbe> {
+    Workspace::probe(&request.workspace_path)
+}
+
+/// Applies a fix [`probe_folder`] offered, then opens the resulting folder.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn apply_folder_fix(request: ApplyFolderFixRequest) -> Result<WorkspaceOpenResult> {
+    apply_folder_fix_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Applies a fix [`probe_folder`] offered through the host-configured context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn apply_folder_fix_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: ApplyFolderFixRequest,
+) -> Result<WorkspaceOpenResult> {
+    let workspace = context.namespaced(Workspace::apply_folder_fix(
+        &request.workspace_path,
+        context.content_policy.clone(),
+        &request.fix,
+    )?)?;
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(WorkspaceOpenResult {
+        diagnostics: workspace_diagnostics(&workspace)?,
+    })
+}
+
+/// Moves the managed folder as one save.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn move_folder(request: MoveFolderRequest) -> Result<MoveFolderResult> {
+    move_folder_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Moves the managed folder through the host-configured context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn move_folder_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: MoveFolderRequest,
+) -> Result<MoveFolderResult> {
+    let mut workspace = context.open_workspace(&request.workspace_path)?;
+    let moved = workspace.move_folder(&request.to)?;
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(MoveFolderResult {
+        moved,
+        diagnostics: workspace_diagnostics(&workspace)?,
     })
 }
 
@@ -2917,6 +3005,8 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::FolderIsElsewhere(_) => "folder_is_elsewhere",
         DraftlineError::FolderMissing(_) => "folder_missing",
         DraftlineError::InvalidFolderMarker(_) => "invalid_folder_marker",
+        DraftlineError::FolderMoveRefused(_) => "folder_move_refused",
+        DraftlineError::FolderFixUnavailable(_) => "folder_fix_unavailable",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::VariationOutsideNamespace(_) => "variation_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",

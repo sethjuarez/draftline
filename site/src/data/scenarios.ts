@@ -476,7 +476,7 @@ export const flowMatrix: Flow[] = [
     title: "Draftline manages one folder",
     group: "Hybrid projects",
     status: "Covered",
-    outcome: "A committed root .draftline file names the one folder Draftline manages; other folders are refused.",
+    outcome: "A committed root .draftline file names the one folder Draftline manages; a probe reports its state with fixes, and moving it is one tracked save.",
   },
 ];
 
