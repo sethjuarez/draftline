@@ -4511,8 +4511,8 @@ fn managing_a_path_that_is_not_a_plain_folder_changes_nothing() {
 
 #[cfg(windows)]
 #[test]
-fn init_never_creates_folders_through_a_junction() {
-    let (temp, _repo) = code_repo();
+fn neither_init_nor_a_move_goes_through_a_junction() {
+    let (temp, repo) = code_repo();
     let outside = tempfile::tempdir().unwrap();
     let link = temp.path().join("link");
     let status = std::process::Command::new("cmd")
@@ -4525,6 +4525,19 @@ fn init_never_creates_folders_through_a_junction() {
     assert!(Workspace::init_with_policy(link.join("deck"), cutready_policy()).is_err());
     assert!(!outside.path().join("deck").exists());
     assert!(!temp.path().join(".draftline").exists());
+
+    let mut pitch = scoped(&temp);
+    pitch.save_version("Marker").unwrap();
+    let before = repo.head().unwrap().target().unwrap();
+    for to in ["link", "link/deck"] {
+        let error = pitch.move_folder(to).unwrap_err();
+        assert!(
+            error.to_string().contains("through a link"),
+            "{to}: {error}"
+        );
+    }
+    assert_eq!(repo.head().unwrap().target().unwrap(), before);
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 }
 
 #[test]

@@ -2319,6 +2319,13 @@ impl Workspace {
         if to.as_os_str().is_empty() {
             return Ok(None);
         }
+        let mut walked = self.root.clone();
+        for component in to.components() {
+            walked.push(component);
+            if fs::symlink_metadata(&walked).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                return Ok(Some(format!("{to_label} is reached through a link")));
+            }
+        }
         let dir = self.root.join(to);
         if dir.is_file() {
             return Ok(Some(format!("{to_label} is a file")));
