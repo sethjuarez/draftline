@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.8.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.7.0...draftline-v0.8.0) (2026-10-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* **workspace:** match DraftlineError with a wildcard arm.
+
+### Features
+
+* **workspace:** mark DraftlineError non_exhaustive ([#59](https://github.com/sethjuarez/draftline/issues/59)) ([4dbdf8d](https://github.com/sethjuarez/draftline/commit/4dbdf8de02a3bc985b2d5b74bfe1d8dee2093053))
+
+
+### Bug Fixes
+
+* **workspace:** fix the CutReady 0.7.0 E2E findings ([#57](https://github.com/sethjuarez/draftline/issues/57)) ([fd726a2](https://github.com/sethjuarez/draftline/commit/fd726a2b08112f2842355fda4eac09cafbd4fd3f))
+
 ## [0.7.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.6.0...draftline-v0.7.0) (2026-10-25)
 
 
