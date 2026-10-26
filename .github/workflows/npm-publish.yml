@@ -7,18 +7,8 @@ on:
         description: "Type publish to publish @draftline/client and @draftline/react"
         required: true
         type: string
-  workflow_call:
-    inputs:
-      publish_client:
-        description: "Whether @draftline/client should be published (subject to version checks)"
-        required: false
-        type: boolean
-        default: true
-      publish_react:
-        description: "Whether @draftline/react should be published (subject to version checks)"
-        required: false
-        type: boolean
-        default: true
+# Dispatch-only on purpose: npm trusted publishing checks the top-level workflow, and it is
+# registered for this file. release-please dispatches it rather than calling it.
 
 permissions:
   contents: read
@@ -30,10 +20,6 @@ jobs:
     name: Test and publish npm packages
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      # A called workflow sees the caller's event (e.g. push), never workflow_call.
-      SELECT_CLIENT: ${{ github.event_name == 'workflow_dispatch' || inputs.publish_client == true }}
-      SELECT_REACT: ${{ github.event_name == 'workflow_dispatch' || inputs.publish_react == true }}
 
     steps:
       - name: Checkout
@@ -95,11 +81,11 @@ jobs:
           fi
 
       - name: Publish @draftline/client
-        if: steps.npm.outputs.publish_client == 'true' && env.SELECT_CLIENT == 'true'
+        if: steps.npm.outputs.publish_client == 'true'
         run: npm publish --workspace @draftline/client --provenance --access public
 
       - name: Publish @draftline/react
-        if: steps.npm.outputs.publish_react == 'true' && env.SELECT_REACT == 'true'
+        if: steps.npm.outputs.publish_react == 'true'
         run: npm publish --workspace @draftline/react --provenance --access public
 
       - name: Setup Node for GitHub Packages
@@ -134,23 +120,23 @@ jobs:
           fi
 
       - name: Stage @sethjuarez/draftline-client
-        if: steps.github_packages.outputs.publish_client == 'true' && env.SELECT_CLIENT == 'true'
+        if: steps.github_packages.outputs.publish_client == 'true'
         run: node scripts/stage-github-package.mjs packages/client @sethjuarez/draftline-client .github-package-staging/client
 
       - name: Publish @sethjuarez/draftline-client
-        if: steps.github_packages.outputs.publish_client == 'true' && env.SELECT_CLIENT == 'true'
+        if: steps.github_packages.outputs.publish_client == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm publish .github-package-staging/client --access public
 
       - name: Stage @sethjuarez/draftline-react
-        if: steps.github_packages.outputs.publish_react == 'true' && env.SELECT_REACT == 'true'
+        if: steps.github_packages.outputs.publish_react == 'true'
         run: |
           client_version=$(node -p "require('./packages/client/package.json').version")
           node scripts/stage-github-package.mjs packages/react @sethjuarez/draftline-react .github-package-staging/react "@draftline/client=npm:@sethjuarez/draftline-client@${client_version}"
 
       - name: Publish @sethjuarez/draftline-react
-        if: steps.github_packages.outputs.publish_react == 'true' && env.SELECT_REACT == 'true'
+        if: steps.github_packages.outputs.publish_react == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm publish .github-package-staging/react --access public
