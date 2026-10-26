@@ -849,6 +849,7 @@ export type FolderFix =
   | { action: 'open' }
   | { action: 'manage_here' }
   | { action: 'open_managed_folder'; folder: string }
+  | { action: 'manage_renamed_folder'; folder: string }
   | { action: 'move_folder_here'; from: string }
   | { action: 'restore_folder'; folder: string }
   | { action: 'switch_to_branch'; branch: string }

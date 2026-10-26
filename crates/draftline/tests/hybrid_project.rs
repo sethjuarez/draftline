@@ -4260,6 +4260,106 @@ fn opening_a_folder_a_developer_renamed_away_says_it_is_missing() {
 }
 
 #[test]
+fn a_folder_a_developer_renamed_is_offered_first_where_it_went() {
+    use draftline::{FolderFix, FolderState};
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    write_file(temp.path(), "cutready/outro.sk", "the end\n");
+    pitch.save_version("Deck").unwrap();
+    drop(pitch);
+
+    // `git mv cutready showcase`, one file edited too, then a commit.
+    fs::rename(temp.path().join("cutready"), temp.path().join("showcase")).unwrap();
+    write_file(temp.path(), "showcase/outro.sk", "the real end\n");
+    let mut index = repo.index().unwrap();
+    index.update_all(["*"], None).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: rename the deck");
+    write_file(temp.path(), "src/later.rs", "// later\n");
+    commit_all(&repo, "Dev: later work");
+
+    let cutready = temp.path().join("cutready");
+    let probe = Workspace::probe(&cutready).unwrap();
+    assert_eq!(probe.state, FolderState::FolderMissing);
+    let showcase = PathBuf::from("showcase");
+    assert_eq!(
+        probe.suggestions[0].fix,
+        FolderFix::ManageRenamedFolder {
+            folder: showcase.clone()
+        },
+        "{probe:?}"
+    );
+    assert_eq!(
+        probe.suggestions.last().unwrap().fix,
+        FolderFix::ManageHere,
+        "creating the old folder is the last resort"
+    );
+
+    // Probing the new folder puts managing it first.
+    let there = Workspace::probe(temp.path().join("showcase")).unwrap();
+    assert_eq!(there.suggestions[0].fix, FolderFix::ManageHere, "{there:?}");
+    assert!(there.suggestions[0].label.contains("renamed here"));
+
+    let workspace =
+        Workspace::apply_folder_fix(&cutready, cutready_policy(), &probe.suggestions[0].fix)
+            .unwrap();
+    assert!(!cutready.exists(), "nothing empty is created");
+    assert_eq!(read(temp.path(), "showcase/intro.sk"), "scene one\n");
+    assert!(workspace.versions().unwrap().len() >= 2);
+    Workspace::open_with_policy(temp.path().join("showcase"), cutready_policy()).unwrap();
+}
+
+#[test]
+fn creating_the_folder_again_leaves_an_identical_marker_untouched() {
+    use draftline::FolderFix;
+    let (temp, repo) = code_repo();
+    scoped(&temp);
+    // As a `core.autocrlf=true` checkout leaves it.
+    let marker = temp.path().join(".draftline");
+    let crlf = fs::read_to_string(&marker)
+        .unwrap()
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+    fs::write(&marker, crlf).unwrap();
+    fs::remove_dir_all(temp.path().join("cutready")).unwrap();
+    let mut index = repo.index().unwrap();
+    index.update_all(["*"], None).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: drop the deck");
+
+    Workspace::apply_folder_fix(
+        temp.path().join("cutready"),
+        cutready_policy(),
+        &FolderFix::ManageHere,
+    )
+    .unwrap();
+    assert!(temp.path().join("cutready").is_dir());
+    assert_eq!(status(&repo, ".draftline"), git2::Status::CURRENT);
+}
+
+#[test]
+fn a_deleted_folder_is_not_mistaken_for_a_rename() {
+    use draftline::FolderFix;
+    let (temp, repo) = code_repo();
+    scoped(&temp);
+    fs::remove_dir_all(temp.path().join("cutready")).unwrap();
+    write_file(temp.path(), "showcase/other.sk", "unrelated\n");
+    let mut index = repo.index().unwrap();
+    index.update_all(["*"], None).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: drop the deck");
+
+    let probe = Workspace::probe(temp.path().join("cutready")).unwrap();
+    assert!(
+        !probe
+            .suggestions
+            .iter()
+            .any(|s| matches!(s.fix, FolderFix::ManageRenamedFolder { .. })),
+        "{probe:?}"
+    );
+}
+
+#[test]
 fn a_branch_without_the_folder_reports_it_missing_but_can_switch_back() {
     let (temp, repo) = code_repo();
     let pitch = scoped(&temp);

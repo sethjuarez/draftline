@@ -573,6 +573,8 @@ pub enum FolderFix {
     ManageHere,
     /// Open the folder Draftline already manages.
     OpenManagedFolder { folder: PathBuf },
+    /// Manage `folder` instead: a commit renamed the managed folder there.
+    ManageRenamedFolder { folder: PathBuf },
     /// Move the managed folder to the requested path, as a save.
     MoveFolderHere { from: PathBuf },
     /// Put the managed folder back from the current version.
@@ -1866,6 +1868,12 @@ impl Workspace {
             FolderFix::OpenManagedFolder { folder } => {
                 Self::open_with_policy(root.join(folder), content_policy)
             }
+            FolderFix::ManageRenamedFolder { folder } => Self::apply_offered_fix(
+                &root.join(folder),
+                content_policy,
+                namespace,
+                &FolderFix::ManageHere,
+            ),
             FolderFix::MoveFolderHere { from } => {
                 let mut workspace = Self::open_with_policy(root.join(from), content_policy)?;
                 workspace.move_folder(&requested)?;
@@ -2134,7 +2142,109 @@ impl Workspace {
                 .suggestions
                 .push(suggest(FolderFix::ManageHere, "Manage this folder instead"));
         }
+        // A commit renamed the folder: following it comes first, since
+        // creating the old one would start empty.
+        if !tracked {
+            match self.renamed_folder(&folder)? {
+                Some(renamed) if renamed == self.scope() => {
+                    if let Some(at) = probe
+                        .suggestions
+                        .iter()
+                        .position(|s| s.fix == FolderFix::ManageHere)
+                    {
+                        let mut first = probe.suggestions.remove(at);
+                        first.label = format!("Manage this folder ({label} was renamed here)");
+                        probe.suggestions.insert(0, first);
+                    }
+                }
+                Some(renamed) => {
+                    let offered = Self::located_in(
+                        &self.root.join(&renamed),
+                        ContentPolicy::default(),
+                        self.variation_namespace.clone(),
+                    )?
+                    .map(|there| there.probe_located(self.root.join(&renamed)))
+                    .transpose()?
+                    .is_some_and(|there| {
+                        there
+                            .suggestions
+                            .iter()
+                            .any(|s| s.fix == FolderFix::ManageHere)
+                    });
+                    if offered {
+                        let text = format!(
+                            "Manage {} instead ({label} was renamed there)",
+                            folder_label(&renamed)
+                        );
+                        probe.suggestions.insert(
+                            0,
+                            suggest(FolderFix::ManageRenamedFolder { folder: renamed }, &text),
+                        );
+                    }
+                }
+                None => {}
+            }
+        }
         Ok(probe)
+    }
+
+    /// Where a commit on the current branch renamed `folder`, when at least
+    /// half of its files went to one folder that is still checked out here.
+    fn renamed_folder(&self, folder: &Path) -> Result<Option<PathBuf>> {
+        const MAX_COMMITS: usize = 500;
+        if folder.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let Ok(mut commit) = self.repo.head().and_then(|head| head.peel_to_commit()) else {
+            return Ok(None);
+        };
+        let head_tree = commit.tree()?;
+        for _ in 0..MAX_COMMITS {
+            let Ok(parent) = commit.parent(0) else {
+                return Ok(None);
+            };
+            let before = parent.tree()?;
+            if !tracks_folder(&before, folder) {
+                commit = parent;
+                continue;
+            }
+            let after = commit.tree()?;
+            let mut diff = self
+                .repo
+                .diff_tree_to_tree(Some(&before), Some(&after), None)?;
+            diff.find_similar(Some(git2::DiffFindOptions::new().renames(true)))?;
+            let mut moved_from = 0usize;
+            let mut targets: BTreeMap<PathBuf, usize> = BTreeMap::new();
+            for delta in diff.deltas() {
+                let (Some(old), Some(new)) = (delta.old_file().path(), delta.new_file().path())
+                else {
+                    continue;
+                };
+                let Ok(rest) = old.strip_prefix(folder) else {
+                    continue;
+                };
+                moved_from += 1;
+                if delta.status() != git2::Delta::Renamed {
+                    continue;
+                }
+                let new_parts: Vec<_> = new.components().collect();
+                let rest_len = rest.components().count();
+                if new_parts.len() <= rest_len || !new.ends_with(rest) {
+                    continue;
+                }
+                let target: PathBuf = new_parts[..new_parts.len() - rest_len].iter().collect();
+                *targets.entry(target).or_default() += 1;
+            }
+            return Ok(targets
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .filter(|(_, count)| *count * 2 >= moved_from)
+                .map(|(target, _)| target)
+                .filter(|target| target != folder)
+                .filter(|target| tracks_folder(&head_tree, target))
+                .filter(|target| self.root.join(target).is_dir()));
+        }
+        Ok(None)
     }
 
     /// Files under `folder` a move would lose or split from Git's index:
@@ -10200,6 +10310,21 @@ impl Workspace {
     fn write_marker(&self) -> Result<()> {
         let bytes = marker_bytes(&self.project_key())?;
         let path = self.marker_path();
+        // Rewriting the same record would leave Git seeing a change when the
+        // checkout converted its line endings.
+        let unchanged = fs::read(&path).is_ok_and(|existing| {
+            existing
+                .trim_ascii_end()
+                .split(|byte| *byte == b'\n')
+                .map(<[u8]>::trim_ascii_end)
+                .eq(bytes
+                    .trim_ascii_end()
+                    .split(|byte| *byte == b'\n')
+                    .map(<[u8]>::trim_ascii_end))
+        });
+        if unchanged {
+            return Ok(());
+        }
         let temp = unique_claim_temp(&path);
         fs::write(&temp, bytes)?;
         replace_file(&temp, &path)?;
