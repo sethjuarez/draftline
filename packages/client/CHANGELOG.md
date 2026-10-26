@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/sethjuarez/draftline/compare/client-v0.4.0...client-v0.4.1) (2026-10-26)
+
+
+### Bug Fixes
+
+* **workspace:** fix the CutReady 0.7.0 E2E findings ([#57](https://github.com/sethjuarez/draftline/issues/57)) ([fd726a2](https://github.com/sethjuarez/draftline/commit/fd726a2b08112f2842355fda4eac09cafbd4fd3f))
+
 ## [0.4.0](https://github.com/sethjuarez/draftline/compare/client-v0.3.0...client-v0.4.0) (2026-10-25)
 
 
