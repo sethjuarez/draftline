@@ -47,15 +47,16 @@ pub struct SendRequest {
     #[serde(default)]
     pub branch: Option<String>,
     /// [SendPreflight::token] the host approved. Send refuses with
-    /// local_state_changed if anything it names has changed since.
+    /// local_state_changed if anything it names has changed since. Optional for
+    /// compatibility; hosts should always pass it.
     #[serde(default)]
     pub expected: Option<SendToken>,
 }
 
 /// What a [SendPreflight] checked. Pass it back as [SendRequest::expected] so
-/// Send acts only on what the host approved. A token approves one attempt:
-/// a failed Send may have moved to its new branch, so preflight again before
-/// retrying.
+/// Send acts only on what the host approved. The token names state, not an
+/// attempt: it stays valid while that state is unchanged. A failed Send may have
+/// moved to its new branch, so preflight again before retrying.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendToken {
     pub remote: String,

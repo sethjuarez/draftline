@@ -1865,7 +1865,7 @@ fn send_retries_safely_after_the_host_fails_and_avoids_taken_branch_names() {
     assert_eq!(tauri.message, "host offline");
     assert!(remote_branch(bare.path(), "cutready/pitch-2").is_some());
 
-    // The token approved one attempt; the retry needs a fresh preflight.
+    // The failed Send moved to its new branch; the retry needs a fresh preflight.
     let error = workspace
         .send("origin", &approved, &mut host, &mut RemoteOptions::new())
         .unwrap_err();
