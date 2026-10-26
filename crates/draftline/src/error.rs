@@ -162,6 +162,13 @@ pub enum DraftlineError {
     #[error("that fix isn't available for this folder: {0}")]
     FolderFixUnavailable(String),
 
+    /// The remote renamed its default branch from `from` to `to`, and this
+    /// branch is the old name: publishing would bring the old name back.
+    #[error(
+        "the remote renamed `{from}` to `{to}`; rename this branch to `{to}` or start a variation for these saves"
+    )]
+    BaseRenamed { from: String, to: String },
+
     #[error("Send branch `{0}` is outside this project's variation namespace")]
     SendOutsideNamespace(String),
 

@@ -8758,7 +8758,38 @@ impl Workspace {
                 return options.map_git_result("fetch_remote", Err(error));
             }
         }
+        // Like `git fetch --prune` for this one branch: a tracking ref for a
+        // branch the remote no longer has would make it look up to date.
+        if let (Some(name), Ok(advertised)) = (remote.name().ok().flatten(), remote.list()) {
+            let merge = format!("refs/heads/{variation}");
+            if !advertised.iter().any(|head| head.name() == merge) {
+                if let Ok(mut tracking) = self
+                    .repo
+                    .find_reference(&format!("refs/remotes/{name}/{variation}"))
+                {
+                    tracking.delete()?;
+                }
+            }
+        }
         self.record_remote_head(&remote)
+    }
+
+    /// Refuses to publish a branch whose remote counterpart was renamed as
+    /// the remote's default: pushing would bring the old name back.
+    fn ensure_base_not_renamed(&self, remote: &str) -> Result<()> {
+        let variation = self.current_variation_unchecked()?;
+        if remote_tracking_oid(&self.repo, remote, &variation).is_some() {
+            return Ok(());
+        }
+        match self.default_branch_on(remote) {
+            Some(base) if self.base_renamed_from(remote, &base).as_deref() == Some(&variation) => {
+                Err(DraftlineError::BaseRenamed {
+                    from: variation,
+                    to: base,
+                })
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Returns collaboration status for the current variation.
@@ -8771,6 +8802,10 @@ impl Workspace {
 
         let Ok(remote_oid) = self.repo.refname_to_id(&remote_ref) else {
             let ahead = self.local_version_count(local)?;
+            let base_renamed_from = self
+                .default_branch_on(&remote)
+                .and_then(|base| self.base_renamed_from(&remote, &base))
+                .filter(|old| *old == variation);
             return Ok(SyncStatus {
                 remote,
                 variation,
@@ -8778,7 +8813,7 @@ impl Workspace {
                 behind: 0,
                 state: SyncState::NoRemoteVersion,
                 incoming: Vec::new(),
-                base_renamed_from: None,
+                base_renamed_from,
             });
         };
 
@@ -9568,6 +9603,7 @@ impl Workspace {
 
         let remote = remote.as_ref().to_string();
         self.fetch_remote_unchecked(&remote, options)?;
+        self.ensure_base_not_renamed(&remote)?;
         let sync_status = self.sync_status(&remote)?;
         if matches!(
             sync_status.state,
@@ -9640,6 +9676,7 @@ impl Workspace {
         }
 
         self.fetch_remote_unchecked(&token.remote, options)?;
+        self.ensure_base_not_renamed(&token.remote)?;
         let actual_remote_oid = remote_tracking_oid(&self.repo, &token.remote, &token.variation);
         if actual_remote_oid != token.expected_remote_oid {
             return Err(DraftlineError::RemoteRace {
@@ -9708,6 +9745,7 @@ impl Workspace {
 
         let remote_name = remote.to_string();
         self.fetch_remote_unchecked(&remote_name, options)?;
+        self.ensure_base_not_renamed(&remote_name)?;
         if let Some(guard) = &send_guard {
             let current = self.current_variation_unchecked()?;
             let actual = self

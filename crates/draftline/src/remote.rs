@@ -28,9 +28,11 @@ pub struct SyncStatus {
     pub behind: usize,
     pub state: SyncState,
     pub incoming: Vec<RemoteVersionSummary>,
-    /// Set only by base status: the remote renamed its default branch from
-    /// this name, and a local branch still has it. Saves made there can be
-    /// moved with `start_variation_here`.
+    /// The remote renamed its default branch from this name, and a local
+    /// branch still has it. Base status sets it for the base; sync status
+    /// sets it when the current variation is that old name. Saves there can be
+    /// moved with `start_variation_here`, or the branch renamed to the new
+    /// name with `rename_variation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_renamed_from: Option<String>,
 }

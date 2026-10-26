@@ -3053,6 +3053,73 @@ fn a_still_advertised_branch_is_not_a_rename() {
 }
 
 #[test]
+fn a_renamed_remote_branch_says_so_instead_of_bringing_the_old_name_back() {
+    use draftline::VariationId;
+    // A standalone folder publishing straight to main, as CutReady's did.
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+    let workspace = Workspace::init_with_policy(temp.path(), cutready_policy()).unwrap();
+    workspace.fetch_remote("origin").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, shared\n");
+    workspace.save_version("Shared").unwrap();
+    workspace.publish_changes("origin").unwrap();
+
+    // GitHub renames main to trunk.
+    let remote = git2::Repository::open_bare(bare.path()).unwrap();
+    let tip = remote.refname_to_id("refs/heads/main").unwrap();
+    remote
+        .reference("refs/heads/trunk", tip, false, "rename")
+        .unwrap();
+    remote.set_head("refs/heads/trunk").unwrap();
+    remote
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .delete()
+        .unwrap();
+
+    workspace.fetch_remote("origin").unwrap();
+    assert!(
+        repo.find_reference("refs/remotes/origin/main").is_err(),
+        "the vanished branch's tracking ref is pruned"
+    );
+    let status = workspace.sync_status("origin").unwrap();
+    assert_eq!(status.state, draftline::SyncState::NoRemoteVersion);
+    assert_eq!(status.base_renamed_from.as_deref(), Some("main"));
+
+    write_file(temp.path(), "cutready/intro.sk", "scene one, later\n");
+    workspace.save_version("Later").unwrap();
+    let expect_renamed = |error: DraftlineError| match error {
+        DraftlineError::BaseRenamed { from, to } => assert_eq!((&*from, &*to), ("main", "trunk")),
+        other => panic!("expected BaseRenamed, got {other:?}"),
+    };
+    expect_renamed(workspace.publish_changes("origin").unwrap_err());
+    expect_renamed(workspace.preflight_publish("origin").unwrap_err());
+    let contract = draftline::tauri_contract::TauriCommandError::from(
+        workspace.publish_changes("origin").unwrap_err(),
+    );
+    assert_eq!(contract.code, "base_renamed");
+    assert!(
+        remote.find_reference("refs/heads/main").is_err(),
+        "the old name is never brought back"
+    );
+
+    // Renaming the branch to the new name puts publishing back on track.
+    workspace
+        .rename_variation(&VariationId::from("main"), &VariationId::from("trunk"))
+        .unwrap();
+    let published = workspace.publish_changes("origin").unwrap();
+    assert_eq!(published.variation, "trunk");
+    assert_eq!(
+        remote.refname_to_id("refs/heads/trunk").unwrap(),
+        repo.head().unwrap().target().unwrap()
+    );
+    assert_eq!(
+        workspace.sync_status("origin").unwrap().base_renamed_from,
+        None
+    );
+}
+
+#[test]
 fn bringing_in_the_latest_base_merges_everything_into_the_variation() {
     let (temp, repo) = code_repo();
     let (bare, other_dir, other) = with_remote(&repo);
