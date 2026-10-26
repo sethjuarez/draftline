@@ -5,8 +5,10 @@ use crate::{workspace::VariationCreatePreflight, PreflightReport, RecoveryState,
 /// Result type used by Draftline APIs.
 pub type Result<T> = std::result::Result<T, DraftlineError>;
 
-/// Errors returned by Draftline.
+/// Errors returned by Draftline. New variants can arrive in any release, so
+/// match with a wildcard arm (or use the Tauri contract's stable code).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DraftlineError {
     #[error("git operation failed: {0}")]
     Git(git2::Error),
