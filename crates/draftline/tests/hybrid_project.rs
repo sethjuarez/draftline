@@ -796,12 +796,40 @@ fn command_contract_lists_and_probes_filtered_files() {
     let probed = filtered_files_with_context(
         &mut context,
         FilteredFilesRequest {
-            workspace_path: folder,
+            workspace_path: folder.clone(),
             paths: Some(vec!["cutready/notes.md".into()]),
         },
     )
     .unwrap();
     assert!(probed.is_empty());
+
+    // A file not written yet is probed by its repository path, reported with `/`.
+    let probed = filtered_files_with_context(
+        &mut context,
+        FilteredFilesRequest {
+            workspace_path: folder.clone(),
+            paths: Some(vec![PathBuf::from("cutready")
+                .join("shots")
+                .join("next.sk")]),
+        },
+    )
+    .unwrap();
+    let json = serde_json::to_value(&probed).unwrap();
+    assert_eq!(json[0]["path"], "cutready/shots/next.sk");
+    assert_eq!(probed[0].path.to_str(), Some("cutready/shots/next.sk"));
+    // A folder-relative path is outside the folder, never silently empty.
+    let error = filtered_files_with_context(
+        &mut context,
+        FilteredFilesRequest {
+            workspace_path: folder,
+            paths: Some(vec!["next.sk".into()]),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::PathOutsideContentPolicy(_)),
+        "{error:?}"
+    );
 }
 #[test]
 fn smudged_lfs_files_are_not_reported_missing() {

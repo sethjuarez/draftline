@@ -10945,7 +10945,8 @@ impl Workspace {
     }
 
     /// Tracked files in the folder that Git stores through a filter driver, such as
-    /// Git LFS, with whether their content is missing from disk.
+    /// Git LFS, with whether their content is missing from disk. Untracked files
+    /// are not listed; check those with [`Workspace::filtered_files_among`].
     pub fn filtered_files(&self) -> Result<Vec<FilteredFile>> {
         let paths = self.tracked_project_paths()?;
         self.filtered_among(paths)
@@ -10985,7 +10986,9 @@ impl Workspace {
     }
 
     /// Which of `paths` Git would store through a filter driver. Paths need
-    /// not exist, so a host can check where it is about to write.
+    /// not exist or be tracked, so a host can check where it is about to write.
+    /// Like every Draftline path, they are relative to the repository, not the
+    /// folder (`cutready/shot.png`); returned paths use `/`.
     pub fn filtered_files_among<I, P>(&self, paths: I) -> Result<Vec<FilteredFile>>
     where
         I: IntoIterator<Item = P>,
@@ -10993,7 +10996,16 @@ impl Workspace {
     {
         let paths = paths
             .into_iter()
-            .map(|path| self.normalize_tracked_content_path(path))
+            .map(|path| {
+                self.normalize_tracked_content_path(path).map(|path| {
+                    PathBuf::from(
+                        path.components()
+                            .map(|part| part.as_os_str().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/"),
+                    )
+                })
+            })
             .collect::<Result<BTreeSet<_>>>()?;
         self.filtered_among(paths)
     }
