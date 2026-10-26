@@ -1702,8 +1702,45 @@ impl Workspace {
     /// Opening a folder below the repository root scopes the workspace to that
     /// folder; see [`Workspace::init_with_policy`].
     pub fn open_with_policy(path: impl AsRef<Path>, content_policy: ContentPolicy) -> Result<Self> {
-        let repo = Repository::discover(path.as_ref())?;
-        Self::from_repository(repo, path.as_ref(), content_policy)
+        let path = absolute_path(path.as_ref())?;
+        if !path.exists() {
+            if let Some(error) = Self::missing_folder_error(&path)? {
+                return Err(error);
+            }
+        }
+        let anchor = path
+            .ancestors()
+            .find(|ancestor| ancestor.exists())
+            .unwrap_or(&path);
+        let repo = Repository::discover(anchor)?;
+        Self::from_repository(repo, &path, content_policy)
+    }
+
+    /// Why a folder that isn't on disk can't be opened, from what
+    /// [`Workspace::probe`] reports, so the host can offer its fixes. `None`
+    /// when it can still open, for example to finish an interrupted move.
+    fn missing_folder_error(path: &Path) -> Result<Option<DraftlineError>> {
+        let probe = Self::probe_in(path, None)?;
+        let requested = || {
+            probe
+                .repository
+                .as_deref()
+                .and_then(|root| folder_in(root, &probe.requested).ok())
+                .unwrap_or_else(|| probe.requested.clone())
+        };
+        Ok(match probe.state {
+            FolderState::ManagedElsewhere => {
+                probe.folder.clone().map(DraftlineError::FolderIsElsewhere)
+            }
+            FolderState::FolderMissing => Some(DraftlineError::FolderMissing(
+                probe.folder.clone().unwrap_or_else(requested),
+            )),
+            FolderState::Unmanaged => Some(DraftlineError::FolderMissing(requested())),
+            FolderState::InvalidMarker => Some(DraftlineError::InvalidFolderMarker(
+                probe.detail.clone().unwrap_or_default(),
+            )),
+            _ => None,
+        })
     }
 
     /// Reports what opening `path` would find, without changing anything,

@@ -4151,6 +4151,48 @@ fn a_missing_folder_is_reported_until_it_comes_back() {
 }
 
 #[test]
+fn opening_a_folder_a_developer_renamed_away_says_it_is_missing() {
+    use draftline::{FolderFix, FolderState};
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    pitch.save_version("Intro").unwrap();
+    drop(pitch);
+
+    // `git mv cutready showcase && git commit`, leaving `.draftline` as is.
+    fs::rename(temp.path().join("cutready"), temp.path().join("showcase")).unwrap();
+    let mut index = repo.index().unwrap();
+    index.update_all(["*"], None).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: rename the deck");
+
+    let cutready = temp.path().join("cutready");
+    let probe = Workspace::probe(&cutready).unwrap();
+    assert_eq!(probe.state, FolderState::FolderMissing);
+    assert!(probe
+        .suggestions
+        .iter()
+        .any(|offered| offered.fix == FolderFix::ManageHere));
+    let error = refused(Workspace::open_with_policy(&cutready, cutready_policy()));
+    assert!(
+        matches!(&error, DraftlineError::FolderMissing(folder) if folder == Path::new("cutready")),
+        "{error:?}"
+    );
+    let tauri = draftline::tauri_contract::TauriCommandError::from(error);
+    assert_eq!(tauri.code, "folder_missing");
+    assert!(!cutready.exists());
+
+    // Once `.draftline` follows the rename, the old path points at the new one.
+    write_file(
+        temp.path(),
+        ".draftline",
+        r#"{"format":1,"folder":"showcase"}"#,
+    );
+    let error = refused(Workspace::open_with_policy(&cutready, cutready_policy()));
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("showcase"));
+    Workspace::open_with_policy(temp.path().join("showcase"), cutready_policy()).unwrap();
+}
+
+#[test]
 fn a_branch_without_the_folder_reports_it_missing_but_can_switch_back() {
     let (temp, repo) = code_repo();
     let pitch = scoped(&temp);
