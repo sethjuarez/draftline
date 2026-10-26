@@ -4448,10 +4448,18 @@ fn an_unreadable_record_is_reported_and_deleting_it_resets_it() {
             temp.path().join("cutready"),
             cutready_policy(),
         ));
-        assert!(
-            matches!(error, DraftlineError::InvalidFolderMarker(_)),
-            "{contents}: {error:?}"
-        );
+        if contents.contains("format") {
+            // A newer format has its own code, so hosts can say "update Draftline".
+            assert!(
+                matches!(error, DraftlineError::NewerFolderMarker(_)),
+                "{contents}: {error:?}"
+            );
+        } else {
+            assert!(
+                matches!(error, DraftlineError::InvalidFolderMarker(_)),
+                "{contents}: {error:?}"
+            );
+        }
     }
     fs::remove_file(&marker).unwrap();
     fs::create_dir(&marker).unwrap();
@@ -4819,6 +4827,10 @@ fn probing_reports_each_folder_state_with_fixes() {
     let probe = Workspace::probe(&cutready).unwrap();
     assert_eq!(probe.state, FolderState::NewerFormat);
     assert_eq!(fixes(&probe), [FolderFix::UpgradeDraftline]);
+    assert!(matches!(
+        Workspace::apply_folder_fix(&cutready, cutready_policy(), &FolderFix::UpgradeDraftline),
+        Err(DraftlineError::NewerFolderMarker(_))
+    ));
 
     // Suggestions serialize flat, the way hosts pass them back.
     let json = serde_json::to_value(&probe.suggestions[0]).unwrap();

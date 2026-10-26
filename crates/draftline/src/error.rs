@@ -154,6 +154,10 @@ pub enum DraftlineError {
     #[error("unreadable Draftline folder record: {0}")]
     InvalidFolderMarker(String),
 
+    /// `.draftline` uses a newer format; update Draftline to open this folder.
+    #[error("this folder needs a newer Draftline: {0}")]
+    NewerFolderMarker(String),
+
     /// The folder can't move there; the text says why.
     #[error("cannot move the Draftline folder: {0}")]
     FolderMoveRefused(String),

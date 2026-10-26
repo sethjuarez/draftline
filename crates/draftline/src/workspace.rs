@@ -1741,6 +1741,9 @@ impl Workspace {
             FolderState::InvalidMarker => Some(DraftlineError::InvalidFolderMarker(
                 probe.detail.clone().unwrap_or_default(),
             )),
+            FolderState::NewerFormat => Some(DraftlineError::NewerFolderMarker(
+                probe.detail.clone().unwrap_or_default(),
+            )),
             _ => None,
         })
     }
@@ -1894,7 +1897,7 @@ impl Workspace {
                 managed.switch_to_folder_branch(branch)?;
                 Self::open_with_policy(root.join(folder), content_policy)
             }
-            FolderFix::UpgradeDraftline => Err(DraftlineError::InvalidFolderMarker(
+            FolderFix::UpgradeDraftline => Err(DraftlineError::NewerFolderMarker(
                 probe.detail.unwrap_or_default(),
             )),
         }
@@ -10234,9 +10237,8 @@ impl Workspace {
         match self.marker_owner()? {
             FolderOwner::Nobody => Ok(None),
             FolderOwner::Folder(folder) => Ok(Some(folder)),
-            FolderOwner::Invalid(reason) | FolderOwner::Newer(reason) => {
-                Err(DraftlineError::InvalidFolderMarker(reason))
-            }
+            FolderOwner::Invalid(reason) => Err(DraftlineError::InvalidFolderMarker(reason)),
+            FolderOwner::Newer(reason) => Err(DraftlineError::NewerFolderMarker(reason)),
         }
     }
 

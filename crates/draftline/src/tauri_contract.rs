@@ -3020,6 +3020,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::FolderMissing(_) => "folder_missing",
         DraftlineError::IncomingFolderElsewhere(_) => "incoming_folder_elsewhere",
         DraftlineError::InvalidFolderMarker(_) => "invalid_folder_marker",
+        DraftlineError::NewerFolderMarker(_) => "newer_folder_marker",
         DraftlineError::FolderMoveRefused(_) => "folder_move_refused",
         DraftlineError::FolderFixUnavailable(_) => "folder_fix_unavailable",
         DraftlineError::BaseRenamed { .. } => "base_renamed",
