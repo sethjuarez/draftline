@@ -796,12 +796,40 @@ fn command_contract_lists_and_probes_filtered_files() {
     let probed = filtered_files_with_context(
         &mut context,
         FilteredFilesRequest {
-            workspace_path: folder,
+            workspace_path: folder.clone(),
             paths: Some(vec!["cutready/notes.md".into()]),
         },
     )
     .unwrap();
     assert!(probed.is_empty());
+
+    // A file not written yet is probed by its repository path, reported with `/`.
+    let probed = filtered_files_with_context(
+        &mut context,
+        FilteredFilesRequest {
+            workspace_path: folder.clone(),
+            paths: Some(vec![PathBuf::from("cutready")
+                .join("shots")
+                .join("next.sk")]),
+        },
+    )
+    .unwrap();
+    let json = serde_json::to_value(&probed).unwrap();
+    assert_eq!(json[0]["path"], "cutready/shots/next.sk");
+    assert_eq!(probed[0].path.to_str(), Some("cutready/shots/next.sk"));
+    // A folder-relative path is outside the folder, never silently empty.
+    let error = filtered_files_with_context(
+        &mut context,
+        FilteredFilesRequest {
+            workspace_path: folder,
+            paths: Some(vec!["next.sk".into()]),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::PathOutsideContentPolicy(_)),
+        "{error:?}"
+    );
 }
 #[test]
 fn smudged_lfs_files_are_not_reported_missing() {
@@ -1859,9 +1887,13 @@ fn send_retries_safely_after_the_host_fails_and_avoids_taken_branch_names() {
         .send("origin", &approved, &mut host, &mut RemoteOptions::new())
         .unwrap_err();
     assert!(matches!(error, DraftlineError::PullRequest(_)), "{error:?}");
+    // Hosts show the provider's own text; the code says where it came from.
+    let tauri = draftline::tauri_contract::TauriCommandError::from(error);
+    assert_eq!(tauri.code, "pull_request_failed");
+    assert_eq!(tauri.message, "host offline");
     assert!(remote_branch(bare.path(), "cutready/pitch-2").is_some());
 
-    // The token approved one attempt; the retry needs a fresh preflight.
+    // The failed Send moved to its new branch; the retry needs a fresh preflight.
     let error = workspace
         .send("origin", &approved, &mut host, &mut RemoteOptions::new())
         .unwrap_err();
@@ -3049,6 +3081,73 @@ fn a_still_advertised_branch_is_not_a_rename() {
 }
 
 #[test]
+fn a_renamed_remote_branch_says_so_instead_of_bringing_the_old_name_back() {
+    use draftline::VariationId;
+    // A standalone folder publishing straight to main, as CutReady's did.
+    let (temp, repo) = code_repo();
+    let (bare, _other_dir, _other) = with_remote(&repo);
+    let workspace = Workspace::init_with_policy(temp.path(), cutready_policy()).unwrap();
+    workspace.fetch_remote("origin").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, shared\n");
+    workspace.save_version("Shared").unwrap();
+    workspace.publish_changes("origin").unwrap();
+
+    // GitHub renames main to trunk.
+    let remote = git2::Repository::open_bare(bare.path()).unwrap();
+    let tip = remote.refname_to_id("refs/heads/main").unwrap();
+    remote
+        .reference("refs/heads/trunk", tip, false, "rename")
+        .unwrap();
+    remote.set_head("refs/heads/trunk").unwrap();
+    remote
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .delete()
+        .unwrap();
+
+    workspace.fetch_remote("origin").unwrap();
+    assert!(
+        repo.find_reference("refs/remotes/origin/main").is_err(),
+        "the vanished branch's tracking ref is pruned"
+    );
+    let status = workspace.sync_status("origin").unwrap();
+    assert_eq!(status.state, draftline::SyncState::NoRemoteVersion);
+    assert_eq!(status.base_renamed_from.as_deref(), Some("main"));
+
+    write_file(temp.path(), "cutready/intro.sk", "scene one, later\n");
+    workspace.save_version("Later").unwrap();
+    let expect_renamed = |error: DraftlineError| match error {
+        DraftlineError::BaseRenamed { from, to } => assert_eq!((&*from, &*to), ("main", "trunk")),
+        other => panic!("expected BaseRenamed, got {other:?}"),
+    };
+    expect_renamed(workspace.publish_changes("origin").unwrap_err());
+    expect_renamed(workspace.preflight_publish("origin").unwrap_err());
+    let contract = draftline::tauri_contract::TauriCommandError::from(
+        workspace.publish_changes("origin").unwrap_err(),
+    );
+    assert_eq!(contract.code, "base_renamed");
+    assert!(
+        remote.find_reference("refs/heads/main").is_err(),
+        "the old name is never brought back"
+    );
+
+    // Renaming the branch to the new name puts publishing back on track.
+    workspace
+        .rename_variation(&VariationId::from("main"), &VariationId::from("trunk"))
+        .unwrap();
+    let published = workspace.publish_changes("origin").unwrap();
+    assert_eq!(published.variation, "trunk");
+    assert_eq!(
+        remote.refname_to_id("refs/heads/trunk").unwrap(),
+        repo.head().unwrap().target().unwrap()
+    );
+    assert_eq!(
+        workspace.sync_status("origin").unwrap().base_renamed_from,
+        None
+    );
+}
+
+#[test]
 fn bringing_in_the_latest_base_merges_everything_into_the_variation() {
     let (temp, repo) = code_repo();
     let (bare, other_dir, other) = with_remote(&repo);
@@ -4147,6 +4246,148 @@ fn a_missing_folder_is_reported_until_it_comes_back() {
 }
 
 #[test]
+fn opening_a_folder_a_developer_renamed_away_says_it_is_missing() {
+    use draftline::{FolderFix, FolderState};
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    pitch.save_version("Intro").unwrap();
+    drop(pitch);
+
+    // `git mv cutready showcase && git commit`, leaving `.draftline` as is.
+    fs::rename(temp.path().join("cutready"), temp.path().join("showcase")).unwrap();
+    let mut index = repo.index().unwrap();
+    index.update_all(["*"], None).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: rename the deck");
+
+    let cutready = temp.path().join("cutready");
+    let probe = Workspace::probe(&cutready).unwrap();
+    assert_eq!(probe.state, FolderState::FolderMissing);
+    assert!(probe
+        .suggestions
+        .iter()
+        .any(|offered| offered.fix == FolderFix::ManageHere));
+    let error = refused(Workspace::open_with_policy(&cutready, cutready_policy()));
+    assert!(
+        matches!(&error, DraftlineError::FolderMissing(folder) if folder == Path::new("cutready")),
+        "{error:?}"
+    );
+    let tauri = draftline::tauri_contract::TauriCommandError::from(error);
+    assert_eq!(tauri.code, "folder_missing");
+    assert!(!cutready.exists());
+
+    // Once `.draftline` follows the rename, the old path points at the new one.
+    write_file(
+        temp.path(),
+        ".draftline",
+        r#"{"format":1,"folder":"showcase"}"#,
+    );
+    let error = refused(Workspace::open_with_policy(&cutready, cutready_policy()));
+    assert_eq!(claimed_elsewhere(error), PathBuf::from("showcase"));
+    Workspace::open_with_policy(temp.path().join("showcase"), cutready_policy()).unwrap();
+}
+
+#[test]
+fn a_folder_a_developer_renamed_is_offered_first_where_it_went() {
+    use draftline::{FolderFix, FolderState};
+    let (temp, repo) = code_repo();
+    let pitch = scoped(&temp);
+    write_file(temp.path(), "cutready/outro.sk", "the end\n");
+    pitch.save_version("Deck").unwrap();
+    drop(pitch);
+
+    // `git mv cutready showcase`, one file edited too, then a commit.
+    fs::rename(temp.path().join("cutready"), temp.path().join("showcase")).unwrap();
+    write_file(temp.path(), "showcase/outro.sk", "the real end\n");
+    let mut index = repo.index().unwrap();
+    index.update_all(["*"], None).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: rename the deck");
+    write_file(temp.path(), "src/later.rs", "// later\n");
+    commit_all(&repo, "Dev: later work");
+
+    let cutready = temp.path().join("cutready");
+    let probe = Workspace::probe(&cutready).unwrap();
+    assert_eq!(probe.state, FolderState::FolderMissing);
+    let showcase = PathBuf::from("showcase");
+    assert_eq!(
+        probe.suggestions[0].fix,
+        FolderFix::ManageRenamedFolder {
+            folder: showcase.clone()
+        },
+        "{probe:?}"
+    );
+    assert_eq!(
+        probe.suggestions.last().unwrap().fix,
+        FolderFix::ManageHere,
+        "creating the old folder is the last resort"
+    );
+
+    // Probing the new folder puts managing it first.
+    let there = Workspace::probe(temp.path().join("showcase")).unwrap();
+    assert_eq!(there.suggestions[0].fix, FolderFix::ManageHere, "{there:?}");
+    assert!(there.suggestions[0].label.contains("renamed here"));
+
+    let workspace =
+        Workspace::apply_folder_fix(&cutready, cutready_policy(), &probe.suggestions[0].fix)
+            .unwrap();
+    assert!(!cutready.exists(), "nothing empty is created");
+    assert_eq!(read(temp.path(), "showcase/intro.sk"), "scene one\n");
+    assert!(workspace.versions().unwrap().len() >= 2);
+    Workspace::open_with_policy(temp.path().join("showcase"), cutready_policy()).unwrap();
+}
+
+#[test]
+fn creating_the_folder_again_leaves_an_identical_marker_untouched() {
+    use draftline::FolderFix;
+    let (temp, repo) = code_repo();
+    scoped(&temp);
+    // As a `core.autocrlf=true` checkout leaves it.
+    let marker = temp.path().join(".draftline");
+    let crlf = fs::read_to_string(&marker)
+        .unwrap()
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+    fs::write(&marker, crlf).unwrap();
+    fs::remove_dir_all(temp.path().join("cutready")).unwrap();
+    let mut index = repo.index().unwrap();
+    index.update_all(["*"], None).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: drop the deck");
+
+    Workspace::apply_folder_fix(
+        temp.path().join("cutready"),
+        cutready_policy(),
+        &FolderFix::ManageHere,
+    )
+    .unwrap();
+    assert!(temp.path().join("cutready").is_dir());
+    assert_eq!(status(&repo, ".draftline"), git2::Status::CURRENT);
+}
+
+#[test]
+fn a_deleted_folder_is_not_mistaken_for_a_rename() {
+    use draftline::FolderFix;
+    let (temp, repo) = code_repo();
+    scoped(&temp);
+    fs::remove_dir_all(temp.path().join("cutready")).unwrap();
+    write_file(temp.path(), "showcase/other.sk", "unrelated\n");
+    let mut index = repo.index().unwrap();
+    index.update_all(["*"], None).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: drop the deck");
+
+    let probe = Workspace::probe(temp.path().join("cutready")).unwrap();
+    assert!(
+        !probe
+            .suggestions
+            .iter()
+            .any(|s| matches!(s.fix, FolderFix::ManageRenamedFolder { .. })),
+        "{probe:?}"
+    );
+}
+
+#[test]
 fn a_branch_without_the_folder_reports_it_missing_but_can_switch_back() {
     let (temp, repo) = code_repo();
     let pitch = scoped(&temp);
@@ -4235,10 +4476,18 @@ fn an_unreadable_record_is_reported_and_deleting_it_resets_it() {
             temp.path().join("cutready"),
             cutready_policy(),
         ));
-        assert!(
-            matches!(error, DraftlineError::InvalidFolderMarker(_)),
-            "{contents}: {error:?}"
-        );
+        if contents.contains("format") {
+            // A newer format has its own code, so hosts can say "update Draftline".
+            assert!(
+                matches!(error, DraftlineError::NewerFolderMarker(_)),
+                "{contents}: {error:?}"
+            );
+        } else {
+            assert!(
+                matches!(error, DraftlineError::InvalidFolderMarker(_)),
+                "{contents}: {error:?}"
+            );
+        }
     }
     fs::remove_file(&marker).unwrap();
     fs::create_dir(&marker).unwrap();
@@ -4606,6 +4855,10 @@ fn probing_reports_each_folder_state_with_fixes() {
     let probe = Workspace::probe(&cutready).unwrap();
     assert_eq!(probe.state, FolderState::NewerFormat);
     assert_eq!(fixes(&probe), [FolderFix::UpgradeDraftline]);
+    assert!(matches!(
+        Workspace::apply_folder_fix(&cutready, cutready_policy(), &FolderFix::UpgradeDraftline),
+        Err(DraftlineError::NewerFolderMarker(_))
+    ));
 
     // Suggestions serialize flat, the way hosts pass them back.
     let json = serde_json::to_value(&probe.suggestions[0]).unwrap();

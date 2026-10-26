@@ -111,7 +111,7 @@ flowchart TD
 | Current support | `fetch_all_variations` fetches and prunes remote-tracking variation refs. `remote_variation_diagnostics` reports local-only variations after remote deletion and remote-only variations after teammate publication. |
 | Safety behavior | Draftline does not delete local variations automatically. |
 | Tests | `scenario_flow_1c_11a_11b_remote_bootstrap_variation_diagnostics_and_adoption` and `remote_variation_diagnostics_reports_local_and_remote_only_variations_after_prune`. |
-| Gap | Rename inference and user-facing "remote option removed or renamed" guidance remain future work. |
+| Gap | A renamed default branch is inferred (Flow 15h); other renamed branches look deleted, and user-facing "remote option removed or renamed" guidance remains host work. |
 
 ## Flow 11c: change or remove remote destination
 

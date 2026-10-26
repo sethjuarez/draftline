@@ -743,7 +743,11 @@ impl From<DraftlineError> for TauriCommandError {
     fn from(error: DraftlineError) -> Self {
         Self {
             code: draftline_error_code(&error).to_string(),
-            message: error.to_string(),
+            message: match &error {
+                // The code already says it's the provider; hosts show its text as-is.
+                DraftlineError::PullRequest(message) => message.clone(),
+                _ => error.to_string(),
+            },
             details: draftline_error_details(&error),
         }
     }
@@ -3016,8 +3020,10 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::FolderMissing(_) => "folder_missing",
         DraftlineError::IncomingFolderElsewhere(_) => "incoming_folder_elsewhere",
         DraftlineError::InvalidFolderMarker(_) => "invalid_folder_marker",
+        DraftlineError::NewerFolderMarker(_) => "newer_folder_marker",
         DraftlineError::FolderMoveRefused(_) => "folder_move_refused",
         DraftlineError::FolderFixUnavailable(_) => "folder_fix_unavailable",
+        DraftlineError::BaseRenamed { .. } => "base_renamed",
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::VariationOutsideNamespace(_) => "variation_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
@@ -3061,6 +3067,9 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         DraftlineError::MergeNeedsDeveloper(paths)
         | DraftlineError::OwnedWorktreeHasChanges(paths) => {
             Some(serde_json::json!({ "paths": paths }))
+        }
+        DraftlineError::BaseRenamed { from, to } => {
+            Some(serde_json::json!({ "from": from, "to": to }))
         }
         DraftlineError::SendOutsideNamespace(branch)
         | DraftlineError::VariationOutsideNamespace(branch) => {

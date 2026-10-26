@@ -573,6 +573,8 @@ pub enum FolderFix {
     ManageHere,
     /// Open the folder Draftline already manages.
     OpenManagedFolder { folder: PathBuf },
+    /// Manage `folder` instead: a commit renamed the managed folder there.
+    ManageRenamedFolder { folder: PathBuf },
     /// Move the managed folder to the requested path, as a save.
     MoveFolderHere { from: PathBuf },
     /// Put the managed folder back from the current version.
@@ -1702,8 +1704,48 @@ impl Workspace {
     /// Opening a folder below the repository root scopes the workspace to that
     /// folder; see [`Workspace::init_with_policy`].
     pub fn open_with_policy(path: impl AsRef<Path>, content_policy: ContentPolicy) -> Result<Self> {
-        let repo = Repository::discover(path.as_ref())?;
-        Self::from_repository(repo, path.as_ref(), content_policy)
+        let path = absolute_path(path.as_ref())?;
+        if !path.exists() {
+            if let Some(error) = Self::missing_folder_error(&path)? {
+                return Err(error);
+            }
+        }
+        let anchor = path
+            .ancestors()
+            .find(|ancestor| ancestor.exists())
+            .unwrap_or(&path);
+        let repo = Repository::discover(anchor)?;
+        Self::from_repository(repo, &path, content_policy)
+    }
+
+    /// Why a folder that isn't on disk can't be opened, from what
+    /// [`Workspace::probe`] reports, so the host can offer its fixes. `None`
+    /// when it can still open, for example to finish an interrupted move.
+    fn missing_folder_error(path: &Path) -> Result<Option<DraftlineError>> {
+        let probe = Self::probe_in(path, None)?;
+        let requested = || {
+            probe
+                .repository
+                .as_deref()
+                .and_then(|root| folder_in(root, &probe.requested).ok())
+                .unwrap_or_else(|| probe.requested.clone())
+        };
+        Ok(match probe.state {
+            FolderState::ManagedElsewhere => {
+                probe.folder.clone().map(DraftlineError::FolderIsElsewhere)
+            }
+            FolderState::FolderMissing => Some(DraftlineError::FolderMissing(
+                probe.folder.clone().unwrap_or_else(requested),
+            )),
+            FolderState::Unmanaged => Some(DraftlineError::FolderMissing(requested())),
+            FolderState::InvalidMarker => Some(DraftlineError::InvalidFolderMarker(
+                probe.detail.clone().unwrap_or_default(),
+            )),
+            FolderState::NewerFormat => Some(DraftlineError::NewerFolderMarker(
+                probe.detail.clone().unwrap_or_default(),
+            )),
+            _ => None,
+        })
     }
 
     /// Reports what opening `path` would find, without changing anything,
@@ -1829,6 +1871,12 @@ impl Workspace {
             FolderFix::OpenManagedFolder { folder } => {
                 Self::open_with_policy(root.join(folder), content_policy)
             }
+            FolderFix::ManageRenamedFolder { folder } => Self::apply_offered_fix(
+                &root.join(folder),
+                content_policy,
+                namespace,
+                &FolderFix::ManageHere,
+            ),
             FolderFix::MoveFolderHere { from } => {
                 let mut workspace = Self::open_with_policy(root.join(from), content_policy)?;
                 workspace.move_folder(&requested)?;
@@ -1849,7 +1897,7 @@ impl Workspace {
                 managed.switch_to_folder_branch(branch)?;
                 Self::open_with_policy(root.join(folder), content_policy)
             }
-            FolderFix::UpgradeDraftline => Err(DraftlineError::InvalidFolderMarker(
+            FolderFix::UpgradeDraftline => Err(DraftlineError::NewerFolderMarker(
                 probe.detail.unwrap_or_default(),
             )),
         }
@@ -2097,7 +2145,109 @@ impl Workspace {
                 .suggestions
                 .push(suggest(FolderFix::ManageHere, "Manage this folder instead"));
         }
+        // A commit renamed the folder: following it comes first, since
+        // creating the old one would start empty.
+        if !tracked {
+            match self.renamed_folder(&folder)? {
+                Some(renamed) if renamed == self.scope() => {
+                    if let Some(at) = probe
+                        .suggestions
+                        .iter()
+                        .position(|s| s.fix == FolderFix::ManageHere)
+                    {
+                        let mut first = probe.suggestions.remove(at);
+                        first.label = format!("Manage this folder ({label} was renamed here)");
+                        probe.suggestions.insert(0, first);
+                    }
+                }
+                Some(renamed) => {
+                    let offered = Self::located_in(
+                        &self.root.join(&renamed),
+                        ContentPolicy::default(),
+                        self.variation_namespace.clone(),
+                    )?
+                    .map(|there| there.probe_located(self.root.join(&renamed)))
+                    .transpose()?
+                    .is_some_and(|there| {
+                        there
+                            .suggestions
+                            .iter()
+                            .any(|s| s.fix == FolderFix::ManageHere)
+                    });
+                    if offered {
+                        let text = format!(
+                            "Manage {} instead ({label} was renamed there)",
+                            folder_label(&renamed)
+                        );
+                        probe.suggestions.insert(
+                            0,
+                            suggest(FolderFix::ManageRenamedFolder { folder: renamed }, &text),
+                        );
+                    }
+                }
+                None => {}
+            }
+        }
         Ok(probe)
+    }
+
+    /// Where a commit on the current branch renamed `folder`, when at least
+    /// half of its files went to one folder that is still checked out here.
+    fn renamed_folder(&self, folder: &Path) -> Result<Option<PathBuf>> {
+        const MAX_COMMITS: usize = 500;
+        if folder.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let Ok(mut commit) = self.repo.head().and_then(|head| head.peel_to_commit()) else {
+            return Ok(None);
+        };
+        let head_tree = commit.tree()?;
+        for _ in 0..MAX_COMMITS {
+            let Ok(parent) = commit.parent(0) else {
+                return Ok(None);
+            };
+            let before = parent.tree()?;
+            if !tracks_folder(&before, folder) {
+                commit = parent;
+                continue;
+            }
+            let after = commit.tree()?;
+            let mut diff = self
+                .repo
+                .diff_tree_to_tree(Some(&before), Some(&after), None)?;
+            diff.find_similar(Some(git2::DiffFindOptions::new().renames(true)))?;
+            let mut moved_from = 0usize;
+            let mut targets: BTreeMap<PathBuf, usize> = BTreeMap::new();
+            for delta in diff.deltas() {
+                let (Some(old), Some(new)) = (delta.old_file().path(), delta.new_file().path())
+                else {
+                    continue;
+                };
+                let Ok(rest) = old.strip_prefix(folder) else {
+                    continue;
+                };
+                moved_from += 1;
+                if delta.status() != git2::Delta::Renamed {
+                    continue;
+                }
+                let new_parts: Vec<_> = new.components().collect();
+                let rest_len = rest.components().count();
+                if new_parts.len() <= rest_len || !new.ends_with(rest) {
+                    continue;
+                }
+                let target: PathBuf = new_parts[..new_parts.len() - rest_len].iter().collect();
+                *targets.entry(target).or_default() += 1;
+            }
+            return Ok(targets
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .filter(|(_, count)| *count * 2 >= moved_from)
+                .map(|(target, _)| target)
+                .filter(|target| target != folder)
+                .filter(|target| tracks_folder(&head_tree, target))
+                .filter(|target| self.root.join(target).is_dir()));
+        }
+        Ok(None)
     }
 
     /// Files under `folder` a move would lose or split from Git's index:
@@ -8721,7 +8871,38 @@ impl Workspace {
                 return options.map_git_result("fetch_remote", Err(error));
             }
         }
+        // Like `git fetch --prune` for this one branch: a tracking ref for a
+        // branch the remote no longer has would make it look up to date.
+        if let (Some(name), Ok(advertised)) = (remote.name().ok().flatten(), remote.list()) {
+            let merge = format!("refs/heads/{variation}");
+            if !advertised.iter().any(|head| head.name() == merge) {
+                if let Ok(mut tracking) = self
+                    .repo
+                    .find_reference(&format!("refs/remotes/{name}/{variation}"))
+                {
+                    tracking.delete()?;
+                }
+            }
+        }
         self.record_remote_head(&remote)
+    }
+
+    /// Refuses to publish a branch whose remote counterpart was renamed as
+    /// the remote's default: pushing would bring the old name back.
+    fn ensure_base_not_renamed(&self, remote: &str) -> Result<()> {
+        let variation = self.current_variation_unchecked()?;
+        if remote_tracking_oid(&self.repo, remote, &variation).is_some() {
+            return Ok(());
+        }
+        match self.default_branch_on(remote) {
+            Some(base) if self.base_renamed_from(remote, &base).as_deref() == Some(&variation) => {
+                Err(DraftlineError::BaseRenamed {
+                    from: variation,
+                    to: base,
+                })
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Returns collaboration status for the current variation.
@@ -8734,6 +8915,10 @@ impl Workspace {
 
         let Ok(remote_oid) = self.repo.refname_to_id(&remote_ref) else {
             let ahead = self.local_version_count(local)?;
+            let base_renamed_from = self
+                .default_branch_on(&remote)
+                .and_then(|base| self.base_renamed_from(&remote, &base))
+                .filter(|old| *old == variation);
             return Ok(SyncStatus {
                 remote,
                 variation,
@@ -8741,7 +8926,7 @@ impl Workspace {
                 behind: 0,
                 state: SyncState::NoRemoteVersion,
                 incoming: Vec::new(),
-                base_renamed_from: None,
+                base_renamed_from,
             });
         };
 
@@ -9531,6 +9716,7 @@ impl Workspace {
 
         let remote = remote.as_ref().to_string();
         self.fetch_remote_unchecked(&remote, options)?;
+        self.ensure_base_not_renamed(&remote)?;
         let sync_status = self.sync_status(&remote)?;
         if matches!(
             sync_status.state,
@@ -9603,6 +9789,7 @@ impl Workspace {
         }
 
         self.fetch_remote_unchecked(&token.remote, options)?;
+        self.ensure_base_not_renamed(&token.remote)?;
         let actual_remote_oid = remote_tracking_oid(&self.repo, &token.remote, &token.variation);
         if actual_remote_oid != token.expected_remote_oid {
             return Err(DraftlineError::RemoteRace {
@@ -9671,6 +9858,7 @@ impl Workspace {
 
         let remote_name = remote.to_string();
         self.fetch_remote_unchecked(&remote_name, options)?;
+        self.ensure_base_not_renamed(&remote_name)?;
         if let Some(guard) = &send_guard {
             let current = self.current_variation_unchecked()?;
             let actual = self
@@ -10049,9 +10237,8 @@ impl Workspace {
         match self.marker_owner()? {
             FolderOwner::Nobody => Ok(None),
             FolderOwner::Folder(folder) => Ok(Some(folder)),
-            FolderOwner::Invalid(reason) | FolderOwner::Newer(reason) => {
-                Err(DraftlineError::InvalidFolderMarker(reason))
-            }
+            FolderOwner::Invalid(reason) => Err(DraftlineError::InvalidFolderMarker(reason)),
+            FolderOwner::Newer(reason) => Err(DraftlineError::NewerFolderMarker(reason)),
         }
     }
 
@@ -10125,6 +10312,21 @@ impl Workspace {
     fn write_marker(&self) -> Result<()> {
         let bytes = marker_bytes(&self.project_key())?;
         let path = self.marker_path();
+        // Rewriting the same record would leave Git seeing a change when the
+        // checkout converted its line endings.
+        let unchanged = fs::read(&path).is_ok_and(|existing| {
+            existing
+                .trim_ascii_end()
+                .split(|byte| *byte == b'\n')
+                .map(<[u8]>::trim_ascii_end)
+                .eq(bytes
+                    .trim_ascii_end()
+                    .split(|byte| *byte == b'\n')
+                    .map(<[u8]>::trim_ascii_end))
+        });
+        if unchanged {
+            return Ok(());
+        }
         let temp = unique_claim_temp(&path);
         fs::write(&temp, bytes)?;
         replace_file(&temp, &path)?;
@@ -10743,7 +10945,8 @@ impl Workspace {
     }
 
     /// Tracked files in the folder that Git stores through a filter driver, such as
-    /// Git LFS, with whether their content is missing from disk.
+    /// Git LFS, with whether their content is missing from disk. Untracked files
+    /// are not listed; check those with [`Workspace::filtered_files_among`].
     pub fn filtered_files(&self) -> Result<Vec<FilteredFile>> {
         let paths = self.tracked_project_paths()?;
         self.filtered_among(paths)
@@ -10783,7 +10986,9 @@ impl Workspace {
     }
 
     /// Which of `paths` Git would store through a filter driver. Paths need
-    /// not exist, so a host can check where it is about to write.
+    /// not exist or be tracked, so a host can check where it is about to write.
+    /// Like every Draftline path, they are relative to the repository, not the
+    /// folder (`cutready/shot.png`); returned paths use `/`.
     pub fn filtered_files_among<I, P>(&self, paths: I) -> Result<Vec<FilteredFile>>
     where
         I: IntoIterator<Item = P>,
@@ -10791,7 +10996,16 @@ impl Workspace {
     {
         let paths = paths
             .into_iter()
-            .map(|path| self.normalize_tracked_content_path(path))
+            .map(|path| {
+                self.normalize_tracked_content_path(path).map(|path| {
+                    PathBuf::from(
+                        path.components()
+                            .map(|part| part.as_os_str().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/"),
+                    )
+                })
+            })
             .collect::<Result<BTreeSet<_>>>()?;
         self.filtered_among(paths)
     }

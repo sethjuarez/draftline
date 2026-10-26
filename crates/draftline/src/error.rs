@@ -154,6 +154,10 @@ pub enum DraftlineError {
     #[error("unreadable Draftline folder record: {0}")]
     InvalidFolderMarker(String),
 
+    /// `.draftline` uses a newer format; update Draftline to open this folder.
+    #[error("this folder needs a newer Draftline: {0}")]
+    NewerFolderMarker(String),
+
     /// The folder can't move there; the text says why.
     #[error("cannot move the Draftline folder: {0}")]
     FolderMoveRefused(String),
@@ -161,6 +165,13 @@ pub enum DraftlineError {
     /// The fix isn't one [`crate::Workspace::probe`] offers for the folder now.
     #[error("that fix isn't available for this folder: {0}")]
     FolderFixUnavailable(String),
+
+    /// The remote renamed its default branch from `from` to `to`, and this
+    /// branch is the old name: publishing would bring the old name back.
+    #[error(
+        "the remote renamed `{from}` to `{to}`; rename this branch to `{to}` or start a variation for these saves"
+    )]
+    BaseRenamed { from: String, to: String },
 
     #[error("Send branch `{0}` is outside this project's variation namespace")]
     SendOutsideNamespace(String),
