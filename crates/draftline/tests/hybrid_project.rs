@@ -1859,6 +1859,10 @@ fn send_retries_safely_after_the_host_fails_and_avoids_taken_branch_names() {
         .send("origin", &approved, &mut host, &mut RemoteOptions::new())
         .unwrap_err();
     assert!(matches!(error, DraftlineError::PullRequest(_)), "{error:?}");
+    // Hosts show the provider's own text; the code says where it came from.
+    let tauri = draftline::tauri_contract::TauriCommandError::from(error);
+    assert_eq!(tauri.code, "pull_request_failed");
+    assert_eq!(tauri.message, "host offline");
     assert!(remote_branch(bare.path(), "cutready/pitch-2").is_some());
 
     // The token approved one attempt; the retry needs a fresh preflight.

@@ -743,7 +743,11 @@ impl From<DraftlineError> for TauriCommandError {
     fn from(error: DraftlineError) -> Self {
         Self {
             code: draftline_error_code(&error).to_string(),
-            message: error.to_string(),
+            message: match &error {
+                // The code already says it's the provider; hosts show its text as-is.
+                DraftlineError::PullRequest(message) => message.clone(),
+                _ => error.to_string(),
+            },
             details: draftline_error_details(&error),
         }
     }
