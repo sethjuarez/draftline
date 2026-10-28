@@ -57,7 +57,7 @@ fn failed(action: &str, output: String) -> DraftlineError {
 }
 
 /// Git's spelling of a repository-relative path: `/`-separated.
-fn git_path(path: &Path) -> Result<String> {
+pub(crate) fn git_path(path: &Path) -> Result<String> {
     let text = path
         .components()
         .map(|part| part.as_os_str().to_string_lossy())
@@ -174,33 +174,46 @@ pub(crate) fn clean(workdir: &Path, paths: &[PathBuf], write: bool) -> Result<Ve
     running.finish("running a Git filter to save files", read)
 }
 
-/// Runs each `(blob, path)` through `path`'s smudge filter, as a checkout
-/// would, handing `write` the bytes for the working file.
+/// Runs `paths` from the index file `index` (not the repository's, which
+/// another Git process may change meanwhile) through their smudge filters in
+/// one `git checkout-index`, so a long-running filter such as
+/// `git-lfs filter-process` serves every file. Git writes into `scratch`,
+/// never the working tree; `write` gets each file Git produced. A file Git
+/// couldn't produce is skipped, and the failure is returned after the rest
+/// are written.
 pub(crate) fn smudge(
     workdir: &Path,
-    entries: &[(Oid, PathBuf)],
+    index: &Path,
+    scratch: &Path,
+    paths: &[PathBuf],
     mut write: impl FnMut(&Path, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    // One process per file: `cat-file --batch --filters` headers give the
-    // unfiltered size, so its output can't be split reliably.
-    for (id, path) in entries {
-        let mut command = git(workdir);
-        command
-            .args(["cat-file", "--filters"])
-            .arg(format!("--path={}", git_path(path)?))
-            .arg(id.to_string());
-        let mut running = Running::spawn(command, Vec::new())?;
-        let mut stdout = running.stdout();
-        let mut content = Vec::new();
-        let read = stdout
-            .read_to_end(&mut content)
-            .map(|_| ())
-            .map_err(DraftlineError::from);
-        drop(stdout);
-        running.finish("running a Git filter to write files", read)?;
-        write(path, &content)?;
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(git_path(path)?.as_bytes());
+        input.push(0);
     }
-    Ok(())
+    std::fs::create_dir_all(scratch)?;
+    let prefix = format!("{}/", scratch.to_string_lossy().replace('\\', "/"));
+    let mut command = git(workdir);
+    command
+        .env("GIT_INDEX_FILE", index)
+        .args(["checkout-index", "-f", "-z"])
+        .arg(format!("--prefix={prefix}"))
+        .arg("--stdin");
+    let mut running = Running::spawn(command, input)?;
+    let read = std::io::copy(&mut running.stdout(), &mut std::io::sink())
+        .map(|_| ())
+        .map_err(DraftlineError::from);
+    let finished = running.finish("running a Git filter to write files", read);
+    for path in paths {
+        match std::fs::read(scratch.join(path)) {
+            Ok(content) => write(path, &content)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    finished
 }
 
 /// Lets Git refresh the index's file timestamps through its filters, so a

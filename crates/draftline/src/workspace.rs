@@ -8320,6 +8320,15 @@ impl Workspace {
         state: RecoveryState,
         changed_workspace: bool,
     ) -> Result<RecoveryRepairResult> {
+        // A checkout killed after writing a filtered file's pointer leaves
+        // nothing for the finishing checkout to update, so smudge it here.
+        let changed_workspace = match self.smudge_left_pointers() {
+            Ok(smudged) => changed_workspace || smudged,
+            Err(error) => {
+                tracing::warn!(%error, "could not check for Git filter pointers");
+                changed_workspace
+            }
+        };
         let completed_state = RecoveryState {
             operation_id: state.operation_id.clone(),
             operation: state.operation.clone(),
@@ -11163,13 +11172,24 @@ impl Workspace {
             .iter()
             .map(|(id, path)| (path.as_path(), *id))
             .collect::<HashMap<_, _>>();
-        if let Err(error) = git_cli::smudge(&self.root, &entries, |path, content| {
+        let write = |path: &Path, content: &[u8]| {
             let Some(pointer) = pointers.get(path) else {
                 return Ok(());
             };
             let pointer = self.repo.find_blob(*pointer)?;
             self.replace_working_file(path, pointer.content(), content)
-        }) {
+        };
+        let scratch = self.repo.path().join("draftline").join(format!(
+            "smudge-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        let result = self.smudge_through_index(&scratch, &entries, write);
+        let _ = fs::remove_dir_all(&scratch);
+        if let Err(error) = result {
             tracing::warn!(%error, "left Git filter pointers in place of file content");
         }
         // The checkout stamped these entries with the pointer's stat, which
@@ -11179,6 +11199,90 @@ impl Workspace {
             tracing::warn!(%error, "could not mark smudged files for an index refresh");
         }
         git_cli::refresh_index(&self.root);
+    }
+
+    /// Smudges `entries` through a private index holding exactly them, so a
+    /// concurrent change to the repository's index can't swap in other blobs.
+    fn smudge_through_index(
+        &self,
+        scratch: &Path,
+        entries: &[(Oid, PathBuf)],
+        write: impl FnMut(&Path, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        fs::create_dir_all(scratch)?;
+        let index_file = scratch.join("index");
+        let mut index = git2::Index::open(&index_file)?;
+        for (id, path) in entries {
+            let name = git_cli::git_path(path)?.into_bytes();
+            index.add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: u32::from(git2::FileMode::Blob),
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: *id,
+                flags: name.len().min(0xfff) as u16,
+                flags_extended: 0,
+                path: name,
+            })?;
+        }
+        index.write()?;
+        let paths = entries
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
+        git_cli::smudge(
+            &self.root,
+            &index_file,
+            &scratch.join("files"),
+            &paths,
+            write,
+        )
+    }
+
+    /// Smudges the folder's filtered files whose disk content is still the
+    /// exact blob `HEAD` stores for them (the pointer a checkout wrote before
+    /// its smudge ran). Such a file looks unchanged, since cleaning it gives
+    /// the same blob, so nothing else would ever replace it. Returns whether
+    /// any file changed.
+    fn smudge_left_pointers(&self) -> Result<bool> {
+        let Ok(head) = self.repo.head().and_then(|head| head.peel_to_tree()) else {
+            return Ok(false);
+        };
+        let runner = FilterRunner::of(&self.repo)?;
+        let mut pointers = Vec::new();
+        for path in self.tracked_project_paths()? {
+            if !matches!(self.filter_use(&runner, None, &path)?, FilterUse::Runs) {
+                continue;
+            }
+            let Ok(entry) = head.get_path(&path) else {
+                continue;
+            };
+            let Ok(blob) = self.repo.find_blob(entry.id()) else {
+                continue;
+            };
+            let full = self.root.join(&path);
+            let same_size = fs::symlink_metadata(&full)
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == blob.size() as u64);
+            if same_size && fs::read(&full).is_ok_and(|disk| disk == blob.content()) {
+                pointers.push(path);
+            }
+        }
+        if pointers.is_empty() {
+            return Ok(false);
+        }
+        self.smudge_written(&head, &pointers);
+        Ok(pointers.iter().any(|path| {
+            !fs::read(self.root.join(path)).is_ok_and(|disk| {
+                head.get_path(path)
+                    .ok()
+                    .and_then(|entry| self.repo.find_blob(entry.id()).ok())
+                    .is_some_and(|blob| disk == blob.content())
+            })
+        }))
     }
 
     fn forget_index_stat(&self, entries: &[(Oid, PathBuf)]) -> Result<()> {

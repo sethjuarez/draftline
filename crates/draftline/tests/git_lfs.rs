@@ -195,6 +195,61 @@ fn restore_switch_and_discard_write_real_lfs_content() {
 }
 
 #[test]
+fn recovering_a_switch_killed_before_its_smudge_writes_real_content() {
+    let Some((temp, repo, workspace)) = lfs_repo() else {
+        return;
+    };
+    let root = temp.path();
+    let shots = (1..=20u8)
+        .map(|seed| (format!("cutready/shots/{}/s{seed}.png", seed % 3), seed))
+        .collect::<Vec<_>>();
+    for (path, seed) in &shots {
+        write(root, path, &image(*seed));
+    }
+    workspace.save_version("Main shots").unwrap();
+    let alt = workspace.create_variation("cutready/alt").unwrap();
+    workspace
+        .switch_variation(alt.id(), SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    for (path, seed) in &shots {
+        write(root, path, &image(seed + 100));
+    }
+    workspace.save_version("Alt shots").unwrap();
+    workspace
+        .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
+        .unwrap();
+
+    // The process dies switching to alt after libgit2 wrote the pointers,
+    // before Draftline smudged them.
+    let target = repo
+        .revparse_single("refs/heads/cutready/alt")
+        .unwrap()
+        .peel_to_tree()
+        .unwrap();
+    repo.checkout_tree(
+        target.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+    repo.set_head("refs/heads/cutready/alt").unwrap();
+    fs::write(
+        root.join(".git/draftline/recovery.json"),
+        r#"{"operation_id":"killed","operation":"SwitchVariation","original_variation":"main","target":"cutready/alt","completed":false}"#,
+    )
+    .unwrap();
+    assert!(read(root, &shots[0].0).starts_with(POINTER_PREFIX));
+
+    let repaired = workspace.repair_recovery("killed").unwrap();
+
+    assert!(repaired.completed && repaired.changed_workspace);
+    for (path, seed) in &shots {
+        assert_file(root, path, seed + 100);
+    }
+    assert!(workspace.changed_files().unwrap().is_empty());
+    assert_eq!(git_status(root), "");
+}
+
+#[test]
 fn shelving_keeps_lfs_content() {
     let Some((temp, _repo, workspace)) = lfs_repo() else {
         return;
