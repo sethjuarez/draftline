@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use git2::{
     build::{CheckoutBuilder, RepoBuilder},
@@ -34,6 +34,7 @@ pub struct Workspace {
     content_policy: ContentPolicy,
     resolver_registry: ResolverRegistry,
     variation_namespace: Option<String>,
+    filter_timeout: Option<Duration>,
 }
 
 /// A named version of the workspace.
@@ -1696,6 +1697,7 @@ impl Workspace {
             content_policy,
             resolver_registry: ResolverRegistry::with_default_resolvers(),
             variation_namespace: None,
+            filter_timeout: None,
         }
         .initialize())
     }
@@ -2043,6 +2045,7 @@ impl Workspace {
             content_policy,
             resolver_registry: ResolverRegistry::with_default_resolvers(),
             variation_namespace: namespace,
+            filter_timeout: None,
         }))
     }
 
@@ -2715,6 +2718,18 @@ impl Workspace {
         self
     }
 
+    /// Bounds each run of a Git filter Draftline delegates to `git` (such as
+    /// Git LFS cleaning files on save or smudging them on switch, restore,
+    /// discard, and incoming changes). A run past `timeout` is stopped, along
+    /// with the processes it started, and fails as
+    /// [`DraftlineError::GitFilterFailed`] on save. A stopped smudge is not an
+    /// error: as when LFS content can't be downloaded, the checkout stands and
+    /// the files it could not smudge stay pointers, which `inspect` reports.
+    /// `None` (the default) waits as long as the filter runs.
+    pub fn set_filter_timeout(&mut self, timeout: Option<Duration>) {
+        self.filter_timeout = timeout;
+    }
+
     /// Returns the repository working-tree root.
     ///
     /// Paths accepted and returned by Draftline are relative to this root. For a
@@ -2897,7 +2912,7 @@ impl Workspace {
                     DiagnosticCode::LfsContentMissing,
                     DiagnosticSeverity::Warning,
                     format!(
-                        "{} project file(s), such as `{}`, are Git LFS pointers; a developer must install Git LFS and run `git lfs pull`",
+                        "{} project file(s), such as `{}`, are Git LFS pointers whose content isn't on disk; retry with `smudge_pointer_files`, or install Git LFS and run `git lfs pull`",
                         missing.len(),
                         missing[0].display()
                     ),
@@ -3079,7 +3094,7 @@ impl Workspace {
             DiagnosticCode::LfsContentMissing => ErrorExplanation {
                 code,
                 message:
-                    "some project files are Git LFS pointers; their content was never downloaded"
+                    "some project files are Git LFS pointers; their content hasn't been downloaded"
                         .to_string(),
                 safe_next_actions: Vec::new(),
                 retry: RetryClass::RetryAfterUserChoice,
@@ -3182,7 +3197,68 @@ impl Workspace {
             return Err(DraftlineError::WorkspaceLocked);
         }
 
+        // While the stale lock stays in place no other Draftline operation
+        // can take ref locks, so clear the dead holder's first.
+        if let Some(metadata) = &inspection.metadata {
+            if operation_lock_holder_is_gone(metadata) {
+                self.clear_abandoned_ref_locks(metadata.process_id)?;
+            }
+        }
         fs::remove_file(self.lock_path())?;
+        Ok(())
+    }
+
+    fn ref_lock_claim_path(&self) -> PathBuf {
+        self.draftline_dir().join("ref-locks.json")
+    }
+
+    /// Removes the ref locks a dead `process_id` claimed while moving `HEAD`
+    /// (see [`RefLockClaim`]), which would otherwise fail every later save
+    /// with `GitIndexLocked`. Only a lock whose file is the one the claim
+    /// recorded is removed; one the process died before recording must have
+    /// appeared after the claim and stayed for two seconds (Git holds a ref
+    /// lock for milliseconds). Any other lock is left alone.
+    fn clear_abandoned_ref_locks(&self, process_id: u32) -> Result<()> {
+        const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+        let path = self.ref_lock_claim_path();
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(());
+        };
+        let Ok(claim) = serde_json::from_slice::<RefLockClaim>(&bytes) else {
+            fs::remove_file(&path)?;
+            return Ok(());
+        };
+        if claim.process_id != process_id {
+            return Ok(());
+        }
+        let claimed_at = fs::metadata(&path)?.modified()?;
+        for lock in &claim.locks {
+            let Some(found) = lock_file_identity(&lock.path) else {
+                continue;
+            };
+            let abandoned = match lock.identity {
+                Some(identity) => identity == (found.0, nanos(found.1)),
+                None if found.1 < claimed_at => false,
+                None => {
+                    if let Some(wait) = SETTLE.checked_sub(found.1.elapsed().unwrap_or_default()) {
+                        std::thread::sleep(wait);
+                    }
+                    lock_file_identity(&lock.path) == Some(found)
+                }
+            };
+            if !abandoned {
+                continue;
+            }
+            match fs::remove_file(&lock.path) {
+                Ok(()) => tracing::warn!(
+                    lock = %lock.path.display(),
+                    "removed a ref lock a crashed operation left"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        fs::remove_file(&path)?;
         Ok(())
     }
 
@@ -3317,8 +3393,13 @@ impl Workspace {
                 self.repair_delete_remote_variation_recovery(state, options)
             }
             RecoveryOperation::MoveFolder => self.settle_folder_move(state),
-            RecoveryOperation::RestoreVersionAsNewSave
-            | RecoveryOperation::MilestoneMerge
+            RecoveryOperation::RestoreVersionAsNewSave => {
+                match self.finish_landed_restore(&state)? {
+                    Some(changed_workspace) => self.complete_recovery(state, changed_workspace),
+                    None => Ok(self.recovery_unavailable(state)),
+                }
+            }
+            RecoveryOperation::MilestoneMerge
             | RecoveryOperation::SquashVersions
             | RecoveryOperation::HistoryCleanup => Ok(self.recovery_unavailable(state)),
         }
@@ -3457,6 +3538,42 @@ impl Workspace {
                 .delete()?;
         }
         Ok(false)
+    }
+
+    /// A restore killed after its save landed: the branch already holds the
+    /// restored content, which can't be undone without rewriting history, so
+    /// repair settles the files on it. `None` until the save lands; rollback
+    /// covers that. Targeted restores roll back.
+    fn finish_landed_restore(&self, state: &RecoveryState) -> Result<Option<bool>> {
+        if state
+            .target
+            .as_deref()
+            .is_none_or(|target| target.contains(" -> "))
+        {
+            return Ok(None);
+        }
+        let Some((before, restored)) = self.recorded_checkout() else {
+            return Ok(None);
+        };
+        // The save landed only if the branch the restore ran on now holds
+        // one commit on top of the recorded tree with the restored tree; a
+        // branch switched or reset to the same content since doesn't count.
+        if state.original_variation.as_deref() != self.current_variation_unchecked().ok().as_deref()
+        {
+            return Ok(None);
+        }
+        let head = self.repo.head()?.peel_to_commit()?;
+        let landed = head.tree_id() == restored.id()
+            && head.parent_count() == 1
+            && head.parent(0)?.tree_id() == before.id();
+        if !landed {
+            return Ok(None);
+        }
+        Ok(Some(self.settle_from(
+            &restored,
+            Some(&before),
+            &head.tree()?,
+        )?))
     }
 
     /// Undoes an interrupted restore: files still at the restored version go
@@ -3875,7 +3992,7 @@ impl Workspace {
             .iter()
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
-        let Ok(ids) = git_cli::clean(&self.root, &paths, false) else {
+        let Ok(ids) = git_cli::clean(&self.root, &paths, false, self.filter_timeout) else {
             return Ok(Vec::new());
         };
         Ok(filtered
@@ -8684,7 +8801,12 @@ impl Workspace {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
         let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
-        self.upload_filtered_content(remote_name, &format!("refs/heads/{variation}"))?;
+        self.upload_filtered_content(
+            remote_name,
+            &format!("refs/heads/{variation}"),
+            options.lfs_timeout(),
+        )?;
+        crate::fault::point("lfs_uploaded");
         let _timeout_guard = options.server_timeout_guard()?;
         let push_result = {
             let mut push_options = options.push_options_with_expectations(
@@ -8698,6 +8820,7 @@ impl Workspace {
             remote.push(&[refspec.as_str()], Some(&mut push_options))
         };
         options.map_git_result("push_current_variation", push_result)?;
+        crate::fault::point("pushed");
 
         Ok(())
     }
@@ -8714,7 +8837,8 @@ impl Workspace {
         let source = refspec.trim_start_matches('+');
         let source = source.split_once(':').map_or(source, |(source, _)| source);
         if !source.is_empty() {
-            self.upload_filtered_content(remote_name, source)?;
+            self.upload_filtered_content(remote_name, source, options.lfs_timeout())?;
+            crate::fault::point("lfs_uploaded");
         }
         let _timeout_guard = options.server_timeout_guard()?;
         let push_result = {
@@ -8723,6 +8847,7 @@ impl Workspace {
             remote.push(&[refspec], Some(&mut push_options))
         };
         options.map_git_result("push_refspec", push_result)?;
+        crate::fault::point("pushed");
 
         Ok(())
     }
@@ -8732,12 +8857,17 @@ impl Workspace {
     /// the remote would get pointers to content no one can download. Runs
     /// only where Draftline runs the LFS filter and this repository has LFS
     /// content; a failed upload refuses the push.
-    fn upload_filtered_content(&self, remote: &str, source: &str) -> Result<()> {
+    fn upload_filtered_content(
+        &self,
+        remote: &str,
+        source: &str,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         if !FilterRunner::of(&self.repo)?.runs("lfs") {
             return Ok(());
         }
         let commit = self.repo.revparse_single(source)?.peel_to_commit()?.id();
-        git_cli::lfs_push(&self.root, remote, commit)
+        git_cli::lfs_push(&self.root, remote, commit, timeout)
     }
 
     fn remote_advertised_oid(
@@ -10239,6 +10369,11 @@ impl Workspace {
             checkout,
         };
         fs::write(self.ledger_path(), serde_json::to_vec_pretty(&ledger)?)?;
+        crate::fault::point(if state.completed {
+            "recovery_completed"
+        } else {
+            "recovery_recorded"
+        });
         if state.completed && matches!(&state.operation, RecoveryOperation::DeleteRemoteVariation) {
             match fs::remove_file(self.remote_delete_recovery_metadata_path(&state.operation_id)) {
                 Ok(()) => {}
@@ -10797,7 +10932,7 @@ impl Workspace {
     /// Stages `paths` as `git add` would, running their clean filters (Git
     /// LFS stores the content under `.git/lfs` and returns a pointer).
     fn add_filtered(&self, index: &mut git2::Index, paths: &[PathBuf]) -> Result<()> {
-        let ids = git_cli::clean(&self.root, paths, true)?;
+        let ids = git_cli::clean(&self.root, paths, true, self.filter_timeout)?;
         // Like `git add`: the file's executable bit counts only where the
         // repository trusts file modes; elsewhere the staged mode stays.
         let trust_mode = cfg!(unix)
@@ -10871,6 +11006,7 @@ impl Workspace {
             .commit(None, &author, &committer, label, &tree, &parents)?;
         let commit = self.repo.find_commit(oid)?;
         let previous = self.while_git_busy(|| self.stage_from(&commit, &affected_paths))?;
+        crate::fault::point("index_staged");
         if let Err(error) =
             self.while_git_busy(|| self.advance_head(branch, &commit, parent.as_ref(), &committer))
         {
@@ -10880,7 +11016,7 @@ impl Workspace {
         // Entries for filtered files carry no timestamps, and libgit2 can't
         // rehash such a file to match them; Git can.
         if !self.filtered_additions(&affected_paths)?.is_empty() {
-            git_cli::refresh_index(&self.root);
+            git_cli::refresh_index(&self.root, self.repo.path(), self.filter_timeout);
         }
         Ok(version_from_commit(&commit))
     }
@@ -10946,9 +11082,16 @@ impl Workspace {
         committer: &Signature<'_>,
     ) -> Result<()> {
         let name = branch.to_string();
+        let mut claim = RefLockClaim::new(vec![
+            self.repo.path().join("HEAD.lock"),
+            self.repo.commondir().join(format!("{name}.lock")),
+        ]);
+        let _claimed = claim.write(self.ref_lock_claim_path())?;
         let mut transaction = self.repo.transaction()?;
         transaction.lock_ref("HEAD")?;
         transaction.lock_ref(&name)?;
+        claim.record_identities();
+        crate::fault::point("refs_locked");
         // A switch to another branch at the same commit after the save began
         // must not land the save there.
         let now = self.repo.find_reference("HEAD")?;
@@ -10974,6 +11117,7 @@ impl Workspace {
         };
         transaction.set_target(&name, commit.id(), Some(committer), &message)?;
         transaction.commit()?;
+        crate::fault::point("head_advanced");
         Ok(())
     }
 
@@ -11126,6 +11270,7 @@ impl Workspace {
                 }
             });
         let result = run(&mut checkout);
+        crate::fault::point("files_written");
         let FilterPlan { refused, smudge } = plan.take();
         if refused.is_empty() {
             // A locked index fails only libgit2's last step, the index
@@ -11177,7 +11322,9 @@ impl Workspace {
                 return Ok(());
             };
             let pointer = self.repo.find_blob(*pointer)?;
-            self.replace_working_file(path, pointer.content(), content)
+            self.replace_working_file(path, pointer.content(), content)?;
+            crate::fault::point("file_smudged");
+            Ok(())
         };
         let scratch = self.repo.path().join("draftline").join(format!(
             "smudge-{}-{}",
@@ -11192,13 +11339,14 @@ impl Workspace {
         if let Err(error) = result {
             tracing::warn!(%error, "left Git filter pointers in place of file content");
         }
+        crate::fault::point("smudged");
         // The checkout stamped these entries with the pointer's stat, which
         // Git takes as proof the real file changed. A zero size makes Git
         // compare content instead, so the refresh restamps them.
         if let Err(error) = self.forget_index_stat(&entries) {
             tracing::warn!(%error, "could not mark smudged files for an index refresh");
         }
-        git_cli::refresh_index(&self.root);
+        git_cli::refresh_index(&self.root, self.repo.path(), self.filter_timeout);
     }
 
     /// Smudges `entries` through a private index holding exactly them, so a
@@ -11239,8 +11387,22 @@ impl Workspace {
             &index_file,
             &scratch.join("files"),
             &paths,
+            self.filter_timeout,
             write,
         )
+    }
+
+    /// Writes the real content of the folder's filtered files (such as Git
+    /// LFS images) that still hold the exact pointer `HEAD` stores: what a
+    /// smudge stopped by [`Workspace::set_filter_timeout`], a failed download,
+    /// or an interrupted checkout leaves behind, and what `inspect` reports
+    /// as `LfsContentMissing`. Runs only where Draftline runs the filter, and
+    /// never touches a file someone changed since. Returns whether any file
+    /// changed; content Git still can't produce stays as its pointer.
+    pub fn smudge_pointer_files(&self) -> Result<bool> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = self.acquire_for_index("smudge_pointer_files")?;
+        self.smudge_left_pointers()
     }
 
     /// Smudges the folder's filtered files whose disk content is still the
@@ -14310,6 +14472,105 @@ fn new_operation_lock_metadata(operation: impl Into<String>) -> OperationLockMet
     }
 }
 
+/// Positive evidence that a lock's process is gone: it ran on this machine
+/// and is no longer running. Age alone never counts.
+fn operation_lock_holder_is_gone(metadata: &OperationLockMetadata) -> bool {
+    let same_host = match (&metadata.host, current_host()) {
+        (Some(recorded), Some(current)) => recorded.eq_ignore_ascii_case(&current),
+        _ => false,
+    };
+    metadata.process_id != std::process::id()
+        && same_host
+        && process_is_running(metadata.process_id) == Some(false)
+}
+
+/// The ref locks an operation is about to take, written before it takes
+/// them, so a crash that leaves them behind can be told apart from a live
+/// Git command's. Removed once the locks are released.
+#[derive(Debug, Serialize, Deserialize)]
+struct RefLockClaim {
+    process_id: u32,
+    locks: Vec<ClaimedRefLock>,
+    #[serde(skip)]
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ClaimedRefLock {
+    path: PathBuf,
+    /// The lock file's identity once taken (see [`lock_file_identity`]).
+    identity: Option<(u64, u64)>,
+}
+
+/// Removes its claim when the operation releases its locks.
+struct RefLockClaimGuard(PathBuf);
+
+impl Drop for RefLockClaimGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+impl RefLockClaim {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self {
+            process_id: std::process::id(),
+            locks: paths
+                .into_iter()
+                .map(|path| ClaimedRefLock {
+                    path,
+                    identity: None,
+                })
+                .collect(),
+            path: None,
+        }
+    }
+
+    fn write(&mut self, path: PathBuf) -> Result<RefLockClaimGuard> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, serde_json::to_vec(self)?)?;
+        self.path = Some(path.clone());
+        Ok(RefLockClaimGuard(path))
+    }
+
+    /// Best effort: without identities, cleanup falls back to timing.
+    fn record_identities(&mut self) {
+        for lock in &mut self.locks {
+            lock.identity = lock_file_identity(&lock.path).map(|found| (found.0, nanos(found.1)));
+        }
+        if let Some(path) = &self.path {
+            if let Ok(bytes) = serde_json::to_vec(self) {
+                let _ = fs::write(path, bytes);
+            }
+        }
+    }
+}
+
+fn nanos(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or_default()
+}
+
+/// A file's identity (inode, or creation time on Windows) and modified time.
+/// NTFS can give a file recreated under the same name its predecessor's
+/// creation time, so a match needs the modified time too.
+fn lock_file_identity(path: &Path) -> Option<(u64, SystemTime)> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    let identity = std::os::unix::fs::MetadataExt::ino(&metadata);
+    #[cfg(windows)]
+    let identity = std::os::windows::fs::MetadataExt::creation_time(&metadata);
+    #[cfg(not(any(unix, windows)))]
+    let identity = 0;
+    Some((identity, metadata.modified().ok()?))
+}
+
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -14825,6 +15086,7 @@ fn unique_claim_temp(path: &Path) -> PathBuf {
 
 struct OperationLock {
     path: PathBuf,
+    _fault: crate::fault::Operation,
 }
 
 impl OperationLock {
@@ -14853,6 +15115,7 @@ impl OperationLock {
 
         Ok(Self {
             path: path.to_path_buf(),
+            _fault: crate::fault::operation(&metadata.operation),
         })
     }
 }
@@ -14884,6 +15147,7 @@ mod test_hooks {
     }
 
     pub fn fire(point: &str, git_dir: &Path) {
+        crate::fault::point(point);
         let hook = HOOKS.with(|hooks| {
             let mut hooks = hooks.borrow_mut();
             let index = hooks.iter().position(|(name, _)| *name == point)?;
@@ -14898,7 +15162,9 @@ mod test_hooks {
 #[cfg(not(test))]
 mod test_hooks {
     #[inline(always)]
-    pub fn fire(_point: &str, _git_dir: &std::path::Path) {}
+    pub fn fire(point: &str, _git_dir: &std::path::Path) {
+        crate::fault::point(point);
+    }
 }
 
 #[cfg(test)]
@@ -17856,6 +18122,86 @@ mod tests {
         assert_eq!(metadata.operation, "scenario_test");
         assert_eq!(metadata.process_id, std::process::id());
         assert!(!metadata.operation_id.is_empty());
+    }
+
+    #[test]
+    fn clear_stale_lock_removes_the_ref_locks_its_dead_holder_left() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let git_dir = workspace.repo.path().to_path_buf();
+        let mut child = std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let head = git_dir.join("HEAD.lock");
+        let branch = git_dir.join("refs/heads/main.lock");
+        let other = git_dir.join("refs/heads/other.lock");
+        fs::write(&head, "").unwrap();
+        fs::write(&branch, "").unwrap();
+        fs::write(&other, "").unwrap();
+        let mut claim = RefLockClaim::new(vec![head.clone(), branch.clone()]);
+        claim.process_id = dead;
+        std::mem::forget(claim.write(workspace.ref_lock_claim_path()).unwrap());
+        claim.record_identities();
+        // A live Git command took the branch's lock after the crashed one's
+        // was released: same path, another file.
+        fs::remove_file(&branch).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&branch, "").unwrap();
+        let metadata = OperationLockMetadata {
+            operation_id: "dead-op".to_string(),
+            operation: "save_version".to_string(),
+            process_id: dead,
+            owner: None,
+            created_at_seconds: now_seconds(),
+            host: current_host(),
+        };
+        fs::write(
+            workspace.lock_path(),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        workspace.clear_stale_lock().unwrap();
+
+        assert!(!workspace.lock_path().exists());
+        assert!(!workspace.ref_lock_claim_path().exists());
+        assert!(!head.exists());
+        assert!(branch.exists());
+        assert!(other.exists());
+    }
+
+    #[test]
+    fn a_stale_lock_known_only_by_age_leaves_ref_locks_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let head = workspace.repo.path().join("HEAD.lock");
+        fs::write(&head, "").unwrap();
+        let mut claim = RefLockClaim::new(vec![head.clone()]);
+        claim.process_id = u32::MAX - 1;
+        std::mem::forget(claim.write(workspace.ref_lock_claim_path()).unwrap());
+        claim.record_identities();
+        let metadata = OperationLockMetadata {
+            operation_id: "old-op".to_string(),
+            operation: "save_version".to_string(),
+            process_id: u32::MAX - 1,
+            owner: None,
+            created_at_seconds: 1,
+            host: Some("elsewhere".to_string()),
+        };
+        fs::write(
+            workspace.lock_path(),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        workspace.clear_stale_lock().unwrap();
+
+        assert!(!workspace.lock_path().exists());
+        assert!(head.exists());
     }
 
     #[test]

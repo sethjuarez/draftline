@@ -60,6 +60,11 @@ jobs:
           DRAFTLINE_REQUIRE_GIT_LFS: "1"
         run: cargo test --workspace
 
+      - name: Crash-point tests
+        env:
+          DRAFTLINE_REQUIRE_GIT_LFS: "1"
+        run: cargo test -p draftline --features fault-injection --test fault_injection
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

@@ -358,3 +358,92 @@ fn a_failed_upload_refuses_the_push() {
     let remote_repo = git2::Repository::open_bare(remote.path()).unwrap();
     assert!(remote_repo.find_reference("refs/heads/main").is_err());
 }
+
+#[test]
+fn a_stalled_upload_times_out_before_the_branch_is_pushed() {
+    let Some((temp, _repo, workspace)) = lfs_repo() else {
+        return;
+    };
+    let root = temp.path();
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "-q", "--bare"]);
+    let url = remote.path().to_string_lossy().replace('\\', "/");
+    workspace.add_remote("origin", &url).unwrap();
+    // An LFS endpoint that accepts connections and never answers.
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let held = server.incoming().collect::<Vec<_>>();
+        drop(held);
+    });
+    git(
+        root,
+        &["config", "lfs.url", &format!("http://127.0.0.1:{port}/lfs")],
+    );
+    write(root, "cutready/intro.png", &image(1));
+    workspace.save_version("One").unwrap();
+
+    let started = std::time::Instant::now();
+    let mut options =
+        draftline::RemoteOptions::new().with_lfs_timeout(std::time::Duration::from_secs(2));
+    let error = workspace
+        .publish_changes_with_options("origin", &mut options)
+        .unwrap_err();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    let draftline::DraftlineError::RemoteOperationTimedOut {
+        operation,
+        timeout_ms,
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(operation, "upload_lfs_content");
+    assert_eq!(*timeout_ms, 2000);
+    let remote_repo = git2::Repository::open_bare(remote.path()).unwrap();
+    assert!(remote_repo.find_reference("refs/heads/main").is_err());
+}
+
+#[test]
+fn a_stalled_smudge_times_out_and_the_pointers_can_be_retried() {
+    let Some((temp, _repo, mut workspace)) = lfs_repo() else {
+        return;
+    };
+    let root = temp.path();
+    write(root, "cutready/intro.png", &image(1));
+    workspace.save_version("One").unwrap();
+    let alt = workspace.create_variation("cutready/alt").unwrap();
+    workspace
+        .switch_variation(alt.id(), SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    write(root, "cutready/intro.png", &image(2));
+    workspace.save_version("Alt").unwrap();
+    // A driver that hangs on every file, smudge and index refresh alike.
+    git(root, &["config", "filter.lfs.process", "sleep 600"]);
+    workspace.set_filter_timeout(Some(std::time::Duration::from_secs(2)));
+
+    let started = std::time::Instant::now();
+    workspace
+        .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
+        .unwrap();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(read(root, "cutready/intro.png").starts_with(POINTER_PREFIX));
+
+    git(
+        root,
+        &["config", "filter.lfs.process", "git-lfs filter-process"],
+    );
+    assert!(workspace.smudge_pointer_files().unwrap());
+    assert_file(root, "cutready/intro.png", 1);
+    assert!(workspace.changed_files().unwrap().is_empty());
+    assert!(!workspace.smudge_pointer_files().unwrap());
+}
