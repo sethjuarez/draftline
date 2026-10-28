@@ -407,3 +407,43 @@ fn a_stalled_upload_times_out_before_the_branch_is_pushed() {
     let remote_repo = git2::Repository::open_bare(remote.path()).unwrap();
     assert!(remote_repo.find_reference("refs/heads/main").is_err());
 }
+
+#[test]
+fn a_stalled_smudge_times_out_and_the_pointers_can_be_retried() {
+    let Some((temp, _repo, mut workspace)) = lfs_repo() else {
+        return;
+    };
+    let root = temp.path();
+    write(root, "cutready/intro.png", &image(1));
+    workspace.save_version("One").unwrap();
+    let alt = workspace.create_variation("cutready/alt").unwrap();
+    workspace
+        .switch_variation(alt.id(), SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    write(root, "cutready/intro.png", &image(2));
+    workspace.save_version("Alt").unwrap();
+    // A driver that hangs on every file, smudge and index refresh alike.
+    git(root, &["config", "filter.lfs.process", "sleep 600"]);
+    workspace.set_filter_timeout(Some(std::time::Duration::from_secs(2)));
+
+    let started = std::time::Instant::now();
+    workspace
+        .switch_variation(&VariationId::from("main"), SwitchPolicy::AbortIfDirty)
+        .unwrap();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(read(root, "cutready/intro.png").starts_with(POINTER_PREFIX));
+
+    git(
+        root,
+        &["config", "filter.lfs.process", "git-lfs filter-process"],
+    );
+    assert!(workspace.smudge_pointer_files().unwrap());
+    assert_file(root, "cutready/intro.png", 1);
+    assert!(workspace.changed_files().unwrap().is_empty());
+    assert!(!workspace.smudge_pointer_files().unwrap());
+}

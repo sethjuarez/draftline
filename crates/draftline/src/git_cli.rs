@@ -352,14 +352,96 @@ pub(crate) fn smudge(
 
 /// Lets Git refresh the index's file timestamps through its filters, so a
 /// filtered file whose content matches its entry stops looking changed.
-/// Best effort: a busy index just means a slower status later.
-pub(crate) fn refresh_index(workdir: &Path) {
-    let _ = git(workdir)
-        .args(["update-index", "-q", "--refresh"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+/// Git refreshes a private copy of the index, which replaces the real one
+/// (under Git's own `index.lock`) only if nothing changed it meanwhile, so a
+/// refresh stopped at `timeout` never leaves or removes a lock in
+/// `git_dir`. Best effort: a busy index or a stopped filter just means a
+/// slower status later.
+pub(crate) fn refresh_index(workdir: &Path, git_dir: &Path, timeout: Option<Duration>) {
+    let index = git_dir.join("index");
+    let Ok(before) = std::fs::read(&index) else {
+        return;
+    };
+    let scratch = git_dir.join("draftline").join(format!(
+        "refresh-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    ));
+    if let Err(error) = refresh_copy(workdir, &index, &scratch, &before, timeout) {
+        tracing::debug!(%error, "index refresh did not finish");
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+fn refresh_copy(
+    workdir: &Path,
+    index: &Path,
+    scratch: &Path,
+    before: &[u8],
+    timeout: Option<Duration>,
+) -> Result<()> {
+    std::fs::create_dir_all(scratch)?;
+    let copy = scratch.join("index");
+    std::fs::write(&copy, before)?;
+    let mut command = git(workdir);
+    command
+        .env("GIT_INDEX_FILE", &copy)
+        .args(["update-index", "-q", "--refresh"]);
+    let action = "refreshing the index through Git filters";
+    let stopped = Stopped::default();
+    let finished = Running::spawn(command, Vec::new())?.finish(
+        action,
+        Deadline::filter(timeout, action, &stopped),
+        drain,
+    );
+    if stopped.get() {
+        return finished;
+    }
+    // `-q` still writes what it could refresh when it reports a failure.
+    let refreshed = std::fs::read(&copy)?;
+    if refreshed != before {
+        install_index(index, before, &refreshed)?;
+    }
+    finished
+}
+
+/// Replaces `index` with `refreshed` as Git would, through `index.lock`,
+/// unless another process holds the lock or `index` no longer reads `before`.
+fn install_index(index: &Path, before: &[u8], refreshed: &[u8]) -> Result<()> {
+    let lock = index.with_file_name("index.lock");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+    else {
+        return Ok(());
+    };
+    let written = (|| -> Result<bool> {
+        if std::fs::read(index)? != before {
+            return Ok(false);
+        }
+        file.write_all(refreshed)?;
+        file.sync_all()?;
+        Ok(true)
+    })();
+    drop(file);
+    match written {
+        Ok(true) => std::fs::rename(&lock, index).map_err(|error| {
+            let _ = std::fs::remove_file(&lock);
+            error.into()
+        }),
+        Ok(false) => {
+            let _ = std::fs::remove_file(&lock);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&lock);
+            Err(error)
+        }
+    }
 }
 
 fn drain(mut stdout: BufReader<ChildStdout>) -> Result<()> {
@@ -438,6 +520,64 @@ mod tests {
             }
             error => panic!("{error:?}"),
         }
+    }
+
+    /// An index refresh whose filter hangs stops at the timeout.
+    #[test]
+    fn a_hung_refresh_is_stopped_at_the_timeout() {
+        if !available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let run = |args: &[&str]| assert!(git(root).args(args).status().unwrap().success());
+        run(&["init", "-q"]);
+        std::fs::write(root.join("a.bin"), "content").unwrap();
+        run(&["add", "a.bin"]);
+        run(&["config", "filter.slow.clean", "sleep 60; cat"]);
+        std::fs::write(root.join(".gitattributes"), "*.bin filter=slow\n").unwrap();
+        // A changed stat makes the refresh run the clean filter.
+        std::fs::write(root.join("a.bin"), "changed").unwrap();
+
+        let started = Instant::now();
+        refresh_index(root, &root.join(".git"), Some(Duration::from_millis(500)));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        // The stopped refresh leaves the index unlocked for the next writer.
+        assert!(!root.join(".git/index.lock").exists());
+    }
+
+    #[test]
+    fn a_refresh_replaces_the_index_only_when_its_lock_is_free() {
+        if !available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let git_dir = root.join(".git");
+        let run = |args: &[&str]| assert!(git(root).args(args).status().unwrap().success());
+        run(&["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "content").unwrap();
+        run(&["add", "a.txt"]);
+        let stale = std::fs::read(git_dir.join("index")).unwrap();
+        // Same content, new stat: only a refresh updates the entry.
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(root.join("a.txt"), "content").unwrap();
+
+        std::fs::write(git_dir.join("index.lock"), "").unwrap();
+        refresh_index(root, &git_dir, None);
+        assert_eq!(std::fs::read(git_dir.join("index")).unwrap(), stale);
+        assert!(git_dir.join("index.lock").exists());
+
+        std::fs::remove_file(git_dir.join("index.lock")).unwrap();
+        refresh_index(root, &git_dir, None);
+        assert_ne!(std::fs::read(git_dir.join("index")).unwrap(), stale);
+        assert!(!git_dir.join("index.lock").exists());
+        assert!(!git_dir.join("draftline").read_dir().unwrap().any(|_| true));
     }
 
     /// A smudge stopped at its timeout writes nothing, since the filter may

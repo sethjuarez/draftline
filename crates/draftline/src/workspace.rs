@@ -2912,7 +2912,7 @@ impl Workspace {
                     DiagnosticCode::LfsContentMissing,
                     DiagnosticSeverity::Warning,
                     format!(
-                        "{} project file(s), such as `{}`, are Git LFS pointers; a developer must install Git LFS and run `git lfs pull`",
+                        "{} project file(s), such as `{}`, are Git LFS pointers whose content isn't on disk; retry with `smudge_pointer_files`, or install Git LFS and run `git lfs pull`",
                         missing.len(),
                         missing[0].display()
                     ),
@@ -3094,7 +3094,7 @@ impl Workspace {
             DiagnosticCode::LfsContentMissing => ErrorExplanation {
                 code,
                 message:
-                    "some project files are Git LFS pointers; their content was never downloaded"
+                    "some project files are Git LFS pointers; their content hasn't been downloaded"
                         .to_string(),
                 safe_next_actions: Vec::new(),
                 retry: RetryClass::RetryAfterUserChoice,
@@ -10955,7 +10955,7 @@ impl Workspace {
         // Entries for filtered files carry no timestamps, and libgit2 can't
         // rehash such a file to match them; Git can.
         if !self.filtered_additions(&affected_paths)?.is_empty() {
-            git_cli::refresh_index(&self.root);
+            git_cli::refresh_index(&self.root, self.repo.path(), self.filter_timeout);
         }
         Ok(version_from_commit(&commit))
     }
@@ -11278,7 +11278,7 @@ impl Workspace {
         if let Err(error) = self.forget_index_stat(&entries) {
             tracing::warn!(%error, "could not mark smudged files for an index refresh");
         }
-        git_cli::refresh_index(&self.root);
+        git_cli::refresh_index(&self.root, self.repo.path(), self.filter_timeout);
     }
 
     /// Smudges `entries` through a private index holding exactly them, so a
@@ -11322,6 +11322,19 @@ impl Workspace {
             self.filter_timeout,
             write,
         )
+    }
+
+    /// Writes the real content of the folder's filtered files (such as Git
+    /// LFS images) that still hold the exact pointer `HEAD` stores: what a
+    /// smudge stopped by [`Workspace::set_filter_timeout`], a failed download,
+    /// or an interrupted checkout leaves behind, and what `inspect` reports
+    /// as `LfsContentMissing`. Runs only where Draftline runs the filter, and
+    /// never touches a file someone changed since. Returns whether any file
+    /// changed; content Git still can't produce stays as its pointer.
+    pub fn smudge_pointer_files(&self) -> Result<bool> {
+        self.ensure_no_pending_recovery()?;
+        let _lock = self.acquire_for_index("smudge_pointer_files")?;
+        self.smudge_left_pointers()
     }
 
     /// Smudges the folder's filtered files whose disk content is still the
