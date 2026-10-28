@@ -14,6 +14,8 @@ crate-type = ["rlib", "staticlib"]
 [features]
 default = []
 vendored-mobile-git = ["git2/vendored-libgit2", "git2/vendored-openssl"]
+# Test-only crash points; see `draftline::fault`. Never ship it.
+fault-injection = []
 
 [dependencies]
 git2 = { version = "0.21", default-features = false, features = ["https", "ssh"] }
@@ -24,3 +26,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[[test]]
+name = "fault_injection"
+required-features = ["fault-injection"]

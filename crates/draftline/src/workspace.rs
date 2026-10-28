@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use git2::{
     build::{CheckoutBuilder, RepoBuilder},
@@ -34,6 +34,7 @@ pub struct Workspace {
     content_policy: ContentPolicy,
     resolver_registry: ResolverRegistry,
     variation_namespace: Option<String>,
+    filter_timeout: Option<Duration>,
 }
 
 /// A named version of the workspace.
@@ -1696,6 +1697,7 @@ impl Workspace {
             content_policy,
             resolver_registry: ResolverRegistry::with_default_resolvers(),
             variation_namespace: None,
+            filter_timeout: None,
         }
         .initialize())
     }
@@ -2043,6 +2045,7 @@ impl Workspace {
             content_policy,
             resolver_registry: ResolverRegistry::with_default_resolvers(),
             variation_namespace: namespace,
+            filter_timeout: None,
         }))
     }
 
@@ -2715,6 +2718,18 @@ impl Workspace {
         self
     }
 
+    /// Bounds each run of a Git filter Draftline delegates to `git` (such as
+    /// Git LFS cleaning files on save or smudging them on switch, restore,
+    /// discard, and incoming changes). A run past `timeout` is stopped, along
+    /// with the processes it started, and fails as
+    /// [`DraftlineError::GitFilterFailed`] on save. A stopped smudge is not an
+    /// error: as when LFS content can't be downloaded, the checkout stands and
+    /// the files it could not smudge stay pointers, which `inspect` reports.
+    /// `None` (the default) waits as long as the filter runs.
+    pub fn set_filter_timeout(&mut self, timeout: Option<Duration>) {
+        self.filter_timeout = timeout;
+    }
+
     /// Returns the repository working-tree root.
     ///
     /// Paths accepted and returned by Draftline are relative to this root. For a
@@ -3317,8 +3332,13 @@ impl Workspace {
                 self.repair_delete_remote_variation_recovery(state, options)
             }
             RecoveryOperation::MoveFolder => self.settle_folder_move(state),
-            RecoveryOperation::RestoreVersionAsNewSave
-            | RecoveryOperation::MilestoneMerge
+            RecoveryOperation::RestoreVersionAsNewSave => {
+                match self.finish_landed_restore(&state)? {
+                    Some(changed_workspace) => self.complete_recovery(state, changed_workspace),
+                    None => Ok(self.recovery_unavailable(state)),
+                }
+            }
+            RecoveryOperation::MilestoneMerge
             | RecoveryOperation::SquashVersions
             | RecoveryOperation::HistoryCleanup => Ok(self.recovery_unavailable(state)),
         }
@@ -3457,6 +3477,42 @@ impl Workspace {
                 .delete()?;
         }
         Ok(false)
+    }
+
+    /// A restore killed after its save landed: the branch already holds the
+    /// restored content, which can't be undone without rewriting history, so
+    /// repair settles the files on it. `None` until the save lands; rollback
+    /// covers that. Targeted restores roll back.
+    fn finish_landed_restore(&self, state: &RecoveryState) -> Result<Option<bool>> {
+        if state
+            .target
+            .as_deref()
+            .is_none_or(|target| target.contains(" -> "))
+        {
+            return Ok(None);
+        }
+        let Some((before, restored)) = self.recorded_checkout() else {
+            return Ok(None);
+        };
+        // The save landed only if the branch the restore ran on now holds
+        // one commit on top of the recorded tree with the restored tree; a
+        // branch switched or reset to the same content since doesn't count.
+        if state.original_variation.as_deref() != self.current_variation_unchecked().ok().as_deref()
+        {
+            return Ok(None);
+        }
+        let head = self.repo.head()?.peel_to_commit()?;
+        let landed = head.tree_id() == restored.id()
+            && head.parent_count() == 1
+            && head.parent(0)?.tree_id() == before.id();
+        if !landed {
+            return Ok(None);
+        }
+        Ok(Some(self.settle_from(
+            &restored,
+            Some(&before),
+            &head.tree()?,
+        )?))
     }
 
     /// Undoes an interrupted restore: files still at the restored version go
@@ -3875,7 +3931,7 @@ impl Workspace {
             .iter()
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
-        let Ok(ids) = git_cli::clean(&self.root, &paths, false) else {
+        let Ok(ids) = git_cli::clean(&self.root, &paths, false, self.filter_timeout) else {
             return Ok(Vec::new());
         };
         Ok(filtered
@@ -8684,7 +8740,12 @@ impl Workspace {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
         let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
-        self.upload_filtered_content(remote_name, &format!("refs/heads/{variation}"))?;
+        self.upload_filtered_content(
+            remote_name,
+            &format!("refs/heads/{variation}"),
+            options.lfs_timeout(),
+        )?;
+        crate::fault::point("lfs_uploaded");
         let _timeout_guard = options.server_timeout_guard()?;
         let push_result = {
             let mut push_options = options.push_options_with_expectations(
@@ -8698,6 +8759,7 @@ impl Workspace {
             remote.push(&[refspec.as_str()], Some(&mut push_options))
         };
         options.map_git_result("push_current_variation", push_result)?;
+        crate::fault::point("pushed");
 
         Ok(())
     }
@@ -8714,7 +8776,8 @@ impl Workspace {
         let source = refspec.trim_start_matches('+');
         let source = source.split_once(':').map_or(source, |(source, _)| source);
         if !source.is_empty() {
-            self.upload_filtered_content(remote_name, source)?;
+            self.upload_filtered_content(remote_name, source, options.lfs_timeout())?;
+            crate::fault::point("lfs_uploaded");
         }
         let _timeout_guard = options.server_timeout_guard()?;
         let push_result = {
@@ -8723,6 +8786,7 @@ impl Workspace {
             remote.push(&[refspec], Some(&mut push_options))
         };
         options.map_git_result("push_refspec", push_result)?;
+        crate::fault::point("pushed");
 
         Ok(())
     }
@@ -8732,12 +8796,17 @@ impl Workspace {
     /// the remote would get pointers to content no one can download. Runs
     /// only where Draftline runs the LFS filter and this repository has LFS
     /// content; a failed upload refuses the push.
-    fn upload_filtered_content(&self, remote: &str, source: &str) -> Result<()> {
+    fn upload_filtered_content(
+        &self,
+        remote: &str,
+        source: &str,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         if !FilterRunner::of(&self.repo)?.runs("lfs") {
             return Ok(());
         }
         let commit = self.repo.revparse_single(source)?.peel_to_commit()?.id();
-        git_cli::lfs_push(&self.root, remote, commit)
+        git_cli::lfs_push(&self.root, remote, commit, timeout)
     }
 
     fn remote_advertised_oid(
@@ -10239,6 +10308,11 @@ impl Workspace {
             checkout,
         };
         fs::write(self.ledger_path(), serde_json::to_vec_pretty(&ledger)?)?;
+        crate::fault::point(if state.completed {
+            "recovery_completed"
+        } else {
+            "recovery_recorded"
+        });
         if state.completed && matches!(&state.operation, RecoveryOperation::DeleteRemoteVariation) {
             match fs::remove_file(self.remote_delete_recovery_metadata_path(&state.operation_id)) {
                 Ok(()) => {}
@@ -10797,7 +10871,7 @@ impl Workspace {
     /// Stages `paths` as `git add` would, running their clean filters (Git
     /// LFS stores the content under `.git/lfs` and returns a pointer).
     fn add_filtered(&self, index: &mut git2::Index, paths: &[PathBuf]) -> Result<()> {
-        let ids = git_cli::clean(&self.root, paths, true)?;
+        let ids = git_cli::clean(&self.root, paths, true, self.filter_timeout)?;
         // Like `git add`: the file's executable bit counts only where the
         // repository trusts file modes; elsewhere the staged mode stays.
         let trust_mode = cfg!(unix)
@@ -10871,6 +10945,7 @@ impl Workspace {
             .commit(None, &author, &committer, label, &tree, &parents)?;
         let commit = self.repo.find_commit(oid)?;
         let previous = self.while_git_busy(|| self.stage_from(&commit, &affected_paths))?;
+        crate::fault::point("index_staged");
         if let Err(error) =
             self.while_git_busy(|| self.advance_head(branch, &commit, parent.as_ref(), &committer))
         {
@@ -10974,6 +11049,7 @@ impl Workspace {
         };
         transaction.set_target(&name, commit.id(), Some(committer), &message)?;
         transaction.commit()?;
+        crate::fault::point("head_advanced");
         Ok(())
     }
 
@@ -11126,6 +11202,7 @@ impl Workspace {
                 }
             });
         let result = run(&mut checkout);
+        crate::fault::point("files_written");
         let FilterPlan { refused, smudge } = plan.take();
         if refused.is_empty() {
             // A locked index fails only libgit2's last step, the index
@@ -11177,7 +11254,9 @@ impl Workspace {
                 return Ok(());
             };
             let pointer = self.repo.find_blob(*pointer)?;
-            self.replace_working_file(path, pointer.content(), content)
+            self.replace_working_file(path, pointer.content(), content)?;
+            crate::fault::point("file_smudged");
+            Ok(())
         };
         let scratch = self.repo.path().join("draftline").join(format!(
             "smudge-{}-{}",
@@ -11192,6 +11271,7 @@ impl Workspace {
         if let Err(error) = result {
             tracing::warn!(%error, "left Git filter pointers in place of file content");
         }
+        crate::fault::point("smudged");
         // The checkout stamped these entries with the pointer's stat, which
         // Git takes as proof the real file changed. A zero size makes Git
         // compare content instead, so the refresh restamps them.
@@ -11239,6 +11319,7 @@ impl Workspace {
             &index_file,
             &scratch.join("files"),
             &paths,
+            self.filter_timeout,
             write,
         )
     }
@@ -14825,6 +14906,7 @@ fn unique_claim_temp(path: &Path) -> PathBuf {
 
 struct OperationLock {
     path: PathBuf,
+    _fault: crate::fault::Operation,
 }
 
 impl OperationLock {
@@ -14853,6 +14935,7 @@ impl OperationLock {
 
         Ok(Self {
             path: path.to_path_buf(),
+            _fault: crate::fault::operation(&metadata.operation),
         })
     }
 }
@@ -14884,6 +14967,7 @@ mod test_hooks {
     }
 
     pub fn fire(point: &str, git_dir: &Path) {
+        crate::fault::point(point);
         let hook = HOOKS.with(|hooks| {
             let mut hooks = hooks.borrow_mut();
             let index = hooks.iter().position(|(name, _)| *name == point)?;
@@ -14898,7 +14982,9 @@ mod test_hooks {
 #[cfg(not(test))]
 mod test_hooks {
     #[inline(always)]
-    pub fn fire(_point: &str, _git_dir: &std::path::Path) {}
+    pub fn fire(point: &str, _git_dir: &std::path::Path) {
+        crate::fault::point(point);
+    }
 }
 
 #[cfg(test)]

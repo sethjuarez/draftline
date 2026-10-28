@@ -75,6 +75,7 @@
 
 pub mod content_policy;
 pub mod error;
+pub mod fault;
 mod git_cli;
 pub mod merge;
 pub mod mobile_ffi;

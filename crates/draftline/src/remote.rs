@@ -165,6 +165,7 @@ pub struct RemoteCredentialRequest<'a> {
 pub struct RemoteOptions<'callbacks> {
     credentials: Option<Box<RemoteCredentialCallback<'callbacks>>>,
     timeout: Option<Duration>,
+    lfs_timeout: Option<Duration>,
     timed_out: Arc<AtomicBool>,
 }
 
@@ -248,6 +249,7 @@ impl Default for RemoteOptions<'_> {
         Self {
             credentials: None,
             timeout: None,
+            lfs_timeout: None,
             timed_out: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -293,6 +295,29 @@ impl<'callbacks> RemoteOptions<'callbacks> {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
+    }
+
+    /// Bounds the Git LFS upload that runs before a push (publish, send, and
+    /// their merges) when the repository routes content through Git LFS.
+    ///
+    /// That upload runs `git lfs push` with Git's own credentials, so
+    /// [`RemoteOptions::with_timeout`] and the credential callback don't reach
+    /// it. An upload still running after `timeout` is stopped, with the
+    /// processes it started, and the operation fails as
+    /// [`DraftlineError::RemoteOperationTimedOut`] with operation
+    /// `upload_lfs_content`. The branch isn't pushed; content already uploaded stays
+    /// on the LFS server and a retry skips it. Size this for the largest
+    /// upload you expect: it is a total deadline, not an idle timeout. Without
+    /// it, the upload waits as long as `git lfs push` does.
+    ///
+    /// [`DraftlineError::RemoteOperationTimedOut`]: crate::DraftlineError::RemoteOperationTimedOut
+    pub fn with_lfs_timeout(mut self, timeout: Duration) -> Self {
+        self.lfs_timeout = Some(timeout);
+        self
+    }
+
+    pub(crate) fn lfs_timeout(&self) -> Option<Duration> {
+        self.lfs_timeout
     }
 
     pub(crate) fn fetch_options(&mut self, operation: &'static str) -> git2::FetchOptions<'_> {
