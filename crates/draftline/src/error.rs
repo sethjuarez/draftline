@@ -185,10 +185,12 @@ pub enum DraftlineError {
     PullRequest(String),
 
     /// A configured Git filter driver, such as Git LFS, failed, or `git`
-    /// couldn't run it; the text is Git's own message. Nothing was saved or
-    /// pushed past the point it failed.
-    #[error("a Git filter (such as Git LFS) failed: {0}")]
-    GitFilterFailed(String),
+    /// couldn't run it. `action` says what Draftline was doing (for example
+    /// "uploading Git LFS content to `origin`"); `output` is Git's own
+    /// message, which can be long. Nothing was saved or pushed past the point
+    /// it failed.
+    #[error("a Git filter (such as Git LFS) failed while {action}")]
+    GitFilterFailed { action: String, output: String },
 
     #[error("merge needs a developer: files outside the project conflict: {0:?}")]
     MergeNeedsDeveloper(Vec<std::path::PathBuf>),

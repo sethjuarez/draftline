@@ -224,6 +224,14 @@ fn publishing_uploads_lfs_content_before_the_branch() {
     workspace.add_remote("origin", &url).unwrap();
     write(root, "cutready/intro.png", &image(1));
     workspace.save_version("One").unwrap();
+    assert!(workspace.runs_filter("lfs").unwrap());
+    let filtered = workspace.filtered_files().unwrap();
+    assert!(filtered[0].driver_configured && filtered[0].driver_runs);
+    let preflight = workspace.preflight_publish("origin").unwrap();
+    let outgoing = &preflight.outgoing_files;
+    assert_eq!(outgoing.len(), 1, "{outgoing:?}");
+    assert_eq!(outgoing[0].kind, draftline::OutgoingFileKind::LfsPointer);
+    assert!(outgoing[0].uploaded);
 
     workspace.publish_changes("origin").unwrap();
 
@@ -258,7 +266,7 @@ fn a_pointer_whose_content_is_missing_is_never_pushed() {
     let error = workspace.publish_changes("origin").unwrap_err();
 
     assert!(
-        matches!(error, draftline::DraftlineError::GitFilterFailed(_)),
+        matches!(error, draftline::DraftlineError::GitFilterFailed { .. }),
         "{error:?}"
     );
     let remote_repo = git2::Repository::open_bare(remote.path()).unwrap();
@@ -282,9 +290,15 @@ fn a_failed_upload_refuses_the_push() {
 
     let error = workspace.publish_changes("origin").unwrap_err();
 
-    assert!(
-        matches!(error, draftline::DraftlineError::GitFilterFailed(_)),
-        "{error:?}"
+    let draftline::DraftlineError::GitFilterFailed { action, output } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(action, "uploading Git LFS content to `origin`");
+    assert!(!output.is_empty());
+    // Git's output stays out of the message; hosts find it in the details.
+    assert_eq!(
+        error.to_string(),
+        "a Git filter (such as Git LFS) failed while uploading Git LFS content to `origin`"
     );
     let remote_repo = git2::Repository::open_bare(remote.path()).unwrap();
     assert!(remote_repo.find_reference("refs/heads/main").is_err());

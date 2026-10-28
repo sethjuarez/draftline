@@ -764,6 +764,7 @@ fn a_clone_without_lfs_content_is_reported_not_read_as_content() {
     assert_eq!(probed.len(), 1);
     assert_eq!(probed[0].path, PathBuf::from("cutready/next.sk"));
     assert!(!probed[0].content_missing);
+    assert!(!probed[0].driver_configured && !probed[0].driver_runs);
 
     repo.config()
         .unwrap()
@@ -2693,6 +2694,9 @@ fn send_and_publish_preflights_report_large_files_and_lfs_pointers_going_out() {
         .preflight_send("origin", &send_request("Big"), &mut RemoteOptions::new())
         .unwrap();
     assert_eq!(kinds(&preflight.outgoing_files), expected);
+    // The LFS driver isn't configured here, so nothing would upload it.
+    assert!(preflight.outgoing_files.iter().all(|file| !file.uploaded));
+    assert!(!workspace.runs_filter("lfs").unwrap());
     assert!(!preflight.outgoing_files_truncated);
     assert!(
         preflight.can_proceed,

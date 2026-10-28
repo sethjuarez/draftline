@@ -3027,7 +3027,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::VariationOutsideNamespace(_) => "variation_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
-        DraftlineError::GitFilterFailed(_) => "git_filter_failed",
+        DraftlineError::GitFilterFailed { .. } => "git_filter_failed",
         DraftlineError::MergeNeedsDeveloper(_) => "merge_needs_developer",
         DraftlineError::NotOwnedWorktree(_) => "not_owned_worktree",
         DraftlineError::OwnedWorktreeInUse(_) => "owned_worktree_in_use",
@@ -3071,6 +3071,9 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         }
         DraftlineError::BaseRenamed { from, to } => {
             Some(serde_json::json!({ "from": from, "to": to }))
+        }
+        DraftlineError::GitFilterFailed { action, output } => {
+            Some(serde_json::json!({ "action": action, "output": output }))
         }
         DraftlineError::SendOutsideNamespace(branch)
         | DraftlineError::VariationOutsideNamespace(branch) => {

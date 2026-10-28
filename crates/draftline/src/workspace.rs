@@ -273,8 +273,13 @@ pub struct FilteredFile {
     /// The `filter` attribute's driver, for example `lfs`.
     pub driver: String,
     /// Git config defines the driver (`filter.<driver>.*`), so plain Git can
-    /// run it here. Draftline still cannot.
+    /// run it here.
     pub driver_configured: bool,
+    /// Draftline runs the driver here (it is configured and the `git`
+    /// executable is available), so saves, checkouts, and pushes handle this
+    /// file; otherwise they refuse with a `GitFilter` hazard.
+    #[serde(default)]
+    pub driver_runs: bool,
     /// The file on disk is a Git LFS pointer: its content was never downloaded.
     pub content_missing: bool,
 }
@@ -4835,7 +4840,8 @@ impl Workspace {
         Err(error)
     }
 
-    /// Creates a new variation from the current version.
+    /// Creates a new variation from the current version. The workspace stays
+    /// on the current variation; call [`Workspace::switch_variation`] to move.
     pub fn create_variation(&self, name: impl AsRef<str>) -> Result<Variation> {
         self.create_variation_with_metadata(name, VariationMetadata::default())
     }
@@ -9372,6 +9378,7 @@ impl Workspace {
                 walk.hide(*oid)?;
             }
         }
+        let uploads_lfs = FilterRunner::of(&self.repo)?.runs("lfs");
         let mut seen = BTreeSet::new();
         let mut files = Vec::new();
         for (scanned, oid) in walk.enumerate() {
@@ -9412,6 +9419,7 @@ impl Workspace {
                     commit: commit.id().to_string(),
                     size,
                     kind,
+                    uploaded: kind == OutgoingFileKind::LfsPointer && uploads_lfs,
                 });
                 if files.len() == MAX_FILES {
                     return Ok((files, true));
@@ -11218,6 +11226,13 @@ impl Workspace {
         Ok(())
     }
 
+    /// Whether Draftline runs the Git filter `driver` (for example `lfs`) in
+    /// this repository: the driver is configured and the `git` executable is
+    /// available. Where it doesn't, files under it are refused.
+    pub fn runs_filter(&self, driver: impl AsRef<str>) -> Result<bool> {
+        Ok(FilterRunner::of(&self.repo)?.runs(driver.as_ref()))
+    }
+
     /// Tracked files in the folder that Git stores through a filter driver, such as
     /// Git LFS, with whether their content is missing from disk. Untracked files
     /// are not listed; check those with [`Workspace::filtered_files_among`].
@@ -11288,7 +11303,7 @@ impl Workspace {
         &self,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> Result<Vec<FilteredFile>> {
-        let config = self.repo.config()?;
+        let runner = FilterRunner::of(&self.repo)?;
         let mut files = Vec::new();
         for path in paths {
             let Some(driver) =
@@ -11296,12 +11311,14 @@ impl Workspace {
             else {
                 continue;
             };
-            let driver_configured = driver_configured(&config, &driver);
+            let driver_configured = driver_configured(&runner.config, &driver);
+            let driver_runs = runner.runs(&driver);
             let content_missing = is_lfs_pointer_file(&self.root.join(&path));
             files.push(FilteredFile {
                 path,
                 driver,
                 driver_configured,
+                driver_runs,
                 content_missing,
             });
         }

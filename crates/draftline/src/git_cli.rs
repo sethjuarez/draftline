@@ -49,6 +49,13 @@ fn git(workdir: &Path) -> Command {
     command
 }
 
+fn failed(action: &str, output: String) -> DraftlineError {
+    DraftlineError::GitFilterFailed {
+        action: action.to_string(),
+        output,
+    }
+}
+
 /// Git's spelling of a repository-relative path: `/`-separated.
 fn git_path(path: &Path) -> Result<String> {
     let text = path
@@ -57,10 +64,10 @@ fn git_path(path: &Path) -> Result<String> {
         .collect::<Vec<_>>()
         .join("/");
     if text.contains(['\n', '\r']) {
-        return Err(DraftlineError::GitFilterFailed(format!(
-            "{} has a line break in its name",
-            path.display()
-        )));
+        return Err(failed(
+            "naming a file for Git",
+            format!("{} has a line break in its name", path.display()),
+        ));
     }
     Ok(text)
 }
@@ -80,7 +87,7 @@ impl Running {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| DraftlineError::GitFilterFailed(format!("cannot run git: {error}")))?;
+            .map_err(|error| failed("starting git", error.to_string()))?;
         let mut stdin = child.stdin.take().expect("piped stdin");
         let feeder = std::thread::spawn(move || stdin.write_all(&input));
         let stderr: ChildStderr = child.stderr.take().expect("piped stderr");
@@ -105,19 +112,27 @@ impl Running {
         let status = self.child.wait();
         let _ = self.feeder.join();
         let errors = self.errors.join().unwrap_or_default();
-        let failed = |detail: String| {
+        let fail = |detail: String| {
             let errors = errors.trim();
-            DraftlineError::GitFilterFailed(if errors.is_empty() {
-                format!("{what}: {detail}")
-            } else {
-                format!("{what}: {errors}")
-            })
+            failed(
+                what,
+                if errors.is_empty() {
+                    detail
+                } else {
+                    errors.to_string()
+                },
+            )
         };
         match (status, read) {
             (Ok(status), Ok(value)) if status.success() => Ok(value),
-            (Ok(status), Ok(_)) => Err(failed(status.to_string())),
-            (Ok(_), Err(error)) => Err(failed(error.to_string())),
-            (Err(error), _) => Err(failed(error.to_string())),
+            (Ok(status), Ok(_)) => Err(fail(status.to_string())),
+            (Ok(status), Err(error @ DraftlineError::GitFilterFailed { .. }))
+                if status.success() =>
+            {
+                Err(error)
+            }
+            (Ok(_), Err(error)) => Err(fail(error.to_string())),
+            (Err(error), _) => Err(fail(error.to_string())),
         }
     }
 }
@@ -149,11 +164,10 @@ pub(crate) fn clean(workdir: &Path, paths: &[PathBuf], write: bool) -> Result<Ve
             line.clear();
         }
         if ids.len() != paths.len() {
-            return Err(DraftlineError::GitFilterFailed(format!(
-                "git hashed {} of {} files",
-                ids.len(),
-                paths.len()
-            )));
+            return Err(failed(
+                "running a Git filter to save files",
+                format!("git hashed {} of {} files", ids.len(), paths.len()),
+            ));
         }
         Ok(ids)
     })();
@@ -205,9 +219,10 @@ pub(crate) fn refresh_index(workdir: &Path) {
 /// pre-push hook would.
 pub(crate) fn lfs_push(workdir: &Path, remote: &str, commit: Oid) -> Result<()> {
     if remote.starts_with('-') {
-        return Err(DraftlineError::GitFilterFailed(format!(
-            "remote `{remote}` cannot be passed to git lfs"
-        )));
+        return Err(failed(
+            &format!("uploading Git LFS content to `{remote}`"),
+            "a remote name starting with `-` cannot be passed to git lfs".to_string(),
+        ));
     }
     let mut command = git(workdir);
     command.args(["lfs", "push", remote, &commit.to_string()]);
