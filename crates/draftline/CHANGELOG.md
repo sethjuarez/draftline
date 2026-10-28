@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.9.0...draftline-v0.10.0) (2026-10-28)
+
+
+### Features
+
+* add crash points for recovery testing and timeouts for Git LFS ([#62](https://github.com/sethjuarez/draftline/issues/62)) ([20e4860](https://github.com/sethjuarez/draftline/commit/20e4860fb0ef8005682b2e9d20ceaba921539033))
+
 ## [0.9.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.8.0...draftline-v0.9.0) (2026-10-28)
 
 

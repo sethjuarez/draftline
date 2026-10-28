@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/sethjuarez/draftline/compare/site-v0.4.0...site-v0.5.0) (2026-10-28)
+
+
+### Features
+
+* add crash points for recovery testing and timeouts for Git LFS ([#62](https://github.com/sethjuarez/draftline/issues/62)) ([20e4860](https://github.com/sethjuarez/draftline/commit/20e4860fb0ef8005682b2e9d20ceaba921539033))
+
 ## [0.4.0](https://github.com/sethjuarez/draftline/compare/site-v0.3.1...site-v0.4.0) (2026-10-28)
 
 
