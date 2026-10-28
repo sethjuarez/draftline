@@ -138,6 +138,9 @@ pub const POINTS: &[&str] = &[
     "after_index_precheck",
     "after_parent_read",
     "index_staged",
+    // `HEAD` and the branch locked (`HEAD.lock`, `refs/heads/<b>.lock`),
+    // not yet moved.
+    "refs_locked",
     "head_advanced",
     // Incoming changes fetched and applied.
     "after_apply_fetch",
