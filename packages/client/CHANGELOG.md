@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/sethjuarez/draftline/compare/client-v0.4.1...client-v0.5.0) (2026-10-28)
+
+
+### Features
+
+* **workspace:** save, restore, and push Git LFS files through git-lfs ([#60](https://github.com/sethjuarez/draftline/issues/60)) ([038ee88](https://github.com/sethjuarez/draftline/commit/038ee881b55c0e0b7ec4f4c6ced715193073a99f))
+
 ## [0.4.1](https://github.com/sethjuarez/draftline/compare/client-v0.4.0...client-v0.4.1) (2026-10-26)
 
 
