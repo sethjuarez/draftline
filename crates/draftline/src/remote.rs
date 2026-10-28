@@ -74,6 +74,12 @@ pub struct OutgoingFile {
     pub commit: String,
     pub size: u64,
     pub kind: OutgoingFileKind,
+    /// For an [OutgoingFileKind::LfsPointer]: Draftline runs the LFS filter
+    /// here, so its push uploads the content first (or fails with
+    /// `GitFilterFailed`). Hosts need not block these. Always `false` for
+    /// other kinds.
+    #[serde(default)]
+    pub uploaded: bool,
 }
 
 /// Why an [OutgoingFile] is reported.
@@ -83,8 +89,10 @@ pub struct OutgoingFile {
 pub enum OutgoingFileKind {
     /// At least the content policy's large-file threshold.
     Large,
-    /// A Git LFS pointer. Draftline's push never uploads LFS objects, so the
-    /// content reaches the remote only if someone ran `git lfs push`.
+    /// A Git LFS pointer. Where Draftline runs the LFS filter (the repository
+    /// configures it and `git` is installed), a push uploads the content
+    /// first, as `git push` would; elsewhere the content reaches the remote
+    /// only if someone runs `git lfs push`.
     LfsPointer,
 }
 

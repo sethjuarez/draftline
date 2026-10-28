@@ -56,6 +56,8 @@ jobs:
           rustup default stable
 
       - name: Test
+        env:
+          DRAFTLINE_REQUIRE_GIT_LFS: "1"
         run: cargo test --workspace
 
       - name: Clippy

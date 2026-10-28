@@ -680,6 +680,8 @@ export interface FilteredFile {
   driver: string;
   /** Git config defines the driver, so plain Git can run it here. */
   driver_configured: boolean;
+  /** Draftline runs the driver here (configured, and `git` is installed); otherwise saves refuse these files. */
+  driver_runs: boolean;
   /** The file on disk is an LFS pointer: its content was never downloaded. */
   content_missing: boolean;
 }
@@ -1047,12 +1049,14 @@ export interface PublishPreflight {
   can_publish: boolean;
 }
 
-/** A file in commits the remote doesn't have yet. `lfs_pointer`: Draftline's push never uploads LFS objects. */
+/** A file in commits the remote doesn't have yet. */
 export interface OutgoingFile {
   path: string;
   commit: string;
   size: number;
   kind: 'large' | 'lfs_pointer' | (string & {});
+  /** An `lfs_pointer` whose content Draftline's push uploads first; no need to block it. */
+  uploaded: boolean;
 }
 export interface PublishResult {
   remote: string;

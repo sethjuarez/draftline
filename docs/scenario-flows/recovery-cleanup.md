@@ -188,7 +188,7 @@ flowchart TD
 | Covered today? | Partially covered. |
 | Current support | Draftline detects binary and large current workspace files in change/preflight reports. Historical diffs do not preserve meaningful `is_large` data. |
 | Safety behavior | Detection gives hosts a chance to warn or block, but Draftline does not enforce asset policy by itself. |
-| Gap | Need a product policy for block/warn/stream/external storage/LFS-like behavior. Standalone projects can reuse the hybrid LFS path (Flow 15i): `filtered_files` detection today, and running `git lfs` when installed once that lands. |
+| Gap | Need a product policy for block/warn/stream/external storage/LFS-like behavior. Standalone projects can reuse the hybrid LFS path (Flow 15i): configured filter drivers such as `git lfs` run through `git` for save, checkout, and push. |
 
 ## Flow 14: recover from interruption or unusual state
 
@@ -220,12 +220,12 @@ flowchart TD
 | Question | Answer |
 |---|---|
 | Covered today? | Partially covered. |
-| Current support | Operation locks prevent concurrent risky operations. `RecoveryState` blocks normal APIs. `workspace_summary` and `inspect` can still surface recovery context. `repair_recovery` and `rollback_recovery` perform metadata-backed repair or rollback for covered operations such as discard, apply incoming, rename, and remote delete, and return typed blockers when the ledger lacks enough state. |
+| Current support | Operation locks prevent concurrent risky operations. `RecoveryState` blocks normal APIs. `workspace_summary` and `inspect` can still surface recovery context. `repair_recovery` and `rollback_recovery` perform metadata-backed repair or rollback for covered operations such as discard, apply incoming, rename, and remote delete, and return typed blockers when the ledger lacks enough state. Both also smudge filtered files (Git LFS) that an interrupted checkout left as the exact pointer `HEAD` stores. |
 | Safety behavior | Draftline avoids pretending the workspace is coherent when an operation may have been interrupted. |
 | Edge cases | `acknowledge_recovery` clears metadata but does not repair or roll back the Git state. Hosts should not present acknowledgment as repair; it can unblock normal APIs while refs and files remain inconsistent. Recovery state is single-slot because only one Draftline risky operation should hold the operation lock at a time. |
 | Records from removed features | Records left by 0.5 milestone merge, squash, or history cleanup are not errors: repair and rollback return `completed: false` with `RepairRecovery` as the only next action, and change nothing. `acknowledge_recovery` (Rust, Tauri `acknowledge_recovery`, client `acknowledgeRecovery`) is the supported exit. Unreadable 0.5 pending-cleanup records are skipped, not reported as errors. |
 | Unpublished 0.5 history cleanups | 0.5 kept these in `<gitdir>/draftline/history-cleanup/pending.json`. `workspace_summary.legacy_history_cleanups` lists them (omitted when empty). `dismiss_legacy_history_cleanup(plan_id)` (client `dismissLegacyHistoryCleanup`) drops the record; it never moves a branch or touches files. The original history stays in the cleanup's backup refs, which are listed as support refs, so the host can bring it back with `restore_support_ref_as_variation`. |
-| Tests | `repair_recovery_finishes_discard_changes`, `repair_recovery_completes_apply_incoming_fast_forward`, `rollback_recovery_restores_deleted_variation`, `repair_remote_delete_recovers_after_visible_ref_was_deleted`, `recovery_records_from_removed_features_still_open_and_can_be_cleared`, `dismissing_an_unpublished_0_5_cleanup_moves_nothing_and_keeps_its_backup`, `unreadable_0_5_cleanup_records_are_skipped`, `tauri_contract_acknowledges_recovery_that_cannot_be_repaired`, and related insufficient-metadata blocker tests. |
+| Tests | `repair_recovery_finishes_discard_changes`, `repair_recovery_completes_apply_incoming_fast_forward`, `rollback_recovery_restores_deleted_variation`, `repair_remote_delete_recovers_after_visible_ref_was_deleted`, `recovery_records_from_removed_features_still_open_and_can_be_cleared`, `dismissing_an_unpublished_0_5_cleanup_moves_nothing_and_keeps_its_backup`, `unreadable_0_5_cleanup_records_are_skipped`, `tauri_contract_acknowledges_recovery_that_cannot_be_repaired`, `recovering_a_switch_killed_before_its_smudge_writes_real_content`, and related insufficient-metadata blocker tests. |
 | Gap | Need broader operation metadata coverage so every interrupted risky operation can either repair, roll back, or explain why manual intervention is required. |
 
 ## Flow 14a: out-of-band Git mutation
