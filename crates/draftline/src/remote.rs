@@ -83,8 +83,10 @@ pub struct OutgoingFile {
 pub enum OutgoingFileKind {
     /// At least the content policy's large-file threshold.
     Large,
-    /// A Git LFS pointer. Draftline's push never uploads LFS objects, so the
-    /// content reaches the remote only if someone ran `git lfs push`.
+    /// A Git LFS pointer. Where Draftline runs the LFS filter (the repository
+    /// configures it and `git` is installed), a push uploads the content
+    /// first, as `git push` would; elsewhere the content reaches the remote
+    /// only if someone runs `git lfs push`.
     LfsPointer,
 }
 

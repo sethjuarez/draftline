@@ -53,6 +53,11 @@ fn code_repo() -> (tempfile::TempDir, git2::Repository) {
         let mut config = repo.config().unwrap();
         config.set_str("user.name", "Dev").unwrap();
         config.set_str("user.email", "dev@example.test").unwrap();
+        // As on a machine without git-lfs, whatever this one has installed;
+        // tests of Git LFS itself opt back in with `install_git_lfs`.
+        for key in ["process", "clean", "smudge"] {
+            config.set_str(&format!("filter.lfs.{key}"), "").unwrap();
+        }
     }
     write_file(temp.path(), "README.md", "# app\n");
     write_file(temp.path(), "src/main.rs", "fn main() {}\n");

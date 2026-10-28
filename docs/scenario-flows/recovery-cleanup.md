@@ -188,7 +188,7 @@ flowchart TD
 | Covered today? | Partially covered. |
 | Current support | Draftline detects binary and large current workspace files in change/preflight reports. Historical diffs do not preserve meaningful `is_large` data. |
 | Safety behavior | Detection gives hosts a chance to warn or block, but Draftline does not enforce asset policy by itself. |
-| Gap | Need a product policy for block/warn/stream/external storage/LFS-like behavior. Standalone projects can reuse the hybrid LFS path (Flow 15i): `filtered_files` detection today, and running `git lfs` when installed once that lands. |
+| Gap | Need a product policy for block/warn/stream/external storage/LFS-like behavior. Standalone projects can reuse the hybrid LFS path (Flow 15i): configured filter drivers such as `git lfs` run through `git` for save, checkout, and push. |
 
 ## Flow 14: recover from interruption or unusual state
 

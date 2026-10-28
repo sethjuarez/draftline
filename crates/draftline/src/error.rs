@@ -184,6 +184,12 @@ pub enum DraftlineError {
     #[error("pull request provider failed: {0}")]
     PullRequest(String),
 
+    /// A configured Git filter driver, such as Git LFS, failed, or `git`
+    /// couldn't run it; the text is Git's own message. Nothing was saved or
+    /// pushed past the point it failed.
+    #[error("a Git filter (such as Git LFS) failed: {0}")]
+    GitFilterFailed(String),
+
     #[error("merge needs a developer: files outside the project conflict: {0:?}")]
     MergeNeedsDeveloper(Vec<std::path::PathBuf>),
 

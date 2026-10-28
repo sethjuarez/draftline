@@ -11,6 +11,7 @@ use git2::{
 };
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::git_cli;
 use crate::merge::{MergeConflict, MergeInput, ResolverRegistry};
 use crate::pull_request::{
     DeveloperCommit, PullRequestProvider, PullRequestRequest, SendPreflight, SendRequest,
@@ -2262,12 +2263,17 @@ impl Workspace {
             .include_ignored(false);
         limit_status_to_scope(&mut options, folder);
         let mut blockers = Vec::new();
-        for entry in self.repo.statuses(Some(&mut options))?.iter() {
+        let statuses = self.repo.statuses(Some(&mut options))?;
+        let filter_clean = self.filter_clean_in_index(&statuses)?;
+        for entry in statuses.iter() {
             let status = entry.status();
             let Ok(path) = entry.path() else {
                 continue;
             };
-            if status == Status::CURRENT || (status == Status::WT_NEW && !policy.tracks(path)?) {
+            if status == Status::CURRENT
+                || (status == Status::WT_NEW && !policy.tracks(path)?)
+                || filter_clean.contains(Path::new(path))
+            {
                 continue;
             }
             blockers.push(PathBuf::from(path));
@@ -3822,10 +3828,56 @@ impl Workspace {
                 }
             }
         }
+        // libgit2 hashes filtered files raw; Git's clean filter decides.
+        let candidates = differing
+            .iter()
+            .filter_map(|path| {
+                let entry = tree.get_path(path).ok()?;
+                (entry.kind() == Some(ObjectType::Blob)).then(|| (path.clone(), entry.id()))
+            })
+            .collect::<Vec<_>>();
+        for path in self.filter_clean(&candidates)? {
+            differing.remove(&path);
+        }
         Ok(paths
             .iter()
             .filter(|path| !differing.contains(*path))
             .cloned()
+            .collect())
+    }
+
+    /// Those of `candidates` (path, stored blob) whose working file Git's
+    /// clean filter turns into exactly that blob, for drivers Draftline runs.
+    /// libgit2 hashes such files raw, so it reports them as changed. Any
+    /// failure just leaves them reported as changed.
+    fn filter_clean(&self, candidates: &[(PathBuf, Oid)]) -> Result<Vec<PathBuf>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runner = FilterRunner::of(&self.repo)?;
+        let mut filtered = Vec::new();
+        for (path, id) in candidates {
+            if self.filter_use(&runner, None, path)? == FilterUse::Runs
+                && fs::symlink_metadata(self.root.join(path)).is_ok_and(|meta| meta.is_file())
+            {
+                filtered.push((path.clone(), *id));
+            }
+        }
+        if filtered.is_empty() {
+            return Ok(Vec::new());
+        }
+        let paths = filtered
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let Ok(ids) = git_cli::clean(&self.root, &paths, false) else {
+            return Ok(Vec::new());
+        };
+        Ok(filtered
+            .into_iter()
+            .zip(ids)
+            .filter(|((_, expected), id)| expected == id)
+            .map(|((path, _), _)| path)
             .collect())
     }
 
@@ -4139,13 +4191,14 @@ impl Workspace {
         limit_status_to_scope(&mut options, self.scope());
 
         let statuses = self.repo.statuses(Some(&mut options))?;
+        let filter_clean = self.filter_clean_in_index(&statuses)?;
         let mut changed = Vec::new();
 
         for entry in statuses.iter() {
             let Ok(path) = entry.path() else {
                 continue;
             };
-            if !self.content_policy.tracks(path)? {
+            if !self.content_policy.tracks(path)? || filter_clean.contains(Path::new(path)) {
                 continue;
             }
 
@@ -4164,6 +4217,29 @@ impl Workspace {
 
         changed.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(changed)
+    }
+
+    /// Paths `statuses` reports as edited only in the working tree that are
+    /// really unchanged: filtered files whose clean output is their index
+    /// entry (see [`Self::filter_clean`]).
+    fn filter_clean_in_index(&self, statuses: &git2::Statuses<'_>) -> Result<HashSet<PathBuf>> {
+        let edited = statuses
+            .iter()
+            .filter(|entry| entry.status() == Status::WT_MODIFIED)
+            .filter_map(|entry| entry.path().ok().map(PathBuf::from))
+            .collect::<Vec<_>>();
+        if edited.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let index = self.repo.index()?;
+        let candidates = edited
+            .into_iter()
+            .filter_map(|path| {
+                let id = index.get_path(&path, 0)?.id;
+                Some((path, id))
+            })
+            .collect::<Vec<_>>();
+        Ok(self.filter_clean(&candidates)?.into_iter().collect())
     }
 
     fn policy_git_diagnostics_unchecked(&self) -> Result<Vec<WorkspaceDiagnostic>> {
@@ -8593,6 +8669,7 @@ impl Workspace {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
         let refspec = format!("refs/heads/{variation}:refs/heads/{variation}");
+        self.upload_filtered_content(remote_name, &format!("refs/heads/{variation}"))?;
         let _timeout_guard = options.server_timeout_guard()?;
         let push_result = {
             let mut push_options = options.push_options_with_expectations(
@@ -8619,6 +8696,11 @@ impl Workspace {
     ) -> Result<()> {
         let mut remote = self.repo.find_remote(remote_name)?;
         ensure_remote_transport_supported(&remote)?;
+        let source = refspec.trim_start_matches('+');
+        let source = source.split_once(':').map_or(source, |(source, _)| source);
+        if !source.is_empty() {
+            self.upload_filtered_content(remote_name, source)?;
+        }
         let _timeout_guard = options.server_timeout_guard()?;
         let push_result = {
             let mut push_options =
@@ -8628,6 +8710,19 @@ impl Workspace {
         options.map_git_result("push_refspec", push_result)?;
 
         Ok(())
+    }
+
+    /// Before a push of `source`, uploads the Git LFS content its commits
+    /// point at that `remote` lacks, as Git's pre-push hook does; otherwise
+    /// the remote would get pointers to content no one can download. Runs
+    /// only where Draftline runs the LFS filter and this repository has LFS
+    /// content; a failed upload refuses the push.
+    fn upload_filtered_content(&self, remote: &str, source: &str) -> Result<()> {
+        if !FilterRunner::of(&self.repo)?.runs("lfs") {
+            return Ok(());
+        }
+        let commit = self.repo.revparse_single(source)?.peel_to_commit()?.id();
+        git_cli::lfs_push(&self.root, remote, commit)
     }
 
     fn remote_advertised_oid(
@@ -10657,12 +10752,67 @@ impl Workspace {
         for path in &removals {
             remove_index_path(&mut index, path)?;
         }
-        for path in &additions {
+        let filtered = self.filtered_additions(&additions)?;
+        for path in additions.iter().filter(|path| !filtered.contains(*path)) {
             index.add_path(path)?;
         }
+        self.add_filtered(&mut index, &filtered)?;
         let affected_paths = removals.into_iter().chain(additions).collect::<Vec<_>>();
 
         Ok((index.write_tree()?, affected_paths))
+    }
+
+    /// The regular files among `additions` whose filter driver Draftline
+    /// runs through `git` (the others were refused already).
+    fn filtered_additions(&self, additions: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        let runner = FilterRunner::of(&self.repo)?;
+        let mut filtered = Vec::new();
+        for path in additions {
+            if self.filter_use(&runner, None, path)? == FilterUse::Runs
+                && fs::symlink_metadata(self.root.join(path)).is_ok_and(|meta| meta.is_file())
+            {
+                filtered.push(path.clone());
+            }
+        }
+        Ok(filtered)
+    }
+
+    /// Stages `paths` as `git add` would, running their clean filters (Git
+    /// LFS stores the content under `.git/lfs` and returns a pointer).
+    fn add_filtered(&self, index: &mut git2::Index, paths: &[PathBuf]) -> Result<()> {
+        let ids = git_cli::clean(&self.root, paths, true)?;
+        // Like `git add`: the file's executable bit counts only where the
+        // repository trusts file modes; elsewhere the staged mode stays.
+        let trust_mode = cfg!(unix)
+            && self
+                .repo
+                .config()?
+                .get_bool("core.filemode")
+                .unwrap_or(true);
+        for (path, id) in paths.iter().zip(ids) {
+            let executable = if trust_mode {
+                is_executable(&self.root.join(path))
+            } else {
+                index
+                    .get_path(path, 0)
+                    .is_some_and(|entry| entry.mode == 0o100755)
+            };
+            index.add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: if executable { 0o100755 } else { 0o100644 },
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id,
+                flags: 0,
+                flags_extended: 0,
+                path: path.to_string_lossy().replace('\\', "/").into_bytes(),
+            })?;
+        }
+        Ok(())
     }
 
     /// Commits `changed_files` on top of HEAD, then syncs only the saved paths
@@ -10709,6 +10859,11 @@ impl Workspace {
         {
             self.restore_index_entries(&affected_paths, previous)?;
             return Err(error);
+        }
+        // Entries for filtered files carry no timestamps, and libgit2 can't
+        // rehash such a file to match them; Git can.
+        if !self.filtered_additions(&affected_paths)?.is_empty() {
+            git_cli::refresh_index(&self.root);
         }
         Ok(version_from_commit(&commit))
     }
@@ -10863,9 +11018,10 @@ impl Workspace {
         target: Option<&Tree<'_>>,
     ) -> Result<Vec<FileHazard>> {
         let attributes = target.map(|tree| self.attributes_of(tree)).transpose()?;
+        let runner = FilterRunner::of(&self.repo)?;
         let mut hazards = Vec::new();
         for path in paths {
-            if self.needs_filter(attributes.as_ref(), path)? {
+            if self.filter_use(&runner, attributes.as_ref(), path)? == FilterUse::Refused {
                 hazards.push(self.filter_hazard(path.clone()));
             }
         }
@@ -10893,43 +11049,75 @@ impl Workspace {
         Ok(repo)
     }
 
-    fn needs_filter(&self, target: Option<&Repository>, path: &Path) -> Result<bool> {
-        if needs_git_filter(&self.repo, path, git2::AttrCheckFlags::FILE_THEN_INDEX)? {
-            return Ok(true);
+    /// How `path` is filtered under the current rules and, for a checkout,
+    /// `target`'s: not at all, by drivers Draftline runs through `git`, or by
+    /// one it can't run (unconfigured, or no `git` here).
+    fn filter_use(
+        &self,
+        runner: &FilterRunner,
+        target: Option<&Repository>,
+        path: &Path,
+    ) -> Result<FilterUse> {
+        let drivers = [
+            git_filter_driver(&self.repo, path, git2::AttrCheckFlags::FILE_THEN_INDEX)?,
+            match target {
+                Some(repo) => git_filter_driver(repo, path, git2::AttrCheckFlags::INDEX_ONLY)?,
+                None => None,
+            },
+        ];
+        let mut found = FilterUse::None;
+        for driver in drivers.into_iter().flatten() {
+            if !runner.runs(&driver) {
+                return Ok(FilterUse::Refused);
+            }
+            found = FilterUse::Runs;
         }
-        match target {
-            Some(repo) => needs_git_filter(repo, path, git2::AttrCheckFlags::INDEX_ONLY),
-            None => Ok(false),
-        }
+        Ok(found)
     }
 
-    /// libgit2 cannot run filter drivers such as Git LFS, so it would write the
-    /// stored pointer text over the real file. Every checkout here aborts while
-    /// planning, before any file is written, if it would update such a path
-    /// under either the current rules or `target`'s.
+    /// libgit2 cannot run filter drivers such as Git LFS, so it writes the
+    /// stored pointer text in place of the real file. A checkout here aborts
+    /// while planning, before any file is written, if it would update a path
+    /// whose driver (under the current rules or `target`'s) Draftline can't
+    /// run; paths whose driver it can run are rewritten through `git` once
+    /// the checkout has written them.
     fn checkout_refusing_filters<'cb>(
         &'cb self,
         mut checkout: CheckoutBuilder<'cb>,
-        refused: &'cb RefCell<Vec<PathBuf>>,
+        plan: &'cb RefCell<FilterPlan>,
         target: &Tree<'_>,
         run: impl FnOnce(&mut CheckoutBuilder<'cb>) -> std::result::Result<(), git2::Error>,
     ) -> Result<()> {
         let attributes = self.attributes_of(target)?;
+        let runner = FilterRunner::of(&self.repo)?;
         checkout
             .notify_on(git2::CheckoutNotificationType::UPDATED)
             .notify(move |_, path, _, file, _| {
                 let Some(path) = path.filter(|_| file.is_some_and(|file| file.exists())) else {
                     return true;
                 };
-                if self.needs_filter(Some(&attributes), path).unwrap_or(true) {
-                    refused.borrow_mut().push(path.to_path_buf());
-                    return false;
+                match self.filter_use(&runner, Some(&attributes), path) {
+                    Ok(FilterUse::None) => true,
+                    Ok(FilterUse::Runs) => {
+                        plan.borrow_mut().smudge.push(path.to_path_buf());
+                        true
+                    }
+                    Ok(FilterUse::Refused) | Err(_) => {
+                        plan.borrow_mut().refused.push(path.to_path_buf());
+                        false
+                    }
                 }
-                true
             });
         let result = run(&mut checkout);
-        let refused = refused.take();
+        let FilterPlan { refused, smudge } = plan.take();
         if refused.is_empty() {
+            // A locked index fails only libgit2's last step, the index
+            // write, so the files are already written.
+            if matches!(&result, Ok(()))
+                || matches!(&result, Err(error) if error.code() == git2::ErrorCode::Locked)
+            {
+                self.smudge_written(target, &smudge);
+            }
             return Ok(result?);
         }
         Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
@@ -10942,6 +11130,92 @@ impl Workspace {
                 .collect(),
             None,
         ))))
+    }
+
+    /// Rewrites the `paths` a checkout just wrote from `target` through their
+    /// smudge filters, then lets Git refresh their index timestamps. Content
+    /// Git can't produce (say, LFS objects it can't download offline) stays
+    /// as the pointer, as with `GIT_LFS_SKIP_SMUDGE`, and shows up in
+    /// `inspect` as missing; the checkout itself still stands.
+    fn smudge_written(&self, target: &Tree<'_>, paths: &[PathBuf]) {
+        let entries = paths
+            .iter()
+            .filter_map(|path| {
+                let entry = target.get_path(path).ok()?;
+                let mode = entry.filemode();
+                (mode == i32::from(git2::FileMode::Blob)
+                    || mode == i32::from(git2::FileMode::BlobExecutable))
+                .then(|| (entry.id(), path.clone()))
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return;
+        }
+        let pointers = entries
+            .iter()
+            .map(|(id, path)| (path.as_path(), *id))
+            .collect::<HashMap<_, _>>();
+        if let Err(error) = git_cli::smudge(&self.root, &entries, |path, content| {
+            let Some(pointer) = pointers.get(path) else {
+                return Ok(());
+            };
+            let pointer = self.repo.find_blob(*pointer)?;
+            self.replace_working_file(path, pointer.content(), content)
+        }) {
+            tracing::warn!(%error, "left Git filter pointers in place of file content");
+        }
+        // The checkout stamped these entries with the pointer's stat, which
+        // Git takes as proof the real file changed. A zero size makes Git
+        // compare content instead, so the refresh restamps them.
+        if let Err(error) = self.forget_index_stat(&entries) {
+            tracing::warn!(%error, "could not mark smudged files for an index refresh");
+        }
+        git_cli::refresh_index(&self.root);
+    }
+
+    fn forget_index_stat(&self, entries: &[(Oid, PathBuf)]) -> Result<()> {
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        let mut changed = false;
+        for (id, path) in entries {
+            let Some(mut entry) = index.get_path(path, 0) else {
+                continue;
+            };
+            if entry.id == *id && entry.file_size != 0 {
+                entry.file_size = 0;
+                entry.mtime = git2::IndexTime::new(0, 0);
+                entry.ctime = git2::IndexTime::new(0, 0);
+                index.add(&entry)?;
+                changed = true;
+            }
+        }
+        if changed {
+            write_index_or_reload(&mut index)?;
+        }
+        Ok(())
+    }
+
+    /// Atomically sets the working file at `path` to `content`, keeping its
+    /// permissions, but only while it still holds `expected` (what the
+    /// checkout wrote): anything else is someone's edit, and stays.
+    fn replace_working_file(&self, path: &Path, expected: &[u8], content: &[u8]) -> Result<()> {
+        let full = self.root.join(path);
+        let metadata = fs::symlink_metadata(&full)?;
+        if !metadata.is_file() || metadata.len() != expected.len() as u64 {
+            return Ok(());
+        }
+        if fs::read(&full)? != expected || expected == content {
+            return Ok(());
+        }
+        let temp = unique_claim_temp(&full);
+        let written = fs::write(&temp, content)
+            .and_then(|()| fs::set_permissions(&temp, metadata.permissions()));
+        if let Err(error) = written {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        replace_file(&temp, &full)?;
+        Ok(())
     }
 
     /// Tracked files in the folder that Git stores through a filter driver, such as
@@ -11022,12 +11296,7 @@ impl Workspace {
             else {
                 continue;
             };
-            let command = |key: &str| {
-                config
-                    .get_string(&format!("filter.{driver}.{key}"))
-                    .is_ok_and(|value| !value.trim().is_empty())
-            };
-            let driver_configured = command("process") || (command("clean") && command("smudge"));
+            let driver_configured = driver_configured(&config, &driver);
             let content_missing = is_lfs_pointer_file(&self.root.join(&path));
             files.push(FilteredFile {
                 path,
@@ -12587,6 +12856,52 @@ fn needs_git_filter(repo: &Repository, path: &Path, flags: git2::AttrCheckFlags)
     Ok(git_filter_driver(repo, path, flags)?.is_some())
 }
 
+/// Whether `config` gives `driver` the commands Git runs: a long-running
+/// `process`, or both `clean` and `smudge`.
+fn driver_configured(config: &git2::Config, driver: &str) -> bool {
+    let command = |key: &str| {
+        config
+            .get_string(&format!("filter.{driver}.{key}"))
+            .is_ok_and(|value| !value.trim().is_empty())
+    };
+    !driver.is_empty() && (command("process") || (command("clean") && command("smudge")))
+}
+
+/// Which filter drivers Draftline can run, through the `git` executable:
+/// those the repository configures, when `git` is available.
+struct FilterRunner {
+    config: git2::Config,
+    git: bool,
+}
+
+impl FilterRunner {
+    fn of(repo: &Repository) -> Result<Self> {
+        Ok(Self {
+            config: repo.config()?.snapshot()?,
+            git: git_cli::available(),
+        })
+    }
+
+    fn runs(&self, driver: &str) -> bool {
+        self.git && driver_configured(&self.config, driver)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterUse {
+    None,
+    Runs,
+    Refused,
+}
+
+/// What a checkout's planning found: paths to refuse, and paths to rewrite
+/// through their filters once it has written them.
+#[derive(Default)]
+struct FilterPlan {
+    refused: Vec<PathBuf>,
+    smudge: Vec<PathBuf>,
+}
+
 /// The filter driver Git would run for `path`, if any.
 fn git_filter_driver(
     repo: &Repository,
@@ -12763,6 +13078,20 @@ fn ensure_plain_or_missing(path: &Path) -> Result<()> {
         Ok(_) => Err(not_a_plain_folder(path)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether the file at `path` has an executable bit set (never on Windows).
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
     }
 }
 
