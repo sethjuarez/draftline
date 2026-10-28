@@ -18181,13 +18181,13 @@ mod tests {
         let head = workspace.repo.path().join("HEAD.lock");
         fs::write(&head, "").unwrap();
         let mut claim = RefLockClaim::new(vec![head.clone()]);
-        claim.process_id = 4242;
+        claim.process_id = u32::MAX - 1;
         std::mem::forget(claim.write(workspace.ref_lock_claim_path()).unwrap());
         claim.record_identities();
         let metadata = OperationLockMetadata {
             operation_id: "old-op".to_string(),
             operation: "save_version".to_string(),
-            process_id: 4242,
+            process_id: u32::MAX - 1,
             owner: None,
             created_at_seconds: 1,
             host: Some("elsewhere".to_string()),
