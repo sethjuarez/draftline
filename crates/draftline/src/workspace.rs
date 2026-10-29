@@ -580,7 +580,8 @@ pub enum FolderFix {
     ManageHere,
     /// Open the folder Draftline already manages.
     OpenManagedFolder { folder: PathBuf },
-    /// Manage `folder` instead: a commit renamed the managed folder there.
+    /// Manage `folder` instead: a commit renamed the managed folder there, or
+    /// moved the managed repository root's content into it.
     ManageRenamedFolder { folder: PathBuf },
     /// Move the managed folder to the requested path, as a save.
     MoveFolderHere { from: PathBuf },
@@ -2104,9 +2105,43 @@ impl Workspace {
         if !self.claimed_folder_missing(&folder)? {
             if owner == mine {
                 probe.suggestions = vec![suggest(FolderFix::Open, "Open")];
+                // A commit moved the root's content into a folder, by hand.
+                if let Some(moved) = self.root_moved_into(&folder)? {
+                    let offered = Self::located_in(
+                        &self.root.join(&moved),
+                        ContentPolicy::default(),
+                        self.variation_namespace.clone(),
+                    )?
+                    .map(|there| there.probe_located(self.root.join(&moved)))
+                    .transpose()?
+                    .is_some_and(|there| {
+                        there
+                            .suggestions
+                            .first()
+                            .is_some_and(|s| s.fix == FolderFix::ManageHere)
+                    });
+                    if offered {
+                        let moved_label = folder_label(&moved);
+                        probe.detail = Some(format!(
+                            "A commit moved the repository's content into {moved_label}."
+                        ));
+                        // Opening the root stays first: it loses nothing, and
+                        // the host may have chosen to keep it before.
+                        probe.suggestions.push(suggest(
+                            FolderFix::ManageRenamedFolder { folder: moved },
+                            &format!("Manage {moved_label} instead (the content was moved there)"),
+                        ));
+                    }
+                }
             } else {
                 probe.state = FolderState::ManagedElsewhere;
                 probe.detail = Some(format!("Draftline manages {label} in this repository."));
+                if self.root_moved_into(&folder)?.as_deref() == Some(self.scope()) {
+                    probe.suggestions.push(suggest(
+                        FolderFix::ManageHere,
+                        "Manage this folder (the repository's content was moved here)",
+                    ));
+                }
                 probe.suggestions.push(suggest(
                     FolderFix::OpenManagedFolder {
                         folder: folder.clone(),
@@ -2257,6 +2292,62 @@ impl Workspace {
                 .filter(|target| self.root.join(target).is_dir()));
         }
         Ok(None)
+    }
+
+    /// Where a commit on the current branch moved the content of `folder`,
+    /// when it is the root, into one new folder by hand: every entry but
+    /// [`REPOSITORY_FILES`] left the root, and every file reappears at the same
+    /// path under one folder that is still checked out here. Only commits whose
+    /// parent still names the root in [`FOLDER_MARKER`] count, and none while
+    /// the root has uncommitted changes outside that folder, which managing it
+    /// would leave behind.
+    fn root_moved_into(&self, folder: &Path) -> Result<Option<PathBuf>> {
+        const MAX_COMMITS: usize = 500;
+        if !folder.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let Ok(mut commit) = self.repo.head().and_then(|head| head.peel_to_commit()) else {
+            return Ok(None);
+        };
+        let head_tree = commit.tree()?;
+        for _ in 0..MAX_COMMITS {
+            let Ok(parent) = commit.parent(0) else {
+                return Ok(None);
+            };
+            let before = parent.tree()?;
+            if tree_marker_folder(&self.repo, &before).as_deref() != Some(Path::new("")) {
+                return Ok(None);
+            }
+            if let Some(target) = root_move_target(&before, &commit.tree()?)? {
+                if !tracks_folder(&head_tree, &target)
+                    || !self.root.join(&target).is_dir()
+                    || self.changes_outside(&target)?
+                {
+                    return Ok(None);
+                }
+                return Ok(Some(target));
+            }
+            commit = parent;
+        }
+        Ok(None)
+    }
+
+    /// Whether the working tree has staged, edited, deleted or new files
+    /// outside `folder` (other than [`FOLDER_MARKER`]); ignored files don't count.
+    fn changes_outside(&self, folder: &Path) -> Result<bool> {
+        let mut options = StatusOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(false);
+        let statuses = self.repo.statuses(Some(&mut options))?;
+        Ok(statuses.iter().any(|entry| {
+            entry.status() != Status::CURRENT
+                && entry.path().is_ok_and(|path| {
+                    let path = Path::new(path);
+                    path != Path::new(FOLDER_MARKER) && !path.starts_with(folder)
+                })
+        }))
     }
 
     /// Files under `folder` a move would lose or split from Git's index:
@@ -15023,6 +15114,54 @@ fn tracks_folder(tree: &Tree<'_>, folder: &Path) -> bool {
         || tree
             .get_path(folder)
             .is_ok_and(|entry| entry.kind() == Some(ObjectType::Tree))
+}
+
+/// The new folder `after` moved all of `before`'s root content into, at the
+/// same paths. Cheap unless every one of the root's own entries is gone.
+fn root_move_target(before: &Tree<'_>, after: &Tree<'_>) -> Result<Option<PathBuf>> {
+    let own: Vec<String> = before
+        .iter()
+        .filter(|entry| !is_repository_file(entry.name_bytes()))
+        .map(|entry| String::from_utf8_lossy(entry.name_bytes()).into_owned())
+        .collect();
+    let gone = own
+        .iter()
+        .filter(|name| after.get_name(name).is_none())
+        .count();
+    let added: Vec<String> = after
+        .iter()
+        .filter(|entry| entry.kind() == Some(ObjectType::Tree))
+        .map(|entry| String::from_utf8_lossy(entry.name_bytes()).into_owned())
+        .filter(|name| before.get_name(name).is_none())
+        .collect();
+    if own.is_empty() || gone < own.len() || added.is_empty() {
+        return Ok(None);
+    }
+    let content: HashSet<PathBuf> = tracked_paths_under(before, Path::new(""))?
+        .into_iter()
+        .filter(|path| !is_repository_path(path))
+        .collect();
+    if content.is_empty() {
+        return Ok(None);
+    }
+    let mut targets: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    for top in &added {
+        for path in tracked_paths_under(after, Path::new(top))? {
+            let parts: Vec<_> = path.components().collect();
+            for split in 1..parts.len() {
+                let rest: PathBuf = parts[split..].iter().collect();
+                if content.contains(&rest) {
+                    let prefix: PathBuf = parts[..split].iter().collect();
+                    *targets.entry(prefix).or_default() += 1;
+                }
+            }
+        }
+    }
+    Ok(targets
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .filter(|(_, count)| *count >= content.len())
+        .map(|(target, _)| target))
 }
 
 fn tracked_paths_under(tree: &Tree<'_>, prefix: &Path) -> Result<Vec<PathBuf>> {

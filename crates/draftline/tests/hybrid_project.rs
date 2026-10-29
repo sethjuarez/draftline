@@ -4397,6 +4397,149 @@ fn a_deleted_folder_is_not_mistaken_for_a_rename() {
 }
 
 #[test]
+fn a_root_folder_a_developer_moved_into_a_subfolder_is_offered_there() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut options = git2::RepositoryInitOptions::new();
+    options.initial_head("main");
+    let repo = git2::Repository::init_opts(temp.path(), &options).unwrap();
+    write_file(temp.path(), "intro.sk", "scene one\n");
+    write_file(temp.path(), "notes.md", "first\n");
+    let root = Workspace::init_with_policy(temp.path(), cutready_policy()).unwrap();
+    let first = root.save_version("First").unwrap();
+    write_file(temp.path(), "notes.md", "second\n");
+    root.save_version("Second").unwrap();
+    drop(root);
+
+    // Code added beside the content isn't a move.
+    write_file(temp.path(), "tools/build.rs", "// build\n");
+    commit_all(&repo, "Dev: tooling");
+    let probe = Workspace::probe(temp.path()).unwrap();
+    assert_eq!(probe.suggestions.len(), 1, "{probe:?}");
+    assert_eq!(probe.suggestions[0].fix, FolderFix::Open);
+
+    // `mkdir cutready; mv <everything but .git and .draftline> cutready/`,
+    // then code at the root and one commit, leaving `.draftline` naming the root.
+    fs::create_dir_all(temp.path().join("cutready")).unwrap();
+    for name in ["intro.sk", "notes.md", "tools"] {
+        fs::rename(
+            temp.path().join(name),
+            temp.path().join("cutready").join(name),
+        )
+        .unwrap();
+    }
+    write_file(temp.path(), "src/app.rs", "fn main() {}\n");
+    write_file(temp.path(), "README.md", "# app\n");
+    let mut index = repo.index().unwrap();
+    index.update_all(["*"], None).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: move the deck aside");
+    write_file(temp.path(), "src/later.rs", "// later\n");
+    commit_all(&repo, "Dev: later work");
+
+    let cutready = PathBuf::from("cutready");
+    let follow = FolderFix::ManageRenamedFolder {
+        folder: cutready.clone(),
+    };
+    let probe = Workspace::probe_with_namespace(temp.path(), "cutready/").unwrap();
+    assert_eq!(probe.state, FolderState::Ready, "the root still opens");
+    assert_eq!(probe.suggestions[0].fix, FolderFix::Open, "{probe:?}");
+    assert_eq!(probe.suggestions[1].fix, follow, "{probe:?}");
+    assert!(probe.detail.as_deref().unwrap().contains("cutready"));
+
+    // Managing the folder would leave an edit at the root behind.
+    write_file(temp.path(), "src/app.rs", "fn main() { todo!() }\n");
+    let busy = Workspace::probe_with_namespace(temp.path(), "cutready/").unwrap();
+    assert_eq!(busy.suggestions.len(), 1, "{busy:?}");
+    let busy = Workspace::probe_with_namespace(temp.path().join("cutready"), "cutready/").unwrap();
+    assert_ne!(busy.suggestions[0].fix, FolderFix::ManageHere, "{busy:?}");
+    write_file(temp.path(), "src/app.rs", "fn main() {}\n");
+
+    let there = Workspace::probe_with_namespace(temp.path().join("cutready"), "cutready/").unwrap();
+    assert_eq!(there.state, FolderState::ManagedElsewhere);
+    assert_eq!(there.suggestions[0].fix, FolderFix::ManageHere, "{there:?}");
+    assert!(there.suggestions[0].label.contains("moved here"));
+    // The content is already there, so moving the root onto it is refused.
+    let move_here = FolderFix::MoveFolderHere {
+        from: PathBuf::new(),
+    };
+    assert!(!there.suggestions.iter().any(|s| s.fix == move_here));
+    let error = refused(Workspace::apply_folder_fix_with_namespace(
+        temp.path().join("cutready"),
+        cutready_policy(),
+        "cutready/",
+        &move_here,
+    ));
+    assert!(
+        matches!(error, DraftlineError::FolderFixUnavailable(_)),
+        "{error:?}"
+    );
+
+    let workspace = Workspace::apply_folder_fix_with_namespace(
+        temp.path(),
+        cutready_policy(),
+        "cutready/",
+        &follow,
+    )
+    .unwrap();
+    assert_eq!(workspace.scope(), cutready.as_path());
+    assert_eq!(read(temp.path(), "cutready/notes.md"), "second\n");
+    assert_eq!(read(temp.path(), "src/app.rs"), "fn main() {}\n");
+    let labels: Vec<_> = workspace
+        .versions()
+        .unwrap()
+        .into_iter()
+        .map(|v| v.label)
+        .collect();
+    assert!(labels.contains(&"First".to_string()), "{labels:?}");
+    workspace
+        .restore_version_as_new_save(first.id(), "Back")
+        .unwrap();
+    assert_eq!(read(temp.path(), "cutready/notes.md"), "first\n");
+    assert_eq!(read(temp.path(), "src/app.rs"), "fn main() {}\n");
+    assert!(!temp.path().join("notes.md").exists());
+
+    let after = Workspace::probe(temp.path()).unwrap();
+    assert_eq!(after.state, FolderState::ManagedElsewhere, "{after:?}");
+    assert!(!after
+        .suggestions
+        .iter()
+        .any(|s| matches!(s.fix, FolderFix::ManageRenamedFolder { .. })));
+}
+
+#[test]
+fn moving_part_of_a_root_folder_is_not_mistaken_for_moving_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut options = git2::RepositoryInitOptions::new();
+    options.initial_head("main");
+    let repo = git2::Repository::init_opts(temp.path(), &options).unwrap();
+    write_file(temp.path(), "intro.sk", "scene one\n");
+    write_file(temp.path(), "outro.sk", "the end\n");
+    write_file(temp.path(), "notes.md", "notes\n");
+    let root = Workspace::init_with_policy(temp.path(), cutready_policy()).unwrap();
+    root.save_version("First").unwrap();
+    drop(root);
+
+    // Two of three files go into `deck/`; `notes.md` stays at the root.
+    fs::create_dir_all(temp.path().join("deck")).unwrap();
+    for name in ["intro.sk", "outro.sk"] {
+        fs::rename(temp.path().join(name), temp.path().join("deck").join(name)).unwrap();
+    }
+    let mut index = repo.index().unwrap();
+    index.update_all(["*"], None).unwrap();
+    index.write().unwrap();
+    commit_all(&repo, "Dev: group the scenes");
+
+    let probe = Workspace::probe(temp.path()).unwrap();
+    assert_eq!(probe.suggestions.len(), 1, "{probe:?}");
+    let there = Workspace::probe(temp.path().join("deck")).unwrap();
+    assert_eq!(there.state, FolderState::ManagedElsewhere);
+    assert!(!there
+        .suggestions
+        .iter()
+        .any(|s| s.fix == FolderFix::ManageHere));
+}
+
+#[test]
 fn a_branch_without_the_folder_reports_it_missing_but_can_switch_back() {
     let (temp, repo) = code_repo();
     let pitch = scoped(&temp);
