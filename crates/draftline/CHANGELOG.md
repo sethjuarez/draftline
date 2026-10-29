@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/sethjuarez/draftline/compare/draftline-v0.10.0...draftline-v0.10.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* **workspace:** offer the folder a developer moved the root's content into ([#64](https://github.com/sethjuarez/draftline/issues/64)) ([62bb5f5](https://github.com/sethjuarez/draftline/commit/62bb5f5e3aa80b37c0250febaed6d5a1b903584b))
+
 ## [0.10.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.9.0...draftline-v0.10.0) (2026-10-28)
 
 
