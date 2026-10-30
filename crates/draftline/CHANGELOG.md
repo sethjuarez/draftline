@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.2](https://github.com/sethjuarez/draftline/compare/draftline-v0.10.1...draftline-v0.10.2) (2026-10-30)
+
+
+### Bug Fixes
+
+* **workspace:** wait out a running operation instead of reporting recovery_required ([#66](https://github.com/sethjuarez/draftline/issues/66)) ([66b9fd0](https://github.com/sethjuarez/draftline/commit/66b9fd0ff8c1db7056acc923043b6145ef1d78bb))
+
 ## [0.10.1](https://github.com/sethjuarez/draftline/compare/draftline-v0.10.0...draftline-v0.10.1) (2026-10-29)
 
 
