@@ -335,7 +335,8 @@ pub struct WorkspaceSummary {
     pub is_dirty: bool,
     /// Incomplete operation state if a prior Draftline operation was interrupted.
     pub recovery: Option<crate::RecoveryState>,
-    /// `true` when a pending recovery means `versions` and `dirty_files` may
+    /// `true` when a pending recovery, or an operation still running after the
+    /// read waited for it, means `versions` and `dirty_files` may
     /// describe two different Git states simultaneously and should not be
     /// rendered as a coherent history view.
     pub state_may_be_inconsistent: bool,
@@ -3254,8 +3255,32 @@ impl Workspace {
         )
     }
 
-    /// Returns incomplete recovery state, if a prior operation was interrupted.
+    /// Returns the unfinished record a crashed or failed operation left, if
+    /// any. A running operation's record (another thread or process holds a
+    /// live lock) isn't one: it is waited out for up to two seconds, and
+    /// reported as `None` if the operation is still running.
     pub fn recovery_state(&self) -> Result<Option<RecoveryState>> {
+        match self.abandoned_recovery_state() {
+            Err(DraftlineError::WorkspaceLocked) => Ok(None),
+            result => result,
+        }
+    }
+
+    /// The recovery record a snapshot reports, and whether its state may be
+    /// inconsistent: an abandoned record, or an operation still running.
+    fn recovery_for_snapshot(&self) -> Result<(Option<RecoveryState>, bool)> {
+        match self.abandoned_recovery_state() {
+            Err(DraftlineError::WorkspaceLocked) => Ok((None, true)),
+            Ok(recovery) => {
+                let inconsistent = recovery.is_some();
+                Ok((recovery, inconsistent))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The incomplete record on disk, whether or not its operation is running.
+    fn recorded_recovery_state(&self) -> Result<Option<RecoveryState>> {
         let path = self.ledger_path();
         if !path.exists() {
             return Ok(None);
@@ -6822,7 +6847,7 @@ impl Workspace {
     /// # Ok::<(), draftline::DraftlineError>(())
     /// ```
     pub fn workspace_summary(&self) -> Result<WorkspaceSummary> {
-        let recovery = self.recovery_state()?;
+        let (recovery, state_may_be_inconsistent) = self.recovery_for_snapshot()?;
         let variations = self.variations_unchecked().unwrap_or_default();
         let active_variation = variations
             .iter()
@@ -6842,7 +6867,6 @@ impl Workspace {
         let versions = self.versions_unchecked().unwrap_or_default();
         let dirty_files = self.changed_files_unchecked().unwrap_or_default();
         let is_dirty = !dirty_files.is_empty();
-        let state_may_be_inconsistent = recovery.is_some();
         let legacy_history_cleanups = self.legacy_history_cleanups().unwrap_or_default();
 
         Ok(WorkspaceSummary {
@@ -6957,8 +6981,7 @@ impl Workspace {
     /// should render recovery UI and avoid offering mutation actions until the
     /// recovery is repaired, rolled back, or acknowledged.
     pub fn workspace_graph(&self, options: WorkspaceGraphOptions) -> Result<WorkspaceGraph> {
-        let recovery = self.recovery_state()?;
-        let state_may_be_inconsistent = recovery.is_some();
+        let (recovery, state_may_be_inconsistent) = self.recovery_for_snapshot()?;
         let current_variation = self
             .current_variation_unchecked()
             .ok()
@@ -7140,8 +7163,7 @@ impl Workspace {
                 "refs-only graph requests do not accept limit or cursor".to_string(),
             ));
         }
-        let recovery = self.recovery_state()?;
-        let state_may_be_inconsistent = recovery.is_some();
+        let (recovery, state_may_be_inconsistent) = self.recovery_for_snapshot()?;
         let current_variation = self
             .current_variation_unchecked()
             .ok()
@@ -10460,11 +10482,14 @@ impl Workspace {
             checkout,
         };
         fs::write(self.ledger_path(), serde_json::to_vec_pretty(&ledger)?)?;
-        crate::fault::point(if state.completed {
-            "recovery_completed"
-        } else {
-            "recovery_recorded"
-        });
+        test_hooks::fire(
+            if state.completed {
+                "recovery_completed"
+            } else {
+                "recovery_recorded"
+            },
+            self.repo.path(),
+        );
         if state.completed && matches!(&state.operation, RecoveryOperation::DeleteRemoteVariation) {
             match fs::remove_file(self.remote_delete_recovery_metadata_path(&state.operation_id)) {
                 Ok(()) => {}
@@ -10790,12 +10815,60 @@ impl Workspace {
     }
 
     fn ensure_no_pending_recovery_in_checkout(&self) -> Result<()> {
-        self.ensure_recovery_is_ours()?;
-        if let Some(state) = self.recovery_state()? {
+        if let Some(state) = self.abandoned_recovery_state()? {
+            self.ensure_recovery_is_ours()?;
             return Err(DraftlineError::RecoveryRequired(Box::new(state)));
         }
-
         Ok(())
+    }
+
+    /// The unfinished record of an operation that is gone. One belonging to
+    /// a running operation (another thread or process holds a live lock) is
+    /// waited out for up to [`OPERATION_BUSY_WAIT`], then reported as
+    /// [`DraftlineError::WorkspaceLocked`], never as needing recovery.
+    fn abandoned_recovery_state(&self) -> Result<Option<RecoveryState>> {
+        let deadline = std::time::Instant::now() + OPERATION_BUSY_WAIT;
+        loop {
+            let first = self.recorded_recovery_state();
+            if matches!(first, Ok(None)) {
+                return Ok(None);
+            }
+            if self.operation_running_elsewhere() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(DraftlineError::WorkspaceLocked);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                continue;
+            }
+            let Some(first) = first? else {
+                return Ok(None);
+            };
+            // Operations hold the lock for as long as their record is
+            // unfinished, so a record unfinished both before and after the
+            // lock was seen free was left by an operation that is gone.
+            match self.recorded_recovery_state()? {
+                None => return Ok(None),
+                Some(state) if state.operation_id == first.operation_id => {
+                    return Ok(Some(state));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// Whether another operation, in this process or another, holds the
+    /// operation lock now. The lock this thread holds doesn't count, nor does
+    /// a stale or unreadable one: neither belongs to a running operation.
+    fn operation_running_elsewhere(&self) -> bool {
+        let path = self.lock_path();
+        if OperationLock::held_by_this_thread(&path) {
+            return false;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            return false;
+        };
+        serde_json::from_slice::<OperationLockMetadata>(&bytes)
+            .is_ok_and(|metadata| !operation_lock_metadata_is_stale(&metadata))
     }
 
     /// Folders in one checkout share its branch, so one folder's unfinished
@@ -15226,6 +15299,8 @@ fn unique_claim_temp(path: &Path) -> PathBuf {
 struct OperationLock {
     path: PathBuf,
     _fault: crate::fault::Operation,
+    /// The lock is registered with the thread that took it, so it stays there.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl OperationLock {
@@ -15252,18 +15327,41 @@ impl OperationLock {
             return Err(error.into());
         }
 
+        HELD_OPERATION_LOCKS.with(|held| held.borrow_mut().push(path.to_path_buf()));
         Ok(Self {
             path: path.to_path_buf(),
             _fault: crate::fault::operation(&metadata.operation),
+            _not_send: std::marker::PhantomData,
         })
+    }
+
+    fn held_by_this_thread(path: &Path) -> bool {
+        HELD_OPERATION_LOCKS.with(|held| held.borrow().iter().any(|held| held == path))
     }
 }
 
 impl Drop for OperationLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+        HELD_OPERATION_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(index) = held.iter().position(|held| *held == self.path) {
+                held.remove(index);
+            }
+        });
     }
 }
+
+thread_local! {
+    /// Operation locks this thread holds, so a check made inside an operation
+    /// doesn't mistake its own lock for another, running operation's.
+    static HELD_OPERATION_LOCKS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How long a call waits for another running operation to finish its
+/// unfinished record before reporting [`DraftlineError::WorkspaceLocked`].
+const OPERATION_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Lets unit tests run Git between two steps of an operation, to force
 /// interleavings that real timing only hits by chance.
@@ -17591,6 +17689,119 @@ mod tests {
 
         workspace.acknowledge_recovery().unwrap();
         assert!(workspace.changes().is_ok());
+    }
+
+    fn workspace_with_alternate() -> (tempfile::TempDir, Workspace, Variation) {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        let variation = workspace.create_variation("alternate").unwrap();
+        (temp, workspace, variation)
+    }
+
+    /// Reads the folder's changes from another thread, as a host's refresh
+    /// does while an operation runs.
+    fn read_changes_elsewhere(root: PathBuf) -> std::thread::JoinHandle<Result<usize>> {
+        std::thread::spawn(move || Ok(Workspace::open(root)?.changes()?.files.len()))
+    }
+
+    #[test]
+    fn a_read_during_a_running_switch_waits_for_it_instead_of_asking_for_recovery() {
+        let (_temp, workspace, variation) = workspace_with_alternate();
+        let root = workspace.root().to_path_buf();
+        let reader = Arc::new(std::sync::Mutex::new(None));
+        let slot = reader.clone();
+        test_hooks::once("recovery_recorded", move |_| {
+            *slot.lock().unwrap() = Some(read_changes_elsewhere(root.clone()));
+            // The read finds the unfinished record while this switch runs.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+
+        workspace
+            .switch_variation(variation.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+
+        let read = reader.lock().unwrap().take().unwrap().join().unwrap();
+        assert_eq!(read.unwrap(), 0);
+        assert_eq!(workspace.current_variation().unwrap(), "alternate");
+    }
+
+    #[test]
+    fn a_read_reports_workspace_locked_when_a_running_operation_outlasts_its_wait() {
+        let (_temp, workspace, variation) = workspace_with_alternate();
+        let root = workspace.root().to_path_buf();
+        type Snapshot = (Option<RecoveryState>, bool);
+        let reads = Arc::new(std::sync::Mutex::new(None));
+        let slot = reads.clone();
+        test_hooks::once("recovery_recorded", move |_| {
+            let changes = read_changes_elsewhere(root.clone());
+            let summary_root = root.clone();
+            let summary = std::thread::spawn(move || -> Result<Snapshot> {
+                let summary = Workspace::open(summary_root)?.workspace_summary()?;
+                Ok((summary.recovery, summary.state_may_be_inconsistent))
+            });
+            let state_root = root.clone();
+            let state = std::thread::spawn(move || Workspace::open(state_root)?.recovery_state());
+            *slot.lock().unwrap() = Some((
+                changes.join().unwrap(),
+                summary.join().unwrap(),
+                state.join().unwrap(),
+            ));
+        });
+
+        workspace
+            .switch_variation(variation.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+
+        let (changes, summary, state) = reads.lock().unwrap().take().unwrap();
+        let error = changes.unwrap_err();
+        assert!(
+            matches!(error, DraftlineError::WorkspaceLocked),
+            "{error:?}"
+        );
+        assert_eq!(summary.unwrap(), (None, true));
+        assert_eq!(state.unwrap(), None);
+        assert!(workspace.changes().is_ok());
+    }
+
+    #[test]
+    fn an_unfinished_record_beside_a_dead_holders_lock_still_needs_recovery() {
+        let (_temp, workspace, _) = workspace_with_alternate();
+        let mut child = std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: "crashed".to_string(),
+                operation: RecoveryOperation::SwitchVariation,
+                original_variation: Some("main".to_string()),
+                target: Some("alternate".to_string()),
+                completed: false,
+            })
+            .unwrap();
+        let metadata = OperationLockMetadata {
+            process_id: dead,
+            ..new_operation_lock_metadata("switch_variation")
+        };
+        fs::write(
+            workspace.lock_path(),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+
+        let error = workspace.changes().unwrap_err();
+
+        assert!(
+            matches!(error, DraftlineError::RecoveryRequired(_)),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < OPERATION_BUSY_WAIT);
     }
 
     #[test]
