@@ -8,6 +8,7 @@ import {
   type DraftlineInvoke,
   type MergeIncomingReport,
   type VariationRenameToken,
+  type Version,
   type WorkspaceDiagnostics,
 } from '../src/index';
 
@@ -657,6 +658,75 @@ describe('createDraftlineClient', () => {
         path: 'post.md',
       },
     ]);
+  });
+
+  it('routes per-path history requests to get_path_history', async () => {
+    const invoke = vi.fn<DraftlineInvoke>(async () => ({ ok: true }) as never);
+    const client = createDraftlineClient({ invoke });
+    const facade = createDraftlineHostFacade({ client, workspacePath: 'C:\\repo' });
+
+    await facade.pathHistory(['deck/plan.sk']);
+    await facade.pathHistory(['deck/plan.sk', 'deck/images'], {
+      all_variations: true,
+      limit: 20,
+      cursor: 20,
+    });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'get_path_history', {
+      request: { workspace_path: 'C:\\repo', paths: ['deck/plan.sk'], options: undefined },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, 'get_path_history', {
+      request: {
+        workspace_path: 'C:\\repo',
+        paths: ['deck/plan.sk', 'deck/images'],
+        options: { all_variations: true, limit: 20, cursor: 20 },
+      },
+    });
+  });
+
+  it('routes path restores to restore_version_paths_as_new_save', async () => {
+    const invoke = vi.fn<DraftlineInvoke>(async () => ({ ok: true }) as never);
+    const client = createDraftlineClient({ invoke });
+    const facade = createDraftlineHostFacade({ client, workspacePath: 'C:\\repo' });
+    const versionId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+    await facade.restorePathsAsNewSave(
+      versionId,
+      ['deck/plan.sk', 'deck/images'],
+      'Restore plan\n\nFirst draft read better',
+    );
+
+    expect(invoke).toHaveBeenCalledWith('restore_version_paths_as_new_save', {
+      request: {
+        workspace_path: 'C:\\repo',
+        version_id: versionId,
+        paths: ['deck/plan.sk', 'deck/images'],
+        label: 'Restore plan\n\nFirst draft read better',
+      },
+    });
+  });
+
+  it('passes a multi-line label through so its body becomes the version comment', async () => {
+    const saved: Version = {
+      id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      label: 'Tighten intro',
+      author: { name: 'Ana', email: 'ana@example.com' },
+      saved_by: { name: 'Ana', email: 'ana@example.com' },
+      time_seconds: 1,
+      comment: 'Shorter hook.',
+    };
+    const invoke = vi.fn<DraftlineInvoke>(async () => ({ version: saved }) as never);
+    const facade = createDraftlineHostFacade({
+      client: createDraftlineClient({ invoke }),
+      workspacePath: 'C:\\repo',
+    });
+
+    const result = await facade.save('Tighten intro\n\nShorter hook.');
+
+    expect(invoke).toHaveBeenCalledWith('save', {
+      request: { workspace_path: 'C:\\repo', label: 'Tighten intro\n\nShorter hook.' },
+    });
+    expect(result.version.comment).toBe('Shorter hook.');
   });
 
   it('subscribes to the stable Draftline workspace event channel', async () => {

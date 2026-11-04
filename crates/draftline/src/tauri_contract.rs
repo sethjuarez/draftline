@@ -13,18 +13,18 @@ use crate::{
     ChangeSet, ContentPolicy, ContentPolicyAudit, ContributorProfile, CurrentFileDiff,
     CurrentFilePreview, DirtySummary, DraftlineError, FilteredFile, FolderFix, FolderMove,
     FolderProbe, HistoryEntry, MergeConflictResolution, MergeIncomingReport, MergeIncomingResult,
-    MergeIncomingToken, MergeResolutionChoice, OperationLockInspection, PreflightReport,
-    PreviewFile, PublishPreflight, PublishResult, RecoveryRepairResult, RecoveryState,
-    RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVariation,
-    RemoteVariationDiagnostics, RestoreVersionTarget, Result, Shelf, ShelfApplyReport, SupportRef,
-    SupportRefScope, SwitchPolicy, SyncState, SyncStatus, Variation, VariationCreatePreflight,
-    VariationCreateToken, VariationId, VariationMetadata, VariationRenamePreflight,
-    VariationRenameToken, VariationSummary, Version, VersionDiff, VersionId, VersionPreview,
-    Workspace, WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary,
-    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail,
-    WorkspaceGraphOptions, WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRefs,
-    WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection,
-    WorkspaceSummary, WorkspaceVerification,
+    MergeIncomingToken, MergeResolutionChoice, OperationLockInspection, PathHistory,
+    PathHistoryOptions, PreflightReport, PreviewFile, PublishPreflight, PublishResult,
+    RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
+    RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result,
+    Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SwitchPolicy, SyncState, SyncStatus,
+    Variation, VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
+    VariationRenamePreflight, VariationRenameToken, VariationSummary, Version, VersionDiff,
+    VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
+    WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
+    WorkspaceGraphNodeDetail, WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
+    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
+    WorkspaceId, WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -240,6 +240,15 @@ pub struct WorkspaceGraphRequest {
     pub options: WorkspaceGraphOptions,
 }
 
+/// Request for the versions that changed some repository-relative paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathHistoryRequest {
+    pub workspace_path: PathBuf,
+    pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub options: PathHistoryOptions,
+}
+
 /// Request for a compressed graph-ready workspace overview.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceGraphOverviewRequest {
@@ -398,6 +407,16 @@ pub struct DiffVersionsRequest {
 pub struct RestoreVersionRequest {
     pub workspace_path: PathBuf,
     pub version_id: String,
+    pub label: String,
+}
+
+/// Request for restoring selected repository-relative paths from one saved
+/// version as a new save. `label` is the full commit message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreVersionPathsRequest {
+    pub workspace_path: PathBuf,
+    pub version_id: String,
+    pub paths: Vec<PathBuf>,
     pub label: String,
 }
 
@@ -1230,6 +1249,23 @@ pub fn get_full_history_with_context(
         .full_history()
 }
 
+/// Returns the versions that changed any of the given paths, newest first.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_path_history(request: PathHistoryRequest) -> Result<PathHistory> {
+    get_path_history_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Returns per-path history using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn get_path_history_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: PathHistoryRequest,
+) -> Result<PathHistory> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .path_history(request.paths, request.options)
+}
+
 /// Returns a graph-ready full-history snapshot over Draftline variations.
 #[tracing::instrument(
     err,
@@ -1682,6 +1718,48 @@ pub fn restore_version_as_new_save_with_context(
         workspace.restore_version_as_new_save_with_profile(&version_id, request.label, profile)?
     } else {
         workspace.restore_version_as_new_save(&version_id, request.label)?
+    };
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(RestoreVersionResult {
+        version,
+        postconditions: collect_postconditions(&workspace, true),
+    })
+}
+
+/// Restores selected paths from a saved version as a new save.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn restore_version_paths_as_new_save(
+    request: RestoreVersionPathsRequest,
+) -> Result<RestoreVersionResult> {
+    restore_version_paths_as_new_save_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Restores selected paths from a saved version as a new save using a
+/// configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn restore_version_paths_as_new_save_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: RestoreVersionPathsRequest,
+) -> Result<RestoreVersionResult> {
+    let version_id = parse_version_id(request.version_id)?;
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let version = if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.restore_version_paths_as_new_save_with_profile(
+            &version_id,
+            &request.paths,
+            request.label,
+            profile,
+        )?
+    } else {
+        workspace.restore_version_paths_as_new_save(&version_id, &request.paths, request.label)?
     };
     context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
     Ok(RestoreVersionResult {
@@ -2995,6 +3073,9 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::RecoveryInOtherFolder(_) => "recovery_in_other_folder",
         DraftlineError::InvalidVariationName(_) => "invalid_variation_name",
         DraftlineError::InvalidGraphOptions(_) => "invalid_graph_options",
+        DraftlineError::NoPathsSelected => "no_paths_selected",
+        DraftlineError::NothingToRestore => "nothing_to_restore",
+        DraftlineError::PathKindChanged(_) => "path_kind_changed",
         DraftlineError::VariationAlreadyExists(_) => "variation_already_exists",
         DraftlineError::VariationNotFound(_) => "variation_not_found",
         DraftlineError::CannotDeleteCurrentVariation(_) => "cannot_delete_current_variation",

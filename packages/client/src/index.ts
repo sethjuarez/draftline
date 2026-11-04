@@ -40,6 +40,7 @@ export interface DraftlineClient {
   getChanges(workspacePath: string): Promise<ChangeSet>;
   getHistory(workspacePath: string): Promise<HistoryEntry[]>;
   getFullHistory(workspacePath: string): Promise<HistoryEntry[]>;
+  getPathHistory(request: PathHistoryRequest): Promise<PathHistory>;
   getWorkspaceGraph(request: WorkspaceGraphRequest): Promise<WorkspaceGraph>;
   getWorkspaceGraphRefs(request: WorkspaceGraphRefsRequest): Promise<WorkspaceGraphRefs>;
   getWorkspaceGraphSummary(request: WorkspaceGraphRequest): Promise<WorkspaceGraphSummary>;
@@ -72,6 +73,7 @@ export interface DraftlineClient {
   previewVersionFile(request: PreviewVersionFileRequest): Promise<PreviewFile | null>;
   previewWorkspaceFile(request: CurrentFileRequest): Promise<CurrentFilePreview | null>;
   restoreVersionAsNewSave(request: RestoreVersionRequest): Promise<RestoreVersionResult>;
+  restoreVersionPathsAsNewSave(request: RestoreVersionPathsRequest): Promise<RestoreVersionResult>;
   restoreVersionAsNewSaveToVariation(
     request: TargetedRestoreVersionRequest,
   ): Promise<TargetedRestoreVersionResult>;
@@ -199,6 +201,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('get_full_history', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
+    getPathHistory: (request) => run('get_path_history', { request }),
     getWorkspaceGraph: (request) => run('get_workspace_graph', { request }),
     getWorkspaceGraphRefs: (request) => run('get_workspace_graph_refs', { request }),
     getWorkspaceGraphSummary: (request) => run('get_workspace_graph_summary', { request }),
@@ -225,6 +228,8 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     previewVersionFile: (request) => run('preview_version_file', { request }),
     previewWorkspaceFile: (request) => run('preview_workspace_file', { request }),
     restoreVersionAsNewSave: (request) => run('restore_version_as_new_save', { request }),
+    restoreVersionPathsAsNewSave: (request) =>
+      run('restore_version_paths_as_new_save', { request }),
     restoreVersionAsNewSaveToVariation: (request) =>
       run('restore_version_as_new_save_to_variation', { request }),
     preflightCreateVariationFromVersion: (request) =>
@@ -331,6 +336,8 @@ export interface Version {
   author: Contributor;
   saved_by: Contributor;
   time_seconds: number;
+  /** The commit message body: the version's longer description. Absent when it has none. */
+  comment?: string | null;
 }
 
 export interface VariationMetadata {
@@ -481,6 +488,34 @@ export interface WorkspaceGraphOptions {
 export interface WorkspaceGraphRequest {
   workspace_path: string;
   options?: WorkspaceGraphOptions;
+}
+
+/** Pages through the versions that changed a set of paths, newest first. */
+export interface PathHistoryOptions {
+  /** Also walk every variation, not only the current one. */
+  all_variations?: boolean;
+  limit?: number | null;
+  cursor?: number | null;
+}
+
+export interface PathHistoryRequest {
+  workspace_path: string;
+  /** Repository-relative files or folders inside the workspace folder. */
+  paths: string[];
+  options?: PathHistoryOptions;
+}
+
+export interface PathHistoryEntry {
+  entry: HistoryEntry;
+  /** The selected files this version changed. */
+  files: ChangedFile[];
+}
+
+export interface PathHistory {
+  paths: string[];
+  entries: PathHistoryEntry[];
+  has_more: boolean;
+  next_cursor: number | null;
 }
 
 export type WorkspaceGraphRefsOptions = Omit<WorkspaceGraphOptions, 'limit' | 'cursor'>;
@@ -1020,6 +1055,8 @@ export interface RemoteVersionSummary {
   label: string;
   author: Contributor;
   time_seconds: number;
+  /** The commit message body, as on `Version.comment`. */
+  comment?: string | null;
 }
 
 export interface SyncStatus {
@@ -1244,6 +1281,15 @@ export interface TargetedRestoreVersionRequest extends RestoreVersionRequest {
   target: RestoreVersionTarget;
 }
 
+/**
+ * Restores only `paths` (repository-relative files or directories inside the
+ * folder) from a version as a new save. `label` is the full commit message, so
+ * "Name\n\nComment" records a version comment.
+ */
+export interface RestoreVersionPathsRequest extends RestoreVersionRequest {
+  paths: string[];
+}
+
 export interface CreateVariationFromVersionRequest extends WorkspaceRequest {
   version_id: string;
   name: string;
@@ -1361,6 +1407,7 @@ export interface DraftlineHostFacade {
   selectedDiscard(paths: string[]): Promise<SelectedDiscardResult>;
   history(): Promise<HistoryEntry[]>;
   fullHistory(): Promise<HistoryEntry[]>;
+  pathHistory(paths: string[], options?: PathHistoryOptions): Promise<PathHistory>;
   workspaceGraph(options?: WorkspaceGraphOptions): Promise<WorkspaceGraph>;
   workspaceGraphRefs(options?: WorkspaceGraphRefsOptions): Promise<WorkspaceGraphRefs>;
   workspaceGraphSummary(options?: WorkspaceGraphOptions): Promise<WorkspaceGraphSummary>;
@@ -1417,6 +1464,11 @@ export interface DraftlineHostFacade {
   previewVersionFile(versionId: string, path: string): Promise<PreviewFile | null>;
   previewWorkspaceFile(path: string): Promise<CurrentFilePreview | null>;
   restoreAsNewSave(versionId: string, label: string): Promise<RestoreVersionResult>;
+  restorePathsAsNewSave(
+    versionId: string,
+    paths: string[],
+    label: string,
+  ): Promise<RestoreVersionResult>;
   restoreAsNewSaveToVariation(
     versionId: string,
     label: string,
@@ -1494,6 +1546,8 @@ export function createDraftlineHostFacade({
     selectedDiscard: (paths) => client.selectedDiscard({ ...workspaceRequest(), paths }),
     history: () => client.getHistory(workspacePath),
     fullHistory: () => client.getFullHistory(workspacePath),
+    pathHistory: (paths, options) =>
+      client.getPathHistory({ workspace_path: workspacePath, paths, options }),
     workspaceGraph: (options) => client.getWorkspaceGraph({ ...workspaceRequest(), options }),
     workspaceGraphRefs: (options) =>
       client.getWorkspaceGraphRefs({ ...workspaceRequest(), options }),
@@ -1578,6 +1632,8 @@ export function createDraftlineHostFacade({
     previewWorkspaceFile: (path) => client.previewWorkspaceFile({ ...workspaceRequest(), path }),
     restoreAsNewSave: (versionId, label) =>
       client.restoreVersionAsNewSave({ ...versionRequest(versionId), label }),
+    restorePathsAsNewSave: (versionId, paths, label) =>
+      client.restoreVersionPathsAsNewSave({ ...versionRequest(versionId), paths, label }),
     restoreAsNewSaveToVariation: (versionId, label, target) =>
       client.restoreVersionAsNewSaveToVariation({ ...versionRequest(versionId), label, target }),
     createVariationFromVersion: (versionId, name, metadata) =>
@@ -1777,6 +1833,10 @@ export async function getFullHistory(workspacePath: string): Promise<HistoryEntr
   return createDraftlineClient().getFullHistory(workspacePath);
 }
 
+export async function getPathHistory(request: PathHistoryRequest): Promise<PathHistory> {
+  return createDraftlineClient().getPathHistory(request);
+}
+
 export async function getWorkspaceGraph(request: WorkspaceGraphRequest): Promise<WorkspaceGraph> {
   return createDraftlineClient().getWorkspaceGraph(request);
 }
@@ -1887,6 +1947,12 @@ export async function restoreVersionAsNewSave(
   request: RestoreVersionRequest,
 ): Promise<RestoreVersionResult> {
   return createDraftlineClient().restoreVersionAsNewSave(request);
+}
+
+export async function restoreVersionPathsAsNewSave(
+  request: RestoreVersionPathsRequest,
+): Promise<RestoreVersionResult> {
+  return createDraftlineClient().restoreVersionPathsAsNewSave(request);
 }
 
 export async function restoreVersionAsNewSaveToVariation(

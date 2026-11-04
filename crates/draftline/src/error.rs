@@ -51,6 +51,19 @@ pub enum DraftlineError {
     #[error("invalid graph options: {0}")]
     InvalidGraphOptions(String),
 
+    /// A path-scoped operation was given no paths.
+    #[error("no paths were given")]
+    NoPathsSelected,
+
+    /// The selected paths already match the version being restored.
+    #[error("the selected paths already match that version")]
+    NothingToRestore,
+
+    /// Restoring the path would turn a file into a folder or back, which a
+    /// path restore refuses rather than leave the files out of step.
+    #[error("restoring would turn a file into a folder or back: {0}")]
+    PathKindChanged(PathBuf),
+
     #[error("variation already exists: {0}")]
     VariationAlreadyExists(String),
 
