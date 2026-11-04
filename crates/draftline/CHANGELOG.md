@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.10.2...draftline-v0.11.0) (2026-11-04)
+
+
+### Features
+
+* **workspace:** version comments, per-path history, and path restore ([#68](https://github.com/sethjuarez/draftline/issues/68)) ([ead6615](https://github.com/sethjuarez/draftline/commit/ead6615471cf35331ed1f9801547908778983029))
+
 ## [0.10.2](https://github.com/sethjuarez/draftline/compare/draftline-v0.10.1...draftline-v0.10.2) (2026-10-30)
 
 
