@@ -6715,6 +6715,147 @@ impl Workspace {
         Ok(version_from_commit(&self.repo.find_commit(oid)?))
     }
 
+    /// Creates a new version that restores only `paths` (files or directories
+    /// inside the folder) from an earlier version, leaving everything else at
+    /// the current save. Paths absent from that version are deleted. Like
+    /// [`Workspace::restore_version_as_new_save`], the workspace must have no
+    /// unsaved changes, and `label` is the full commit message ("Name" or
+    /// "Name\n\nComment").
+    pub fn restore_version_paths_as_new_save<I, P>(
+        &self,
+        version: &VersionId,
+        paths: I,
+        label: impl AsRef<str>,
+    ) -> Result<Version>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.restore_version_paths_as_new_save_with_optional_profile(version, paths, label, None)
+    }
+
+    /// [`Workspace::restore_version_paths_as_new_save`] with host-supplied
+    /// attribution.
+    pub fn restore_version_paths_as_new_save_with_profile<I, P>(
+        &self,
+        version: &VersionId,
+        paths: I,
+        label: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<Version>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.restore_version_paths_as_new_save_with_optional_profile(
+            version,
+            paths,
+            label,
+            Some(profile),
+        )
+    }
+
+    fn restore_version_paths_as_new_save_with_optional_profile<I, P>(
+        &self,
+        version: &VersionId,
+        paths: I,
+        label: impl AsRef<str>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<Version>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        const OPERATION: &str = "restore_version_paths_as_new_save";
+        let paths = self.normalize_folder_paths(paths)?;
+        self.ensure_no_pending_recovery()?;
+        let _lock = self.acquire_for_index(OPERATION)?;
+        let branch = self.ensure_on_branch()?;
+        let head_commit = self.repo.head()?.peel_to_commit()?;
+        let head_tree = head_commit.tree()?;
+        let restored_tree = {
+            let source = self.relocated_tree(&self.find_version_commit(version)?)?;
+            let mut diff_options = DiffOptions::new();
+            diff_options.disable_pathspec_match(true);
+            for path in &paths {
+                diff_options.pathspec(folder_key(path));
+            }
+            let changes =
+                self.tracked_tree_changes(Some(&head_tree), &source, &mut diff_options)?;
+            if changes.is_empty() {
+                return Err(DraftlineError::NothingToRestore);
+            }
+            // Removals first, then upserts: a path that turned from a file
+            // into a folder (or back) can't change type in one update.
+            let mut removals = git2::build::TreeUpdateBuilder::new();
+            let mut upserts = git2::build::TreeUpdateBuilder::new();
+            for change in &changes {
+                let key = folder_key(&change.path);
+                if change.kind == ChangeKind::Deleted {
+                    removals.remove(key.as_str());
+                } else {
+                    let entry = source.get_path(&change.path)?;
+                    upserts.upsert(key.as_str(), entry.id(), blob_file_mode(entry.filemode()));
+                }
+            }
+            let without = removals.create_updated(&self.repo, &head_tree)?;
+            let tree_id = upserts.create_updated(&self.repo, &self.repo.find_tree(without)?)?;
+            self.repo.find_tree(tree_id)?
+        };
+        let report = preflight_report(
+            OPERATION,
+            true,
+            self.changed_files_unchecked()?,
+            self.target_tree_hazards(&restored_tree)?,
+            None,
+        );
+        if !report.can_proceed {
+            return Err(DraftlineError::PreflightFailed(Box::new(report)));
+        }
+
+        let (author, committer) = self.rewrite_signatures(profile)?;
+        let operation_id = new_operation_id();
+        // Recorded like a whole-version restore: repair and rollback work
+        // from the recorded trees, whatever subset was restored.
+        self.write_recovery_state_for_checkout(
+            &RecoveryState {
+                operation_id: operation_id.clone(),
+                operation: RecoveryOperation::RestoreVersionAsNewSave,
+                original_variation: self.current_variation().ok(),
+                target: Some(version.as_str().to_string()),
+                completed: false,
+            },
+            &head_tree,
+            &restored_tree,
+        )?;
+
+        self.checkout_or_keep_recovery(&restored_tree)?;
+        let oid = self.repo.commit(
+            None,
+            &author,
+            &committer,
+            label.as_ref(),
+            &restored_tree,
+            &[&head_commit],
+        )?;
+        self.advance_head(
+            &branch,
+            &self.repo.find_commit(oid)?,
+            Some(&head_commit),
+            &committer,
+        )?;
+
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::RestoreVersionAsNewSave,
+            original_variation: None,
+            target: Some(version.as_str().to_string()),
+            completed: true,
+        })?;
+
+        Ok(version_from_commit(&self.repo.find_commit(oid)?))
+    }
+
     /// Restores a saved version as a new save on a selected target variation.
     ///
     /// The target is resolved and preflighted before Draftline writes the restored
@@ -18523,6 +18664,165 @@ mod tests {
     }
 
     #[test]
+    fn restore_version_paths_restores_only_the_selected_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "post.md", b"one");
+        write_file(workspace.root(), "notes.md", b"notes one");
+        write_file(workspace.root(), "images/cover.png", &[0, 159, 146, 150, 0]);
+        let first = workspace.save_version("First").unwrap();
+        write_file(workspace.root(), "post.md", b"two");
+        write_file(workspace.root(), "notes.md", b"notes two");
+        write_file(workspace.root(), "images/cover.png", &[0, 1, 2, 3, 0]);
+        write_file(workspace.root(), "images/extra.png", &[0, 9, 9, 0]);
+        write_file(workspace.root(), "added.md", b"added later");
+        let second = workspace.save_version("Second").unwrap();
+
+        let restored = workspace
+            .restore_version_paths_as_new_save(
+                first.id(),
+                ["post.md", "images", "added.md"],
+                "Restore post\n\nBrought back the first draft",
+            )
+            .unwrap();
+
+        assert_eq!(restored.label, "Restore post");
+        assert_eq!(
+            restored.comment.as_deref(),
+            Some("Brought back the first draft")
+        );
+        let read = |path: &str| fs::read(workspace.root().join(path)).ok();
+        assert_eq!(read("post.md").as_deref(), Some(&b"one"[..]));
+        assert_eq!(
+            read("images/cover.png").as_deref(),
+            Some(&[0, 159, 146, 150, 0][..])
+        );
+        assert_eq!(read("images/extra.png"), None, "absent then, so deleted");
+        assert_eq!(read("added.md"), None, "absent then, so deleted");
+        assert_eq!(
+            read("notes.md").as_deref(),
+            Some(&b"notes two"[..]),
+            "unselected paths stay"
+        );
+        assert!(workspace.changed_files().unwrap().is_empty());
+        assert!(workspace.recovery_state().unwrap().is_none());
+
+        let history = workspace.history().unwrap();
+        assert_eq!(history[0].version.id(), restored.id());
+        assert_eq!(history[1].version.id(), second.id());
+        let commit = workspace
+            .repo
+            .find_commit(restored.id().as_str().parse().unwrap())
+            .unwrap();
+        assert_eq!(commit.parent_count(), 1);
+        assert_eq!(
+            commit.parent_id(0).unwrap().to_string(),
+            second.id().as_str()
+        );
+
+        assert!(matches!(
+            workspace.restore_version_paths_as_new_save(first.id(), ["post.md"], "Again"),
+            Err(DraftlineError::NothingToRestore)
+        ));
+        assert!(matches!(
+            workspace.restore_version_paths_as_new_save(first.id(), ["never.md"], "Typo"),
+            Err(DraftlineError::NothingToRestore)
+        ));
+        assert!(matches!(
+            workspace.restore_version_paths_as_new_save(first.id(), Vec::<&str>::new(), "None"),
+            Err(DraftlineError::NoPathsSelected)
+        ));
+        assert!(workspace
+            .restore_version_paths_as_new_save(first.id(), ["../outside.md"], "Out")
+            .is_err());
+        assert_eq!(workspace.history().unwrap()[0].version.id(), restored.id());
+    }
+
+    #[test]
+    fn restore_version_paths_handles_files_turning_into_folders() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "docs/readme.md", b"a folder");
+        let first = workspace.save_version("First").unwrap();
+        fs::remove_dir_all(workspace.root().join("docs")).unwrap();
+        write_file(workspace.root(), "docs", b"now a file");
+        workspace.save_version("Second").unwrap();
+
+        workspace
+            .restore_version_paths_as_new_save(first.id(), ["docs"], "Back")
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("docs/readme.md")).unwrap(),
+            "a folder"
+        );
+        assert!(workspace.changed_files().unwrap().is_empty());
+    }
+    #[test]
+    fn restore_version_paths_refuses_unsaved_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "post.md", b"one");
+        let first = workspace.save_version("First").unwrap();
+        write_file(workspace.root(), "post.md", b"two");
+        let second = workspace.save_version("Second").unwrap();
+        write_file(workspace.root(), "notes.md", b"unsaved");
+
+        let error = workspace
+            .restore_version_paths_as_new_save(first.id(), ["post.md"], "Restore")
+            .unwrap_err();
+        assert!(matches!(error, DraftlineError::PreflightFailed(_)));
+        assert_eq!(workspace.history().unwrap()[0].version.id(), second.id());
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("post.md")).unwrap(),
+            "two"
+        );
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_version_paths_works_in_a_moved_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        write_file(temp.path(), "README.md", b"app");
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        index.write().unwrap();
+        let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "App", &tree, &[])
+            .unwrap();
+
+        let mut workspace = Workspace::init(temp.path().join("deck")).unwrap();
+        write_file(workspace.root(), "deck/plan.sk", b"base");
+        write_file(workspace.root(), "deck/other.sk", b"other");
+        let base = workspace.save_version("Base").unwrap();
+        workspace.move_folder("pitch").unwrap();
+        write_file(workspace.root(), "pitch/plan.sk", b"after the move");
+        write_file(workspace.root(), "pitch/other.sk", b"other after");
+        workspace.save_version("After").unwrap();
+
+        workspace
+            .restore_version_paths_as_new_save(base.id(), ["pitch/plan.sk"], "Restore plan")
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("pitch/plan.sk")).unwrap(),
+            "base"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("pitch/other.sk")).unwrap(),
+            "other after"
+        );
+        assert!(!workspace.root().join("deck/plan.sk").exists());
+        assert!(matches!(
+            workspace.restore_version_paths_as_new_save(base.id(), ["README.md"], "Out"),
+            Err(DraftlineError::PathOutsideContentPolicy(_))
+        ));
+    }
+
+    #[test]
     fn creates_variation_from_version_without_switching() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
@@ -22999,6 +23299,31 @@ mod tests {
             fs::read_to_string(workspace.root().join("post.md")).unwrap(),
             "first"
         );
+    }
+
+    #[test]
+    fn restore_version_paths_with_profile_records_profile_attribution() {
+        let (_temp, workspace) = attribution_workspace();
+        let first = restore_fixture(&workspace);
+
+        let restored = workspace
+            .restore_version_paths_as_new_save_with_profile(
+                first.id(),
+                ["post.md"],
+                "Restore post",
+                &attribution_profile(),
+            )
+            .unwrap();
+
+        assert_profile_attribution(&restored);
+        let restored = workspace
+            .restore_version_paths_as_new_save(
+                workspace.history().unwrap()[1].version.id(),
+                ["post.md"],
+                "Back again",
+            )
+            .unwrap();
+        assert_git_config_attribution(&restored);
     }
 
     #[test]

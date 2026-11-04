@@ -73,6 +73,7 @@ export interface DraftlineClient {
   previewVersionFile(request: PreviewVersionFileRequest): Promise<PreviewFile | null>;
   previewWorkspaceFile(request: CurrentFileRequest): Promise<CurrentFilePreview | null>;
   restoreVersionAsNewSave(request: RestoreVersionRequest): Promise<RestoreVersionResult>;
+  restoreVersionPathsAsNewSave(request: RestoreVersionPathsRequest): Promise<RestoreVersionResult>;
   restoreVersionAsNewSaveToVariation(
     request: TargetedRestoreVersionRequest,
   ): Promise<TargetedRestoreVersionResult>;
@@ -227,6 +228,8 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     previewVersionFile: (request) => run('preview_version_file', { request }),
     previewWorkspaceFile: (request) => run('preview_workspace_file', { request }),
     restoreVersionAsNewSave: (request) => run('restore_version_as_new_save', { request }),
+    restoreVersionPathsAsNewSave: (request) =>
+      run('restore_version_paths_as_new_save', { request }),
     restoreVersionAsNewSaveToVariation: (request) =>
       run('restore_version_as_new_save_to_variation', { request }),
     preflightCreateVariationFromVersion: (request) =>
@@ -1278,6 +1281,15 @@ export interface TargetedRestoreVersionRequest extends RestoreVersionRequest {
   target: RestoreVersionTarget;
 }
 
+/**
+ * Restores only `paths` (repository-relative files or directories inside the
+ * folder) from a version as a new save. `label` is the full commit message, so
+ * "Name\n\nComment" records a version comment.
+ */
+export interface RestoreVersionPathsRequest extends RestoreVersionRequest {
+  paths: string[];
+}
+
 export interface CreateVariationFromVersionRequest extends WorkspaceRequest {
   version_id: string;
   name: string;
@@ -1452,6 +1464,11 @@ export interface DraftlineHostFacade {
   previewVersionFile(versionId: string, path: string): Promise<PreviewFile | null>;
   previewWorkspaceFile(path: string): Promise<CurrentFilePreview | null>;
   restoreAsNewSave(versionId: string, label: string): Promise<RestoreVersionResult>;
+  restorePathsAsNewSave(
+    versionId: string,
+    paths: string[],
+    label: string,
+  ): Promise<RestoreVersionResult>;
   restoreAsNewSaveToVariation(
     versionId: string,
     label: string,
@@ -1615,6 +1632,8 @@ export function createDraftlineHostFacade({
     previewWorkspaceFile: (path) => client.previewWorkspaceFile({ ...workspaceRequest(), path }),
     restoreAsNewSave: (versionId, label) =>
       client.restoreVersionAsNewSave({ ...versionRequest(versionId), label }),
+    restorePathsAsNewSave: (versionId, paths, label) =>
+      client.restoreVersionPathsAsNewSave({ ...versionRequest(versionId), paths, label }),
     restoreAsNewSaveToVariation: (versionId, label, target) =>
       client.restoreVersionAsNewSaveToVariation({ ...versionRequest(versionId), label, target }),
     createVariationFromVersion: (versionId, name, metadata) =>
@@ -1928,6 +1947,12 @@ export async function restoreVersionAsNewSave(
   request: RestoreVersionRequest,
 ): Promise<RestoreVersionResult> {
   return createDraftlineClient().restoreVersionAsNewSave(request);
+}
+
+export async function restoreVersionPathsAsNewSave(
+  request: RestoreVersionPathsRequest,
+): Promise<RestoreVersionResult> {
+  return createDraftlineClient().restoreVersionPathsAsNewSave(request);
 }
 
 export async function restoreVersionAsNewSaveToVariation(

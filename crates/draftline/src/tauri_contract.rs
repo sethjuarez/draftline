@@ -410,6 +410,16 @@ pub struct RestoreVersionRequest {
     pub label: String,
 }
 
+/// Request for restoring selected repository-relative paths from one saved
+/// version as a new save. `label` is the full commit message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreVersionPathsRequest {
+    pub workspace_path: PathBuf,
+    pub version_id: String,
+    pub paths: Vec<PathBuf>,
+    pub label: String,
+}
+
 /// Request for restoring one saved version as a new save on a target variation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetedRestoreVersionRequest {
@@ -1708,6 +1718,48 @@ pub fn restore_version_as_new_save_with_context(
         workspace.restore_version_as_new_save_with_profile(&version_id, request.label, profile)?
     } else {
         workspace.restore_version_as_new_save(&version_id, request.label)?
+    };
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(RestoreVersionResult {
+        version,
+        postconditions: collect_postconditions(&workspace, true),
+    })
+}
+
+/// Restores selected paths from a saved version as a new save.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn restore_version_paths_as_new_save(
+    request: RestoreVersionPathsRequest,
+) -> Result<RestoreVersionResult> {
+    restore_version_paths_as_new_save_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Restores selected paths from a saved version as a new save using a
+/// configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn restore_version_paths_as_new_save_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: RestoreVersionPathsRequest,
+) -> Result<RestoreVersionResult> {
+    let version_id = parse_version_id(request.version_id)?;
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let version = if let Some(profile) = context.contributor_profile.as_ref() {
+        workspace.restore_version_paths_as_new_save_with_profile(
+            &version_id,
+            &request.paths,
+            request.label,
+            profile,
+        )?
+    } else {
+        workspace.restore_version_paths_as_new_save(&version_id, &request.paths, request.label)?
     };
     context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
     Ok(RestoreVersionResult {
@@ -3022,6 +3074,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidVariationName(_) => "invalid_variation_name",
         DraftlineError::InvalidGraphOptions(_) => "invalid_graph_options",
         DraftlineError::NoPathsSelected => "no_paths_selected",
+        DraftlineError::NothingToRestore => "nothing_to_restore",
         DraftlineError::VariationAlreadyExists(_) => "variation_already_exists",
         DraftlineError::VariationNotFound(_) => "variation_not_found",
         DraftlineError::CannotDeleteCurrentVariation(_) => "cannot_delete_current_variation",

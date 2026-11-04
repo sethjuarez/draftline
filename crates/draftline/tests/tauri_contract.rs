@@ -20,20 +20,21 @@ use draftline::tauri_contract::{
     publish_current_variation, rename_variation, restore_version_as_new_save,
     restore_version_as_new_save_to_variation,
     restore_version_as_new_save_to_variation_with_context,
-    restore_version_as_new_save_with_context, save, search_workspace_graph, selected_discard,
-    selected_save, selected_save_with_context, selected_shelve, selected_shelve_with_context,
-    switch_variation, verify_workspace, whole_file_use_content_resolutions, CloneWorkspaceRequest,
-    ConflictContentSource, CreateVariationFromVersionRequest, CurrentFileRequest,
-    DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
-    GuardedCreateVariationFromVersionRequest, ListSupportRefsRequest, MergeIncomingRequest,
-    MergeIncomingWithResolutionsRequest, PathHistoryRequest,
-    PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
+    restore_version_as_new_save_with_context, restore_version_paths_as_new_save, save,
+    search_workspace_graph, selected_discard, selected_save, selected_save_with_context,
+    selected_shelve, selected_shelve_with_context, switch_variation, verify_workspace,
+    whole_file_use_content_resolutions, CloneWorkspaceRequest, ConflictContentSource,
+    CreateVariationFromVersionRequest, CurrentFileRequest, DiffVersionsRequest,
+    DraftlineCommandContext, DraftlineEventKind, GuardedCreateVariationFromVersionRequest,
+    ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
+    PathHistoryRequest, PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
     PublishCurrentVariationRequest, RemoteRequest, RemoteVariationRequest, RenameVariationRequest,
-    RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
-    SelectedShelveRequest, ShelfRequest, SwitchVariationRequest, TargetedRestoreVersionRequest,
-    VersionRequest, WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
-    WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest, WorkspaceGraphRequest,
-    WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest, WorkspaceRequest,
+    RestoreVersionPathsRequest, RestoreVersionRequest, SaveRequest, SelectedDiscardRequest,
+    SelectedSaveRequest, SelectedShelveRequest, ShelfRequest, SwitchVariationRequest,
+    TargetedRestoreVersionRequest, VersionRequest, WorkspaceGraphAroundVersionRequest,
+    WorkspaceGraphNeighborhoodRequest, WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest,
+    WorkspaceGraphRequest, WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest,
+    WorkspaceRequest,
 };
 use draftline::{
     ContentPolicy, Contributor, ContributorProfile, MergeConflictResolution, MergeResolutionChoice,
@@ -786,6 +787,37 @@ fn tauri_contract_returns_per_path_history() {
     }))
     .unwrap_err();
     assert_eq!(error.code, "no_paths_selected");
+}
+
+#[test]
+fn tauri_contract_restores_selected_paths_as_new_save() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"# One");
+    write_file(workspace.root(), "notes.md", b"notes one");
+    let first = workspace.save_version("First").unwrap();
+    write_file(workspace.root(), "post.md", b"# Two");
+    write_file(workspace.root(), "notes.md", b"notes two");
+    workspace.save_version("Second").unwrap();
+
+    let request: RestoreVersionPathsRequest = serde_json::from_value(serde_json::json!({
+        "workspace_path": temp.path(),
+        "version_id": first.id().as_str(),
+        "paths": ["post.md"],
+        "label": "Restore post\n\nFirst draft read better",
+    }))
+    .unwrap();
+    let result = restore_version_paths_as_new_save(request.clone()).unwrap();
+    let json = serde_json::to_value(&result).unwrap();
+    assert_object_keys(&json, &[], &["postconditions", "version"]);
+    assert_eq!(json["version"]["label"], "Restore post");
+    assert_eq!(json["version"]["comment"], "First draft read better");
+    assert_eq!(read_file(workspace.root(), "post.md"), "# One");
+    assert_eq!(read_file(workspace.root(), "notes.md"), "notes two");
+
+    let error = into_tauri_result(restore_version_paths_as_new_save(request)).unwrap_err();
+    assert_eq!(error.code, "nothing_to_restore");
 }
 
 #[test]

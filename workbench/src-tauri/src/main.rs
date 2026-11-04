@@ -435,6 +435,18 @@ fn restore_version_as_new_save(
 }
 
 #[tauri::command]
+fn restore_version_paths_as_new_save(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: contract::RestoreVersionPathsRequest,
+) -> TauriCommandResult<RestoreVersionResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::restore_version_paths_as_new_save_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
 fn restore_version_as_new_save_to_variation(
     state: tauri::State<'_, DraftlineContextState>,
     request: TargetedRestoreVersionRequest,
@@ -830,6 +842,7 @@ fn main() {
             preview_version_file,
             preview_workspace_file,
             restore_version_as_new_save,
+            restore_version_paths_as_new_save,
             restore_version_as_new_save_to_variation,
             create_variation_from_version,
             preflight_create_variation_from_version,

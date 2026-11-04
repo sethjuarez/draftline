@@ -684,6 +684,28 @@ describe('createDraftlineClient', () => {
     });
   });
 
+  it('routes path restores to restore_version_paths_as_new_save', async () => {
+    const invoke = vi.fn<DraftlineInvoke>(async () => ({ ok: true }) as never);
+    const client = createDraftlineClient({ invoke });
+    const facade = createDraftlineHostFacade({ client, workspacePath: 'C:\\repo' });
+    const versionId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+    await facade.restorePathsAsNewSave(
+      versionId,
+      ['deck/plan.sk', 'deck/images'],
+      'Restore plan\n\nFirst draft read better',
+    );
+
+    expect(invoke).toHaveBeenCalledWith('restore_version_paths_as_new_save', {
+      request: {
+        workspace_path: 'C:\\repo',
+        version_id: versionId,
+        paths: ['deck/plan.sk', 'deck/images'],
+        label: 'Restore plan\n\nFirst draft read better',
+      },
+    });
+  });
+
   it('passes a multi-line label through so its body becomes the version comment', async () => {
     const saved: Version = {
       id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',

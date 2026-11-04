@@ -55,6 +55,10 @@ pub enum DraftlineError {
     #[error("no paths were given")]
     NoPathsSelected,
 
+    /// The selected paths already match the version being restored.
+    #[error("the selected paths already match that version")]
+    NothingToRestore,
+
     #[error("variation already exists: {0}")]
     VariationAlreadyExists(String),
 
