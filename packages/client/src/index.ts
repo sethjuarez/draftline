@@ -40,6 +40,7 @@ export interface DraftlineClient {
   getChanges(workspacePath: string): Promise<ChangeSet>;
   getHistory(workspacePath: string): Promise<HistoryEntry[]>;
   getFullHistory(workspacePath: string): Promise<HistoryEntry[]>;
+  getPathHistory(request: PathHistoryRequest): Promise<PathHistory>;
   getWorkspaceGraph(request: WorkspaceGraphRequest): Promise<WorkspaceGraph>;
   getWorkspaceGraphRefs(request: WorkspaceGraphRefsRequest): Promise<WorkspaceGraphRefs>;
   getWorkspaceGraphSummary(request: WorkspaceGraphRequest): Promise<WorkspaceGraphSummary>;
@@ -199,6 +200,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
       run('get_full_history', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
+    getPathHistory: (request) => run('get_path_history', { request }),
     getWorkspaceGraph: (request) => run('get_workspace_graph', { request }),
     getWorkspaceGraphRefs: (request) => run('get_workspace_graph_refs', { request }),
     getWorkspaceGraphSummary: (request) => run('get_workspace_graph_summary', { request }),
@@ -483,6 +485,34 @@ export interface WorkspaceGraphOptions {
 export interface WorkspaceGraphRequest {
   workspace_path: string;
   options?: WorkspaceGraphOptions;
+}
+
+/** Pages through the versions that changed a set of paths, newest first. */
+export interface PathHistoryOptions {
+  /** Also walk every variation, not only the current one. */
+  all_variations?: boolean;
+  limit?: number | null;
+  cursor?: number | null;
+}
+
+export interface PathHistoryRequest {
+  workspace_path: string;
+  /** Repository-relative files or folders inside the workspace folder. */
+  paths: string[];
+  options?: PathHistoryOptions;
+}
+
+export interface PathHistoryEntry {
+  entry: HistoryEntry;
+  /** The selected files this version changed. */
+  files: ChangedFile[];
+}
+
+export interface PathHistory {
+  paths: string[];
+  entries: PathHistoryEntry[];
+  has_more: boolean;
+  next_cursor: number | null;
 }
 
 export type WorkspaceGraphRefsOptions = Omit<WorkspaceGraphOptions, 'limit' | 'cursor'>;
@@ -1365,6 +1395,7 @@ export interface DraftlineHostFacade {
   selectedDiscard(paths: string[]): Promise<SelectedDiscardResult>;
   history(): Promise<HistoryEntry[]>;
   fullHistory(): Promise<HistoryEntry[]>;
+  pathHistory(paths: string[], options?: PathHistoryOptions): Promise<PathHistory>;
   workspaceGraph(options?: WorkspaceGraphOptions): Promise<WorkspaceGraph>;
   workspaceGraphRefs(options?: WorkspaceGraphRefsOptions): Promise<WorkspaceGraphRefs>;
   workspaceGraphSummary(options?: WorkspaceGraphOptions): Promise<WorkspaceGraphSummary>;
@@ -1498,6 +1529,8 @@ export function createDraftlineHostFacade({
     selectedDiscard: (paths) => client.selectedDiscard({ ...workspaceRequest(), paths }),
     history: () => client.getHistory(workspacePath),
     fullHistory: () => client.getFullHistory(workspacePath),
+    pathHistory: (paths, options) =>
+      client.getPathHistory({ workspace_path: workspacePath, paths, options }),
     workspaceGraph: (options) => client.getWorkspaceGraph({ ...workspaceRequest(), options }),
     workspaceGraphRefs: (options) =>
       client.getWorkspaceGraphRefs({ ...workspaceRequest(), options }),
@@ -1779,6 +1812,10 @@ export async function getHistory(workspacePath: string): Promise<HistoryEntry[]>
 
 export async function getFullHistory(workspacePath: string): Promise<HistoryEntry[]> {
   return createDraftlineClient().getFullHistory(workspacePath);
+}
+
+export async function getPathHistory(request: PathHistoryRequest): Promise<PathHistory> {
+  return createDraftlineClient().getPathHistory(request);
 }
 
 export async function getWorkspaceGraph(request: WorkspaceGraphRequest): Promise<WorkspaceGraph> {

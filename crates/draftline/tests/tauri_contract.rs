@@ -6,18 +6,19 @@ use draftline::tauri_contract::{
     audit_content_policy, clone_workspace, create_variation_from_version,
     create_variation_from_version_guarded, diff_version_to_workspace, diff_versions,
     diff_workspace_file, fetch_remote, get_changes, get_full_history, get_history,
-    get_workspace_graph, get_workspace_graph_agent_summary, get_workspace_graph_around_version,
-    get_workspace_graph_common_ancestor, get_workspace_graph_compare_summary,
-    get_workspace_graph_for_variation, get_workspace_graph_neighborhood, get_workspace_graph_node,
-    get_workspace_graph_overview, get_workspace_graph_path, get_workspace_graph_refs,
-    get_workspace_graph_summary, inspect_workspace, into_tauri_result, list_remote_variations,
-    list_remotes, list_shelves, list_support_refs, list_variations, merge_conflict_view_model,
-    merge_incoming, merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
-    open_workspace, preflight_apply_incoming, preflight_apply_shelf,
-    preflight_create_variation_from_version, preflight_merge_incoming, preflight_rename_variation,
-    preflight_switch_variation, preview_shelf, preview_version, preview_version_file,
-    preview_workspace_file, publish_current_variation, rename_variation,
-    restore_version_as_new_save, restore_version_as_new_save_to_variation,
+    get_path_history, get_workspace_graph, get_workspace_graph_agent_summary,
+    get_workspace_graph_around_version, get_workspace_graph_common_ancestor,
+    get_workspace_graph_compare_summary, get_workspace_graph_for_variation,
+    get_workspace_graph_neighborhood, get_workspace_graph_node, get_workspace_graph_overview,
+    get_workspace_graph_path, get_workspace_graph_refs, get_workspace_graph_summary,
+    inspect_workspace, into_tauri_result, list_remote_variations, list_remotes, list_shelves,
+    list_support_refs, list_variations, merge_conflict_view_model, merge_incoming,
+    merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context, open_workspace,
+    preflight_apply_incoming, preflight_apply_shelf, preflight_create_variation_from_version,
+    preflight_merge_incoming, preflight_rename_variation, preflight_switch_variation,
+    preview_shelf, preview_version, preview_version_file, preview_workspace_file,
+    publish_current_variation, rename_variation, restore_version_as_new_save,
+    restore_version_as_new_save_to_variation,
     restore_version_as_new_save_to_variation_with_context,
     restore_version_as_new_save_with_context, save, search_workspace_graph, selected_discard,
     selected_save, selected_save_with_context, selected_shelve, selected_shelve_with_context,
@@ -25,19 +26,19 @@ use draftline::tauri_contract::{
     ConflictContentSource, CreateVariationFromVersionRequest, CurrentFileRequest,
     DiffVersionsRequest, DraftlineCommandContext, DraftlineEventKind,
     GuardedCreateVariationFromVersionRequest, ListSupportRefsRequest, MergeIncomingRequest,
-    MergeIncomingWithResolutionsRequest, PreflightCreateVariationFromVersionRequest,
-    PreviewVersionFileRequest, PublishCurrentVariationRequest, RemoteRequest,
-    RemoteVariationRequest, RenameVariationRequest, RestoreVersionRequest, SaveRequest,
-    SelectedDiscardRequest, SelectedSaveRequest, SelectedShelveRequest, ShelfRequest,
-    SwitchVariationRequest, TargetedRestoreVersionRequest, VersionRequest,
-    WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
+    MergeIncomingWithResolutionsRequest, PathHistoryRequest,
+    PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
+    PublishCurrentVariationRequest, RemoteRequest, RemoteVariationRequest, RenameVariationRequest,
+    RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
+    SelectedShelveRequest, ShelfRequest, SwitchVariationRequest, TargetedRestoreVersionRequest,
+    VersionRequest, WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
     WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest, WorkspaceGraphRequest,
     WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest, WorkspaceRequest,
 };
 use draftline::{
     ContentPolicy, Contributor, ContributorProfile, MergeConflictResolution, MergeResolutionChoice,
-    OperationLockState, RestoreVersionTarget, SupportRefScope, SwitchPolicy, SyncState,
-    VariationId, Workspace, WorkspaceGraphOverviewOptions,
+    OperationLockState, PathHistoryOptions, RestoreVersionTarget, SupportRefScope, SwitchPolicy,
+    SyncState, VariationId, Workspace, WorkspaceGraphOverviewOptions,
 };
 use serde_json::Value;
 
@@ -730,6 +731,61 @@ fn tauri_contract_records_version_comments() {
     assert!(history
         .iter()
         .any(|entry| entry.version.comment.as_deref() == Some("Base read better.")));
+}
+
+#[test]
+fn tauri_contract_returns_per_path_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"# One");
+    let first = workspace.save_version("First").unwrap();
+    write_file(workspace.root(), "notes.md", b"notes");
+    workspace.save_version("Notes").unwrap();
+    write_file(workspace.root(), "post.md", b"# Two");
+    let second = workspace.save_version("Second").unwrap();
+
+    let request: PathHistoryRequest = serde_json::from_value(serde_json::json!({
+        "workspace_path": temp.path(),
+        "paths": ["post.md"],
+        "options": { "limit": 1 },
+    }))
+    .unwrap();
+    let page = get_path_history(request).unwrap();
+    let json = serde_json::to_value(&page).unwrap();
+    assert_object_keys(&json, &[], &["entries", "has_more", "next_cursor", "paths"]);
+    assert_object_keys(&json["entries"][0], &[], &["entry", "files"]);
+    assert_eq!(json["paths"], serde_json::json!(["post.md"]));
+    assert_eq!(
+        json["entries"][0]["entry"]["version"]["id"],
+        second.id().as_str()
+    );
+    assert_eq!(json["entries"][0]["files"][0]["path"], "post.md");
+    assert_eq!(json["has_more"], true);
+    assert_eq!(json["next_cursor"], 1);
+
+    // Options are optional on the wire.
+    let request: PathHistoryRequest = serde_json::from_value(serde_json::json!({
+        "workspace_path": temp.path(),
+        "paths": ["post.md"],
+    }))
+    .unwrap();
+    let all = get_path_history(request).unwrap();
+    assert_eq!(
+        all.entries
+            .iter()
+            .map(|item| item.entry.version.id().clone())
+            .collect::<Vec<_>>(),
+        vec![second.id().clone(), first.id().clone()]
+    );
+
+    let error = into_tauri_result(get_path_history(PathHistoryRequest {
+        workspace_path: temp.path().to_path_buf(),
+        paths: Vec::new(),
+        options: PathHistoryOptions::default(),
+    }))
+    .unwrap_err();
+    assert_eq!(error.code, "no_paths_selected");
 }
 
 #[test]

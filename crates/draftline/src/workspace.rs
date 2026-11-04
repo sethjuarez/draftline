@@ -1248,6 +1248,67 @@ fn touches_folder_by_default() -> bool {
     true
 }
 
+/// Options for [`Workspace::path_history`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PathHistoryOptions {
+    /// Walk every local variation, like [`Workspace::full_history`], instead
+    /// of only the current one.
+    #[serde(default)]
+    pub all_variations: bool,
+    /// Most entries to return in this page.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Index of the first matching entry, from a previous page's `next_cursor`.
+    #[serde(default)]
+    pub cursor: Option<usize>,
+}
+
+impl PathHistoryOptions {
+    /// Options for the current variation's whole history.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Walks every local variation instead of only the current one.
+    pub fn all_variations(mut self, all_variations: bool) -> Self {
+        self.all_variations = all_variations;
+        self
+    }
+
+    /// Returns at most `limit` entries.
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Starts at the `cursor`-th matching entry.
+    pub fn cursor(mut self, cursor: usize) -> Self {
+        self.cursor = Some(cursor);
+        self
+    }
+}
+
+/// A version that changed at least one of the paths asked about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PathHistoryEntry {
+    pub entry: HistoryEntry,
+    /// The asked-about files this version changed, against its first parent.
+    pub files: Vec<ChangedFile>,
+}
+
+/// One page of the versions that changed some paths, newest first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PathHistory {
+    /// The normalized paths asked about.
+    pub paths: Vec<PathBuf>,
+    pub entries: Vec<PathHistoryEntry>,
+    pub has_more: bool,
+    pub next_cursor: Option<usize>,
+}
+
 /// Per-variation snapshot with head version and total version count.
 ///
 /// Returned by [`Workspace::variation_summaries`].  Provides the information
@@ -6997,6 +7058,186 @@ impl Workspace {
         Ok(entries)
     }
 
+    /// Returns the versions that changed any of `paths`, newest first, like
+    /// `git log -- <paths>` but following the folder through moves.
+    ///
+    /// Paths are repository-relative, like every other Draftline path, and
+    /// must lie inside the folder; a path may name a file or a directory.
+    /// Each entry lists the tracked files under `paths` that the version
+    /// changed against its first parent.
+    ///
+    /// History is simplified the way `git log` does it: a merge whose result
+    /// on `paths` matches one of its parents is not listed, and only that
+    /// parent's side is followed, so versions whose changes the merge
+    /// discarded do not appear. Pages with `limit` and `cursor`; the cursor is
+    /// an offset, valid while the walked variations don't move. Walks only
+    /// the current variation unless `all_variations` is set.
+    ///
+    /// ```no_run
+    /// use draftline::{PathHistoryOptions, Workspace};
+    ///
+    /// let workspace = Workspace::open("my-content")?;
+    /// let page = workspace.path_history(["post.md"], PathHistoryOptions::new().limit(20))?;
+    /// for item in page.entries {
+    ///     println!("{} {:?}", item.entry.version.label, item.entry.version.comment);
+    /// }
+    /// # Ok::<(), draftline::DraftlineError>(())
+    /// ```
+    pub fn path_history<I, P>(&self, paths: I, options: PathHistoryOptions) -> Result<PathHistory>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.ensure_no_pending_recovery()?;
+        if options.limit == Some(0) {
+            return Err(DraftlineError::InvalidGraphOptions(
+                "path history limit must be at least 1".to_string(),
+            ));
+        }
+        let paths = self.normalize_folder_paths(paths)?;
+        let mut page = PathHistory {
+            paths: paths.clone(),
+            entries: Vec::new(),
+            has_more: false,
+            next_cursor: None,
+        };
+        let tips = self.variation_tips_map()?;
+        let head_oid = self.repo.head().ok().and_then(|h| h.target());
+
+        let mut walk = self.repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+        if options.all_variations {
+            for (_, tip) in self.listed_variation_tip_oids()? {
+                walk.push(tip)?;
+            }
+        } else if walk.push_head().is_err() {
+            return Ok(page);
+        }
+
+        let mut diff_options = DiffOptions::new();
+        diff_options.disable_pathspec_match(true);
+        for path in &paths {
+            diff_options.pathspec(folder_key(path));
+        }
+        let start = options.cursor.unwrap_or_default();
+        let end = start.saturating_add(options.limit.unwrap_or(usize::MAX));
+        let mut folders = FolderChanges::new(&self.repo, self.scope());
+        // Commits still reachable through simplified history. Topological
+        // order visits every child before its parents, so a commit absent
+        // here by its turn was reached only through a pruned merge side.
+        let mut wanted = std::collections::HashSet::new();
+        if options.all_variations {
+            wanted.extend(
+                self.listed_variation_tip_oids()?
+                    .into_iter()
+                    .map(|(_, tip)| tip),
+            );
+        } else {
+            wanted.extend(head_oid);
+        }
+        let mut matched = 0usize;
+        for oid in walk {
+            let oid = oid?;
+            if !wanted.contains(&oid) {
+                continue;
+            }
+            let commit = self.repo.find_commit(oid)?;
+            let tree = self.relocated_tree_with(&mut folders, &commit)?;
+            let mut files = None;
+            let mut same_as = None;
+            for parent in commit.parents() {
+                let parent_tree = self.relocated_tree_with(&mut folders, &parent)?;
+                let changes =
+                    self.tracked_tree_changes(Some(&parent_tree), &tree, &mut diff_options)?;
+                if changes.is_empty() {
+                    same_as = Some(parent.id());
+                    break;
+                }
+                files.get_or_insert(changes);
+            }
+            if let Some(parent) = same_as {
+                wanted.insert(parent);
+                continue;
+            }
+            wanted.extend(commit.parent_ids());
+            let files = match files {
+                Some(files) => files,
+                None => self.tracked_tree_changes(None, &tree, &mut diff_options)?,
+            };
+            if files.is_empty() {
+                continue;
+            }
+            if matched >= end {
+                page.has_more = true;
+                page.next_cursor = Some(end);
+                break;
+            }
+            if matched >= start {
+                let touches = folders.touches(&commit)?;
+                page.entries.push(PathHistoryEntry {
+                    entry: history_entry_from_commit(&commit, touches, &tips, head_oid)?,
+                    files,
+                });
+            }
+            matched += 1;
+        }
+        Ok(page)
+    }
+
+    /// Tracked files that differ between `from` (or nothing) and `to` under
+    /// the pathspec in `options`.
+    fn tracked_tree_changes(
+        &self,
+        from: Option<&Tree<'_>>,
+        to: &Tree<'_>,
+        options: &mut DiffOptions,
+    ) -> Result<Vec<ChangedFile>> {
+        let diff = self.repo.diff_tree_to_tree(from, Some(to), Some(options))?;
+        let mut files = Vec::new();
+        for mut file in diff_deltas_to_changed_files(&diff) {
+            if !self.content_policy.tracks(&file.path)? {
+                continue;
+            }
+            // Deltas only know binary-ness once content is loaded; ask the blob.
+            if !file.is_binary {
+                let blob = to
+                    .get_path(&file.path)
+                    .ok()
+                    .or_else(|| from.and_then(|from| from.get_path(&file.path).ok()))
+                    .and_then(|entry| self.repo.find_blob(entry.id()).ok());
+                file.is_binary = blob.is_some_and(|blob| blob.is_binary());
+            }
+            files.push(file);
+        }
+        Ok(files)
+    }
+
+    /// Repository-relative files or directories inside the folder, deduplicated
+    /// and sorted. The folder itself is refused: its history is
+    /// [`Workspace::history`].
+    fn normalize_folder_paths<I, P>(&self, paths: I) -> Result<Vec<PathBuf>>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let mut normalized = BTreeSet::new();
+        for path in paths {
+            let path = normalize_workspace_relative(path)?;
+            let inside = path
+                .strip_prefix(self.scope())
+                .map(|relative| !relative.as_os_str().is_empty())
+                .unwrap_or(false);
+            if !inside {
+                return Err(DraftlineError::PathOutsideContentPolicy(path));
+            }
+            normalized.insert(path);
+        }
+        if normalized.is_empty() {
+            return Err(DraftlineError::NoPathsSelected);
+        }
+        Ok(normalized.into_iter().collect())
+    }
+
     /// Returns a graph-ready full-history snapshot over Draftline variations.
     ///
     /// The graph is read-only. It exposes the same version and variation
@@ -11943,8 +12184,18 @@ impl Workspace {
     /// `commit`'s tree with Draftline's folder where the folder is now, so a
     /// version saved before a move reads, diffs and restores as this folder's.
     fn relocated_tree(&self, commit: &Commit<'_>) -> Result<Tree<'_>> {
+        self.relocated_tree_with(&mut FolderChanges::new(&self.repo, self.scope()), commit)
+    }
+
+    /// [`Self::relocated_tree`] reusing `folders`, so walks over many commits
+    /// look up where the folder was only once per commit.
+    fn relocated_tree_with(
+        &self,
+        folders: &mut FolderChanges<'_>,
+        commit: &Commit<'_>,
+    ) -> Result<Tree<'_>> {
         let tree = commit.tree()?;
-        let from = FolderChanges::new(&self.repo, self.scope()).folder_at(commit)?;
+        let from = folders.folder_at(commit)?;
         if from == self.scope() {
             return Ok(self.repo.find_tree(tree.id())?);
         }
@@ -18036,6 +18287,239 @@ mod tests {
             .find(|entry| entry.version.label == "Before switching")
             .expect("SaveFirst wrote a save");
         assert_eq!(saved.version.comment.as_deref(), Some("Parked edits"));
+    }
+
+    fn path_history_ids(history: &PathHistory) -> Vec<VersionId> {
+        history
+            .entries
+            .iter()
+            .map(|item| item.entry.version.id().clone())
+            .collect()
+    }
+
+    #[test]
+    fn path_history_lists_the_versions_that_changed_the_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "post.md", b"one");
+        let first = workspace.save_version("First").unwrap();
+        write_file(workspace.root(), "notes.md", b"notes");
+        workspace.save_version("Notes").unwrap();
+        write_file(workspace.root(), "post.md", b"two");
+        let second = workspace.save_version("Second\n\nTighter").unwrap();
+        write_file(workspace.root(), "images/cover.png", &[0, 159, 146, 150, 0]);
+        let cover = workspace.save_version("Cover").unwrap();
+        fs::remove_file(workspace.root().join("post.md")).unwrap();
+        let removed = workspace.save_version("Drop post").unwrap();
+
+        let post = workspace
+            .path_history(["post.md"], PathHistoryOptions::new())
+            .unwrap();
+        assert_eq!(post.paths, vec![PathBuf::from("post.md")]);
+        assert_eq!(
+            path_history_ids(&post),
+            vec![
+                removed.id().clone(),
+                second.id().clone(),
+                first.id().clone()
+            ]
+        );
+        assert!(!post.has_more);
+        assert_eq!(post.next_cursor, None);
+        assert_eq!(post.entries[0].files[0].kind, ChangeKind::Deleted);
+        assert_eq!(post.entries[1].files[0].kind, ChangeKind::Modified);
+        assert_eq!(
+            post.entries[1].entry.version.comment.as_deref(),
+            Some("Tighter")
+        );
+        assert_eq!(post.entries[2].files[0].kind, ChangeKind::Added);
+        assert!(post
+            .entries
+            .iter()
+            .all(|item| item.files.len() == 1 && item.files[0].path == Path::new("post.md")));
+
+        let images = workspace
+            .path_history(["images"], PathHistoryOptions::new())
+            .unwrap();
+        assert_eq!(path_history_ids(&images), vec![cover.id().clone()]);
+        assert_eq!(
+            images.entries[0].files[0].path,
+            PathBuf::from("images/cover.png")
+        );
+        assert!(images.entries[0].files[0].is_binary);
+
+        let both = workspace
+            .path_history(
+                ["images/", "./post.md", "post.md"],
+                PathHistoryOptions::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            both.paths,
+            vec![PathBuf::from("images"), PathBuf::from("post.md")]
+        );
+        assert_eq!(both.entries.len(), 4);
+
+        let page = workspace
+            .path_history(["post.md"], PathHistoryOptions::new().limit(2))
+            .unwrap();
+        assert_eq!(
+            path_history_ids(&page),
+            vec![removed.id().clone(), second.id().clone()]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor, Some(2));
+        let rest = workspace
+            .path_history(["post.md"], PathHistoryOptions::new().limit(2).cursor(2))
+            .unwrap();
+        assert_eq!(path_history_ids(&rest), vec![first.id().clone()]);
+        assert!(!rest.has_more);
+
+        assert!(matches!(
+            workspace.path_history(Vec::<&str>::new(), PathHistoryOptions::new()),
+            Err(DraftlineError::NoPathsSelected)
+        ));
+        assert!(workspace
+            .path_history(["../outside.md"], PathHistoryOptions::new())
+            .is_err());
+        assert!(matches!(
+            workspace.path_history(["post.md"], PathHistoryOptions::new().limit(0)),
+            Err(DraftlineError::InvalidGraphOptions(_))
+        ));
+        assert!(workspace
+            .path_history(["never.md"], PathHistoryOptions::new())
+            .unwrap()
+            .entries
+            .is_empty());
+    }
+
+    #[test]
+    fn path_history_walks_other_variations_on_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        let main = workspace.current_variation().unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"alternate");
+        let other = workspace.save_version("Alternate").unwrap();
+        workspace
+            .switch_variation(&VariationId::from(main), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+
+        let current = workspace
+            .path_history(["post.md"], PathHistoryOptions::new())
+            .unwrap();
+        assert_eq!(path_history_ids(&current), vec![base.id().clone()]);
+        let all = workspace
+            .path_history(["post.md"], PathHistoryOptions::new().all_variations(true))
+            .unwrap();
+        assert_eq!(
+            path_history_ids(&all),
+            vec![other.id().clone(), base.id().clone()]
+        );
+        assert_eq!(
+            all.entries[0].entry.variation_tips,
+            vec![alternate.id().clone()]
+        );
+    }
+
+    #[test]
+    fn path_history_skips_changes_a_merge_discarded() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        let main = workspace.current_variation().unwrap();
+        let alternate = workspace.create_variation("alternate").unwrap();
+        workspace
+            .switch_variation(alternate.id(), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"alternate");
+        let discarded = workspace.save_version("Alternate").unwrap();
+        workspace
+            .switch_variation(&VariationId::from(main), SwitchPolicy::AbortIfDirty)
+            .unwrap();
+        write_file(workspace.root(), "post.md", b"main");
+        let kept = workspace.save_version("Main").unwrap();
+
+        // Merge the alternate in but keep main's post.md.
+        let repo = Repository::open(workspace.root()).unwrap();
+        let ours = repo
+            .find_commit(kept.id().as_str().parse().unwrap())
+            .unwrap();
+        let theirs = repo
+            .find_commit(discarded.id().as_str().parse().unwrap())
+            .unwrap();
+        let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Merge alternate",
+            &ours.tree().unwrap(),
+            &[&ours, &theirs],
+        )
+        .unwrap();
+
+        let history = workspace
+            .path_history(["post.md"], PathHistoryOptions::new())
+            .unwrap();
+        assert_eq!(
+            path_history_ids(&history),
+            vec![kept.id().clone(), base.id().clone()]
+        );
+    }
+
+    #[test]
+    fn path_history_follows_the_folder_through_a_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        write_file(temp.path(), "README.md", b"app");
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        index.write().unwrap();
+        let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "App", &tree, &[])
+            .unwrap();
+
+        let mut workspace = Workspace::init(temp.path().join("deck")).unwrap();
+        write_file(workspace.root(), "deck/plan.sk", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "deck/other.sk", b"other");
+        workspace.save_version("Other").unwrap();
+        workspace.move_folder("pitch").unwrap();
+        write_file(workspace.root(), "pitch/plan.sk", b"after the move");
+        let after = workspace.save_version("After").unwrap();
+
+        let history = workspace
+            .path_history(["pitch/plan.sk"], PathHistoryOptions::new())
+            .unwrap();
+        assert_eq!(
+            path_history_ids(&history),
+            vec![after.id().clone(), base.id().clone()],
+            "the move itself changes no content"
+        );
+        assert_eq!(
+            history.entries[1].files[0].path,
+            PathBuf::from("pitch/plan.sk")
+        );
+        for outside in ["deck/plan.sk", "README.md", "pitch"] {
+            assert!(
+                matches!(
+                    workspace.path_history([outside], PathHistoryOptions::new()),
+                    Err(DraftlineError::PathOutsideContentPolicy(_))
+                ),
+                "{outside}"
+            );
+        }
     }
 
     #[test]

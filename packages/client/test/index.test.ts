@@ -660,6 +660,30 @@ describe('createDraftlineClient', () => {
     ]);
   });
 
+  it('routes per-path history requests to get_path_history', async () => {
+    const invoke = vi.fn<DraftlineInvoke>(async () => ({ ok: true }) as never);
+    const client = createDraftlineClient({ invoke });
+    const facade = createDraftlineHostFacade({ client, workspacePath: 'C:\\repo' });
+
+    await facade.pathHistory(['deck/plan.sk']);
+    await facade.pathHistory(['deck/plan.sk', 'deck/images'], {
+      all_variations: true,
+      limit: 20,
+      cursor: 20,
+    });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'get_path_history', {
+      request: { workspace_path: 'C:\\repo', paths: ['deck/plan.sk'], options: undefined },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, 'get_path_history', {
+      request: {
+        workspace_path: 'C:\\repo',
+        paths: ['deck/plan.sk', 'deck/images'],
+        options: { all_variations: true, limit: 20, cursor: 20 },
+      },
+    });
+  });
+
   it('passes a multi-line label through so its body becomes the version comment', async () => {
     const saved: Version = {
       id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',

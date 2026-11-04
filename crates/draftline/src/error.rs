@@ -51,6 +51,10 @@ pub enum DraftlineError {
     #[error("invalid graph options: {0}")]
     InvalidGraphOptions(String),
 
+    /// A path-scoped operation was given no paths.
+    #[error("no paths were given")]
+    NoPathsSelected,
+
     #[error("variation already exists: {0}")]
     VariationAlreadyExists(String),
 

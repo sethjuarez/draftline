@@ -208,6 +208,15 @@ fn get_full_history(
     contract::into_tauri_result(contract::get_full_history_with_context(&context, request))
 }
 
+#[tauri::command]
+fn get_path_history(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: contract::PathHistoryRequest,
+) -> TauriCommandResult<draftline::PathHistory> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::get_path_history_with_context(&context, request))
+}
+
 #[tauri_plugin_auditaur::auditaur_command]
 fn get_workspace_graph(
     state: tauri::State<'_, DraftlineContextState>,
@@ -800,6 +809,7 @@ fn main() {
             get_changes,
             get_history,
             get_full_history,
+            get_path_history,
             get_workspace_graph,
             get_workspace_graph_refs,
             get_workspace_graph_summary,
