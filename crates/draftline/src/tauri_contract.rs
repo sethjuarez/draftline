@@ -3075,6 +3075,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidGraphOptions(_) => "invalid_graph_options",
         DraftlineError::NoPathsSelected => "no_paths_selected",
         DraftlineError::NothingToRestore => "nothing_to_restore",
+        DraftlineError::PathKindChanged(_) => "path_kind_changed",
         DraftlineError::VariationAlreadyExists(_) => "variation_already_exists",
         DraftlineError::VariationNotFound(_) => "variation_not_found",
         DraftlineError::CannotDeleteCurrentVariation(_) => "cannot_delete_current_variation",

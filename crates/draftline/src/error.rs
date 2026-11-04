@@ -59,6 +59,11 @@ pub enum DraftlineError {
     #[error("the selected paths already match that version")]
     NothingToRestore,
 
+    /// Restoring the path would turn a file into a folder or back, which a
+    /// path restore refuses rather than leave the files out of step.
+    #[error("restoring would turn a file into a folder or back: {0}")]
+    PathKindChanged(PathBuf),
+
     #[error("variation already exists: {0}")]
     VariationAlreadyExists(String),
 

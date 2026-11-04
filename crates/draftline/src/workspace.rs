@@ -6785,16 +6785,27 @@ impl Workspace {
             if changes.is_empty() {
                 return Err(DraftlineError::NothingToRestore);
             }
-            // Removals first, then upserts: a path that turned from a file
-            // into a folder (or back) can't change type in one update.
+            // Removals first, then upserts, so each update keeps a path's
+            // kind. A path that turns from a file into a folder (or back) is
+            // refused: checkout can't be trusted to swap it on disk.
             let mut removals = git2::build::TreeUpdateBuilder::new();
             let mut upserts = git2::build::TreeUpdateBuilder::new();
             for change in &changes {
                 let key = folder_key(&change.path);
+                let (from, to) = if change.kind == ChangeKind::Deleted {
+                    (&head_tree, &source)
+                } else {
+                    (&source, &head_tree)
+                };
+                // A file going away whose folder appears, or one arriving
+                // where a file stood, sits under a file on the other side.
+                if let Some(blocker) = file_ancestor(to, &change.path)? {
+                    return Err(DraftlineError::PathKindChanged(blocker));
+                }
                 if change.kind == ChangeKind::Deleted {
                     removals.remove(key.as_str());
                 } else {
-                    let entry = source.get_path(&change.path)?;
+                    let entry = from.get_path(&change.path)?;
                     upserts.upsert(key.as_str(), entry.id(), blob_file_mode(entry.filemode()));
                 }
             }
@@ -15404,6 +15415,24 @@ fn optional_tree_entry(tree: &Tree<'_>, path: &Path) -> Result<Option<Oid>> {
     }
 }
 
+/// The nearest proper ancestor of `path` that `tree` holds as a file, if any.
+fn file_ancestor(tree: &Tree<'_>, path: &Path) -> Result<Option<PathBuf>> {
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        match tree.get_path(ancestor) {
+            Ok(entry) if entry.kind() != Some(git2::ObjectType::Tree) => {
+                return Ok(Some(ancestor.to_path_buf()));
+            }
+            Ok(_) => return Ok(None),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
+}
+
 /// Literal (non-glob) pathspec for the folder, or `None` when unscoped.
 fn scope_pathspec(scope: &Path) -> Option<String> {
     if scope.as_os_str().is_empty() {
@@ -18740,23 +18769,51 @@ mod tests {
     }
 
     #[test]
-    fn restore_version_paths_handles_files_turning_into_folders() {
+    fn restore_version_paths_refuses_files_turning_into_folders() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = Workspace::init(temp.path()).unwrap();
 
         write_file(workspace.root(), "docs/readme.md", b"a folder");
+        write_file(workspace.root(), "notes", b"a file");
         let first = workspace.save_version("First").unwrap();
+        // Saves can't swap a file and a folder either, so commit it with Git.
         fs::remove_dir_all(workspace.root().join("docs")).unwrap();
+        fs::remove_file(workspace.root().join("notes")).unwrap();
         write_file(workspace.root(), "docs", b"now a file");
-        workspace.save_version("Second").unwrap();
+        write_file(workspace.root(), "notes/a.md", b"now a folder");
+        let repo = Repository::open(workspace.root()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("docs/readme.md")).unwrap();
+        index.remove_path(Path::new("notes")).unwrap();
+        index.add_path(Path::new("docs")).unwrap();
+        index.add_path(Path::new("notes/a.md")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = git2::Signature::now("Dev", "dev@example.test").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Second",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+        let second = workspace.history().unwrap()[0].version.clone();
+        assert!(workspace.changed_files().unwrap().is_empty());
 
-        workspace
-            .restore_version_paths_as_new_save(first.id(), ["docs"], "Back")
-            .unwrap();
-        assert_eq!(
-            fs::read_to_string(workspace.root().join("docs/readme.md")).unwrap(),
-            "a folder"
-        );
+        for (path, blocker) in [("docs", "docs"), ("notes", "notes")] {
+            let error = workspace
+                .restore_version_paths_as_new_save(first.id(), [path], "Back")
+                .unwrap_err();
+            assert!(
+                matches!(&error, DraftlineError::PathKindChanged(at) if at == Path::new(blocker)),
+                "{path}: {error:?}"
+            );
+        }
+        assert_eq!(workspace.history().unwrap()[0].version.id(), second.id());
+        assert!(workspace.recovery_state().unwrap().is_none());
         assert!(workspace.changed_files().unwrap().is_empty());
     }
     #[test]
