@@ -685,6 +685,54 @@ fn tauri_contract_smokes_history_preview_restore_shelf_and_policy_commands() {
 }
 
 #[test]
+fn tauri_contract_records_version_comments() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"# Base");
+    let base = save(SaveRequest {
+        workspace_path: temp.path().to_path_buf(),
+        label: "Base".to_string(),
+    })
+    .unwrap();
+    assert_eq!(base.version.comment, None);
+    let json = serde_json::to_value(&base).unwrap();
+    assert!(json["version"].get("comment").is_none());
+
+    // The label is the whole commit message; its body is the comment.
+    write_file(workspace.root(), "post.md", b"# Second");
+    let saved = save(SaveRequest {
+        workspace_path: temp.path().to_path_buf(),
+        label: "Second\n\nWhy this save exists.".to_string(),
+    })
+    .unwrap();
+    assert_eq!(saved.version.label, "Second");
+    assert_eq!(
+        saved.version.comment.as_deref(),
+        Some("Why this save exists.")
+    );
+    let json = serde_json::to_value(&saved).unwrap();
+    assert_eq!(json["version"]["label"], "Second");
+    assert_eq!(json["version"]["comment"], "Why this save exists.");
+
+    let restored = restore_version_as_new_save(RestoreVersionRequest {
+        workspace_path: temp.path().to_path_buf(),
+        version_id: base.version.id().as_str().to_string(),
+        label: "Back to base\n\nBase read better.".to_string(),
+    })
+    .unwrap();
+    assert_eq!(restored.version.label, "Back to base");
+
+    let history = get_full_history(WorkspaceRequest {
+        workspace_path: temp.path().to_path_buf(),
+    })
+    .unwrap();
+    assert!(history
+        .iter()
+        .any(|entry| entry.version.comment.as_deref() == Some("Base read better.")));
+}
+
+#[test]
 fn tauri_contract_restores_version_to_target_variation() {
     let temp = tempfile::tempdir().unwrap();
     let workspace = Workspace::init(temp.path()).unwrap();
@@ -851,11 +899,15 @@ fn tauri_contract_smokes_collaboration_incoming_and_merge() {
     let merged = merge_incoming(MergeIncomingRequest {
         workspace_path: author_dir.path().to_path_buf(),
         remote: "origin".to_string(),
-        label: "Workbench contract merge".to_string(),
+        label: "Workbench contract merge\n\nTook the teammate's notes.".to_string(),
         from_base: false,
     })
     .unwrap();
     assert_eq!(merged.merge.version.label, "Workbench contract merge");
+    assert_eq!(
+        merged.merge.version.comment.as_deref(),
+        Some("Took the teammate's notes.")
+    );
     assert_eq!(
         read_file(author.root(), "author.md"),
         "local branch of work"

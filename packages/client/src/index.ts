@@ -331,6 +331,8 @@ export interface Version {
   author: Contributor;
   saved_by: Contributor;
   time_seconds: number;
+  /** The commit message body: the version's longer description. Absent when it has none. */
+  comment?: string | null;
 }
 
 export interface VariationMetadata {
@@ -1020,6 +1022,8 @@ export interface RemoteVersionSummary {
   label: string;
   author: Contributor;
   time_seconds: number;
+  /** The commit message body, as on `Version.comment`. */
+  comment?: string | null;
 }
 
 export interface SyncStatus {

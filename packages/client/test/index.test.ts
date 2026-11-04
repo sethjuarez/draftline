@@ -8,6 +8,7 @@ import {
   type DraftlineInvoke,
   type MergeIncomingReport,
   type VariationRenameToken,
+  type Version,
   type WorkspaceDiagnostics,
 } from '../src/index';
 
@@ -657,6 +658,29 @@ describe('createDraftlineClient', () => {
         path: 'post.md',
       },
     ]);
+  });
+
+  it('passes a multi-line label through so its body becomes the version comment', async () => {
+    const saved: Version = {
+      id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      label: 'Tighten intro',
+      author: { name: 'Ana', email: 'ana@example.com' },
+      saved_by: { name: 'Ana', email: 'ana@example.com' },
+      time_seconds: 1,
+      comment: 'Shorter hook.',
+    };
+    const invoke = vi.fn<DraftlineInvoke>(async () => ({ version: saved }) as never);
+    const facade = createDraftlineHostFacade({
+      client: createDraftlineClient({ invoke }),
+      workspacePath: 'C:\\repo',
+    });
+
+    const result = await facade.save('Tighten intro\n\nShorter hook.');
+
+    expect(invoke).toHaveBeenCalledWith('save', {
+      request: { workspace_path: 'C:\\repo', label: 'Tighten intro\n\nShorter hook.' },
+    });
+    expect(result.version.comment).toBe('Shorter hook.');
   });
 
   it('subscribes to the stable Draftline workspace event channel', async () => {

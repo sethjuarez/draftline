@@ -45,12 +45,40 @@ pub struct Version {
     pub author: Contributor,
     pub saved_by: Contributor,
     pub time_seconds: i64,
+    /// The save's longer description: the commit message body, without
+    /// Draftline's own trailers. `None` when the save has no comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 impl Version {
     pub fn id(&self) -> &VersionId {
         &self.id
     }
+}
+
+/// `Draftline-Some-Key: value`, the trailer shape Draftline writes into
+/// commit bodies.
+fn is_draftline_trailer(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("Draftline-") else {
+        return false;
+    };
+    let Some((key, _)) = rest.split_once(':') else {
+        return false;
+    };
+    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// A commit body as a version comment: Draftline trailers removed, trimmed,
+/// `None` when nothing is left.
+fn comment_from_body(body: Option<&str>) -> Option<String> {
+    let kept: Vec<&str> = body?
+        .lines()
+        .filter(|line| !is_draftline_trailer(line))
+        .collect();
+    let comment = kept.join("\n");
+    let comment = comment.trim();
+    (!comment.is_empty()).then(|| comment.to_string())
 }
 
 /// Identifier for a version.
@@ -13828,6 +13856,7 @@ fn version_from_commit(commit: &Commit<'_>) -> Version {
         author: contributor_from_signature(&commit.author()),
         saved_by: contributor_from_signature(&commit.committer()),
         time_seconds: commit.time().seconds(),
+        comment: comment_from_body(commit.body().ok().flatten()),
     }
 }
 
@@ -14441,6 +14470,7 @@ fn remote_summary_from_commit(commit: &Commit<'_>) -> RemoteVersionSummary {
             .to_string(),
         author: contributor_from_signature(&commit.author()),
         time_seconds: commit.time().seconds(),
+        comment: comment_from_body(commit.body().ok().flatten()),
     }
 }
 
@@ -17903,6 +17933,109 @@ mod tests {
             "first"
         );
         assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn comment_from_body_drops_draftline_trailers() {
+        assert_eq!(comment_from_body(None), None);
+        assert_eq!(comment_from_body(Some("  \n ")), None);
+        assert_eq!(
+            comment_from_body(Some("Draftline-Moved-From: old/place\n")),
+            None
+        );
+        assert_eq!(
+            comment_from_body(Some("Why it changed\n\nDraftline-Moved-From: old\n")),
+            Some("Why it changed".to_string())
+        );
+    }
+
+    #[test]
+    fn versions_carry_their_comment_through_saves_history_and_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "post.md", b"first");
+        let plain = workspace.save_version("Plain").unwrap();
+        assert_eq!(plain.comment, None);
+
+        write_file(workspace.root(), "post.md", b"second");
+        // Hosts write the comment as the body of the label they pass in.
+        let second = workspace
+            .save_version("Second\n\nRewrote the post.\n\nKept the title.\n")
+            .unwrap();
+        assert_eq!(second.label, "Second");
+        assert_eq!(
+            second.comment.as_deref(),
+            Some("Rewrote the post.\n\nKept the title.")
+        );
+
+        write_file(workspace.root(), "notes.md", b"notes");
+        let selected = workspace
+            .save_files(["notes.md"], "Notes\n\nOnly notes")
+            .unwrap();
+        assert_eq!(selected.label, "Notes");
+        assert_eq!(selected.comment.as_deref(), Some("Only notes"));
+
+        let history = workspace.history().unwrap();
+        let entry = history
+            .iter()
+            .find(|entry| entry.version.id() == second.id())
+            .unwrap();
+        assert_eq!(entry.version, second);
+
+        let graph = workspace
+            .workspace_graph(WorkspaceGraphOptions::default())
+            .unwrap();
+        let node = graph
+            .nodes
+            .iter()
+            .find(|node| node.version.id() == second.id())
+            .unwrap();
+        assert_eq!(node.version.comment, second.comment);
+
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("comment").is_none(), "absent comment is omitted");
+        let json = serde_json::to_value(&second).unwrap();
+        assert_eq!(json["comment"], "Rewrote the post.\n\nKept the title.");
+        let mut legacy = serde_json::to_value(&second).unwrap();
+        legacy.as_object_mut().unwrap().remove("comment");
+        let parsed: Version = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.comment, None);
+    }
+
+    #[test]
+    fn restores_and_save_first_switches_record_a_comment() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+
+        write_file(workspace.root(), "post.md", b"first");
+        let first = workspace.save_version("First").unwrap();
+        write_file(workspace.root(), "post.md", b"second");
+        workspace.save_version("Second").unwrap();
+
+        let restored = workspace
+            .restore_version_as_new_save(first.id(), "Back to first\n\nSecond read worse.")
+            .unwrap();
+        assert_eq!(restored.label, "Back to first");
+        assert_eq!(restored.comment.as_deref(), Some("Second read worse."));
+
+        let variation = workspace.create_variation("alternate").unwrap();
+        write_file(workspace.root(), "post.md", b"unsaved");
+        workspace
+            .switch_variation(
+                variation.id(),
+                SwitchPolicy::SaveFirst {
+                    label: "Before switching\n\nParked edits".to_string(),
+                },
+            )
+            .unwrap();
+        let saved = workspace
+            .full_history()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.version.label == "Before switching")
+            .expect("SaveFirst wrote a save");
+        assert_eq!(saved.version.comment.as_deref(), Some("Parked edits"));
     }
 
     #[test]

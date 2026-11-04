@@ -54,6 +54,9 @@ pub struct RemoteVersionSummary {
     pub label: String,
     pub author: Contributor,
     pub time_seconds: i64,
+    /// The commit message body, as on [`crate::Version::comment`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 /// Result of publishing local versions to a remote.
