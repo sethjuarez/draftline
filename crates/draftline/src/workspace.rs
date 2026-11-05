@@ -631,6 +631,104 @@ pub struct ProjectSettingsUpdate {
     pub commit_template: Option<String>,
 }
 
+/// What to look at besides the repository in [`Workspace::inspect_repository`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InspectRepositoryOptions {
+    /// Where the host would put the project: a new folder inside a local
+    /// repository (relative to its root) or a clone destination for a
+    /// remote one (relative paths resolve against the current directory).
+    pub target_folder: Option<PathBuf>,
+}
+
+impl InspectRepositoryOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_target_folder(mut self, target_folder: impl Into<PathBuf>) -> Self {
+        self.target_folder = Some(target_folder.into());
+        self
+    }
+}
+
+/// Whether [`Workspace::inspect_repository`] looked at a folder on this
+/// machine or asked a remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryLocationKind {
+    Local,
+    Remote,
+}
+
+/// What [`Workspace::inspect_repository`] found, without changing anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RepositoryInspection {
+    pub location_kind: RepositoryLocationKind,
+    /// A local folder inside a Git work tree, or a remote that answered.
+    pub is_repository: bool,
+    /// The local work tree's root; `None` for a remote or a bare repository.
+    pub root: Option<PathBuf>,
+    /// The folder Draftline manages in this repository, from `.draftline`
+    /// or this machine's record. Always `None` for a remote (its files
+    /// aren't read before cloning).
+    pub project: Option<InspectedProject>,
+    /// The checked-out branch (local only), including an unborn one.
+    pub current_branch: Option<String>,
+    /// The remote's default branch: its `HEAD` for a remote, or what
+    /// `refs/remotes/origin/HEAD` records locally (no network).
+    pub default_branch: Option<String>,
+    /// Branch names: local branches, or the remote's branches.
+    pub branches: Vec<String>,
+    /// Configured remotes (local only), with any login removed from URLs.
+    pub remotes: Vec<RemoteEndpoint>,
+    pub lfs: LfsInspection,
+    pub target_folder: Option<TargetFolderInspection>,
+}
+
+/// The project a repository already has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct InspectedProject {
+    /// Relative to the repository root (empty for the root).
+    pub folder: PathBuf,
+    pub id: Option<String>,
+    pub base_branch: Option<String>,
+    pub commit_template: Option<String>,
+    /// `false` when only this machine's record names the folder (the
+    /// marker isn't written or committed yet).
+    pub in_marker: bool,
+}
+
+/// Git LFS in the repository and on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct LfsInspection {
+    /// Whether a `.gitattributes` (committed, or the root's working copy)
+    /// sends files through `filter=lfs`. `None` for a remote.
+    pub used: Option<bool>,
+    /// Whether `git lfs` runs on this machine.
+    pub available: bool,
+}
+
+/// The folder the host would put the project in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TargetFolderInspection {
+    pub path: PathBuf,
+    /// Relative to the local repository's root, when it is inside it.
+    pub folder: Option<PathBuf>,
+    pub exists: bool,
+    pub is_directory: bool,
+    /// An existing folder with nothing in it.
+    pub empty: bool,
+    /// Why the project can't go there, as the error code creating it would
+    /// give: `folder_not_empty`, `folder_is_elsewhere` (the repository
+    /// manages another folder) or `path_escapes_workspace`.
+    pub blocker: Option<String>,
+}
+
 /// Who manages the repository, as the marker or local record says.
 #[derive(PartialEq)]
 enum FolderOwner {
@@ -1851,6 +1949,16 @@ impl Workspace {
         project_path: &Path,
         content_policy: ContentPolicy,
     ) -> Result<Self> {
+        Ok(Self::unclaimed_read_only(repo, project_path, content_policy)?.initialize())
+    }
+
+    /// [`Self::unclaimed`] without creating Draftline's state folder, for
+    /// callers that only read.
+    fn unclaimed_read_only(
+        repo: Repository,
+        project_path: &Path,
+        content_policy: ContentPolicy,
+    ) -> Result<Self> {
         let root = repo
             .workdir()
             .map(Path::to_path_buf)
@@ -1865,8 +1973,7 @@ impl Workspace {
             resolver_registry: ResolverRegistry::with_default_resolvers(),
             variation_namespace: None,
             filter_timeout: None,
-        }
-        .initialize())
+        })
     }
 
     /// Opens an existing workspace.
@@ -2298,6 +2405,179 @@ impl Workspace {
                 tracing::warn!(%error, "could not restore .draftline after a failed project init");
             }
         })
+    }
+
+    /// Looks at a repository before the host opens, clones or adds a project
+    /// to it, and changes nothing. `location` is a local path (any folder in
+    /// a work tree) or a remote URL; a remote is only asked for its
+    /// branches. A local path that isn't in a repository (or doesn't exist)
+    /// is reported with `is_repository: false`.
+    pub fn inspect_repository(
+        location: &str,
+        options: &InspectRepositoryOptions,
+        remote_options: &mut RemoteOptions<'_>,
+    ) -> Result<RepositoryInspection> {
+        let location = location.trim();
+        let local = Path::new(location);
+        let remote = !local.exists() && looks_like_remote_url(location);
+        let mut inspection = if remote {
+            Self::inspect_remote(location, remote_options)?
+        } else {
+            Self::inspect_local(local)?
+        };
+        if let Some(target) = &options.target_folder {
+            inspection.target_folder = Some(inspect_target_folder(&inspection, target)?);
+        }
+        Ok(inspection)
+    }
+
+    fn inspect_remote(url: &str, options: &mut RemoteOptions<'_>) -> Result<RepositoryInspection> {
+        crate::remote::ensure_supported_remote_url(url)?;
+        let mut remote = git2::Remote::create_detached(url)?;
+        let _timeout_guard = options.server_timeout_guard()?;
+        let heads = |remote: &git2::Remote<'_>| -> std::result::Result<_, git2::Error> {
+            let default_branch = remote
+                .default_branch()
+                .ok()
+                .and_then(|name| name.as_str().ok().map(str::to_string));
+            let branches = remote
+                .list()?
+                .iter()
+                .filter_map(|head| head.name().strip_prefix("refs/heads/"))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            Ok((default_branch, branches))
+        };
+        let listed = if options.has_network_callbacks() {
+            let callbacks = options.remote_callbacks("inspect_repository");
+            remote
+                .connect_auth(Direction::Fetch, Some(callbacks), None)
+                .and_then(|mut connection| heads(connection.remote()))
+        } else {
+            remote
+                .connect(Direction::Fetch)
+                .and_then(|()| heads(&remote))
+        };
+        let (default_branch, mut branches) =
+            options.map_git_result("inspect_repository", listed)?;
+        branches.sort();
+        Ok(RepositoryInspection {
+            location_kind: RepositoryLocationKind::Remote,
+            is_repository: true,
+            root: None,
+            project: None,
+            current_branch: None,
+            default_branch: default_branch
+                .and_then(|name| name.strip_prefix("refs/heads/").map(str::to_string)),
+            branches,
+            remotes: Vec::new(),
+            lfs: LfsInspection {
+                used: None,
+                available: git_cli::lfs_available(),
+            },
+            target_folder: None,
+        })
+    }
+
+    fn inspect_local(location: &Path) -> Result<RepositoryInspection> {
+        let lfs_available = git_cli::lfs_available();
+        let mut inspection = RepositoryInspection {
+            location_kind: RepositoryLocationKind::Local,
+            is_repository: false,
+            root: None,
+            project: None,
+            current_branch: None,
+            default_branch: None,
+            branches: Vec::new(),
+            remotes: Vec::new(),
+            lfs: LfsInspection {
+                used: None,
+                available: lfs_available,
+            },
+            target_folder: None,
+        };
+        let location = absolute_path(location)?;
+        if !location.is_dir() {
+            return Ok(inspection);
+        }
+        let Ok(repo) = Repository::discover(&location) else {
+            return Ok(inspection);
+        };
+        inspection.is_repository = true;
+        inspection.current_branch = repo
+            .find_reference("HEAD")
+            .ok()
+            .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string))
+            .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_string));
+        inspection.default_branch = repo
+            .find_reference("refs/remotes/origin/HEAD")
+            .ok()
+            .and_then(|head| head.symbolic_target().ok().flatten().map(str::to_string))
+            .and_then(|target| {
+                target
+                    .strip_prefix("refs/remotes/origin/")
+                    .map(str::to_string)
+            });
+        let mut branches = repo
+            .branches(Some(BranchType::Local))?
+            .filter_map(|branch| branch.ok())
+            .filter_map(|(branch, _)| branch.name().ok().flatten().map(str::to_string))
+            .collect::<Vec<_>>();
+        branches.sort();
+        inspection.branches = branches;
+        let mut remotes = Vec::new();
+        for name in repo
+            .remotes()?
+            .iter()
+            .filter_map(|name| name.ok().flatten())
+        {
+            let url = repo
+                .find_remote(name)
+                .ok()
+                .and_then(|remote| remote.url().ok().map(redact_remote_url))
+                .unwrap_or_default();
+            remotes.push(RemoteEndpoint {
+                name: name.to_string(),
+                url,
+            });
+        }
+        remotes.sort_by(|left, right| left.name.cmp(&right.name));
+        inspection.remotes = remotes;
+        let Some(workdir) = repo.workdir().map(Path::to_path_buf) else {
+            return Ok(inspection);
+        };
+        inspection.lfs.used = Some(uses_lfs(&repo, &workdir));
+        inspection.root = Some(workdir.clone());
+        let root = Self::unclaimed_read_only(repo, &workdir, ContentPolicy::default())?;
+        inspection.project = match root.read_marker()? {
+            Some(folder) => {
+                let settings = root.marker_settings();
+                Some(InspectedProject {
+                    folder: PathBuf::from(folder),
+                    id: settings.id,
+                    base_branch: settings.base_branch,
+                    commit_template: settings.commit_template,
+                    in_marker: true,
+                })
+            }
+            None => match root.claim_owner()? {
+                FolderOwner::Nobody => None,
+                FolderOwner::Folder(folder) => Some(InspectedProject {
+                    folder: PathBuf::from(folder),
+                    id: None,
+                    base_branch: None,
+                    commit_template: None,
+                    in_marker: false,
+                }),
+                FolderOwner::Invalid(reason) => {
+                    return Err(DraftlineError::InvalidFolderMarker(reason))
+                }
+                FolderOwner::Newer(reason) => {
+                    return Err(DraftlineError::NewerFolderMarker(reason))
+                }
+            },
+        };
+        Ok(inspection)
     }
 
     /// Whether HEAD's committed marker already holds `marker`, so writing it
@@ -16672,8 +16952,114 @@ fn workdir_patch_text(diff: &git2::Diff<'_>, skip_changing: bool) -> Result<Stri
     Ok(text)
 }
 
+/// Whether `location` names a remote rather than a local path: a URL with a
+/// scheme, or scp-like `user@host:path`.
+fn looks_like_remote_url(location: &str) -> bool {
+    // `C:\foo`, `C:/foo` and `C://foo` are Windows drive paths, not URLs.
+    let bytes = location.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes.get(2).is_none_or(|byte| matches!(byte, b'/' | b'\\'))
+    {
+        return false;
+    }
+    if let Some((scheme, _)) = location.split_once("://") {
+        return !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "+-.".contains(character));
+    }
+    match (location.find('@'), location.find(':')) {
+        // `C:\...` has no `@` before its colon.
+        (Some(at), Some(colon)) => at < colon && !location[..at].contains(['/', '\\']),
+        _ => false,
+    }
+}
+
+/// Whether a committed `.gitattributes`, or the root's working copy, sends
+/// files through Git LFS.
+fn uses_lfs(repo: &Repository, workdir: &Path) -> bool {
+    let says_lfs = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .any(|line| line.split_whitespace().any(|word| word == "filter=lfs"))
+    };
+    if fs::read(workdir.join(".gitattributes")).is_ok_and(|bytes| says_lfs(&bytes)) {
+        return true;
+    }
+    let Ok(tree) = repo.head().and_then(|head| head.peel_to_tree()) else {
+        return false;
+    };
+    let mut found = false;
+    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
+        if entry.name().ok() == Some(".gitattributes")
+            && entry.kind() == Some(ObjectType::Blob)
+            && repo
+                .find_blob(entry.id())
+                .is_ok_and(|blob| says_lfs(blob.content()))
+        {
+            found = true;
+            return git2::TreeWalkResult::Abort;
+        }
+        git2::TreeWalkResult::Ok
+    });
+    found
+}
+
+/// Where `target` is and whether a project can go there.
+fn inspect_target_folder(
+    inspection: &RepositoryInspection,
+    target: &Path,
+) -> Result<TargetFolderInspection> {
+    let path = match (&inspection.root, target.is_absolute()) {
+        (Some(root), false) => root.join(target),
+        _ => absolute_path(target)?,
+    };
+    let exists = path.exists();
+    let is_directory = path.is_dir();
+    let empty = is_directory && fs::read_dir(&path)?.next().is_none();
+    let folder = match &inspection.root {
+        Some(root) => folder_in(root, &path).ok(),
+        None => None,
+    };
+    let blocker = if inspection.root.is_some()
+        && folder.as_ref().is_none_or(|folder| {
+            folder
+                .components()
+                .next()
+                .is_some_and(|first| first.as_os_str().eq_ignore_ascii_case(".git"))
+        }) {
+        Some("path_escapes_workspace")
+    } else if exists && !empty {
+        Some("folder_not_empty")
+    } else if let (Some(project), Some(folder)) = (&inspection.project, &folder) {
+        (folder_key(&project.folder) != folder_key(folder)).then_some("folder_is_elsewhere")
+    } else {
+        None
+    };
+    Ok(TargetFolderInspection {
+        path,
+        folder,
+        exists,
+        is_directory,
+        empty,
+        blocker: blocker.map(str::to_string),
+    })
+}
+
 fn redact_remote_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
+        // scp-like `login@host:path`: only the conventional `git` login stays.
+        if looks_like_remote_url(url) {
+            if let Some((login, rest)) = url.split_once('@') {
+                if login != "git" {
+                    return rest.to_string();
+                }
+            }
+        }
         return url.to_string();
     };
     let authority_start = scheme_end + 3;

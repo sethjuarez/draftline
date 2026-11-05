@@ -25,6 +25,16 @@ pub(crate) fn available() -> bool {
     })
 }
 
+/// Whether `git lfs` runs here. Not cached: a preflight may run again
+/// after the user installs it.
+pub(crate) fn lfs_available() -> bool {
+    git(&std::env::temp_dir())
+        .args(["lfs", "version"])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 /// A `git` command in `workdir` that ignores any repository the host
 /// process's environment points at and never prompts on a terminal.
 fn git(workdir: &Path) -> Command {

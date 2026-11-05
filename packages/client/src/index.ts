@@ -88,6 +88,7 @@ export interface DraftlineClient {
   previewVersionFile(request: PreviewVersionFileRequest): Promise<PreviewFile | null>;
   readVersionFileBytes(request: ReadVersionFileBytesRequest): Promise<VersionFileBytes | null>;
   githubRepoAccess(request: GitHubRepoAccessRequest): Promise<GitHubRepoAccess>;
+  inspectRepository(request: InspectRepositoryRequest): Promise<RepositoryInspection>;
   previewWorkspaceFile(request: CurrentFileRequest): Promise<CurrentFilePreview | null>;
   restoreVersionAsNewSave(request: RestoreVersionRequest): Promise<RestoreVersionResult>;
   restoreVersionPathsAsNewSave(request: RestoreVersionPathsRequest): Promise<RestoreVersionResult>;
@@ -273,6 +274,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     previewVersionFile: (request) => run('preview_version_file', { request }),
     readVersionFileBytes: (request) => run('read_version_file_bytes', { request }),
     githubRepoAccess: (request) => run('github_repo_access', { request }),
+    inspectRepository: (request) => run('inspect_repository', { request }),
     previewWorkspaceFile: (request) => run('preview_workspace_file', { request }),
     restoreVersionAsNewSave: (request) => run('restore_version_as_new_save', { request }),
     restoreVersionPathsAsNewSave: (request) =>
@@ -1441,6 +1443,55 @@ export interface GitHubRepoAccess {
   fork_parent: GitHubRepo | null;
 }
 
+/**
+ * A repository to look at before opening, cloning or adding a project to it:
+ * a local path (any folder in a work tree) or a remote URL.
+ */
+export interface InspectRepositoryRequest {
+  location: string;
+  /** Where the project would go: relative to a local repository's root, or a clone destination. */
+  target_folder?: string | null;
+  timeout_ms?: number | null;
+  /** The host's GitHub token; needs a host built with Draftline's `github` feature. */
+  github_token?: string | null;
+}
+
+export interface InspectedProject {
+  folder: string;
+  id: string | null;
+  base_branch: string | null;
+  commit_template: string | null;
+  /** False when only this machine's record names the folder. */
+  in_marker: boolean;
+}
+
+export interface TargetFolderInspection {
+  path: string;
+  folder: string | null;
+  exists: boolean;
+  is_directory: boolean;
+  empty: boolean;
+  /** `folder_not_empty`, `folder_is_elsewhere` or `path_escapes_workspace`. */
+  blocker: string | null;
+}
+
+/** What `inspectRepository` found; it changes nothing. */
+export interface RepositoryInspection {
+  location_kind: 'local' | 'remote';
+  is_repository: boolean;
+  root: string | null;
+  project: InspectedProject | null;
+  current_branch: string | null;
+  default_branch: string | null;
+  branches: string[];
+  remotes: RemoteEndpoint[];
+  lfs: { used: boolean | null; available: boolean };
+  target_folder: TargetFolderInspection | null;
+  /** Present on hosts built with the `github` feature when a token was given. */
+  github?: GitHubRepoAccess | null;
+  github_error?: TauriCommandError | null;
+}
+
 export interface DiffVersionsRequest extends WorkspaceRequest {
   from_version_id: string;
   to_version_id: string;
@@ -2209,6 +2260,17 @@ export async function githubRepoAccess(
   request: GitHubRepoAccessRequest,
 ): Promise<GitHubRepoAccess> {
   return createDraftlineClient().githubRepoAccess(request);
+}
+
+/**
+ * Looks at a local folder or remote URL before opening, cloning or adding a
+ * project: branches, remotes, an existing project, Git LFS, the target
+ * folder and, with a GitHub token, push access.
+ */
+export async function inspectRepository(
+  request: InspectRepositoryRequest,
+): Promise<RepositoryInspection> {
+  return createDraftlineClient().inspectRepository(request);
 }
 
 export async function previewWorkspaceFile(
