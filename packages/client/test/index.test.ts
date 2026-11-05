@@ -926,6 +926,23 @@ describe('createDraftlineClient', () => {
     });
   });
 
+  it('clones a repository without claiming it, with progress', async () => {
+    const cloned = { is_repository: true, project: null, project_path: null };
+    const invoke = vi.fn<DraftlineInvoke>(async () => cloned as never);
+    const unlisten = vi.fn();
+    const listen = vi.fn(async () => unlisten);
+    const client = createDraftlineClient({ invoke, listen: listen as never });
+    const request = { remote_url: 'https://example.test/repo.git', workspace_path: 'C:\\clone' };
+
+    await expect(client.cloneRepository(request)).resolves.toEqual(cloned);
+    expect(invoke).toHaveBeenLastCalledWith('clone_repository', { request });
+    await client.cloneRepository({ ...request, progress_id: 'p1' }, () => {});
+    expect(invoke).toHaveBeenLastCalledWith('clone_repository', {
+      request: { ...request, progress_id: 'p1' },
+    });
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
   it('inspects a repository before adding a project', async () => {
     const inspection = {
       location_kind: 'local',

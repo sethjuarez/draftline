@@ -111,9 +111,9 @@ pub use remote::{
 };
 pub use workspace::{
     AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult, ChangeKind, ChangeSet,
-    ChangedFile, ContentPolicyAudit, CurrentFileDiff, CurrentFilePreview, DiagnosticCode,
-    DiagnosticSeverity, DirtySummary, ErrorExplanation, FileHazard, FileHazardKind, FilteredFile,
-    FolderFix, FolderMove, FolderProbe, FolderState, FolderSuggestion, HistoryEntry,
+    ChangedFile, ClonedRepository, ContentPolicyAudit, CurrentFileDiff, CurrentFilePreview,
+    DiagnosticCode, DiagnosticSeverity, DirtySummary, ErrorExplanation, FileHazard, FileHazardKind,
+    FilteredFile, FolderFix, FolderMove, FolderProbe, FolderState, FolderSuggestion, HistoryEntry,
     InspectRepositoryOptions, InspectedProject, LegacyHistoryCleanup, LfsInspection,
     MergeConflictResolution, MergeIncomingReport, MergeIncomingResult, MergeIncomingToken,
     MergeResolutionChoice, OperationLockInspection, OperationLockMetadata, OperationLockState,

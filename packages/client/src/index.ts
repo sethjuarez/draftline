@@ -39,6 +39,16 @@ export interface DraftlineClient {
     request: CloneWorkspaceWithOptionsRequest,
     onProgress?: (progress: CloneProgressEvent) => void,
   ): Promise<WorkspaceOpenResult>;
+  /**
+   * Clones a repository without opening or claiming a project in it, so a
+   * repository without a marker can then get a project folder with
+   * `initProjectInRepository`. `onProgress` works as in
+   * `cloneWorkspaceWithOptions`.
+   */
+  cloneRepository(
+    request: CloneRepositoryRequest,
+    onProgress?: (progress: CloneProgressEvent) => void,
+  ): Promise<ClonedRepository>;
   adoptWorkspace(workspacePath: string): Promise<AdoptWorkspaceResult>;
   inspectWorkspace(workspacePath: string): Promise<WorkspaceDiagnostics>;
   verifyWorkspace(workspacePath: string): Promise<WorkspaceVerification>;
@@ -167,30 +177,37 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     }
   }
 
+  async function cloneWithProgress<T>(
+    command: string,
+    request: CloneWorkspaceWithOptionsRequest,
+    onProgress?: (progress: CloneProgressEvent) => void,
+  ): Promise<T> {
+    if (!onProgress) {
+      return run(command, { request });
+    }
+    const progressId = request.progress_id ?? newProgressId();
+    const unlisten = await listen<CloneProgressEvent>(cloneProgressEventName, (event) => {
+      if (event.payload.progress_id === progressId) {
+        onProgress(event.payload);
+      }
+    });
+    try {
+      return await run<T>(command, { request: { ...request, progress_id: progressId } });
+    } finally {
+      unlisten();
+    }
+  }
+
   return {
     openWorkspace: (workspacePath) =>
       run('open_workspace', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
     cloneWorkspace: (request) => run('clone_workspace', { request }),
-    cloneWorkspaceWithOptions: async (request, onProgress) => {
-      if (!onProgress) {
-        return run('clone_workspace_with_options', { request });
-      }
-      const progressId = request.progress_id ?? newProgressId();
-      const unlisten = await listen<CloneProgressEvent>(cloneProgressEventName, (event) => {
-        if (event.payload.progress_id === progressId) {
-          onProgress(event.payload);
-        }
-      });
-      try {
-        return await run<WorkspaceOpenResult>('clone_workspace_with_options', {
-          request: { ...request, progress_id: progressId },
-        });
-      } finally {
-        unlisten();
-      }
-    },
+    cloneWorkspaceWithOptions: (request, onProgress) =>
+      cloneWithProgress<WorkspaceOpenResult>('clone_workspace_with_options', request, onProgress),
+    cloneRepository: (request, onProgress) =>
+      cloneWithProgress<ClonedRepository>('clone_repository', request, onProgress),
     adoptWorkspace: (workspacePath) =>
       run('adopt_workspace', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
@@ -1376,6 +1393,15 @@ export interface CloneProgressEvent {
   received_bytes: number;
 }
 
+/** Same options as a clone with options; the clone opens and claims nothing. */
+export type CloneRepositoryRequest = CloneWorkspaceWithOptionsRequest;
+
+/** A plain clone: what `inspectRepository` reports for it, and its project's folder. */
+export interface ClonedRepository extends RepositoryInspection {
+  /** The folder the marker names (created if missing), or null without a project. */
+  project_path: string | null;
+}
+
 function newProgressId(): string {
   const random = globalThis.crypto?.randomUUID?.();
   return random ?? `clone-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
@@ -2267,6 +2293,18 @@ export async function githubRepoAccess(
  * project: branches, remotes, an existing project, Git LFS, the target
  * folder and, with a GitHub token, push access.
  */
+/**
+ * Clones a repository without opening or claiming a project in it. Refuses a
+ * non-empty destination (`folder_not_empty`) and leaves the destination as it
+ * was when the clone fails.
+ */
+export async function cloneRepository(
+  request: CloneRepositoryRequest,
+  onProgress?: (progress: CloneProgressEvent) => void,
+): Promise<ClonedRepository> {
+  return createDraftlineClient().cloneRepository(request, onProgress);
+}
+
 export async function inspectRepository(
   request: InspectRepositoryRequest,
 ): Promise<RepositoryInspection> {

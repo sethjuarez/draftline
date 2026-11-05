@@ -91,6 +91,18 @@ fn clone_workspace_with_options(
 }
 
 #[tauri::command]
+fn clone_repository(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: contract::CloneRepositoryRequest,
+) -> TauriCommandResult<draftline::ClonedRepository> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::clone_repository_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
 fn adopt_workspace(
     state: tauri::State<'_, DraftlineContextState>,
     request: WorkspaceRequest,
@@ -988,6 +1000,7 @@ fn main() {    let _ = tracing_subscriber::registry()
             read_version_file_bytes,
             github_repo_access,
             inspect_repository,
+            clone_repository,
             preview_workspace_file,
             restore_version_as_new_save,
             restore_version_paths_as_new_save,

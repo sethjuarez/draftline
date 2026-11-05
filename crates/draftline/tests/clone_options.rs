@@ -4,12 +4,13 @@ use std::{
 };
 
 use draftline::tauri_contract::{
-    clone_workspace_with_options_with_context, CloneProgressEvent,
-    CloneWorkspaceWithOptionsRequest, DraftlineCommandContext,
+    clone_repository, clone_repository_with_context, clone_workspace_with_options_with_context,
+    CloneProgressEvent, CloneRepositoryRequest, CloneWorkspaceWithOptionsRequest,
+    DraftlineCommandContext,
 };
 use draftline::{
-    CloneOptions, CloneProgress, CloneStage, ContentPolicy, DraftlineError, RemoteOptions,
-    Workspace,
+    CloneOptions, CloneProgress, CloneStage, ContentPolicy, DraftlineError, ProjectSettingsUpdate,
+    RemoteCredential, RemoteOptions, Workspace,
 };
 
 fn commit_files(repo: &git2::Repository, branch: &str, files: &[(&str, &str)], message: &str) {
@@ -460,4 +461,241 @@ fn contract_asks_for_a_blobless_clone() {
     }))
     .unwrap();
     assert!(!request.blobless, "blobless is opt-in");
+}
+
+fn clone_plain(remote: &Path, dest: &Path) -> draftline::Result<draftline::ClonedRepository> {
+    Workspace::clone_repository(
+        url(remote),
+        dest,
+        &CloneOptions::new(),
+        &mut RemoteOptions::new(),
+    )
+}
+
+#[test]
+fn a_plain_clone_of_an_unmarked_repository_leaves_room_for_a_project_folder() {
+    let source = source_repo();
+    let temp = tempfile::tempdir().unwrap();
+    let dest = temp.path().join("clone");
+
+    let cloned = clone_plain(source.path(), &dest).unwrap();
+
+    assert!(cloned.inspection.is_repository);
+    assert_eq!(cloned.inspection.project, None);
+    assert_eq!(cloned.project_path, None);
+    assert_eq!(cloned.inspection.current_branch.as_deref(), Some("main"));
+    // Nothing claimed: no marker, no local record, no state folder.
+    assert!(!dest.join(".draftline").exists());
+    assert!(!dest.join(".git").join("draftline").exists());
+    let repo = git2::Repository::open(&dest).unwrap();
+    assert!(repo.statuses(None).unwrap().is_empty());
+
+    let workspace = Workspace::init_project_in_repository(
+        &dest,
+        "Q3 Demo",
+        ProjectSettingsUpdate::default(),
+        ContentPolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(workspace.scope(), Path::new("q3-demo"));
+}
+
+#[test]
+fn a_plain_clone_of_a_marked_branch_reports_and_creates_its_project_folder() {
+    let source = source_repo();
+    let temp = tempfile::tempdir().unwrap();
+    let dest = temp.path().join("clone");
+
+    let cloned = Workspace::clone_repository(
+        url(source.path()),
+        &dest,
+        &CloneOptions::new().with_branch("cutready/review"),
+        &mut RemoteOptions::new(),
+    )
+    .unwrap();
+
+    let project = cloned.inspection.project.unwrap();
+    assert_eq!(project.folder, Path::new("cutready"));
+    assert!(project.in_marker);
+    let path = cloned.project_path.unwrap();
+    assert!(path.ends_with("cutready") && path.is_dir());
+    assert!(!dest.join(".git").join("draftline").exists());
+    let workspace = Workspace::open(&path).unwrap();
+    assert_eq!(workspace.scope(), Path::new("cutready"));
+}
+
+#[test]
+fn a_plain_clone_leaves_its_destination_as_it_was_when_it_fails() {
+    let source = source_repo();
+    let temp = tempfile::tempdir().unwrap();
+
+    // A folder with something in it is refused untouched.
+    let full = temp.path().join("full");
+    std::fs::create_dir(&full).unwrap();
+    std::fs::write(full.join("keep.txt"), "mine").unwrap();
+    let error = clone_plain(source.path(), &full).unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::FolderNotEmpty(_)),
+        "{error:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(full.join("keep.txt")).unwrap(),
+        "mine"
+    );
+
+    // A missing remote leaves no folder behind, or an empty one emptied.
+    let missing = temp.path().join("nowhere");
+    let dest = temp.path().join("new");
+    assert!(clone_plain(&missing, &dest).is_err());
+    assert!(!dest.exists());
+    let empty = temp.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    assert!(clone_plain(&missing, &empty).is_err());
+    assert_eq!(empty.read_dir().unwrap().count(), 0);
+
+    // An unreadable marker is refused, and the chosen folder stays, empty.
+    let repo = git2::Repository::open(source.path()).unwrap();
+    commit_files(
+        &repo,
+        "main",
+        &[(".draftline", "not a marker")],
+        "Bad marker",
+    );
+    let error = clone_plain(source.path(), &empty).unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::InvalidFolderMarker(_)),
+        "{error:?}"
+    );
+    assert!(empty.is_dir());
+    assert_eq!(empty.read_dir().unwrap().count(), 0);
+}
+
+#[test]
+fn contract_clones_a_repository_without_claiming_it() {
+    let source = source_repo();
+    let temp = tempfile::tempdir().unwrap();
+    let dest = temp.path().join("clone");
+    let events = Arc::new(Mutex::new(Vec::<CloneProgressEvent>::new()));
+    let sink = Arc::clone(&events);
+    let mut context = DraftlineCommandContext::new().with_clone_progress_sink(move |event| {
+        sink.lock().unwrap().push(event);
+    });
+
+    let cloned = clone_repository_with_context(
+        &mut context,
+        CloneRepositoryRequest {
+            remote_url: url(source.path()),
+            workspace_path: dest.clone(),
+            branch: None,
+            progress_id: Some("plain".to_string()),
+            blobless: false,
+        },
+    )
+    .unwrap();
+
+    let json = serde_json::to_value(&cloned).unwrap();
+    assert_eq!(json["is_repository"], true);
+    assert_eq!(json["project"], serde_json::Value::Null);
+    assert_eq!(json["project_path"], serde_json::Value::Null);
+    let events = events.lock().unwrap();
+    assert!(events
+        .iter()
+        .all(|event| event.progress_id.as_deref() == Some("plain")));
+    assert!(events
+        .iter()
+        .any(|event| event.progress.stage == CloneStage::CheckingOut));
+
+    let error = clone_repository(CloneRepositoryRequest {
+        remote_url: url(source.path()),
+        workspace_path: dest,
+        branch: None,
+        progress_id: None,
+        blobless: false,
+    })
+    .unwrap_err();
+    assert_eq!(
+        draftline::tauri_contract::TauriCommandError::from(error).code,
+        "folder_not_empty"
+    );
+}
+
+#[test]
+fn a_rejected_login_stops_asking_instead_of_looping() {
+    let server = httpmock::MockServer::start();
+    server.mock(|_, then| {
+        then.status(401)
+            .header("WWW-Authenticate", "Basic realm=\"git\"");
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let asked = std::cell::Cell::new(0);
+    let mut options = RemoteOptions::new().with_credentials(|_| {
+        asked.set(asked.get() + 1);
+        Ok(RemoteCredential::UsernamePassword {
+            username: "x-access-token".to_string(),
+            password: "wrong".to_string(),
+        })
+    });
+
+    let result = Workspace::clone_repository(
+        server.url("/o/r.git"),
+        temp.path().join("clone"),
+        &CloneOptions::new(),
+        &mut options,
+    );
+
+    assert!(result.is_err());
+    assert!(
+        (1..=5).contains(&asked.get()),
+        "asked {} times",
+        asked.get()
+    );
+    assert!(!temp.path().join("clone").exists());
+}
+
+#[test]
+fn a_plain_clone_never_fills_a_link_or_file_and_leaves_no_staging_behind() {
+    let source = source_repo();
+    let temp = tempfile::tempdir().unwrap();
+    let names = |path: &Path| {
+        let mut names: Vec<_> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let file = temp.path().join("file");
+    std::fs::write(&file, "").unwrap();
+    let error = clone_plain(source.path(), &file).unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::FolderNotEmpty(_)),
+        "{error:?}"
+    );
+
+    let target = temp.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let link = temp.path().join("link");
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_dir(&target, &link);
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&target, &link);
+    if linked.is_ok() {
+        let error = clone_plain(source.path(), &link).unwrap_err();
+        assert!(
+            matches!(error, DraftlineError::FolderNotEmpty(_)),
+            "{error:?}"
+        );
+        assert_eq!(target.read_dir().unwrap().count(), 0);
+    }
+
+    let before = names(temp.path());
+    assert!(clone_plain(&temp.path().join("nowhere"), &temp.path().join("dest")).is_err());
+    assert_eq!(names(temp.path()), before);
+    let deep = temp.path().join("a").join("b").join("clone");
+    assert!(clone_plain(&temp.path().join("nowhere"), &deep).is_err());
+    assert_eq!(names(temp.path()), before);
+
+    clone_plain(source.path(), &deep).unwrap();
+    assert_eq!(names(&temp.path().join("a").join("b")), ["clone"]);
 }

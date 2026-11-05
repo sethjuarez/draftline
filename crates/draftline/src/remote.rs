@@ -691,9 +691,20 @@ impl<'callbacks> RemoteOptions<'callbacks> {
 
         if let Some(credentials) = self.credentials.as_mut() {
             let timed_out = Arc::clone(&self.timed_out);
+            let mut attempts = 0;
             callbacks.credentials(move |url, username_from_url, allowed| {
                 if let Some(deadline) = deadline {
                     deadline.check(&timed_out)?;
+                }
+                // libgit2 asks again after every rejected login; a host
+                // returning the same one would otherwise loop forever.
+                attempts += 1;
+                if attempts > MAX_CREDENTIAL_ATTEMPTS {
+                    return Err(git2::Error::new(
+                        git2::ErrorCode::Auth,
+                        git2::ErrorClass::Net,
+                        "the remote rejected the credentials",
+                    ));
                 }
                 let request = RemoteCredentialRequest {
                     url,
@@ -713,6 +724,9 @@ impl<'callbacks> RemoteOptions<'callbacks> {
         callbacks
     }
 }
+
+/// How often one operation asks the host for credentials before giving up.
+const MAX_CREDENTIAL_ATTEMPTS: usize = 5;
 
 fn duration_millis_i32(duration: Duration) -> i32 {
     duration.as_millis().clamp(1, i32::MAX as u128) as i32
