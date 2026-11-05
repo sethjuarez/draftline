@@ -199,6 +199,10 @@ pub enum DraftlineError {
     #[error("cannot move the Draftline folder: {0}")]
     FolderMoveRefused(String),
 
+    /// A project setting for `.draftline` isn't valid; the text says why.
+    #[error("invalid project settings: {0}")]
+    InvalidProjectSettings(String),
+
     /// The fix isn't one [`crate::Workspace::probe`] offers for the folder now.
     #[error("that fix isn't available for this folder: {0}")]
     FolderFixUnavailable(String),

@@ -20,17 +20,18 @@ use crate::{
     CurrentFilePreview, DirtySummary, DraftlineError, FilteredFile, FolderFix, FolderMove,
     FolderProbe, HistoryEntry, MergeConflictResolution, MergeIncomingReport, MergeIncomingResult,
     MergeIncomingToken, MergeResolutionChoice, OperationLockInspection, PathHistory,
-    PathHistoryOptions, PreflightReport, PreviewFile, PublishPreflight, PublishResult,
-    RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint,
-    RemoteOptions, RemoteVariation, RemoteVariationDiagnostics, RestoreVersionTarget, Result,
-    Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SwitchPolicy, SyncState, SyncStatus,
-    Variation, VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
-    VariationRenamePreflight, VariationRenameToken, VariationSummary, Version, VersionDiff,
-    VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
-    WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
-    WorkspaceGraphNodeDetail, WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
-    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
-    WorkspaceId, WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
+    PathHistoryOptions, PreflightReport, PreviewFile, ProjectSettings, ProjectSettingsUpdate,
+    PublishPreflight, PublishResult, RecoveryRepairResult, RecoveryState, RemoteCredential,
+    RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVariation,
+    RemoteVariationDiagnostics, RestoreVersionTarget, Result, Shelf, ShelfApplyReport, SupportRef,
+    SupportRefScope, SwitchPolicy, SyncState, SyncStatus, Variation, VariationCreatePreflight,
+    VariationCreateToken, VariationId, VariationMetadata, VariationRenamePreflight,
+    VariationRenameToken, VariationSummary, Version, VersionDiff, VersionId, VersionPreview,
+    Workspace, WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary,
+    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail,
+    WorkspaceGraphOptions, WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRefs,
+    WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection,
+    WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -1060,6 +1061,68 @@ pub fn move_folder_with_context(
         moved,
         diagnostics: workspace_diagnostics(&workspace)?,
     })
+}
+
+/// Request to replace the project settings `.draftline` records. Each field
+/// replaces the recorded value; `None` clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateProjectSettingsRequest {
+    pub workspace_path: PathBuf,
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    #[serde(default)]
+    pub commit_template: Option<String>,
+}
+
+/// Reads the project id, base branch and commit template `.draftline` records.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn project_settings(request: WorkspaceRequest) -> Result<ProjectSettings> {
+    project_settings_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Reads project settings through the host-configured context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn project_settings_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: WorkspaceRequest,
+) -> Result<ProjectSettings> {
+    context
+        .open_workspace(&request.workspace_path)?
+        .project_settings()
+}
+
+/// Replaces the project settings and saves `.draftline` when they changed.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn update_project_settings(request: UpdateProjectSettingsRequest) -> Result<ProjectSettings> {
+    update_project_settings_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Replaces the project settings through the host-configured context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn update_project_settings_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: UpdateProjectSettingsRequest,
+) -> Result<ProjectSettings> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let update = ProjectSettingsUpdate {
+        base_branch: request.base_branch,
+        commit_template: request.commit_template,
+    };
+    let settings = match context.contributor_profile.as_ref() {
+        Some(profile) => workspace.update_project_settings_with_profile(update, profile)?,
+        None => workspace.update_project_settings(update)?,
+    };
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(settings)
 }
 
 /// Clones a Draftline workspace using backend-only credentials from the context.
@@ -3599,6 +3662,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::IncomingFolderElsewhere(_) => "incoming_folder_elsewhere",
         DraftlineError::InvalidFolderMarker(_) => "invalid_folder_marker",
         DraftlineError::NewerFolderMarker(_) => "newer_folder_marker",
+        DraftlineError::InvalidProjectSettings(_) => "invalid_project_settings",
         DraftlineError::FolderMoveRefused(_) => "folder_move_refused",
         DraftlineError::FolderFixUnavailable(_) => "folder_fix_unavailable",
         DraftlineError::BaseRenamed { .. } => "base_renamed",

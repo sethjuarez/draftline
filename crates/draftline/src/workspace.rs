@@ -559,11 +559,73 @@ fn is_repository_path(path: &Path) -> bool {
 const MOVED_FROM_TRAILER: &str = "Draftline-Moved-From";
 
 /// The contents of [`FOLDER_MARKER`]: `{ "format": 1, "folder": "cutready" }`,
-/// with `"."` for the whole repository.
+/// with `"."` for the whole repository, plus optional [`ProjectSettings`].
+/// Readers ignore fields they don't know, so the format stays 1.
 #[derive(Serialize, Deserialize)]
 struct FolderMarker {
     format: u32,
     folder: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commit_template: Option<String>,
+}
+
+/// The settings [`FOLDER_MARKER`] carries besides the folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MarkerSettings {
+    id: Option<String>,
+    base_branch: Option<String>,
+    commit_template: Option<String>,
+}
+
+impl MarkerSettings {
+    /// The settings in a marker's bytes; an unreadable marker has none.
+    fn from_marker(bytes: &[u8]) -> Self {
+        serde_json::from_slice::<FolderMarker>(bytes)
+            .ok()
+            .filter(|marker| marker.format == 1)
+            .map(|marker| Self {
+                id: marker.id.filter(|id| !id.trim().is_empty()),
+                base_branch: marker.base_branch,
+                commit_template: marker.commit_template,
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The text a commit template puts in place of the version name.
+const COMMIT_TEMPLATE_SUBJECT: &str = "{subject}";
+
+/// Project settings recorded in `.draftline`, next to the folder it names.
+/// The marker is committed, so every clone and branch shares them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ProjectSettings {
+    /// The managed folder, relative to the repository root (empty for the root).
+    pub folder: PathBuf,
+    /// Stable project id, independent of the folder's name: it survives
+    /// [`Workspace::move_folder`]. `None` until Draftline assigns one (see
+    /// [`Workspace::update_project_settings`]).
+    pub id: Option<String>,
+    /// The branch this project's work merges into.
+    pub base_branch: Option<String>,
+    /// Template for the first line of every commit Draftline writes on a
+    /// branch (saves, restores, merges, folder moves). `{subject}` stands for
+    /// the version name, e.g. `docs(demo): {subject}`.
+    pub commit_template: Option<String>,
+}
+
+/// New project settings for [`Workspace::update_project_settings`]. Each
+/// field replaces the recorded value; `None` clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSettingsUpdate {
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    #[serde(default)]
+    pub commit_template: Option<String>,
 }
 
 /// Who manages the repository, as the marker or local record says.
@@ -2013,6 +2075,125 @@ impl Workspace {
         }
     }
 
+    /// The settings `.draftline` records for this folder. A folder whose
+    /// marker isn't written yet has none.
+    pub fn project_settings(&self) -> Result<ProjectSettings> {
+        let mine = self.project_key();
+        match self.read_marker()? {
+            Some(folder) if folder != mine => {
+                return Err(DraftlineError::FolderIsElsewhere(PathBuf::from(folder)))
+            }
+            Some(_) => {}
+            None => {
+                return Ok(ProjectSettings {
+                    folder: self.scope().to_path_buf(),
+                    id: None,
+                    base_branch: None,
+                    commit_template: None,
+                })
+            }
+        }
+        let settings = self.marker_settings();
+        Ok(ProjectSettings {
+            folder: self.scope().to_path_buf(),
+            id: settings.id,
+            base_branch: settings.base_branch,
+            commit_template: settings.commit_template,
+        })
+    }
+
+    /// Replaces the base branch and commit template `.draftline` records,
+    /// assigning the project an id if it has none, and saves the marker as
+    /// its own version on the current variation. Other unsaved changes stay
+    /// unsaved. Nothing is saved when the settings already match.
+    pub fn update_project_settings(
+        &self,
+        update: ProjectSettingsUpdate,
+    ) -> Result<ProjectSettings> {
+        self.update_project_settings_in(update, None)
+    }
+
+    /// [`Self::update_project_settings`] with host-supplied attribution.
+    pub fn update_project_settings_with_profile(
+        &self,
+        update: ProjectSettingsUpdate,
+        profile: &ContributorProfile,
+    ) -> Result<ProjectSettings> {
+        self.update_project_settings_in(update, Some(profile))
+    }
+
+    fn update_project_settings_in(
+        &self,
+        update: ProjectSettingsUpdate,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<ProjectSettings> {
+        let base_branch = validate_base_branch(update.base_branch)?;
+        let commit_template = validate_commit_template(update.commit_template)?;
+        let _lock = self.acquire_for_index("update_project_settings")?;
+        self.ensure_no_pending_recovery()?;
+        let branch = self.ensure_on_branch()?;
+        let mine = self.project_key();
+        if let Some(folder) = self.read_marker()?.filter(|folder| *folder != mine) {
+            return Err(DraftlineError::FolderIsElsewhere(PathBuf::from(folder)));
+        }
+        let settings = MarkerSettings {
+            id: self.marker_settings().id.or_else(|| Some(new_project_id())),
+            base_branch,
+            commit_template,
+        };
+        let path = self.marker_path();
+        let previous = fs::read(&path).ok();
+        self.write_marker_with(&settings)?;
+        let desired = marker_bytes(&mine, &settings)?;
+        if !self.head_marker_matches(&desired)? {
+            if let Err(error) = self.commit_content_changes(
+                &branch,
+                &[],
+                "update_project_settings",
+                "Update project settings",
+                profile,
+            ) {
+                let rollback = match previous {
+                    Some(bytes) => write_file_atomically(&path, &bytes),
+                    None => fs::remove_file(&path).map_err(DraftlineError::from),
+                };
+                if let Err(rollback) = rollback {
+                    tracing::warn!(
+                        error = %rollback,
+                        "could not put back .draftline after a failed settings update"
+                    );
+                }
+                return Err(error);
+            }
+        }
+        self.project_settings()
+    }
+
+    /// Whether HEAD's committed marker already holds `marker`, so writing it
+    /// leaves nothing to save.
+    fn head_marker_matches(&self, marker: &[u8]) -> Result<bool> {
+        let tree = self.head_tree_or_empty()?;
+        let Some(entry) = tree.get_name(FOLDER_MARKER) else {
+            return Ok(false);
+        };
+        Ok(self
+            .repo
+            .find_blob(entry.id())
+            .is_ok_and(|blob| same_marker_text(blob.content(), marker)))
+    }
+
+    /// The working tree marker's settings; none when it can't be read.
+    fn marker_settings(&self) -> MarkerSettings {
+        fs::read(self.marker_path())
+            .map(|bytes| MarkerSettings::from_marker(&bytes))
+            .unwrap_or_default()
+    }
+
+    /// `message` with the project's commit template applied to its first line.
+    fn commit_message(&self, message: &str) -> String {
+        apply_commit_template(self.marker_settings().commit_template.as_deref(), message)
+    }
+
     /// Moves the folder Draftline manages to `to` (absolute, or relative to the
     /// repository root) as one save on the current variation, which also
     /// rewrites `.draftline`. The folder may move from the root into a
@@ -2084,12 +2265,12 @@ impl Workspace {
         test_hooks::fire("after_folder_move_checkout", self.repo.path());
         // The trailer names where the folder was, so commits from before the
         // marker existed still read at the right place after this move.
-        let message = format!(
+        let message = self.commit_message(&format!(
             "Move Draftline folder from {} to {}\n\n{MOVED_FROM_TRAILER}: {}\n",
             folder_label(&from),
             folder_label(&to),
             marker_folder(&folder_key(&from))
-        );
+        ));
         let oid = self
             .repo
             .commit(None, &author, &committer, &message, &moved, &[&head_commit])?;
@@ -2732,7 +2913,15 @@ impl Workspace {
             moved.add(&entry)?;
         }
         let tree = self.repo.find_tree(moved.write_tree_to(&self.repo)?)?;
-        let marker = self.repo.blob(&marker_bytes(&to)?)?;
+        // The project's id and settings move with it.
+        let settings = match head
+            .get_name(FOLDER_MARKER)
+            .and_then(|entry| self.repo.find_blob(entry.id()).ok())
+        {
+            Some(blob) => MarkerSettings::from_marker(blob.content()),
+            None => self.marker_settings(),
+        };
+        let marker = self.repo.blob(&marker_bytes(&to, &settings)?)?;
         let mut builder = self.repo.treebuilder(Some(&tree))?;
         builder.insert(FOLDER_MARKER, marker, 0o100644)?;
         Ok(builder.write()?)
@@ -6796,12 +6985,13 @@ impl Workspace {
             &restored_tree,
         )?;
 
+        let message = self.commit_message(label.as_ref());
         self.checkout_or_keep_recovery(&restored_tree)?;
         let oid = self.repo.commit(
             None,
             &author,
             &committer,
-            label.as_ref(),
+            &message,
             &restored_tree,
             &[&head_commit],
         )?;
@@ -6948,12 +7138,13 @@ impl Workspace {
             &restored_tree,
         )?;
 
+        let message = self.commit_message(label.as_ref());
         self.checkout_or_keep_recovery(&restored_tree)?;
         let oid = self.repo.commit(
             None,
             &author,
             &committer,
-            label.as_ref(),
+            &message,
             &restored_tree,
             &[&head_commit],
         )?;
@@ -7061,6 +7252,7 @@ impl Workspace {
             &restored_tree,
         )?;
 
+        let message = self.commit_message(label.as_ref());
         // Move files before any ref so HEAD is still the checkout baseline.
         self.checkout_or_keep_recovery(&restored_tree)?;
         let target_ref = format!("refs/heads/{target_name}");
@@ -7071,7 +7263,7 @@ impl Workspace {
                 Some(&target_ref),
                 &author,
                 &committer,
-                label.as_ref(),
+                &message,
                 &restored_tree,
                 &[&parent],
             )?)
@@ -11522,27 +11714,20 @@ impl Workspace {
     /// Writes [`FOLDER_MARKER`] for this folder; a rename keeps readers from
     /// ever seeing a partial file.
     fn write_marker(&self) -> Result<()> {
-        let bytes = marker_bytes(&self.project_key())?;
+        // A marker naming another folder still carries the project's settings.
+        self.write_marker_with(&self.marker_settings())
+    }
+
+    fn write_marker_with(&self, settings: &MarkerSettings) -> Result<()> {
+        let bytes = marker_bytes(&self.project_key(), settings)?;
         let path = self.marker_path();
         // Rewriting the same record would leave Git seeing a change when the
         // checkout converted its line endings.
-        let unchanged = fs::read(&path).is_ok_and(|existing| {
-            existing
-                .trim_ascii_end()
-                .split(|byte| *byte == b'\n')
-                .map(<[u8]>::trim_ascii_end)
-                .eq(bytes
-                    .trim_ascii_end()
-                    .split(|byte| *byte == b'\n')
-                    .map(<[u8]>::trim_ascii_end))
-        });
+        let unchanged = fs::read(&path).is_ok_and(|existing| same_marker_text(&existing, &bytes));
         if unchanged {
             return Ok(());
         }
-        let temp = unique_claim_temp(&path);
-        fs::write(&temp, bytes)?;
-        replace_file(&temp, &path)?;
-        Ok(())
+        write_file_atomically(&path, &bytes)
     }
 
     /// Points the local record at this folder once the marker agrees, so
@@ -12014,9 +12199,10 @@ impl Workspace {
         // Like `git commit`: the index is updated before the branch moves, so a
         // busy index fails the save cleanly instead of leaving a commit the
         // index would silently revert on the developer's next commit.
+        let message = self.commit_message(label);
         let oid = self
             .repo
-            .commit(None, &author, &committer, label, &tree, &parents)?;
+            .commit(None, &author, &committer, &message, &tree, &parents)?;
         let commit = self.repo.find_commit(oid)?;
         let previous = self.while_git_busy(|| self.stage_from(&commit, &affected_paths))?;
         crate::fault::point("index_staged");
@@ -13396,11 +13582,12 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
         let (author, committer) = self.workspace_signatures(profile)?;
+        let message = self.commit_message(label);
         let oid = self.repo.commit(
             None,
             &author,
             &committer,
-            label,
+            &message,
             tree,
             &[&merge_input.local_commit, &merge_input.remote_commit],
         )?;
@@ -15418,6 +15605,100 @@ fn remote_summary_from_commit(commit: &Commit<'_>) -> RemoteVersionSummary {
     }
 }
 
+/// A random id in UUID v4 form for a new project.
+fn new_project_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let mut bytes = [0u8; 16];
+    for (index, half) in bytes.chunks_mut(8).enumerate() {
+        // Each RandomState is keyed from the OS's random source.
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u128(nanos);
+        hasher.write_u32(std::process::id());
+        hasher.write_usize(index);
+        half.copy_from_slice(&hasher.finish().to_le_bytes());
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// A base branch must be a valid local branch name.
+fn validate_base_branch(branch: Option<String>) -> Result<Option<String>> {
+    let Some(branch) = branch.map(|branch| branch.trim().to_string()) else {
+        return Ok(None);
+    };
+    if branch.is_empty() {
+        return Ok(None);
+    }
+    if !git2::Branch::name_is_valid(&branch)? {
+        return Err(DraftlineError::InvalidProjectSettings(format!(
+            "`{branch}` is not a valid branch name"
+        )));
+    }
+    Ok(Some(branch))
+}
+
+/// A commit template is one line with `{subject}` exactly once.
+fn validate_commit_template(template: Option<String>) -> Result<Option<String>> {
+    let Some(template) = template.filter(|template| !template.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if template.contains(['\n', '\r']) {
+        return Err(DraftlineError::InvalidProjectSettings(
+            "the commit template must be one line".to_string(),
+        ));
+    }
+    if template.matches(COMMIT_TEMPLATE_SUBJECT).count() != 1 {
+        return Err(DraftlineError::InvalidProjectSettings(format!(
+            "the commit template must contain {COMMIT_TEMPLATE_SUBJECT} exactly once"
+        )));
+    }
+    Ok(Some(template))
+}
+
+/// Puts `message`'s first line into `template`'s `{subject}`, keeping the
+/// rest of the message. A first line that already fits the template, or a
+/// template that isn't valid, leaves the message as it is.
+fn apply_commit_template(template: Option<&str>, message: &str) -> String {
+    let Some((prefix, suffix)) = template
+        .filter(|template| {
+            !template.contains(['\n', '\r'])
+                && template.matches(COMMIT_TEMPLATE_SUBJECT).count() == 1
+        })
+        .and_then(|template| template.split_once(COMMIT_TEMPLATE_SUBJECT))
+    else {
+        return message.to_string();
+    };
+    let (subject, rest) = match message.split_once('\n') {
+        Some((subject, rest)) => (subject, Some(rest)),
+        None => (message, None),
+    };
+    if subject.starts_with(prefix) && subject.ends_with(suffix) {
+        return message.to_string();
+    }
+    let mut out = format!("{prefix}{subject}{suffix}");
+    if let Some(rest) = rest {
+        out.push('\n');
+        out.push_str(rest);
+    }
+    out
+}
+
 fn new_operation_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -16183,10 +16464,32 @@ fn folder_label(folder: &Path) -> String {
     }
 }
 
-fn marker_bytes(key: &str) -> Result<Vec<u8>> {
+/// Whether two marker texts match, ignoring line endings a checkout converted.
+fn same_marker_text(left: &[u8], right: &[u8]) -> bool {
+    left.trim_ascii_end()
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::trim_ascii_end)
+        .eq(right
+            .trim_ascii_end()
+            .split(|byte| *byte == b'\n')
+            .map(<[u8]>::trim_ascii_end))
+}
+
+/// Replaces `path` with `bytes` through a temporary file.
+fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp = unique_claim_temp(path);
+    fs::write(&temp, bytes)?;
+    replace_file(&temp, path)?;
+    Ok(())
+}
+
+fn marker_bytes(key: &str, settings: &MarkerSettings) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(&FolderMarker {
         format: 1,
         folder: marker_folder(key),
+        id: settings.id.clone(),
+        base_branch: settings.base_branch.clone(),
+        commit_template: settings.commit_template.clone(),
     })?;
     bytes.push(b'\n');
     Ok(bytes)
@@ -20413,7 +20716,11 @@ mod tests {
 
         // Meanwhile another folder takes over.
         let marker = fs::read(temp.path().join(FOLDER_MARKER)).unwrap();
-        write_file(temp.path(), FOLDER_MARKER, &marker_bytes("other").unwrap());
+        write_file(
+            temp.path(),
+            FOLDER_MARKER,
+            &marker_bytes("other", &MarkerSettings::default()).unwrap(),
+        );
         for result in [
             managed.restore_missing_folder(),
             managed.switch_to_folder_branch(&branch),

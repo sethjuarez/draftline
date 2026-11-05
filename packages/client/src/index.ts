@@ -23,6 +23,8 @@ export interface DraftlineClient {
   probeFolder(workspacePath: string): Promise<FolderProbe>;
   applyFolderFix(workspacePath: string, fix: FolderFix): Promise<WorkspaceOpenResult>;
   moveFolder(request: MoveFolderRequest): Promise<MoveFolderResult>;
+  projectSettings(request: WorkspaceRequest): Promise<ProjectSettings>;
+  updateProjectSettings(request: UpdateProjectSettingsRequest): Promise<ProjectSettings>;
   cloneWorkspace(request: CloneWorkspaceRequest): Promise<WorkspaceOpenResult>;
   adoptWorkspace(workspacePath: string): Promise<AdoptWorkspaceResult>;
   inspectWorkspace(workspacePath: string): Promise<WorkspaceDiagnostics>;
@@ -172,6 +174,8 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
         request: { workspace_path: workspacePath, fix } satisfies ApplyFolderFixRequest,
       }),
     moveFolder: (request) => run('move_folder', { request }),
+    projectSettings: (request) => run('project_settings', { request }),
+    updateProjectSettings: (request) => run('update_project_settings', { request }),
     verifyWorkspace: (workspacePath) =>
       run('verify_workspace', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
@@ -938,6 +942,27 @@ export interface MoveFolderResult {
   diagnostics: WorkspaceDiagnostics;
 }
 
+/** Settings `.draftline` records for the folder; committed, so every clone shares them. */
+export interface ProjectSettings {
+  /** The managed folder, relative to the repository root (empty for the root). */
+  folder: string;
+  /** Stable id that survives a folder move; null until Draftline assigns one. */
+  id: string | null;
+  /** The branch this project's work merges into. */
+  base_branch: string | null;
+  /**
+   * Template for the first line of every commit Draftline writes on a branch,
+   * with `{subject}` standing for the version name, e.g. `docs(demo): {subject}`.
+   */
+  commit_template: string | null;
+}
+
+/** Replaces the recorded settings; `null` or a missing field clears it. */
+export interface UpdateProjectSettingsRequest extends WorkspaceRequest {
+  base_branch?: string | null;
+  commit_template?: string | null;
+}
+
 export interface AdoptWorkspaceResult {
   preflight: AdoptionPreflightReport;
   diagnostics: WorkspaceDiagnostics;
@@ -1462,6 +1487,16 @@ export interface DraftlineHostFacade {
    * from then on: create a new facade for the new folder.
    */
   moveFolder(to: string): Promise<MoveFolderResult>;
+  /** Reads the project id, base branch and commit template from `.draftline`. */
+  projectSettings(): Promise<ProjectSettings>;
+  /**
+   * Replaces the base branch and commit template (null clears), assigning an id
+   * if the project has none, and saves `.draftline` when they changed.
+   */
+  updateProjectSettings(settings: {
+    base_branch?: string | null;
+    commit_template?: string | null;
+  }): Promise<ProjectSettings>;
   inspect(): Promise<WorkspaceDiagnostics>;
   preflightSwitchVariation(variationId: string): Promise<PreflightReport>;
   switchVariation(variationId: string): Promise<SwitchVariationResult>;
@@ -1616,6 +1651,9 @@ export function createDraftlineHostFacade({
     probeFolder: () => client.probeFolder(workspacePath),
     applyFolderFix: (fix) => client.applyFolderFix(workspacePath, fix),
     moveFolder: (to) => client.moveFolder({ ...workspaceRequest(), to }),
+    projectSettings: () => client.projectSettings(workspaceRequest()),
+    updateProjectSettings: (settings) =>
+      client.updateProjectSettings({ ...workspaceRequest(), ...settings }),
     inspect: () => client.inspectWorkspace(workspacePath),
     preflightSwitchVariation: (variationId) =>
       client.preflightSwitchVariation({ ...workspaceRequest(), variation_id: variationId }),
@@ -2150,6 +2188,16 @@ export async function applyFolderFix(
 
 export async function moveFolder(request: MoveFolderRequest): Promise<MoveFolderResult> {
   return createDraftlineClient().moveFolder(request);
+}
+
+export async function projectSettings(request: WorkspaceRequest): Promise<ProjectSettings> {
+  return createDraftlineClient().projectSettings(request);
+}
+
+export async function updateProjectSettings(
+  request: UpdateProjectSettingsRequest,
+): Promise<ProjectSettings> {
+  return createDraftlineClient().updateProjectSettings(request);
 }
 
 export async function filteredFiles(request: FilteredFilesRequest): Promise<FilteredFile[]> {

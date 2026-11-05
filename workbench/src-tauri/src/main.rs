@@ -672,6 +672,30 @@ fn move_folder(
 }
 
 #[tauri::command]
+fn project_settings(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: contract::WorkspaceRequest,
+) -> TauriCommandResult<draftline::ProjectSettings> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::project_settings_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn update_project_settings(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: contract::UpdateProjectSettingsRequest,
+) -> TauriCommandResult<draftline::ProjectSettings> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::update_project_settings_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
 fn dismiss_legacy_history_cleanup(
     state: tauri::State<'_, DraftlineContextState>,
     request: LegacyHistoryCleanupRequest,
@@ -921,6 +945,8 @@ fn main() {    let _ = tracing_subscriber::registry()
             probe_folder,
             apply_folder_fix,
             move_folder,
+            project_settings,
+            update_project_settings,
             dismiss_legacy_history_cleanup,
             selected_save,
             selected_shelve,
