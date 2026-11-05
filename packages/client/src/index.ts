@@ -87,6 +87,7 @@ export interface DraftlineClient {
   previewVersion(request: VersionRequest): Promise<VersionPreview>;
   previewVersionFile(request: PreviewVersionFileRequest): Promise<PreviewFile | null>;
   readVersionFileBytes(request: ReadVersionFileBytesRequest): Promise<VersionFileBytes | null>;
+  githubRepoAccess(request: GitHubRepoAccessRequest): Promise<GitHubRepoAccess>;
   previewWorkspaceFile(request: CurrentFileRequest): Promise<CurrentFilePreview | null>;
   restoreVersionAsNewSave(request: RestoreVersionRequest): Promise<RestoreVersionResult>;
   restoreVersionPathsAsNewSave(request: RestoreVersionPathsRequest): Promise<RestoreVersionResult>;
@@ -271,6 +272,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     previewVersion: (request) => run('preview_version', { request }),
     previewVersionFile: (request) => run('preview_version_file', { request }),
     readVersionFileBytes: (request) => run('read_version_file_bytes', { request }),
+    githubRepoAccess: (request) => run('github_repo_access', { request }),
     previewWorkspaceFile: (request) => run('preview_workspace_file', { request }),
     restoreVersionAsNewSave: (request) => run('restore_version_as_new_save', { request }),
     restoreVersionPathsAsNewSave: (request) =>
@@ -1415,6 +1417,30 @@ export interface VersionFileBytes {
   data_base64: string;
 }
 
+/**
+ * A GitHub remote and the token the host signed in with; Draftline uses the
+ * token for this call only. Needs a host built with Draftline's `github`
+ * feature that registers `github_repo_access`.
+ */
+export interface GitHubRepoAccessRequest {
+  remote_url: string;
+  token: string;
+}
+
+export interface GitHubRepo {
+  owner: string;
+  repo: string;
+}
+
+/** What a GitHub token may do with a repository. */
+export interface GitHubRepoAccess {
+  repository: GitHubRepo;
+  default_branch: string;
+  can_push: boolean;
+  private: boolean;
+  fork_parent: GitHubRepo | null;
+}
+
 export interface DiffVersionsRequest extends WorkspaceRequest {
   from_version_id: string;
   to_version_id: string;
@@ -2173,6 +2199,16 @@ export async function readVersionFileBytes(
   request: ReadVersionFileBytesRequest,
 ): Promise<VersionFileBytes | null> {
   return createDraftlineClient().readVersionFileBytes(request);
+}
+
+/**
+ * What a GitHub token may do with a remote's repository. Fails with
+ * `github_unauthorized`, `github_repository_not_found` or `pull_request_failed`.
+ */
+export async function githubRepoAccess(
+  request: GitHubRepoAccessRequest,
+): Promise<GitHubRepoAccess> {
+  return createDraftlineClient().githubRepoAccess(request);
 }
 
 export async function previewWorkspaceFile(

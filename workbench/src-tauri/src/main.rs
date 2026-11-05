@@ -427,6 +427,21 @@ fn read_version_file_bytes(
     ))
 }
 
+// Network calls block, so they run off the async runtime.
+#[tauri::command]
+async fn github_repo_access(
+    request: contract::GitHubRepoAccessRequest,
+) -> TauriCommandResult<draftline::github::GitHubRepoAccess> {
+    let result = tauri::async_runtime::spawn_blocking(move || contract::github_repo_access(request))
+        .await
+        .map_err(|error| contract::TauriCommandError {
+            code: "internal".to_string(),
+            message: error.to_string(),
+            details: None,
+        })?;
+    contract::into_tauri_result(result)
+}
+
 #[tauri::command]
 fn diff_workspace_file(
     state: tauri::State<'_, DraftlineContextState>,
@@ -957,6 +972,7 @@ fn main() {    let _ = tracing_subscriber::registry()
             preview_version,
             preview_version_file,
             read_version_file_bytes,
+            github_repo_access,
             preview_workspace_file,
             restore_version_as_new_save,
             restore_version_paths_as_new_save,

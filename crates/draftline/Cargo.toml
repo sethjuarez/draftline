@@ -16,6 +16,8 @@ default = []
 vendored-mobile-git = ["git2/vendored-libgit2", "git2/vendored-openssl"]
 # Test-only crash points; see `draftline::fault`. Never ship it.
 fault-injection = []
+# GitHub pull requests for Send: `draftline::github::GitHubProvider`.
+github = ["dep:reqwest"]
 
 [dependencies]
 git2 = { version = "0.21", default-features = false, features = ["https", "ssh"] }
@@ -23,10 +25,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing.workspace = true
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "json", "default-tls"] }
 
 [dev-dependencies]
 tempfile = "3"
+httpmock = "0.7"
 
 [[test]]
 name = "fault_injection"
 required-features = ["fault-injection"]
+
+[[test]]
+name = "github_provider"
+required-features = ["github"]
+
+[package.metadata.docs.rs]
+features = ["github"]

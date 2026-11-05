@@ -960,6 +960,52 @@ pub enum ConflictContentSource {
     Base,
 }
 
+/// Request for [`github_repo_access`]: a GitHub remote and the token the
+/// host signed in with. Draftline uses the token for this call only.
+#[cfg(feature = "github")]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubRepoAccessRequest {
+    /// A github.com remote URL (HTTPS, `git@github.com:` or `ssh://`).
+    pub remote_url: String,
+    pub token: String,
+}
+
+#[cfg(feature = "github")]
+impl std::fmt::Debug for GitHubRepoAccessRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHubRepoAccessRequest")
+            .finish_non_exhaustive()
+    }
+}
+
+/// What the host's GitHub token may do with a remote's repository: push
+/// access, default branch and fork parent. Read-only; `github` feature.
+#[cfg(feature = "github")]
+// The remote URL may carry a login, so it is never traced.
+#[tracing::instrument(err, skip_all)]
+pub fn github_repo_access(
+    request: GitHubRepoAccessRequest,
+) -> Result<crate::github::GitHubRepoAccess> {
+    crate::github::GitHubProvider::for_remote_url(&request.remote_url, request.token)?.repo_access()
+}
+
+/// [`github_repo_access`] against a GitHub Enterprise Server `host` the
+/// host app trusts (from its own settings, never from the frontend; the
+/// token goes there). The remote must be on that host.
+#[cfg(feature = "github")]
+#[tracing::instrument(err, skip_all, fields(host))]
+pub fn github_repo_access_on_enterprise_host(
+    request: GitHubRepoAccessRequest,
+    host: &str,
+) -> Result<crate::github::GitHubRepoAccess> {
+    crate::github::GitHubProvider::for_enterprise_remote_url(
+        &request.remote_url,
+        host,
+        request.token,
+    )?
+    .repo_access()
+}
+
 /// Error shape that Tauri commands can serialize directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TauriCommandError {
@@ -3841,6 +3887,9 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::SendOutsideNamespace(_) => "send_outside_namespace",
         DraftlineError::VariationOutsideNamespace(_) => "variation_outside_namespace",
         DraftlineError::PullRequest(_) => "pull_request_failed",
+        DraftlineError::GitHubUnauthorized(_) => "github_unauthorized",
+        DraftlineError::GitHubNoPushAccess { .. } => "github_no_push_access",
+        DraftlineError::GitHubRepositoryNotFound(_) => "github_repository_not_found",
         DraftlineError::GitFilterFailed { .. } => "git_filter_failed",
         DraftlineError::MergeNeedsDeveloper(_) => "merge_needs_developer",
         DraftlineError::NotOwnedWorktree(_) => "not_owned_worktree",
@@ -3906,6 +3955,10 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         DraftlineError::SendOutsideNamespace(branch)
         | DraftlineError::VariationOutsideNamespace(branch)
         | DraftlineError::NothingToMerge(branch) => Some(serde_json::json!({ "branch": branch })),
+        DraftlineError::GitHubNoPushAccess { repository, .. }
+        | DraftlineError::GitHubRepositoryNotFound(repository) => {
+            Some(serde_json::json!({ "repository": repository }))
+        }
         DraftlineError::SyncNeedsMerge(status) => match serde_json::to_value(status.as_ref()) {
             Ok(value) => Some(value),
             Err(error) => Some(serde_json::json!({
