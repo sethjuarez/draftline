@@ -102,6 +102,19 @@ remote content. Whole-file choices support `use_ours`, `use_theirs`, `use_base`,
 `delete`, or `use_content`; semantic `field_path` conflicts currently require a
 host-produced `use_content` result for the resolved file.
 
+Merging one local variation into the current one follows the same shape without
+a remote: `preflight_merge_variation` (read-only; `source_variation_id`) returns a
+`MergeIncomingReport` whose `sync_status.variation` is the source and whose token
+has `local: true`. `merge_variation` writes a clean merge; conflicts go through
+`merge_variation_with_resolutions` with that token. The label is the full
+version message (`"Name\n\nComment"`). The result is always a two-parent version,
+even when a fast-forward was possible, so the merge stays a named step in
+history. Errors: `preflight_failed` (unsaved changes, hazards, or unresolved
+conflicts), `nothing_to_merge`, `local_state_changed` (either branch moved since
+preflight), `invalid_merge_token` (a remote token on a local merge or the
+reverse), `merge_needs_developer`, `variation_not_found`, and
+`variation_outside_namespace` when a namespaced host names a branch outside it.
+
 The Workbench contract keeps credential handling out of frontend DTOs. Hosts route
 commands through `DraftlineCommandContext` to configure content policy,
 host-provided contributor attribution, backend-only remote credentials, and
@@ -161,6 +174,23 @@ let mut context = DraftlineCommandContext::new()
 let _ = selected_save_with_context(&mut context, request);
 # Ok::<(), draftline::DraftlineError>(())
 ```
+
+Events never fire while another Draftline operation on the same checkout holds
+its operation lock (for example a merge, shelf apply, or switch still writing
+files on another thread or process). The event waits for that operation to
+finish, up to `with_event_defer_timeout` (default
+`DEFAULT_EVENT_DEFER_TIMEOUT`, 30 seconds; after that it is emitted anyway).
+If that operation emits its own event of the same kind in the same process,
+the waiting event is dropped (unless it carries a sync status), so the host
+sees one event, after the files are written.
+
+Reads of unsaved work (`changed_files`, `changes`, `diff_version_to_workspace`,
+`diff_workspace_file`) tolerate files that change or vanish mid-scan, as editors
+that save atomically cause. They rescan for up to about 0.6 seconds; the
+rescan reports the file's new state (changed, deleted, or gone). On the last
+attempt a file still changing is left out of the patch text but stays listed.
+Only a file rewritten continuously for longer than that surfaces the Git
+error.
 
 Treat `ContributorProfile` as product identity and service attribution, not as a
 Git configuration screen. The host should derive `author` from the signed-in

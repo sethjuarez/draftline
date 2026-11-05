@@ -4,7 +4,13 @@
 //! expose them behind `#[tauri::command]` wrappers while preserving Draftline's
 //! existing preflight, recovery, and verification semantics.
 
-use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Mutex};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +49,46 @@ pub struct DraftlineCommandContext<'callbacks> {
     event_sink: Option<Box<EventSink<'callbacks>>>,
     next_event_sequence: u64,
     variation_namespace: Option<String>,
+    event_defer_timeout: Duration,
+}
+
+/// How long an event waits by default for another running operation to
+/// finish before it is emitted anyway.
+pub const DEFAULT_EVENT_DEFER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a deferred event checks whether the running operation finished.
+const EVENT_DEFER_POLL: Duration = Duration::from_millis(25);
+
+/// After a deferred event's wait ends, how long it gives the operation that
+/// held the lock to emit its own event, which then stands in for this one.
+const EVENT_COALESCE_GRACE: Duration = Duration::from_millis(100);
+
+/// Events emitted per workspace root and kind in this process, shared by
+/// every context, so a deferred event can tell that a newer one of the same
+/// kind already went out.
+type EventKey = (PathBuf, String);
+
+fn event_generations() -> &'static Mutex<HashMap<EventKey, u64>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<EventKey, u64>>> = OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn event_key(root: &Path, kind: &DraftlineEventKind) -> EventKey {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    (root, format!("{kind:?}"))
+}
+
+fn event_generation(key: &EventKey) -> u64 {
+    event_generations()
+        .lock()
+        .map(|generations| generations.get(key).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+fn bump_event_generation(key: EventKey) {
+    if let Ok(mut generations) = event_generations().lock() {
+        *generations.entry(key).or_insert(0) += 1;
+    }
 }
 
 impl fmt::Debug for DraftlineCommandContext<'_> {
@@ -58,6 +104,7 @@ impl fmt::Debug for DraftlineCommandContext<'_> {
             .field("has_event_sink", &self.event_sink.is_some())
             .field("next_event_sequence", &self.next_event_sequence)
             .field("variation_namespace", &self.variation_namespace)
+            .field("event_defer_timeout", &self.event_defer_timeout)
             .finish()
     }
 }
@@ -71,6 +118,7 @@ impl<'callbacks> Default for DraftlineCommandContext<'callbacks> {
             event_sink: None,
             next_event_sequence: 1,
             variation_namespace: None,
+            event_defer_timeout: DEFAULT_EVENT_DEFER_TIMEOUT,
         }
     }
 }
@@ -102,6 +150,15 @@ impl<'callbacks> DraftlineCommandContext<'callbacks> {
 
     pub fn with_event_sink(mut self, sink: impl FnMut(DraftlineEvent) + Send + 'callbacks) -> Self {
         self.event_sink = Some(Box::new(sink));
+        self
+    }
+
+    /// Caps how long an event waits for another running Draftline operation
+    /// on the same checkout (one holding its operation lock) to finish before
+    /// it is emitted anyway. Defaults to [`DEFAULT_EVENT_DEFER_TIMEOUT`];
+    /// `Duration::ZERO` emits immediately.
+    pub fn with_event_defer_timeout(mut self, timeout: Duration) -> Self {
+        self.event_defer_timeout = timeout;
         self
     }
 
@@ -149,14 +206,54 @@ impl<'callbacks> DraftlineCommandContext<'callbacks> {
         kind: DraftlineEventKind,
         sync_status: Option<SyncStatus>,
     ) {
+        if self.event_sink.is_none() {
+            return;
+        }
+
+        // Another operation still writing files would make the event's
+        // snapshot (and any refresh the host runs on it) see a half-written
+        // workspace. Wait for it, then let its own event of the same kind
+        // stand in for ours. An event carrying a sync status always goes out.
+        let key = event_key(workspace.root(), &kind);
+        let generation = event_generation(&key);
+        if wait_for_running_operation(workspace, self.event_defer_timeout)
+            && sync_status.is_none()
+            && event_generation(&key) != generation
+        {
+            return;
+        }
+
         let Some(sink) = self.event_sink.as_mut() else {
             return;
         };
-
         let event =
             DraftlineEvent::from_workspace(workspace, kind, self.next_event_sequence, sync_status);
         self.next_event_sequence += 1;
+        bump_event_generation(key);
         sink(event);
+    }
+}
+
+/// Waits, up to `timeout`, while another live operation holds the checkout's
+/// operation lock. Once it is released, waits a short grace for that
+/// operation to emit its own event, and keeps waiting if another operation
+/// took the lock meanwhile. True when it had to wait.
+fn wait_for_running_operation(workspace: &Workspace, timeout: Duration) -> bool {
+    if timeout.is_zero() || !workspace.another_operation_running() {
+        return false;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        while Instant::now() < deadline && workspace.another_operation_running() {
+            std::thread::sleep(EVENT_DEFER_POLL);
+        }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(EVENT_COALESCE_GRACE.min(deadline - Instant::now()));
+        if Instant::now() >= deadline || !workspace.another_operation_running() {
+            return true;
+        }
     }
 }
 
@@ -705,6 +802,32 @@ pub struct MergeIncomingCommandResult {
     pub preflight: MergeIncomingReport,
     pub merge: MergeIncomingResult,
     pub postconditions: CommandPostconditions,
+}
+
+/// Request to preflight merging another local variation into the current one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreflightMergeVariationRequest {
+    pub workspace_path: PathBuf,
+    pub source_variation_id: String,
+}
+
+/// Request to merge another local variation into the current one. `label` is
+/// the new version's full message (`"Name\n\nComment"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeVariationRequest {
+    pub workspace_path: PathBuf,
+    pub source_variation_id: String,
+    pub label: String,
+}
+
+/// Request to merge a local variation after explicit conflict resolution;
+/// the token (from [`preflight_merge_variation`]) names the source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeVariationWithResolutionsRequest {
+    pub workspace_path: PathBuf,
+    pub label: String,
+    pub token: MergeIncomingToken,
+    pub resolutions: Vec<MergeConflictResolution>,
 }
 
 /// UI-friendly conflict model grouped by file and semantic field path.
@@ -2853,6 +2976,12 @@ pub fn merge_incoming_with_resolutions_with_context(
     request: MergeIncomingWithResolutionsRequest,
 ) -> Result<MergeIncomingCommandResult> {
     let workspace = context.open_workspace(&request.workspace_path)?;
+    if request.token.local {
+        return Err(DraftlineError::InvalidMergeToken(
+            "this token is for a local variation merge; use merge_variation_with_resolutions"
+                .to_string(),
+        ));
+    }
     let contributor_profile = context.contributor_profile.clone();
     let (preflight, merge) = {
         let mut options = context.remote_options();
@@ -2886,6 +3015,124 @@ pub fn merge_incoming_with_resolutions_with_context(
         DraftlineEventKind::HistoryChanged,
         Some(preflight.sync_status.clone()),
     );
+    Ok(MergeIncomingCommandResult {
+        preflight,
+        merge,
+        postconditions: collect_postconditions(&workspace, true),
+    })
+}
+
+/// Preflights merging another local variation into the current one. Read-only.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preflight_merge_variation(
+    request: PreflightMergeVariationRequest,
+) -> Result<MergeIncomingReport> {
+    preflight_merge_variation_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Preflights a local variation merge using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preflight_merge_variation_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: PreflightMergeVariationRequest,
+) -> Result<MergeIncomingReport> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    workspace.preflight_merge_variation(&VariationId::from(request.source_variation_id))
+}
+
+/// Merges another local variation into the current one as a new two-parent
+/// version. Refuses with `merge_needs_developer`, `preflight_failed` (unsaved
+/// changes, hazards, or conflicts needing resolutions) or `nothing_to_merge`.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn merge_variation(request: MergeVariationRequest) -> Result<MergeIncomingCommandResult> {
+    merge_variation_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Merges a local variation using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn merge_variation_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: MergeVariationRequest,
+) -> Result<MergeIncomingCommandResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let preflight =
+        workspace.preflight_merge_variation(&VariationId::from(request.source_variation_id))?;
+    let Some(token) = preflight.token.clone() else {
+        return Err(merge_variation_preflight_error(preflight));
+    };
+    let merge = match context.contributor_profile.as_ref() {
+        Some(profile) => workspace.merge_variation_with_profile(token, request.label, profile)?,
+        None => workspace.merge_variation(token, request.label)?,
+    };
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(MergeIncomingCommandResult {
+        preflight,
+        merge,
+        postconditions: collect_postconditions(&workspace, true),
+    })
+}
+
+/// Merges a local variation using explicit user-provided conflict resolutions.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn merge_variation_with_resolutions(
+    request: MergeVariationWithResolutionsRequest,
+) -> Result<MergeIncomingCommandResult> {
+    merge_variation_with_resolutions_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Merges a local variation with resolutions using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn merge_variation_with_resolutions_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: MergeVariationWithResolutionsRequest,
+) -> Result<MergeIncomingCommandResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let Some(source) = request.token.source.clone().filter(|_| request.token.local) else {
+        return Err(DraftlineError::InvalidMergeToken(
+            "this token is for an incoming merge; use merge_incoming_with_resolutions".to_string(),
+        ));
+    };
+    let preflight = workspace.preflight_merge_variation(&VariationId::from(source))?;
+    match &preflight.token {
+        None => return Err(merge_variation_preflight_error(preflight)),
+        Some(token) if *token != request.token => {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{}", request.token.variation, request.token.local_oid),
+                actual: format!("{}@{}", token.variation, token.local_oid),
+            })
+        }
+        Some(_) => {}
+    }
+    let merge = match context.contributor_profile.as_ref() {
+        Some(profile) => workspace.merge_variation_with_resolutions_and_profile(
+            request.token,
+            request.label,
+            request.resolutions,
+            profile,
+        )?,
+        None => workspace.merge_variation_with_resolutions(
+            request.token,
+            request.label,
+            request.resolutions,
+        )?,
+    };
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
     Ok(MergeIncomingCommandResult {
         preflight,
         merge,
@@ -3005,6 +3252,31 @@ fn merge_preflight_error(preflight: MergeIncomingReport) -> DraftlineError {
     DraftlineError::SyncNeedsMerge(Box::new(preflight.sync_status))
 }
 
+fn merge_variation_preflight_error(preflight: MergeIncomingReport) -> DraftlineError {
+    if !preflight.developer_conflicts.is_empty() {
+        return DraftlineError::MergeNeedsDeveloper(preflight.developer_conflicts);
+    }
+    if preflight.sync_status.behind == 0 {
+        return DraftlineError::NothingToMerge(preflight.sync_status.variation);
+    }
+    DraftlineError::PreflightFailed(Box::new(PreflightReport {
+        operation: "merge_variation".to_string(),
+        will_write_files: true,
+        dirty_files: preflight.dirty_files,
+        file_hazards: preflight.file_hazards,
+        untracked_assets: Vec::new(),
+        unresolved_conflicts: preflight
+            .conflicts
+            .into_iter()
+            .map(|conflict| conflict.path)
+            .collect(),
+        large_files: Vec::new(),
+        binary_files: Vec::new(),
+        variation_divergence: Some("variation merge is blocked".to_string()),
+        can_proceed: false,
+    }))
+}
+
 /// Converts a Draftline result into a Tauri-serializable result.
 pub fn into_tauri_result<T>(result: Result<T>) -> TauriCommandResult<T> {
     result.map_err(TauriCommandError::from)
@@ -3095,6 +3367,8 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidContributorIdentity(_) => "invalid_contributor_identity",
         DraftlineError::RemoteOperationTimedOut { .. } => "remote_operation_timed_out",
         DraftlineError::InvalidMergeResolution(_) => "invalid_merge_resolution",
+        DraftlineError::InvalidMergeToken(_) => "invalid_merge_token",
+        DraftlineError::NothingToMerge(_) => "nothing_to_merge",
         DraftlineError::SendBaseUnknown => "send_base_unknown",
         DraftlineError::SendBaseNotOnRemote(_) => "send_base_not_on_remote",
         DraftlineError::FolderIsElsewhere(_) => "folder_is_elsewhere",
@@ -3113,6 +3387,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::NotOwnedWorktree(_) => "not_owned_worktree",
         DraftlineError::OwnedWorktreeInUse(_) => "owned_worktree_in_use",
         DraftlineError::OwnedWorktreeHasChanges(_) => "owned_worktree_has_changes",
+        DraftlineError::ShelfOverlapsUnsavedChanges { .. } => "shelf_overlaps_unsaved_changes",
     }
 }
 
@@ -3153,13 +3428,15 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         DraftlineError::BaseRenamed { from, to } => {
             Some(serde_json::json!({ "from": from, "to": to }))
         }
+        DraftlineError::ShelfOverlapsUnsavedChanges { shelf, paths } => {
+            Some(serde_json::json!({ "shelf": shelf, "paths": paths }))
+        }
         DraftlineError::GitFilterFailed { action, output } => {
             Some(serde_json::json!({ "action": action, "output": output }))
         }
         DraftlineError::SendOutsideNamespace(branch)
-        | DraftlineError::VariationOutsideNamespace(branch) => {
-            Some(serde_json::json!({ "branch": branch }))
-        }
+        | DraftlineError::VariationOutsideNamespace(branch)
+        | DraftlineError::NothingToMerge(branch) => Some(serde_json::json!({ "branch": branch })),
         DraftlineError::SyncNeedsMerge(status) => match serde_json::to_value(status.as_ref()) {
             Ok(value) => Some(value),
             Err(error) => Some(serde_json::json!({
@@ -3167,5 +3444,141 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
             })),
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{mpsc, Arc};
+
+    type Recorded = Arc<Mutex<Vec<(DraftlineEventKind, Instant)>>>;
+
+    fn recording_context(events: Recorded) -> DraftlineCommandContext<'static> {
+        DraftlineCommandContext::new().with_event_sink(move |event| {
+            events.lock().unwrap().push((event.kind, Instant::now()));
+        })
+    }
+
+    /// Holds the operation lock on another thread for `hold`, then optionally
+    /// emits that operation's own event, the way a contract command does.
+    fn run_operation(
+        root: PathBuf,
+        hold: Duration,
+        emit_after: Option<(Recorded, DraftlineEventKind)>,
+    ) -> (mpsc::Receiver<()>, std::thread::JoinHandle<Instant>) {
+        let (locked, ready) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let workspace = Workspace::open(&root).unwrap();
+            let lock = workspace.hold_operation_lock_for_test();
+            locked.send(()).unwrap();
+            std::thread::sleep(hold);
+            drop(lock);
+            let released = Instant::now();
+            if let Some((events, kind)) = emit_after {
+                recording_context(events).emit(&workspace, kind, None);
+            }
+            released
+        });
+        (ready, handle)
+    }
+
+    #[test]
+    fn an_event_during_another_operation_waits_and_coalesces_into_its_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (ready, operation) = run_operation(
+            workspace.root().to_path_buf(),
+            Duration::from_millis(300),
+            Some((events.clone(), DraftlineEventKind::DirtyChanged)),
+        );
+        ready.recv().unwrap();
+
+        recording_context(events.clone()).emit(&workspace, DraftlineEventKind::DirtyChanged, None);
+        let released = operation.join().unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "one event after the operation");
+        assert!(events[0].1 >= released);
+    }
+
+    #[test]
+    fn a_deferred_event_of_another_kind_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (ready, operation) = run_operation(
+            workspace.root().to_path_buf(),
+            Duration::from_millis(300),
+            Some((events.clone(), DraftlineEventKind::HistoryChanged)),
+        );
+        ready.recv().unwrap();
+
+        recording_context(events.clone()).emit(&workspace, DraftlineEventKind::DirtyChanged, None);
+        let released = operation.join().unwrap();
+
+        let events = events.lock().unwrap();
+        let kinds = events
+            .iter()
+            .map(|(kind, _)| kind.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds.len(), 2);
+        assert!(kinds.contains(&DraftlineEventKind::DirtyChanged));
+        assert!(kinds.contains(&DraftlineEventKind::HistoryChanged));
+        assert!(events.iter().all(|(_, at)| *at >= released));
+    }
+
+    #[test]
+    fn an_event_waits_for_an_operation_that_emits_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (ready, operation) = run_operation(
+            workspace.root().to_path_buf(),
+            Duration::from_millis(200),
+            None,
+        );
+        ready.recv().unwrap();
+
+        recording_context(events.clone()).emit(&workspace, DraftlineEventKind::DirtyChanged, None);
+        let released = operation.join().unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, DraftlineEventKind::DirtyChanged);
+        assert!(
+            events[0].1 >= released,
+            "emitted only after the lock was released"
+        );
+    }
+
+    #[test]
+    fn an_event_is_emitted_anyway_once_the_defer_timeout_passes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (ready, operation) =
+            run_operation(workspace.root().to_path_buf(), Duration::from_secs(2), None);
+        ready.recv().unwrap();
+
+        let started = Instant::now();
+        recording_context(events.clone())
+            .with_event_defer_timeout(Duration::from_millis(100))
+            .emit(&workspace, DraftlineEventKind::DirtyChanged, None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(events.lock().unwrap().len(), 1);
+        operation.join().unwrap();
+    }
+
+    #[test]
+    fn an_event_with_no_running_operation_is_emitted_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started = Instant::now();
+        recording_context(events.clone()).emit(&workspace, DraftlineEventKind::DirtyChanged, None);
+        assert!(started.elapsed() < EVENT_COALESCE_GRACE);
+        assert_eq!(events.lock().unwrap().len(), 1);
     }
 }

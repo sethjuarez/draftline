@@ -676,6 +676,13 @@ fn tauri_contract_smokes_history_preview_restore_shelf_and_policy_commands() {
     let applied = apply_shelf(shelf_request.clone()).unwrap();
     assert_eq!(applied.shelf.id, "temporary-shelf");
     assert!(applied.postconditions.errors.is_empty());
+
+    // Applying again would overwrite the now-unsaved shelf.md.
+    let overlap = into_tauri_result(apply_shelf(shelf_request.clone())).unwrap_err();
+    assert_eq!(overlap.code, "shelf_overlaps_unsaved_changes");
+    let details = overlap.details.expect("overlap details");
+    assert_eq!(details["shelf"], "temporary-shelf");
+    assert_eq!(details["paths"], serde_json::json!(["shelf.md"]));
     workspace.discard_changes().unwrap();
 
     let deleted = draftline::tauri_contract::delete_shelf(shelf_request).unwrap();

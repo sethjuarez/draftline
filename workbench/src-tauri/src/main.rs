@@ -7,6 +7,7 @@ use draftline::tauri_contract::{
     GuardedCreateVariationFromVersionRequest, GuardedCreateVariationFromVersionResult,
     LegacyHistoryCleanupRequest, ListSupportRefsRequest,
     MergeIncomingCommandResult, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
+    MergeVariationRequest, MergeVariationWithResolutionsRequest, PreflightMergeVariationRequest,
     PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
     PublishCurrentVariationRequest, PublishCurrentVariationResult, RecoveryRequest, RemoteRequest,
     RemoteVariationRequest, RestoreVersionRequest, RestoreVersionResult, SaveRequest, SaveResult,
@@ -777,8 +778,39 @@ fn merge_incoming_with_resolutions(
     ))
 }
 
-fn main() {
-    let _ = tracing_subscriber::registry()
+#[tauri::command]
+fn preflight_merge_variation(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: PreflightMergeVariationRequest,
+) -> TauriCommandResult<MergeIncomingReport> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::preflight_merge_variation_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri::command]
+fn merge_variation(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: MergeVariationRequest,
+) -> TauriCommandResult<MergeIncomingCommandResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::merge_variation_with_context(&mut context, request))
+}
+
+#[tauri::command]
+fn merge_variation_with_resolutions(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: MergeVariationWithResolutionsRequest,
+) -> TauriCommandResult<MergeIncomingCommandResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::merge_variation_with_resolutions_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+fn main() {    let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
@@ -873,7 +905,10 @@ fn main() {
             apply_incoming,
             preflight_merge_incoming,
             merge_incoming,
-            merge_incoming_with_resolutions
+            merge_incoming_with_resolutions,
+            preflight_merge_variation,
+            merge_variation,
+            merge_variation_with_resolutions
         ])
         .run(tauri::generate_context!())
         .expect("error while running Draftline Workbench");

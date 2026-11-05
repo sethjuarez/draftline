@@ -1438,9 +1438,14 @@ pub struct Shelf {
 #[non_exhaustive]
 pub struct ShelfApplyReport {
     pub shelf: Shelf,
+    /// Every unsaved change in the folder. Only `overlapping_files` block.
     pub dirty_files: Vec<ChangedFile>,
     pub file_hazards: Vec<FileHazard>,
     pub can_proceed: bool,
+    /// Unsaved changes at paths the shelf would write. Applying refuses
+    /// with `ShelfOverlapsUnsavedChanges` while this is non-empty.
+    #[serde(default)]
+    pub overlapping_files: Vec<ChangedFile>,
 }
 
 /// Read-only merge-incoming preflight report.
@@ -1473,6 +1478,12 @@ pub struct MergeIncomingToken {
     /// branch, from [`Workspace::preflight_merge_base`]).
     #[serde(default)]
     pub source: Option<String>,
+    /// `true` for a merge of another local variation, from
+    /// [`Workspace::preflight_merge_variation`]: `source` names it, `remote`
+    /// is empty and `remote_oid` is its tip. Only
+    /// [`Workspace::merge_variation`] and friends accept these tokens.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
 }
 
 /// Explicit user choice for resolving one merge conflict.
@@ -3659,7 +3670,17 @@ impl Workspace {
                 }
             }
             RecoveryOperation::ApplyShelf => {
-                let changed_files = self.changed_files_unchecked()?;
+                // Apply refuses when unsaved edits sit at the shelf's paths,
+                // so only those paths can hold its half-written content;
+                // edits elsewhere predate the apply and are kept.
+                let Some(target) = state.target.as_deref() else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let Ok((_id, commit)) = self.find_shelf_commit(target) else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let (_tree, paths) = self.shelf_target_tree(&commit)?;
+                let changed_files = self.changed_files_at(&paths)?;
                 let changed_workspace = !changed_files.is_empty();
                 if changed_workspace {
                     self.discard_changed_files(&changed_files)?;
@@ -4510,6 +4531,10 @@ impl Workspace {
     }
 
     fn changed_files_unchecked(&self) -> Result<Vec<ChangedFile>> {
+        retry_scan(|_| self.scan_changed_files())
+    }
+
+    fn scan_changed_files(&self) -> Result<Vec<ChangedFile>> {
         let mut options = StatusOptions::new();
         options
             .include_untracked(true)
@@ -5708,15 +5733,34 @@ impl Workspace {
         })
     }
 
-    /// Preflights applying a shelf into the current workspace.
+    /// Preflights applying a shelf into the current workspace. Unsaved
+    /// changes only block when they sit at a path the shelf writes (see
+    /// [`ShelfApplyReport::overlapping_files`]); other edits are left alone.
     pub fn preflight_apply_shelf(&self, id: impl AsRef<str>) -> Result<ShelfApplyReport> {
         self.ensure_no_pending_recovery()?;
         let (safe_name, commit) = self.find_shelf_commit(id.as_ref())?;
-        let (tree_id, _paths) = self.shelf_target_tree(&commit)?;
+        let (tree_id, paths) = self.shelf_target_tree(&commit)?;
         let tree = self.repo.find_tree(tree_id)?;
         let dirty_files = self.changed_files_unchecked()?;
+        let mut overlapping_files = self.changed_files_at(&paths)?;
+        // A dirty file at a parent or child path of a shelf path (a file
+        // where the shelf needs a folder, or the reverse), or at a case alias,
+        // would be overwritten or block checkout just the same.
+        let shelf_keys = paths.iter().map(|path| path_key(path)).collect::<Vec<_>>();
+        for file in &dirty_files {
+            let key = path_key(&file.path);
+            let related = shelf_keys.iter().any(|shelf| {
+                *shelf == key
+                    || shelf.starts_with(&format!("{key}/"))
+                    || key.starts_with(&format!("{shelf}/"))
+            });
+            if related && !overlapping_files.iter().any(|f| f.path == file.path) {
+                overlapping_files.push(file.clone());
+            }
+        }
+        overlapping_files.sort_by(|left, right| left.path.cmp(&right.path));
         let file_hazards = self.target_tree_hazards(&tree)?;
-        let can_proceed = dirty_files.is_empty() && file_hazards.is_empty();
+        let can_proceed = overlapping_files.is_empty() && file_hazards.is_empty();
 
         Ok(ShelfApplyReport {
             shelf: Shelf {
@@ -5726,15 +5770,79 @@ impl Workspace {
             dirty_files,
             file_hazards,
             can_proceed,
+            overlapping_files,
         })
     }
 
+    /// Unsaved changes at exactly `paths` (repository-relative). Rename
+    /// detection is off, so a renamed file shows at both its old and new path.
+    fn changed_files_at(&self, paths: &[PathBuf]) -> Result<Vec<ChangedFile>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        retry_scan(|_| self.scan_changed_files_at(paths))
+    }
+
+    fn scan_changed_files_at(&self, paths: &[PathBuf]) -> Result<Vec<ChangedFile>> {
+        let mut options = StatusOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .disable_pathspec_match(true);
+        for path in paths {
+            options.pathspec(path.to_string_lossy().replace('\\', "/"));
+        }
+        let statuses = self.repo.statuses(Some(&mut options))?;
+        let filter_clean = self.filter_clean_in_index(&statuses)?;
+        let mut changed = Vec::new();
+        for entry in statuses.iter() {
+            let Ok(path) = entry.path() else {
+                continue;
+            };
+            if entry.status().is_ignored()
+                || path == FOLDER_MARKER
+                || !self.content_policy.tracks(path)?
+                || filter_clean.contains(Path::new(path))
+            {
+                continue;
+            }
+            let relative = PathBuf::from(path);
+            let full_path = self.root.join(&relative);
+            changed.push(ChangedFile {
+                path: relative,
+                kind: status_to_change_kind(entry.status()),
+                is_binary: file_is_binary(&full_path)?,
+                is_large: file_is_large(
+                    &full_path,
+                    self.content_policy.large_file_threshold_bytes(),
+                )?,
+            });
+        }
+        changed.sort_by(|left, right| left.path.cmp(&right.path));
+        changed.dedup_by(|left, right| left.path == right.path);
+        Ok(changed)
+    }
+
     /// Applies a shelf as working-tree content and preserves the shelf.
+    ///
+    /// Unsaved changes elsewhere in the folder are kept. If any sit at a path
+    /// the shelf writes, this refuses with
+    /// [`DraftlineError::ShelfOverlapsUnsavedChanges`] and changes nothing.
     pub fn apply_shelf(&self, id: impl AsRef<str>) -> Result<Shelf> {
         self.ensure_no_pending_recovery()?;
         let safe_name = validate_variation_name(id.as_ref())?;
         let _lock = self.acquire_for_index("apply_shelf")?;
         let report = self.preflight_apply_shelf(&safe_name)?;
+        if !report.overlapping_files.is_empty() {
+            return Err(DraftlineError::ShelfOverlapsUnsavedChanges {
+                shelf: safe_name,
+                paths: report
+                    .overlapping_files
+                    .into_iter()
+                    .map(|file| file.path)
+                    .collect(),
+            });
+        }
         if !report.can_proceed {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
                 "apply_shelf",
@@ -7061,7 +7169,11 @@ impl Workspace {
             return Ok(None);
         }
 
-        let bytes = fs::read(full_path)?;
+        let bytes = match fs::read(full_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let content = std::str::from_utf8(&bytes).ok().map(ToString::to_string);
         Ok(Some(CurrentFilePreview {
             path,
@@ -8336,6 +8448,15 @@ impl Workspace {
         sync_status: SyncStatus,
         source: Option<String>,
     ) -> Result<MergeIncomingReport> {
+        self.preflight_merge_with(sync_status, source, false)
+    }
+
+    fn preflight_merge_with(
+        &self,
+        sync_status: SyncStatus,
+        source: Option<String>,
+        local: bool,
+    ) -> Result<MergeIncomingReport> {
         self.ensure_on_branch()?;
         let dirty_files = self.changed_files_unchecked()?;
         let mut file_hazards = Vec::new();
@@ -8344,7 +8465,12 @@ impl Workspace {
         let mut token = None;
 
         if Self::mergeable_state(&sync_status.state, source.is_some()) {
-            let merge_input = self.merge_input_for_status(&sync_status)?;
+            let merge_input = if local {
+                let head = self.repo.head()?.peel_to_commit()?.id();
+                self.merge_input_between(head, self.variation_tip_oid(&sync_status.variation)?)?
+            } else {
+                self.merge_input_for_status(&sync_status)?
+            };
             let (trees, dropped) = self.merge_trees_for(&merge_input)?;
             let plan = self.plan_clean_merge(&trees[0], &trees[1], &trees[2])?;
             if !dropped.is_empty() {
@@ -8366,6 +8492,7 @@ impl Workspace {
                     remote_oid: merge_input.remote_commit.id().to_string(),
                     merge_base_oid: merge_input.base_commit.id().to_string(),
                     source,
+                    local,
                 });
             }
         }
@@ -8484,6 +8611,11 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
         self.ensure_no_pending_recovery()?;
+        if token.local {
+            return Err(DraftlineError::InvalidMergeToken(
+                "this token is for a local variation merge; use merge_variation".to_string(),
+            ));
+        }
         let _lock = self.acquire_for_index(operation)?;
         self.ensure_on_branch()?;
         let dirty_files = self.changed_files_unchecked()?;
@@ -8542,7 +8674,29 @@ impl Workspace {
             });
         }
 
-        let (trees, dropped) = self.merge_trees_for(&merge_input)?;
+        self.finish_merge(
+            operation,
+            variation,
+            &merge_input,
+            label,
+            resolutions,
+            profile,
+        )
+    }
+
+    /// Plans, resolves, and writes a preflighted merge of `merge_input` as a
+    /// two-parent version on `variation`. The caller holds the operation lock
+    /// and has checked the token against the live refs.
+    fn finish_merge(
+        &self,
+        operation: &str,
+        variation: String,
+        merge_input: &IncomingMergeInput<'_>,
+        label: &str,
+        resolutions: Option<Vec<MergeConflictResolution>>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<MergeIncomingResult> {
+        let (trees, dropped) = self.merge_trees_for(merge_input)?;
         if !dropped.is_empty() {
             return Err(DraftlineError::MergeNeedsDeveloper(dropped));
         }
@@ -8575,7 +8729,197 @@ impl Workspace {
             ))));
         }
 
-        self.write_incoming_merge_version(variation, &merge_input, label, &tree, files, profile)
+        self.write_incoming_merge_version(
+            operation,
+            variation,
+            merge_input,
+            label,
+            &tree,
+            files,
+            profile,
+        )
+    }
+
+    /// Preflights merging another local variation into the current one,
+    /// without fetching or changing anything. `source` is a branch name; with
+    /// a variation namespace it must be inside it or be the base branch.
+    ///
+    /// The report has the same shape as [`Self::preflight_merge_incoming`]'s:
+    /// `sync_status.variation` names `source`, `sync_status.remote` is empty,
+    /// and `incoming` lists `source`'s versions this variation lacks. A token
+    /// is issued only when `source` has something to bring in and the
+    /// workspace is clean; pass it to [`Self::merge_variation`] or
+    /// [`Self::merge_variation_with_resolutions`].
+    pub fn preflight_merge_variation(&self, source: &VariationId) -> Result<MergeIncomingReport> {
+        self.ensure_no_pending_recovery()?;
+        self.ensure_on_branch()?;
+        self.ensure_variation_switchable(&self.current_variation_unchecked()?)?;
+        let status = self.local_merge_status(source.as_str())?;
+        self.preflight_merge_with(status, Some(source.as_str().to_string()), true)
+    }
+
+    /// Merges a preflighted local variation into the current one as a new
+    /// version labelled `label` (the full message, `"Name\n\nComment"`).
+    ///
+    /// Like [`Self::preflight_merge_base`]'s merges, this always writes a
+    /// two-parent version, even when the current variation has nothing of its
+    /// own and could fast-forward (`git merge --no-ff`), so the merge is a
+    /// named, revertible step in history. Refuses unsaved changes, conflicts
+    /// without resolutions, and tokens the live branches no longer match.
+    pub fn merge_variation(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_variation_core("merge_variation", token, label.as_ref(), None, None)
+    }
+
+    /// [`Self::merge_variation`] with host-supplied attribution.
+    pub fn merge_variation_with_profile(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_variation_core(
+            "merge_variation",
+            token,
+            label.as_ref(),
+            None,
+            Some(profile),
+        )
+    }
+
+    /// [`Self::merge_variation`] with explicit conflict resolutions.
+    pub fn merge_variation_with_resolutions(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        resolutions: impl IntoIterator<Item = MergeConflictResolution>,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_variation_core(
+            "merge_variation_with_resolutions",
+            token,
+            label.as_ref(),
+            Some(resolutions.into_iter().collect()),
+            None,
+        )
+    }
+
+    /// [`Self::merge_variation_with_resolutions`] with host-supplied attribution.
+    pub fn merge_variation_with_resolutions_and_profile(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        resolutions: impl IntoIterator<Item = MergeConflictResolution>,
+        profile: &ContributorProfile,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_variation_core(
+            "merge_variation_with_resolutions",
+            token,
+            label.as_ref(),
+            Some(resolutions.into_iter().collect()),
+            Some(profile),
+        )
+    }
+
+    fn merge_variation_core(
+        &self,
+        operation: &str,
+        token: MergeIncomingToken,
+        label: &str,
+        resolutions: Option<Vec<MergeConflictResolution>>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<MergeIncomingResult> {
+        self.ensure_no_pending_recovery()?;
+        let Some(source) = token.source.clone().filter(|_| token.local) else {
+            return Err(DraftlineError::InvalidMergeToken(
+                "this token is for an incoming merge; use merge_incoming".to_string(),
+            ));
+        };
+        let _lock = self.acquire_for_index(operation)?;
+        self.ensure_on_branch()?;
+        let dirty_files = self.changed_files_unchecked()?;
+        if !dirty_files.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                operation,
+                true,
+                dirty_files,
+                Vec::new(),
+                None,
+            ))));
+        }
+
+        let variation = self.current_variation_unchecked()?;
+        self.ensure_variation_switchable(&variation)?;
+        let local_oid = self.repo.head()?.peel_to_commit()?.id();
+        if variation != token.variation || local_oid.to_string() != token.local_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{}", token.variation, token.local_oid),
+                actual: format!("{variation}@{local_oid}"),
+            });
+        }
+        self.ensure_variation_switchable(&source)?;
+        let source_oid = self.variation_tip_oid(&source)?;
+        if source_oid.to_string() != token.remote_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{source}@{}", token.remote_oid),
+                actual: format!("{source}@{source_oid}"),
+            });
+        }
+        let merge_input = self.merge_input_between(local_oid, source_oid)?;
+        if merge_input.base_commit.id().to_string() != token.merge_base_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: token.merge_base_oid,
+                actual: merge_input.base_commit.id().to_string(),
+            });
+        }
+        if merge_input.base_commit.id() == source_oid {
+            return Err(DraftlineError::NothingToMerge(source));
+        }
+
+        self.finish_merge(
+            operation,
+            variation,
+            &merge_input,
+            label,
+            resolutions,
+            profile,
+        )
+    }
+
+    /// How the current variation compares with local `source`, shaped like a
+    /// [`SyncStatus`] with an empty `remote`.
+    fn local_merge_status(&self, source: &str) -> Result<SyncStatus> {
+        self.ensure_variation_switchable(source)?;
+        let source_oid = self.variation_tip_oid(source)?;
+        let local = self.repo.head()?.peel_to_commit()?.id();
+        let (ahead, behind) = self.repo.graph_ahead_behind(local, source_oid)?;
+        let state = match (ahead, behind) {
+            (0, 0) => SyncState::UpToDate,
+            (_, 0) => SyncState::LocalAhead,
+            (0, _) => SyncState::IncomingAvailable,
+            _ => SyncState::NeedsMerge,
+        };
+        Ok(SyncStatus {
+            remote: String::new(),
+            variation: source.to_string(),
+            ahead,
+            behind,
+            state,
+            incoming: self.incoming_versions(local, source_oid)?,
+            base_renamed_from: None,
+        })
+    }
+
+    fn variation_tip_oid(&self, name: &str) -> Result<Oid> {
+        match self.repo.find_branch(name, BranchType::Local) {
+            Ok(branch) => Ok(branch.get().peel_to_commit()?.id()),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                Err(DraftlineError::VariationNotFound(name.to_string()))
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn ensure_head_unchanged(&self, variation: &str, oid: git2::Oid) -> Result<()> {
@@ -8765,16 +9109,17 @@ impl Workspace {
         let commit = self.find_version_commit(version)?;
         let tree = self.relocated_tree(&commit)?;
 
-        let mut opts = DiffOptions::new();
-        opts.include_untracked(true).recurse_untracked_dirs(true);
-        limit_diff_to_scope(&mut opts, self.scope());
-        let diff = self
-            .repo
-            .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts))?;
-
-        let files =
-            diff_deltas_to_changed_files_with_policy(&diff, &self.root, &self.content_policy)?;
-        let patch = diff_to_patch_text(&diff)?;
+        let (files, patch) = retry_scan(|last_attempt| {
+            let mut opts = DiffOptions::new();
+            opts.include_untracked(true).recurse_untracked_dirs(true);
+            limit_diff_to_scope(&mut opts, self.scope());
+            let diff = self
+                .repo
+                .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts))?;
+            let files =
+                diff_deltas_to_changed_files_with_policy(&diff, &self.root, &self.content_policy)?;
+            Ok((files, workdir_patch_text(&diff, last_attempt)?))
+        })?;
 
         Ok(VersionDiff {
             from_version: Some(version.clone()),
@@ -8793,19 +9138,21 @@ impl Workspace {
         }
 
         let head_tree = self.repo.head()?.peel_to_commit()?.tree()?;
-        let mut opts = DiffOptions::new();
-        opts.include_untracked(true)
-            .recurse_untracked_dirs(true)
-            .disable_pathspec_match(true)
-            .pathspec(&path);
-        let diff = self
-            .repo
-            .diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts))?;
-        let files =
-            diff_deltas_to_changed_files_with_policy(&diff, &self.root, &self.content_policy)?;
+        let (files, patch, preview) = retry_scan(|last_attempt| {
+            let mut opts = DiffOptions::new();
+            opts.include_untracked(true)
+                .recurse_untracked_dirs(true)
+                .disable_pathspec_match(true)
+                .pathspec(&path);
+            let diff = self
+                .repo
+                .diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts))?;
+            let files =
+                diff_deltas_to_changed_files_with_policy(&diff, &self.root, &self.content_policy)?;
+            let patch = workdir_patch_text(&diff, last_attempt)?;
+            Ok((files, patch, self.preview_workspace_file(&path)?))
+        })?;
         let file = files.into_iter().find(|file| file.path == path);
-        let patch = diff_to_patch_text(&diff)?;
-        let preview = self.preview_workspace_file(&path)?;
 
         Ok(Some(CurrentFileDiff {
             path,
@@ -10762,6 +11109,10 @@ impl Workspace {
     }
 
     fn diff_unsaved_text(&self) -> Result<String> {
+        retry_scan(|last_attempt| self.scan_unsaved_text(last_attempt))
+    }
+
+    fn scan_unsaved_text(&self, skip_changing: bool) -> Result<String> {
         let head_tree = self
             .repo
             .head()
@@ -10772,16 +11123,7 @@ impl Workspace {
         let diff = self
             .repo
             .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut options))?;
-
-        let mut text = String::new();
-        diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
-            if let Ok(content) = std::str::from_utf8(line.content()) {
-                text.push_str(content);
-            }
-            true
-        })?;
-
-        Ok(text)
+        workdir_patch_text(&diff, skip_changing)
     }
 
     fn find_version_commit(&self, version: &VersionId) -> Result<git2::Commit<'_>> {
@@ -12685,6 +13027,14 @@ impl Workspace {
         let local_oid = self.repo.head()?.peel_to_commit()?.id();
         let remote_ref = format!("refs/remotes/{}/{}", status.remote, status.variation);
         let remote_oid = self.repo.refname_to_id(&remote_ref)?;
+        self.merge_input_between(local_oid, remote_oid)
+    }
+
+    fn merge_input_between(
+        &self,
+        local_oid: Oid,
+        remote_oid: Oid,
+    ) -> Result<IncomingMergeInput<'_>> {
         let base_oid = self.repo.merge_base(local_oid, remote_oid)?;
 
         Ok(IncomingMergeInput {
@@ -12951,6 +13301,7 @@ impl Workspace {
     #[allow(clippy::too_many_arguments)]
     fn write_incoming_merge_version(
         &self,
+        operation: &str,
         variation: String,
         merge_input: &IncomingMergeInput<'_>,
         label: &str,
@@ -12979,12 +13330,8 @@ impl Workspace {
         // Like `git merge`: files move from HEAD to the merged tree without
         // overwriting local edits, before the branch moves.
         self.checkout_or_keep_recovery(tree)?;
-        self.repo.reference(
-            &format!("refs/heads/{variation}"),
-            oid,
-            true,
-            "merge_incoming",
-        )?;
+        self.repo
+            .reference(&format!("refs/heads/{variation}"), oid, true, operation)?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,
@@ -13865,7 +14212,7 @@ fn discard_preflight_report(
 fn file_is_large(path: &Path, threshold: u64) -> Result<bool> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(metadata.is_file() && metadata.len() > threshold),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if is_vanished_io_error(&error) => Ok(false),
         Err(error) => Err(error.into()),
     }
 }
@@ -13873,11 +14220,116 @@ fn file_is_large(path: &Path, threshold: u64) -> Result<bool> {
 fn file_is_binary(path: &Path) -> Result<bool> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if is_vanished_io_error(&error) => return Ok(false),
         Err(error) => return Err(error.into()),
     };
 
     Ok(bytes.contains(&0) || std::str::from_utf8(&bytes).is_err())
+}
+
+/// A file that is gone, or (Windows sharing violation) mid-replace: content
+/// checks report it as plain text rather than failing the scan.
+fn is_vanished_io_error(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(32)
+}
+
+/// A file that vanished, or is mid-replace (Windows reports a sharing
+/// violation or a pending delete as access denied), while it was being read.
+fn is_transient_io_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    ) || error.raw_os_error() == Some(32)
+}
+
+/// libgit2's errors when a working-tree file changes or vanishes between
+/// listing it and reading or hashing it, as editors that save atomically
+/// (write a temp file, then rename it over) cause.
+fn is_transient_scan_error(error: &DraftlineError) -> bool {
+    match error {
+        DraftlineError::Io(error) => is_transient_io_error(error),
+        DraftlineError::Git(error) => {
+            let message = error.message();
+            message.contains("file changed before we could read it")
+                || message.contains("error reading file for hashing")
+                || (error.code() == git2::ErrorCode::NotFound
+                    && matches!(
+                        error.class(),
+                        git2::ErrorClass::Os
+                            | git2::ErrorClass::Filesystem
+                            | git2::ErrorClass::Index
+                            | git2::ErrorClass::Filter
+                            | git2::ErrorClass::None
+                    ))
+        }
+        _ => false,
+    }
+}
+
+/// Pauses between attempts of a working-tree scan that hit a file changing
+/// under it; about two thirds of a second in all.
+const SCAN_RETRY_DELAYS_MS: [u64; 6] = [10, 20, 40, 80, 160, 320];
+
+/// Runs a read-only working-tree scan, rerunning it when a file changed or
+/// vanished mid-scan. A rerun sees the file's new state: gone (so it is
+/// reported deleted or not at all) or rewritten (reported changed).
+///
+/// `scan` gets `true` on its last attempt, when it should skip what it can
+/// (see [`workdir_patch_text`]) rather than fail: a scan slower than the
+/// gap between saves would otherwise never finish.
+fn retry_scan<T>(mut scan: impl FnMut(bool) -> Result<T>) -> Result<T> {
+    let mut delays = SCAN_RETRY_DELAYS_MS.iter().peekable();
+    loop {
+        let last_attempt = delays.peek().is_none();
+        let result = scan_fault::inject().map_or_else(|| scan(last_attempt), Err);
+        match result {
+            Err(error) if is_transient_scan_error(&error) => match delays.next() {
+                Some(delay) => {
+                    tracing::debug!(%error, "file changed during a scan; scanning again");
+                    std::thread::sleep(std::time::Duration::from_millis(*delay));
+                }
+                None => return Err(error),
+            },
+            other => return other,
+        }
+    }
+}
+
+/// Lets tests make the next scans fail as if a file changed under them.
+#[cfg(test)]
+mod scan_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PENDING: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub fn fail_next(count: u32) {
+        PENDING.with(|pending| pending.set(count));
+    }
+
+    pub fn inject() -> Option<crate::DraftlineError> {
+        PENDING.with(|pending| {
+            let count = pending.get();
+            (count > 0).then(|| {
+                pending.set(count - 1);
+                git2::Error::new(
+                    git2::ErrorCode::GenericError,
+                    git2::ErrorClass::Os,
+                    "file changed before we could read it",
+                )
+                .into()
+            })
+        })
+    }
+}
+
+#[cfg(not(test))]
+mod scan_fault {
+    #[inline(always)]
+    pub fn inject() -> Option<crate::DraftlineError> {
+        None
+    }
 }
 
 /// libgit2 shares one in-memory index per repository, so a failed write
@@ -15441,6 +15893,12 @@ fn scope_pathspec(scope: &Path) -> Option<String> {
     Some(scope.to_string_lossy().replace('\\', "/"))
 }
 
+/// Case-folded, `/`-separated form of a repository path, for comparing paths
+/// the way a case-insensitive file system would.
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
 /// Restricts a status scan to the folder so large code repositories
 /// are not walked in full.
 fn limit_status_to_scope(options: &mut StatusOptions, scope: &Path) {
@@ -15513,6 +15971,39 @@ fn diff_to_patch_text(diff: &git2::Diff<'_>) -> Result<String> {
         }
         true
     })?;
+    Ok(text)
+}
+
+/// [`diff_to_patch_text`] for a diff against the working tree, built one file
+/// at a time. With `skip_changing`, a file that changes or vanishes while
+/// its text is read is left out of the patch (it is still listed as
+/// changed) instead of failing the whole diff.
+fn workdir_patch_text(diff: &git2::Diff<'_>, skip_changing: bool) -> Result<String> {
+    if !skip_changing {
+        return diff_to_patch_text(diff);
+    }
+    let mut text = String::new();
+    for index in 0..diff.deltas().len() {
+        let patch = match git2::Patch::from_diff(diff, index) {
+            Ok(Some(patch)) => patch,
+            Ok(None) => continue,
+            Err(error) => {
+                let error = DraftlineError::from(error);
+                if !is_transient_scan_error(&error) {
+                    return Err(error);
+                }
+                tracing::debug!(%error, "file still changing; leaving it out of the patch");
+                continue;
+            }
+        };
+        let mut patch = patch;
+        patch.print(&mut |_delta, _hunk, line| {
+            if let Ok(content) = std::str::from_utf8(line.content()) {
+                text.push_str(content);
+            }
+            true
+        })?;
+    }
     Ok(text)
 }
 
@@ -15791,6 +16282,28 @@ impl OperationLock {
     }
 }
 
+impl Workspace {
+    /// True while a live operation on another thread or process holds this
+    /// checkout's operation lock (a stale lock or this thread's own doesn't
+    /// count), so its files may be mid-write.
+    pub(crate) fn another_operation_running(&self) -> bool {
+        let path = self.lock_path();
+        if OperationLock::held_by_this_thread(&path) {
+            return false;
+        }
+        matches!(
+            self.inspect_operation_lock(),
+            Ok(inspection) if inspection.state == OperationLockState::Locked && !inspection.is_stale
+        )
+    }
+
+    /// Holds the operation lock, as a running operation would.
+    #[cfg(test)]
+    pub(crate) fn hold_operation_lock_for_test(&self) -> impl Sized {
+        self.acquire_operation_lock("test").unwrap()
+    }
+}
+
 impl Drop for OperationLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
@@ -15909,6 +16422,10 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, content).unwrap();
+    }
+
+    fn read_file(root: &Path, relative: &str) -> String {
+        fs::read_to_string(root.join(relative)).unwrap()
     }
 
     fn stage_file(workspace: &Workspace, relative: &str) {
@@ -20649,10 +21166,266 @@ mod tests {
         let report = workspace.preflight_apply_shelf("draft-shelf").unwrap();
         assert!(!report.can_proceed);
         assert_eq!(report.dirty_files[0].path, PathBuf::from("post.md"));
+        assert_eq!(report.overlapping_files[0].path, PathBuf::from("post.md"));
 
         let err = workspace.apply_shelf("draft-shelf").unwrap_err();
-        assert!(matches!(err, DraftlineError::PreflightFailed(_)));
+        match err {
+            DraftlineError::ShelfOverlapsUnsavedChanges { shelf, paths } => {
+                assert_eq!(shelf, "draft-shelf");
+                assert_eq!(paths, vec![PathBuf::from("post.md")]);
+            }
+            other => panic!("expected overlap error, got {other:?}"),
+        }
         assert_eq!(workspace.list_shelves().unwrap().len(), 1);
+        assert_eq!(read_file(workspace.root(), "post.md"), "dirty");
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn scan_errors_from_a_file_changing_mid_scan_are_transient() {
+        let changed = git2::Error::new(
+            git2::ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "file changed before we could read it",
+        );
+        let hashing = git2::Error::new(
+            git2::ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "error reading file for hashing: The process cannot access the file",
+        );
+        let vanished = git2::Error::new(
+            git2::ErrorCode::NotFound,
+            git2::ErrorClass::Os,
+            "could not open 'post.md'",
+        );
+        for error in [changed, hashing, vanished] {
+            assert!(is_transient_scan_error(&error.into()));
+        }
+
+        let missing_ref = git2::Error::new(
+            git2::ErrorCode::NotFound,
+            git2::ErrorClass::Reference,
+            "reference 'refs/heads/x' not found",
+        );
+        assert!(!is_transient_scan_error(&missing_ref.into()));
+        let missing_object = git2::Error::new(
+            git2::ErrorCode::NotFound,
+            git2::ErrorClass::Odb,
+            "object not found",
+        );
+        assert!(!is_transient_scan_error(&missing_object.into()));
+        assert!(is_transient_scan_error(
+            &std::io::Error::from(std::io::ErrorKind::NotFound).into()
+        ));
+        assert!(!is_transient_scan_error(&DraftlineError::NothingToMerge(
+            "x".into()
+        )));
+    }
+
+    #[test]
+    fn scans_retry_when_a_file_changes_under_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        let base = workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"edited");
+
+        scan_fault::fail_next(2);
+        assert_eq!(workspace.changed_files().unwrap().len(), 1);
+        scan_fault::fail_next(2);
+        assert_eq!(workspace.changes().unwrap().files.len(), 1);
+        scan_fault::fail_next(2);
+        let diff = workspace.diff_version_to_workspace(&base.id).unwrap();
+        assert_eq!(diff.files.len(), 1);
+        scan_fault::fail_next(2);
+        assert!(workspace.diff_workspace_file("post.md").unwrap().is_some());
+
+        scan_fault::fail_next(SCAN_RETRY_DELAYS_MS.len() as u32 + 1);
+        let error = workspace.changed_files().unwrap_err();
+        assert!(is_transient_scan_error(&error), "{error}");
+        scan_fault::fail_next(0);
+    }
+
+    #[test]
+    fn file_by_file_patch_text_matches_the_whole_diff() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"one\ntwo\n");
+        write_file(workspace.root(), "gone.md", b"bye\n");
+        write_file(workspace.root(), "image.bin", b"\0\x01\x02");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"one\nthree\n");
+        fs::remove_file(workspace.root().join("gone.md")).unwrap();
+        write_file(workspace.root(), "image.bin", b"\0\x03\x04\x05");
+        write_file(workspace.root(), "fresh.md", b"new\n");
+
+        let head = workspace.repo.head().unwrap().peel_to_tree().unwrap();
+        let mut options = DiffOptions::new();
+        options.include_untracked(true).recurse_untracked_dirs(true);
+        let diff = workspace
+            .repo
+            .diff_tree_to_workdir_with_index(Some(&head), Some(&mut options))
+            .unwrap();
+        let whole = diff_to_patch_text(&diff).unwrap();
+        assert!(whole.contains("Binary files"), "{whole}");
+        assert_eq!(workdir_patch_text(&diff, true).unwrap(), whole);
+    }
+
+    #[test]
+    fn content_checks_treat_a_vanished_file_as_plain() {
+        let temp = tempfile::tempdir().unwrap();
+        let gone = temp.path().join("gone.md");
+        assert!(!file_is_binary(&gone).unwrap());
+        assert!(!file_is_large(&gone, 0).unwrap());
+    }
+
+    #[test]
+    fn scans_survive_files_being_replaced_and_deleted() {
+        use std::sync::atomic::AtomicBool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        for index in 0..20 {
+            write_file(workspace.root(), &format!("note-{index}.md"), b"base");
+        }
+        let base = workspace.save_version("Base").unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let root = workspace.root().to_path_buf();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut round = 0usize;
+                while !stop.load(Ordering::SeqCst) {
+                    let index = round % 20;
+                    let path = root.join(format!("note-{index}.md"));
+                    if round.is_multiple_of(3) {
+                        let _ = fs::remove_file(&path);
+                    } else {
+                        let temp = root.join(format!(".note-{index}.tmp"));
+                        if fs::write(&temp, format!("edit {round}")).is_ok() {
+                            let _ = fs::rename(&temp, &path);
+                        }
+                        let _ = fs::remove_file(&temp);
+                    }
+                    round += 1;
+                    // Editors save in bursts (atomic save, swap and backup
+                    // files), not continuously.
+                    let pause = if round.is_multiple_of(5) { 400 } else { 5 };
+                    std::thread::sleep(std::time::Duration::from_millis(pause));
+                }
+            })
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut result = Ok(());
+        while result.is_ok() && std::time::Instant::now() < deadline {
+            result = workspace
+                .changed_files()
+                .and_then(|_| workspace.changes())
+                .and_then(|_| workspace.diff_version_to_workspace(&base.id))
+                .map(|_| ());
+        }
+        stop.store(true, Ordering::SeqCst);
+        churn.join().unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn apply_shelf_keeps_unsaved_changes_that_do_not_overlap() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        write_file(workspace.root(), "notes.md", b"notes");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+        workspace.shelve_changes("draft-shelf").unwrap();
+        write_file(workspace.root(), "notes.md", b"unsaved notes");
+        write_file(workspace.root(), "fresh.md", b"untracked");
+
+        let report = workspace.preflight_apply_shelf("draft-shelf").unwrap();
+        assert!(report.can_proceed, "{report:?}");
+        assert!(report.overlapping_files.is_empty());
+        assert_eq!(report.dirty_files.len(), 2);
+
+        workspace.apply_shelf("draft-shelf").unwrap();
+        assert_eq!(read_file(workspace.root(), "post.md"), "shelved");
+        assert_eq!(read_file(workspace.root(), "notes.md"), "unsaved notes");
+        assert_eq!(read_file(workspace.root(), "fresh.md"), "untracked");
+        assert_eq!(workspace.list_shelves().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn apply_shelf_refuses_a_dirty_file_where_the_shelf_needs_a_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "notes/a.md", b"shelved");
+        workspace.shelve_changes("draft-shelf").unwrap();
+        let _ = fs::remove_dir_all(workspace.root().join("notes"));
+        write_file(workspace.root(), "notes", b"a file, not a folder");
+
+        let err = workspace.apply_shelf("draft-shelf").unwrap_err();
+        let DraftlineError::ShelfOverlapsUnsavedChanges { paths, .. } = err else {
+            panic!("expected overlap error, got {err:?}");
+        };
+        assert_eq!(paths, vec![PathBuf::from("notes")]);
+        assert_eq!(read_file(workspace.root(), "notes"), "a file, not a folder");
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_shelf_refuses_when_a_renamed_file_overlaps_either_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        write_file(workspace.root(), "notes.md", b"notes");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+        workspace.shelve_changes("draft-shelf").unwrap();
+        fs::rename(
+            workspace.root().join("post.md"),
+            workspace.root().join("renamed.md"),
+        )
+        .unwrap();
+
+        let err = workspace.apply_shelf("draft-shelf").unwrap_err();
+        let DraftlineError::ShelfOverlapsUnsavedChanges { paths, .. } = err else {
+            panic!("expected overlap error, got {err:?}");
+        };
+        assert_eq!(paths, vec![PathBuf::from("post.md")]);
+        assert!(workspace.root().join("renamed.md").exists());
+    }
+
+    #[test]
+    fn apply_shelf_rollback_only_discards_the_shelf_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        write_file(workspace.root(), "notes.md", b"notes");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+        workspace.shelve_changes("draft-shelf").unwrap();
+        write_file(workspace.root(), "notes.md", b"unsaved notes");
+
+        // Simulate a crash mid-apply: the shelf content is half written and
+        // recovery state is left incomplete.
+        write_file(workspace.root(), "post.md", b"shelved");
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: new_operation_id(),
+                operation: RecoveryOperation::ApplyShelf,
+                original_variation: workspace.current_variation_unchecked().ok(),
+                target: Some("draft-shelf".to_string()),
+                completed: false,
+            })
+            .unwrap();
+        let state = workspace.recovery_state().unwrap().unwrap();
+
+        workspace.rollback_recovery(&state.operation_id).unwrap();
+        assert_eq!(read_file(workspace.root(), "post.md"), "base");
+        assert_eq!(read_file(workspace.root(), "notes.md"), "unsaved notes");
     }
 
     #[test]

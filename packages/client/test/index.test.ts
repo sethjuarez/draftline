@@ -706,6 +706,45 @@ describe('createDraftlineClient', () => {
     });
   });
 
+  it('routes local variation merges to the merge_variation commands', async () => {
+    const invoke = vi.fn<DraftlineInvoke>(async () => ({ ok: true }) as never);
+    const client = createDraftlineClient({ invoke });
+    const facade = createDraftlineHostFacade({ client, workspacePath: 'C:\\repo' });
+    const token = {
+      remote: '',
+      variation: 'cutready/draft',
+      local_oid: 'local',
+      remote_oid: 'source',
+      merge_base_oid: 'base',
+      local: true,
+    };
+    const resolutions = [
+      {
+        path: 'post.md',
+        field_path: null,
+        choice: { kind: 'use_content' as const, content: 'resolved' },
+      },
+    ];
+
+    await facade.preflightMergeVariation('cutready/review');
+    await facade.mergeVariation('cutready/review', 'Merge review\n\nTake the edits');
+    await facade.mergeVariationWithResolutions('Merge review', token, resolutions);
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'preflight_merge_variation', {
+      request: { workspace_path: 'C:\\repo', source_variation_id: 'cutready/review' },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, 'merge_variation', {
+      request: {
+        workspace_path: 'C:\\repo',
+        source_variation_id: 'cutready/review',
+        label: 'Merge review\n\nTake the edits',
+      },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, 'merge_variation_with_resolutions', {
+      request: { workspace_path: 'C:\\repo', label: 'Merge review', token, resolutions },
+    });
+  });
+
   it('passes a multi-line label through so its body becomes the version comment', async () => {
     const saved: Version = {
       id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
