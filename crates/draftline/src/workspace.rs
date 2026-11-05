@@ -730,6 +730,19 @@ pub struct TargetFolderInspection {
 }
 
 /// Who manages the repository, as the marker or local record says.
+/// A repository cloned by [`Workspace::clone_repository`]: what
+/// [`Workspace::inspect_repository`] reports for it, and the folder of the
+/// project its marker names, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ClonedRepository {
+    #[serde(flatten)]
+    pub inspection: RepositoryInspection,
+    /// The project folder the marker names, created when the branch doesn't
+    /// have it yet; `None` when the repository has no project.
+    pub project_path: Option<PathBuf>,
+}
+
 #[derive(PartialEq)]
 enum FolderOwner {
     Nobody,
@@ -3468,7 +3481,99 @@ impl Workspace {
         clone_options: &CloneOptions,
         options: &mut RemoteOptions<'_>,
     ) -> Result<Self> {
-        ensure_supported_remote_url(remote_url.as_ref())?;
+        let repo = Self::clone_repo(remote_url.as_ref(), path.as_ref(), clone_options, options)?;
+        Self::open_clone(repo, path.as_ref(), content_policy)
+    }
+
+    /// Clones a repository without opening or claiming any folder in it, so
+    /// the host can then open the project its marker names or
+    /// [start one in a folder](Self::init_project_in_repository). Unlike
+    /// [`Self::clone_workspace_with`], a repository without a `.draftline`
+    /// marker is left exactly as cloned.
+    ///
+    /// When the cloned branch's marker names a folder the branch doesn't have
+    /// yet, the folder is created, as opening the project would. The result
+    /// describes the clone as [`Self::inspect_repository`] would, plus that
+    /// folder's path.
+    ///
+    /// Refuses a destination that exists and isn't empty
+    /// ([`DraftlineError::FolderNotEmpty`]). If the clone fails, or its marker
+    /// can't be read ([`DraftlineError::InvalidFolderMarker`],
+    /// [`DraftlineError::NewerFolderMarker`]), the destination is left as it
+    /// was: the clone fills a hidden folder beside it and moves into place
+    /// only once it has succeeded. A link or a file at the destination is
+    /// refused as not empty.
+    pub fn clone_repository(
+        remote_url: impl AsRef<str>,
+        path: impl AsRef<Path>,
+        clone_options: &CloneOptions,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<ClonedRepository> {
+        let path = absolute_path(path.as_ref())?;
+        let not_empty = || DraftlineError::FolderNotEmpty(path.clone());
+        // Only a missing path or a plain, empty folder: never a link, whose
+        // target the clone would fill.
+        let existed = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {
+                if fs::read_dir(&path)?.next().is_some() {
+                    return Err(not_empty());
+                }
+                true
+            }
+            Ok(_) => return Err(not_empty()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| DraftlineError::PathEscapesWorkspace(path.clone()))?;
+        let created_parents = create_missing_dirs(parent)?;
+
+        // The clone happens in a folder only this call owns, so a failure
+        // removes nothing but its own work.
+        let result = (|| {
+            let staging = create_staging_dir(&path)?;
+            let cloned = Self::clone_repo(remote_url.as_ref(), &staging, clone_options, options)
+                .map(drop)
+                .and_then(|()| Self::inspect_local(&staging));
+            if let Err(error) = cloned {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+            if let Err(error) = publish_staging_dir(&staging, &path, existed) {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(match error.kind() {
+                    std::io::ErrorKind::NotFound => error.into(),
+                    _ => not_empty(),
+                });
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for created in created_parents.iter().rev() {
+                let _ = fs::remove_dir(created);
+            }
+            return Err(error);
+        }
+
+        let inspection = Self::inspect_local(&path)?;
+        let project_path = match &inspection.project {
+            Some(project) => Some(create_folder_within(&path, &project.folder)?),
+            None => None,
+        };
+        Ok(ClonedRepository {
+            inspection,
+            project_path,
+        })
+    }
+
+    fn clone_repo(
+        remote_url: &str,
+        path: &Path,
+        clone_options: &CloneOptions,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<Repository> {
+        ensure_supported_remote_url(remote_url)?;
         let branch = clone_options.branch.as_deref();
         if let Some(branch) = branch {
             if !git2::Branch::name_is_valid(branch)? {
@@ -3476,10 +3581,8 @@ impl Workspace {
             }
         }
         if clone_options.blobless {
-            if let Some(repo) =
-                Self::clone_blobless(remote_url.as_ref(), path.as_ref(), branch, options)?
-            {
-                return Self::open_clone(repo, path.as_ref(), content_policy);
+            if let Some(repo) = Self::clone_blobless(remote_url, path, branch, options)? {
+                return Ok(repo);
             }
         }
         let mut builder = RepoBuilder::new();
@@ -3494,20 +3597,19 @@ impl Workspace {
             let fetch_options = options.clone_fetch_options();
             builder.fetch_options(fetch_options);
         }
-        let repo = match builder.clone(remote_url.as_ref(), path.as_ref()) {
-            Ok(repo) => repo,
+        match builder.clone(remote_url, path) {
+            Ok(repo) => Ok(repo),
             Err(error)
                 if branch.is_some()
                     && error.code() == git2::ErrorCode::NotFound
                     && error.class() == git2::ErrorClass::Reference =>
             {
-                return Err(DraftlineError::VariationNotFound(
+                Err(DraftlineError::VariationNotFound(
                     branch.unwrap_or_default().to_string(),
                 ))
             }
-            Err(error) => return Err(error.into()),
-        };
-        Self::open_clone(repo, path.as_ref(), content_policy)
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Opens a fresh clone at the folder the repository's marker names, not
@@ -16950,6 +17052,47 @@ fn workdir_patch_text(diff: &git2::Diff<'_>, skip_changing: bool) -> Result<Stri
         })?;
     }
     Ok(text)
+}
+
+/// A new, empty folder beside `path` for a clone to fill before it moves
+/// into place.
+fn create_staging_dir(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().unwrap_or(path);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or_default();
+    for attempt in 0..100u32 {
+        let staging = parent.join(format!(
+            ".{name}.draftline-clone-{}-{nanos:x}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&staging) {
+            Ok(()) => return Ok(staging),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(std::io::Error::other("could not create a folder to clone into").into())
+}
+
+/// Moves a finished clone to `path`. An empty folder already there is
+/// replaced only while it is still empty, and put back if the move loses a
+/// race to something else.
+fn publish_staging_dir(staging: &Path, path: &Path, existed: bool) -> std::io::Result<()> {
+    if existed {
+        // Fails, removing nothing, once anything is in the folder.
+        fs::remove_dir(path)?;
+    }
+    fs::rename(staging, path).inspect_err(|_| {
+        if existed {
+            let _ = fs::create_dir(path);
+        }
+    })
 }
 
 /// Whether `location` names a remote rather than a local path: a URL with a

@@ -16,22 +16,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     merge::MergeConflict, AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult,
-    ChangeSet, CloneOptions, CloneProgress, ContentPolicy, ContentPolicyAudit, ContributorProfile,
-    CurrentFileDiff, CurrentFilePreview, DirtySummary, DraftlineError, FilteredFile, FolderFix,
-    FolderMove, FolderProbe, HistoryEntry, InspectRepositoryOptions, MergeConflictResolution,
-    MergeIncomingReport, MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice,
-    OperationLockInspection, PathHistory, PathHistoryOptions, PreflightReport, PreviewFile,
-    ProjectSettings, ProjectSettingsUpdate, PublishPreflight, PublishResult, RecoveryRepairResult,
-    RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions,
-    RemoteVariation, RemoteVariationDiagnostics, RepositoryInspection, RestoreVersionTarget,
-    Result, Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SwitchPolicy, SyncState,
-    SyncStatus, Variation, VariationCreatePreflight, VariationCreateToken, VariationId,
-    VariationMetadata, VariationRenamePreflight, VariationRenameToken, VariationSummary, Version,
-    VersionDiff, VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
-    WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
-    WorkspaceGraphNodeDetail, WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
-    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
-    WorkspaceId, WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
+    ChangeSet, CloneOptions, CloneProgress, ClonedRepository, ContentPolicy, ContentPolicyAudit,
+    ContributorProfile, CurrentFileDiff, CurrentFilePreview, DirtySummary, DraftlineError,
+    FilteredFile, FolderFix, FolderMove, FolderProbe, HistoryEntry, InspectRepositoryOptions,
+    MergeConflictResolution, MergeIncomingReport, MergeIncomingResult, MergeIncomingToken,
+    MergeResolutionChoice, OperationLockInspection, PathHistory, PathHistoryOptions,
+    PreflightReport, PreviewFile, ProjectSettings, ProjectSettingsUpdate, PublishPreflight,
+    PublishResult, RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest,
+    RemoteEndpoint, RemoteOptions, RemoteVariation, RemoteVariationDiagnostics,
+    RepositoryInspection, RestoreVersionTarget, Result, Shelf, ShelfApplyReport, SupportRef,
+    SupportRefScope, SwitchPolicy, SyncState, SyncStatus, Variation, VariationCreatePreflight,
+    VariationCreateToken, VariationId, VariationMetadata, VariationRenamePreflight,
+    VariationRenameToken, VariationSummary, Version, VersionDiff, VersionId, VersionPreview,
+    Workspace, WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary,
+    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail,
+    WorkspaceGraphOptions, WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRefs,
+    WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection,
+    WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -461,6 +462,20 @@ pub struct CloneWorkspaceWithOptionsRequest {
     pub progress_id: Option<String>,
     /// A blobless clone (`git clone --filter=blob:none`), falling back to a
     /// full clone; see [`CloneOptions::with_blobless`].
+    #[serde(default)]
+    pub blobless: bool,
+}
+
+/// Request for [`clone_repository`]: a clone that opens and claims nothing,
+/// with the same options as [`CloneWorkspaceWithOptionsRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneRepositoryRequest {
+    pub remote_url: String,
+    pub workspace_path: PathBuf,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub progress_id: Option<String>,
     #[serde(default)]
     pub blobless: bool,
 }
@@ -1531,6 +1546,54 @@ pub fn clone_workspace_with_options_with_context(
     };
     context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
     Ok(result)
+}
+
+/// Clones a repository without opening or claiming a project in it; see
+/// [`Workspace::clone_repository`]. Emits no workspace event: nothing is open.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn clone_repository(request: CloneRepositoryRequest) -> Result<ClonedRepository> {
+    clone_repository_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// [`clone_repository`] with the context's credentials, reporting progress
+/// to its clone progress sink.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn clone_repository_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: CloneRepositoryRequest,
+) -> Result<ClonedRepository> {
+    let mut clone_options = CloneOptions::new().with_blobless(request.blobless);
+    if let Some(branch) = request.branch {
+        clone_options = clone_options.with_branch(branch);
+    }
+    let mut options = context.remote_options();
+    if let Some(sink) = context.clone_progress_sink.as_ref() {
+        let progress_id = request.progress_id.clone();
+        let workspace_path = request.workspace_path.clone();
+        options = options.with_progress(move |progress| {
+            if let Ok(mut sink) = sink.lock() {
+                sink(CloneProgressEvent {
+                    progress_id: progress_id.clone(),
+                    workspace_path: workspace_path.clone(),
+                    progress: *progress,
+                });
+            }
+        });
+    }
+    Workspace::clone_repository(
+        request.remote_url,
+        &request.workspace_path,
+        &clone_options,
+        &mut options,
+    )
 }
 
 /// Adopts an existing Git repository as a Draftline workspace.
