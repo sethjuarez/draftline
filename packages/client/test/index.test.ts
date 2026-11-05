@@ -925,6 +925,30 @@ describe('createDraftlineClient', () => {
       request: { remote_url: 'https://github.com/contoso/app', token: 't' },
     });
   });
+
+  it('inspects a repository before adding a project', async () => {
+    const inspection = {
+      location_kind: 'local',
+      is_repository: true,
+      root: 'C:\\repo',
+      project: null,
+      current_branch: 'main',
+      default_branch: 'main',
+      branches: ['main'],
+      remotes: [],
+      lfs: { used: false, available: true },
+      target_folder: null,
+    };
+    const invoke = vi.fn<DraftlineInvoke>(async () => inspection as never);
+    const client = createDraftlineClient({ invoke });
+
+    await expect(
+      client.inspectRepository({ location: 'C:\\repo', target_folder: 'demo' }),
+    ).resolves.toEqual(inspection);
+    expect(invoke).toHaveBeenCalledWith('inspect_repository', {
+      request: { location: 'C:\\repo', target_folder: 'demo' },
+    });
+  });
 });
 
 const fixtureDiagnostics: WorkspaceDiagnostics = {

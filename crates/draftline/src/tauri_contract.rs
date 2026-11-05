@@ -18,20 +18,20 @@ use crate::{
     merge::MergeConflict, AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult,
     ChangeSet, CloneOptions, CloneProgress, ContentPolicy, ContentPolicyAudit, ContributorProfile,
     CurrentFileDiff, CurrentFilePreview, DirtySummary, DraftlineError, FilteredFile, FolderFix,
-    FolderMove, FolderProbe, HistoryEntry, MergeConflictResolution, MergeIncomingReport,
-    MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice, OperationLockInspection,
-    PathHistory, PathHistoryOptions, PreflightReport, PreviewFile, ProjectSettings,
-    ProjectSettingsUpdate, PublishPreflight, PublishResult, RecoveryRepairResult, RecoveryState,
-    RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVariation,
-    RemoteVariationDiagnostics, RestoreVersionTarget, Result, Shelf, ShelfApplyReport, SupportRef,
-    SupportRefScope, SwitchPolicy, SyncState, SyncStatus, Variation, VariationCreatePreflight,
-    VariationCreateToken, VariationId, VariationMetadata, VariationRenamePreflight,
-    VariationRenameToken, VariationSummary, Version, VersionDiff, VersionId, VersionPreview,
-    Workspace, WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary,
-    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail,
-    WorkspaceGraphOptions, WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRefs,
-    WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection,
-    WorkspaceSummary, WorkspaceVerification,
+    FolderMove, FolderProbe, HistoryEntry, InspectRepositoryOptions, MergeConflictResolution,
+    MergeIncomingReport, MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice,
+    OperationLockInspection, PathHistory, PathHistoryOptions, PreflightReport, PreviewFile,
+    ProjectSettings, ProjectSettingsUpdate, PublishPreflight, PublishResult, RecoveryRepairResult,
+    RecoveryState, RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions,
+    RemoteVariation, RemoteVariationDiagnostics, RepositoryInspection, RestoreVersionTarget,
+    Result, Shelf, ShelfApplyReport, SupportRef, SupportRefScope, SwitchPolicy, SyncState,
+    SyncStatus, Variation, VariationCreatePreflight, VariationCreateToken, VariationId,
+    VariationMetadata, VariationRenamePreflight, VariationRenameToken, VariationSummary, Version,
+    VersionDiff, VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
+    WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
+    WorkspaceGraphNodeDetail, WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
+    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
+    WorkspaceId, WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -53,6 +53,8 @@ pub struct DraftlineCommandContext<'callbacks> {
     variation_namespace: Option<String>,
     event_defer_timeout: Duration,
     clone_progress_sink: Option<Mutex<Box<CloneProgressSink<'callbacks>>>>,
+    #[cfg(feature = "github")]
+    github_enterprise_host: Option<String>,
 }
 
 /// How long an event waits by default for another running operation to
@@ -127,6 +129,8 @@ impl<'callbacks> Default for DraftlineCommandContext<'callbacks> {
             variation_namespace: None,
             event_defer_timeout: DEFAULT_EVENT_DEFER_TIMEOUT,
             clone_progress_sink: None,
+            #[cfg(feature = "github")]
+            github_enterprise_host: None,
         }
     }
 }
@@ -158,6 +162,16 @@ impl<'callbacks> DraftlineCommandContext<'callbacks> {
 
     pub fn with_event_sink(mut self, sink: impl FnMut(DraftlineEvent) + Send + 'callbacks) -> Self {
         self.event_sink = Some(Box::new(sink));
+        self
+    }
+
+    /// Asks this GitHub Enterprise Server host (`ghe.example.com`, reached
+    /// at `https://HOST/api/v3`) instead of github.com when commands such as
+    /// [`inspect_repository_with_context`] use a GitHub token. Set it from
+    /// the host's own settings: the token is sent there.
+    #[cfg(feature = "github")]
+    pub fn with_github_enterprise_host(mut self, host: impl Into<String>) -> Self {
+        self.github_enterprise_host = Some(host.into());
         self
     }
 
@@ -1004,6 +1018,147 @@ pub fn github_repo_access_on_enterprise_host(
         request.token,
     )?
     .repo_access()
+}
+
+/// Request for [`inspect_repository`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectRepositoryRequest {
+    /// A local path (any folder in a work tree) or a remote URL.
+    pub location: String,
+    /// Where the project would go: a folder inside the local repository
+    /// (relative to its root) or a clone destination.
+    #[serde(default)]
+    pub target_folder: Option<PathBuf>,
+    /// Gives up on a remote that stops answering for this long.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// The host's GitHub token. When set and the repository is on
+    /// github.com (or the context's enterprise host) through the remote URL,
+    /// or a local repository's `origin` or first GitHub remote, the result
+    /// includes what the token may do.
+    #[cfg(feature = "github")]
+    #[serde(default)]
+    pub github_token: Option<String>,
+}
+
+impl fmt::Debug for InspectRepositoryRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The location may be a URL with a login in it.
+        f.debug_struct("InspectRepositoryRequest")
+            .field("target_folder", &self.target_folder)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What [`inspect_repository`] found.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryInspectionResult {
+    #[serde(flatten)]
+    pub inspection: RepositoryInspection,
+    /// What the GitHub token may do with the repository: push access,
+    /// default branch, fork parent. `None` without a token or a GitHub
+    /// remote, or when GitHub refused (see `github_error`).
+    #[cfg(feature = "github")]
+    pub github: Option<crate::github::GitHubRepoAccess>,
+    /// Why GitHub couldn't be asked, such as `github_unauthorized`; the
+    /// rest of the inspection still stands.
+    #[cfg(feature = "github")]
+    pub github_error: Option<TauriCommandError>,
+}
+
+/// Looks at a repository before the host opens, clones or adds a project to
+/// it (see [`Workspace::inspect_repository`]). Changes nothing.
+#[tracing::instrument(err(level = tracing::Level::WARN), skip_all)]
+pub fn inspect_repository(request: InspectRepositoryRequest) -> Result<RepositoryInspectionResult> {
+    inspect_repository_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// [`inspect_repository`] using the context's credentials for a remote.
+#[tracing::instrument(err(level = tracing::Level::WARN), skip_all)]
+pub fn inspect_repository_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: InspectRepositoryRequest,
+) -> Result<RepositoryInspectionResult> {
+    let mut options = InspectRepositoryOptions::new();
+    if let Some(target) = &request.target_folder {
+        options = options.with_target_folder(target.clone());
+    }
+    let inspection = {
+        let mut remote_options = context.remote_options();
+        if let Some(timeout_ms) = request.timeout_ms {
+            remote_options = remote_options.with_timeout(Duration::from_millis(timeout_ms.max(1)));
+        }
+        Workspace::inspect_repository(&request.location, &options, &mut remote_options)?
+    };
+    #[cfg(feature = "github")]
+    {
+        let (github, github_error) = match request
+            .github_token
+            .filter(|token| !token.trim().is_empty())
+            .and_then(|token| {
+                let host = context.github_enterprise_host.as_deref();
+                Some((
+                    github_remote_url(&request.location, &inspection, host)?,
+                    token,
+                ))
+            }) {
+            Some((remote_url, token)) => {
+                let provider = match context.github_enterprise_host.as_deref() {
+                    Some(host) => crate::github::GitHubProvider::for_enterprise_remote_url(
+                        &remote_url,
+                        host,
+                        token,
+                    ),
+                    None => crate::github::GitHubProvider::for_remote_url(&remote_url, token),
+                };
+                match provider.and_then(|provider| provider.repo_access()) {
+                    Ok(access) => (Some(access), None),
+                    Err(error) => (None, Some(TauriCommandError::from(error))),
+                }
+            }
+            None => (None, None),
+        };
+        Ok(RepositoryInspectionResult {
+            inspection,
+            github,
+            github_error,
+        })
+    }
+    #[cfg(not(feature = "github"))]
+    Ok(RepositoryInspectionResult { inspection })
+}
+
+/// The GitHub remote to ask about (on github.com, or `enterprise_host`): the
+/// inspected URL itself, or a local repository's `origin` (else its first
+/// GitHub remote).
+#[cfg(feature = "github")]
+fn github_remote_url(
+    location: &str,
+    inspection: &RepositoryInspection,
+    enterprise_host: Option<&str>,
+) -> Option<String> {
+    let parse_github_remote_url = |url: &str| {
+        crate::github::parse_remote_url_on(url, enterprise_host.unwrap_or("github.com"))
+    };
+    if inspection.location_kind == crate::RepositoryLocationKind::Remote {
+        return parse_github_remote_url(location).map(|_| location.trim().to_string());
+    }
+    let repo = git2::Repository::discover(inspection.root.as_ref()?).ok()?;
+    let urls = repo
+        .remotes()
+        .ok()?
+        .iter()
+        .filter_map(|name| name.ok().flatten().map(str::to_string))
+        .filter_map(|name| {
+            let url = repo.find_remote(&name).ok()?.url().ok()?.to_string();
+            parse_github_remote_url(&url).map(|_| (name, url))
+        })
+        .collect::<Vec<_>>();
+    urls.iter()
+        .find(|(name, _)| name == "origin")
+        .or(urls.first())
+        .map(|(_, url)| url.clone())
 }
 
 /// Error shape that Tauri commands can serialize directly.

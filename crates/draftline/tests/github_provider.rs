@@ -380,3 +380,66 @@ fn contract_refuses_a_missing_token_and_a_non_github_remote() {
     .unwrap_err();
     assert_eq!(TauriCommandError::from(error).code, "pull_request_failed");
 }
+
+#[test]
+fn inspect_repository_adds_github_access_for_a_local_repository() {
+    use draftline::tauri_contract::{
+        inspect_repository, inspect_repository_with_context, DraftlineCommandContext,
+        InspectRepositoryRequest,
+    };
+    let server = MockServer::start();
+    let host = server.address().to_string();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v3/repos/contoso/app")
+            .header("authorization", format!("Bearer {TOKEN}"));
+        then.status(200).json_body(json!({
+            "full_name": "contoso/app",
+            "default_branch": "main",
+            "permissions": { "push": true }
+        }));
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init(temp.path()).unwrap();
+    repo.remote("upstream", "https://example.com/other.git")
+        .unwrap();
+    repo.remote("origin", &format!("https://{host}/contoso/app.git"))
+        .unwrap();
+    let request = |token: Option<&str>| InspectRepositoryRequest {
+        location: temp.path().to_str().unwrap().to_string(),
+        target_folder: None,
+        timeout_ms: None,
+        github_token: token.map(str::to_string),
+    };
+
+    let mut context = DraftlineCommandContext::new().with_github_enterprise_host(host.clone());
+    let result = inspect_repository_with_context(&mut context, request(Some(TOKEN))).unwrap();
+    let access = result.github.unwrap();
+    assert!(access.can_push);
+    assert_eq!(result.github_error, None);
+    assert!(result.inspection.is_repository);
+
+    // A refused token doesn't sink the rest of the inspection.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/api/v3/repos/contoso/app");
+        then.status(401)
+            .json_body(json!({ "message": "Bad credentials" }));
+    });
+    repo.remote_set_url(
+        "origin",
+        &format!("https://{}/contoso/app.git", server.address()),
+    )
+    .unwrap();
+    let mut context =
+        DraftlineCommandContext::new().with_github_enterprise_host(server.address().to_string());
+    let result = inspect_repository_with_context(&mut context, request(Some(TOKEN))).unwrap();
+    assert_eq!(result.github, None);
+    assert_eq!(result.github_error.unwrap().code, "github_unauthorized");
+
+    // No token, or no github.com remote: nothing asked.
+    let result = inspect_repository(request(None)).unwrap();
+    assert_eq!((result.github, result.github_error), (None, None));
+    let result = inspect_repository(request(Some(TOKEN))).unwrap();
+    assert_eq!((result.github, result.github_error), (None, None));
+}
