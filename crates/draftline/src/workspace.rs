@@ -21,7 +21,7 @@ use crate::recovery::RecoveryOperation;
 use crate::remote::{ensure_supported_remote_url, PushRefExpectation};
 use crate::worktree::{OwnedWorktree, WorktreeStart, OWNED_WORKTREE_PREFIX};
 use crate::{
-    path::normalize_workspace_relative, CloneOptions, ContentPolicy, Contributor,
+    path::normalize_workspace_relative, CloneOptions, CloneStage, ContentPolicy, Contributor,
     ContributorProfile, DraftlineError, OutgoingFile, OutgoingFileKind, PublishPreflight,
     PublishResult, PublishToken, RecoveryState, RemoteEndpoint, RemoteOptions,
     RemoteVersionSummary, Result, SyncState, SyncStatus,
@@ -3176,6 +3176,11 @@ impl Workspace {
     /// Refuses a `branch` that isn't a valid branch name
     /// ([`DraftlineError::InvalidVariationName`]) or that the remote doesn't
     /// have ([`DraftlineError::VariationNotFound`]).
+    ///
+    /// A [blobless](CloneOptions::with_blobless) clone runs `git clone
+    /// --filter=blob:none` when it can, and is otherwise a full clone. There,
+    /// the remote options' timeout stops `git` once it has reported nothing
+    /// for that long.
     pub fn clone_workspace_with(
         remote_url: impl AsRef<str>,
         path: impl AsRef<Path>,
@@ -3188,6 +3193,13 @@ impl Workspace {
         if let Some(branch) = branch {
             if !git2::Branch::name_is_valid(branch)? {
                 return Err(DraftlineError::InvalidVariationName(branch.to_string()));
+            }
+        }
+        if clone_options.blobless {
+            if let Some(repo) =
+                Self::clone_blobless(remote_url.as_ref(), path.as_ref(), branch, options)?
+            {
+                return Self::open_clone(repo, path.as_ref(), content_policy);
             }
         }
         let mut builder = RepoBuilder::new();
@@ -3215,11 +3227,116 @@ impl Workspace {
             }
             Err(error) => return Err(error.into()),
         };
-        // Open the folder the repository's marker names, not its root.
-        // The folder may not exist on the cloned branch yet.
+        Self::open_clone(repo, path.as_ref(), content_policy)
+    }
+
+    /// Opens a fresh clone at the folder the repository's marker names, not
+    /// its root. The folder may not exist on the cloned branch yet.
+    fn open_clone(repo: Repository, path: &Path, content_policy: ContentPolicy) -> Result<Self> {
         let folder = head_marker_folder(&repo).unwrap_or_default();
-        let project = create_folder_within(path.as_ref(), &folder)?;
+        let project = create_folder_within(path, &folder)?;
         Self::from_repository(repo, &project, content_policy)
+    }
+
+    /// Clones with `git clone --filter=blob:none`, or `None` for a full
+    /// clone: when `git` isn't here, the remote isn't HTTP(S) or local (SSH
+    /// could prompt), or the host's credentials can't be handed to `git`.
+    fn clone_blobless(
+        url: &str,
+        path: &Path,
+        branch: Option<&str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<Option<Repository>> {
+        if !git_cli::available() {
+            tracing::info!("git is not available; cloning in full");
+            return Ok(None);
+        }
+        let lower = url.to_ascii_lowercase();
+        let http = lower.starts_with("https://") || lower.starts_with("http://");
+        let local =
+            lower.starts_with("file://") || (!url.contains("://") && Path::new(url).exists());
+        if !http && !local {
+            tracing::info!("blobless clones run over HTTP(S) only; cloning in full");
+            return Ok(None);
+        }
+        let login = if options.has_credentials() && !local {
+            // Never hand a login to git over plain HTTP.
+            if !lower.starts_with("https://") {
+                return Ok(None);
+            }
+            match options.credentials_for(url) {
+                Some(Ok(crate::RemoteCredential::UsernamePassword { username, password })) => {
+                    Some((username, password))
+                }
+                // libgit2 asks again when the remote wants a login.
+                _ => {
+                    tracing::info!("git can't use these credentials; cloning in full");
+                    return Ok(None);
+                }
+            }
+        } else {
+            None
+        };
+        let clone = git_cli::BloblessClone {
+            url,
+            path,
+            branch,
+            login,
+            idle_timeout: options.timeout(),
+        };
+        let reported = git_cli::clone_blobless(&clone, |(stage, completed, total, bytes)| {
+            options.report_progress(stage, completed, total, bytes)
+        });
+        match reported {
+            Ok(()) => {
+                let repo = Repository::open(path)?;
+                // git reports checkout only when it runs long; finish it here.
+                let files = repo.index().map(|index| index.len() as u64).unwrap_or(0);
+                options.report_progress(CloneStage::CheckingOut, files, files, None);
+                Ok(Some(repo))
+            }
+            Err(git_cli::CloneFailure::BranchNotFound) => Err(DraftlineError::VariationNotFound(
+                branch.unwrap_or_default().to_string(),
+            )),
+            Err(git_cli::CloneFailure::TimedOut) => Err(options.timeout_error("clone_workspace")),
+            Err(git_cli::CloneFailure::Failed(output)) => Err(DraftlineError::Git(
+                git2::Error::new(git2::ErrorCode::GenericError, git2::ErrorClass::Net, output),
+            )),
+        }
+    }
+
+    /// Whether this repository is a partial clone (such as a
+    /// [blobless](CloneOptions::with_blobless) one), whose remote holds file
+    /// contents it hasn't downloaded. libgit2, which Draftline reads through,
+    /// can't download them, so reading an older version's file that was
+    /// never checked out can fail here until `git` fetches it.
+    pub fn is_partial_clone(&self) -> bool {
+        // This repository's own config: a global setting says nothing here.
+        let Ok(config) = self
+            .repo
+            .config()
+            .and_then(|config| config.open_level(git2::ConfigLevel::Local))
+        else {
+            return false;
+        };
+        if config
+            .get_string("extensions.partialclone")
+            .is_ok_and(|remote| !remote.trim().is_empty())
+        {
+            return true;
+        }
+        let Ok(mut entries) = config.entries(Some(r"^remote\..*\.promisor$")) else {
+            return false;
+        };
+        let mut names = Vec::new();
+        while let Some(Ok(entry)) = entries.next() {
+            if let Ok(name) = entry.name() {
+                names.push(name.to_string());
+            }
+        }
+        names
+            .iter()
+            .any(|name| config.get_bool(name).unwrap_or(false))
     }
 
     /// Adds a semantic merge resolver ahead of Draftline's built-in resolvers.

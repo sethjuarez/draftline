@@ -480,9 +480,389 @@ pub(crate) fn lfs_push(
     )
 }
 
+/// What [`clone_blobless`] clones.
+pub(crate) struct BloblessClone<'a> {
+    pub url: &'a str,
+    pub path: &'a Path,
+    pub branch: Option<&'a str>,
+    /// A username and password (or token) for an HTTPS remote, handed to
+    /// `git` through a credential helper that lives only in its environment.
+    pub login: Option<(String, String)>,
+    /// How long `git` may go without reporting anything before it is stopped.
+    pub idle_timeout: Option<Duration>,
+}
+
+/// How a `git clone` failed.
+pub(crate) enum CloneFailure {
+    /// The remote has no such branch.
+    BranchNotFound,
+    /// `git` went quiet for longer than the idle timeout and was stopped.
+    TimedOut,
+    Failed(String),
+}
+
+/// One progress line from `git clone --progress`: its stage, `completed` of
+/// `total`, and the bytes received so far when the line says.
+pub(crate) type CloneProgressLine = (crate::CloneStage, u64, u64, Option<u64>);
+
+/// Clones `clone.url` without file contents (`--filter=blob:none`): every
+/// commit and tree, but only the blobs the checkout needs; `git` downloads
+/// the rest when something reads them. Never shallow. Progress lines go to
+/// `progress` on the calling thread. A missing target folder is created
+/// first, so it's ours; a failed clone removes it. Like `git` and libgit2, a
+/// failed clone into a folder that was empty empties it again; it touches
+/// nothing in a folder it couldn't prove empty.
+pub(crate) fn clone_blobless(
+    clone: &BloblessClone<'_>,
+    mut progress: impl FnMut(CloneProgressLine),
+) -> std::result::Result<(), CloneFailure> {
+    let target = CloneTarget::claim(clone.path);
+    let mut command = git(Path::new("."));
+    // Untranslated output, so progress and errors can be read. No prompts:
+    // an empty GIT_ASKPASS skips every askpass program.
+    command
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_ASKPASS", "")
+        .env_remove("SSH_ASKPASS");
+    only_credentials(
+        &mut command,
+        clone
+            .login
+            .as_ref()
+            .map(|(username, password)| (username.as_str(), password.as_str())),
+    );
+    command.args(["clone", "--progress", "--filter=blob:none", "--no-local"]);
+    if let Some(branch) = clone.branch {
+        command.args(["--branch", branch]);
+    }
+    command.arg("--").arg(clone.url).arg(clone.path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| CloneFailure::Failed(format!("starting git: {error}")))?;
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (sender, lines) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while let Ok(1) = reader.read(&mut byte) {
+            if byte[0] == b'\r' || byte[0] == b'\n' {
+                if !line.is_empty() {
+                    let text = String::from_utf8_lossy(&line).into_owned();
+                    line.clear();
+                    if sender.send(text).is_err() {
+                        return;
+                    }
+                }
+            } else {
+                line.push(byte[0]);
+            }
+        }
+        if !line.is_empty() {
+            let _ = sender.send(String::from_utf8_lossy(&line).into_owned());
+        }
+    });
+    let mut messages: Vec<String> = Vec::new();
+    let mut heard = Instant::now();
+    let outcome = loop {
+        match lines.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                heard = Instant::now();
+                match parse_clone_progress(&line) {
+                    Some(line) => progress(line),
+                    None => {
+                        if !line.starts_with("remote:") {
+                            messages.push(line);
+                        }
+                    }
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // stderr closed, but git (or a filter it runs) may still be
+                // running, so keep the idle timeout.
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                    Err(error) => {
+                        kill_tree(&mut child);
+                        break Err(CloneFailure::Failed(error.to_string()));
+                    }
+                }
+            }
+        }
+        if clone
+            .idle_timeout
+            .is_some_and(|after| heard.elapsed() >= after)
+        {
+            kill_tree(&mut child);
+            break Err(CloneFailure::TimedOut);
+        }
+    };
+    let result = match outcome {
+        Ok(status) if status.success() => return Ok(()),
+        Ok(status) => {
+            let text = messages.join("\n");
+            if text.contains("Remote branch") && text.contains("not found") {
+                Err(CloneFailure::BranchNotFound)
+            } else if text.trim().is_empty() {
+                Err(CloneFailure::Failed(format!("git clone failed: {status}")))
+            } else {
+                Err(CloneFailure::Failed(text))
+            }
+        }
+        Err(failure) => Err(failure),
+    };
+    target.clean_up(clone.path);
+    result
+}
+
+/// What was at a clone's target before the clone started.
+enum CloneTarget {
+    /// Missing, so created here: nobody else's.
+    Created,
+    Empty,
+    /// Not empty, not a folder, or unreadable: never cleaned up.
+    Other,
+}
+
+impl CloneTarget {
+    /// Creates `path` when it's missing (atomically, so a folder something
+    /// else creates meanwhile is never taken for ours).
+    fn claim(path: &Path) -> Self {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::create_dir(path).is_ok() {
+            return Self::Created;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => match std::fs::read_dir(path) {
+                Ok(mut entries) => match entries.next() {
+                    None => Self::Empty,
+                    Some(_) => Self::Other,
+                },
+                Err(_) => Self::Other,
+            },
+            _ => Self::Other,
+        }
+    }
+
+    /// Removes what a failed clone left in `path`.
+    fn clean_up(&self, path: &Path) {
+        match self {
+            Self::Created => {
+                let _ = std::fs::remove_dir_all(path);
+            }
+            Self::Empty => remove_clone_leftovers(path),
+            Self::Other => {}
+        }
+    }
+}
+
+/// Turns off the configured credential helpers for `command`, so it neither
+/// reads nor stores a login the host didn't hand over. With a `login`, adds
+/// one helper that answers `get` with it, from variables only this `git`
+/// sees, and ignores `store` and `erase`.
+fn only_credentials(command: &mut Command, login: Option<(&str, &str)>) {
+    command
+        .env("GIT_CONFIG_KEY_0", "credential.helper")
+        .env("GIT_CONFIG_VALUE_0", "");
+    let Some((username, password)) = login else {
+        command.env("GIT_CONFIG_COUNT", "1");
+        return;
+    };
+    command
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_1", "credential.helper")
+        .env(
+            "GIT_CONFIG_VALUE_1",
+            "!f() { if test \"$1\" = get; then printf 'username=%s\\npassword=%s\\n' \"$DRAFTLINE_GIT_USERNAME\" \"$DRAFTLINE_GIT_PASSWORD\"; fi; }; f",
+        )
+        .env("DRAFTLINE_GIT_USERNAME", username)
+        .env("DRAFTLINE_GIT_PASSWORD", password);
+}
+
+/// Empties a folder a failed clone wrote into.
+fn remove_clone_leftovers(path: &Path) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let target = entry.path();
+        let _ = if target.is_dir() {
+            std::fs::remove_dir_all(&target)
+        } else {
+            std::fs::remove_file(&target)
+        };
+    }
+}
+
+/// Reads a `git clone --progress` line such as
+/// `Receiving objects:  45% (450/1000), 1.20 MiB | 2.00 MiB/s`.
+fn parse_clone_progress(line: &str) -> Option<CloneProgressLine> {
+    use crate::CloneStage;
+    let (stage, rest) = [
+        ("Receiving objects:", CloneStage::Receiving),
+        ("Resolving deltas:", CloneStage::Resolving),
+        ("Updating files:", CloneStage::CheckingOut),
+    ]
+    .into_iter()
+    .find_map(|(prefix, stage)| line.strip_prefix(prefix).map(|rest| (stage, rest)))?;
+    let open = rest.find('(')?;
+    let close = open + rest[open..].find(')')?;
+    let (completed, total) = rest[open + 1..close].split_once('/')?;
+    let completed = completed.trim().parse().ok()?;
+    let total = total.trim().parse().ok()?;
+    let bytes = rest[close + 1..]
+        .trim_start_matches(',')
+        .split('|')
+        .next()
+        .and_then(parse_size);
+    Some((stage, completed, total, bytes))
+}
+
+/// `1.20 MiB` and the like, as bytes.
+fn parse_size(text: &str) -> Option<u64> {
+    let (number, unit) = text.trim().split_once(' ')?;
+    let number: f64 = number.parse().ok()?;
+    let scale = match unit.trim() {
+        "bytes" | "byte" => 1.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((number * scale) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_login_reaches_git_only_through_its_own_helper() {
+        if !available() {
+            return;
+        }
+        let mut command = git(Path::new("."));
+        only_credentials(&mut command, Some(("x-access-token", "s3cret value")));
+        command.args(["credential", "fill"]);
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=example.test\n\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("username=x-access-token"), "{text}");
+        assert!(text.contains("password=s3cret value"), "{text}");
+    }
+
+    /// Runs `git credential <action>` with a sentinel helper in the global
+    /// config; returns whether it succeeded and what the sentinel saw.
+    fn credential_with_sentinel(
+        action: &str,
+        reset: bool,
+        login: Option<(&str, &str)>,
+    ) -> (bool, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let seen = temp.path().join("seen.txt");
+        let global = temp.path().join("gitconfig");
+        let seen_path = seen.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            &global,
+            format!(
+                "[credential]\n\thelper = \"!f() {{ echo \\\"$1\\\" >> '{seen_path}'; }}; f\"\n"
+            ),
+        )
+        .unwrap();
+        let mut command = git(temp.path());
+        command
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ASKPASS", "")
+            .env_remove("SSH_ASKPASS");
+        if reset {
+            only_credentials(&mut command, login);
+        }
+        command.args(["credential", action]);
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=example.test\nusername=u\npassword=p\n\n")
+            .unwrap();
+        let ok = child.wait().unwrap().success();
+        (ok, std::fs::read_to_string(&seen).unwrap_or_default())
+    }
+
+    #[test]
+    fn configured_credential_helpers_never_see_a_clone() {
+        if !available() {
+            return;
+        }
+        // Without the reset, the sentinel is called.
+        let (_, seen) = credential_with_sentinel("approve", false, None);
+        assert_eq!(seen.trim(), "store");
+        for action in ["fill", "approve", "reject"] {
+            let (_, seen) = credential_with_sentinel(action, true, None);
+            assert_eq!(seen, "", "{action} reached the configured helper");
+            let (ok, seen) = credential_with_sentinel(action, true, Some(("u", "p")));
+            assert!(ok, "{action} with a login failed");
+            assert_eq!(
+                seen, "",
+                "{action} with a login reached the configured helper"
+            );
+        }
+    }
+
+    #[test]
+    fn clone_progress_lines_are_read() {
+        use crate::CloneStage;
+        assert_eq!(
+            parse_clone_progress("Receiving objects:  45% (450/1000), 1.50 MiB | 2.00 MiB/s"),
+            Some((CloneStage::Receiving, 450, 1000, Some(1_572_864)))
+        );
+        assert_eq!(
+            parse_clone_progress("Resolving deltas: 100% (7/7), done."),
+            Some((CloneStage::Resolving, 7, 7, None))
+        );
+        assert_eq!(
+            parse_clone_progress("Updating files:  50% (20/40)"),
+            Some((CloneStage::CheckingOut, 20, 40, None))
+        );
+        assert_eq!(
+            parse_clone_progress("remote: Counting objects: 3, done."),
+            None
+        );
+        assert_eq!(parse_clone_progress("Cloning into 'x'..."), None);
+    }
 
     /// A filter that hangs (here, a shell that starts a `sleep`) is killed,
     /// with what it started, once the timeout passes.

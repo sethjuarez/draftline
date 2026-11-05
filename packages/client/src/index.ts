@@ -1352,6 +1352,11 @@ export interface CloneWorkspaceWithOptionsRequest extends CloneWorkspaceRequest 
   branch?: string | null;
   /** Echoed in every progress event for this clone. */
   progress_id?: string | null;
+  /**
+   * Download file contents only for the checkout (`git clone --filter=blob:none`).
+   * Needs `git`; otherwise the clone is full.
+   */
+  blobless?: boolean;
 }
 
 export type CloneStage = 'receiving' | 'resolving' | 'checking_out';
