@@ -7,6 +7,7 @@ use draftline::tauri_contract::{
     GuardedCreateVariationFromVersionRequest, GuardedCreateVariationFromVersionResult,
     LegacyHistoryCleanupRequest, ListSupportRefsRequest,
     MergeIncomingCommandResult, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
+    MergeIncomingWithTokenRequest,
     MergeVariationRequest, MergeVariationWithResolutionsRequest, PreflightMergeVariationRequest,
     PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
     PublishCurrentVariationRequest, PublishCurrentVariationResult, RecoveryRequest, RemoteRequest,
@@ -779,6 +780,18 @@ fn merge_incoming_with_resolutions(
 }
 
 #[tauri::command]
+fn merge_incoming_with_token(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: MergeIncomingWithTokenRequest,
+) -> TauriCommandResult<MergeIncomingCommandResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::merge_incoming_with_token_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
 fn preflight_merge_variation(
     state: tauri::State<'_, DraftlineContextState>,
     request: PreflightMergeVariationRequest,
@@ -906,6 +919,7 @@ fn main() {    let _ = tracing_subscriber::registry()
             preflight_merge_incoming,
             merge_incoming,
             merge_incoming_with_resolutions,
+            merge_incoming_with_token,
             preflight_merge_variation,
             merge_variation,
             merge_variation_with_resolutions

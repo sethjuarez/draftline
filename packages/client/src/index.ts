@@ -116,6 +116,7 @@ export interface DraftlineClient {
   mergeIncomingWithResolutions(
     request: MergeIncomingWithResolutionsRequest,
   ): Promise<MergeIncomingCommandResult>;
+  mergeIncomingWithToken(request: MergeIncomingWithTokenRequest): Promise<MergeIncomingCommandResult>;
   preflightMergeVariation(request: PreflightMergeVariationRequest): Promise<MergeIncomingReport>;
   mergeVariation(request: MergeVariationRequest): Promise<MergeIncomingCommandResult>;
   mergeVariationWithResolutions(
@@ -282,6 +283,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     mergeIncoming: (request) => run('merge_incoming', { request }),
     mergeIncomingWithResolutions: (request) =>
       run('merge_incoming_with_resolutions', { request }),
+    mergeIncomingWithToken: (request) => run('merge_incoming_with_token', { request }),
     preflightMergeVariation: (request) => run('preflight_merge_variation', { request }),
     mergeVariation: (request) => run('merge_variation', { request }),
     mergeVariationWithResolutions: (request) =>
@@ -1397,6 +1399,16 @@ export interface MergeIncomingWithResolutionsRequest extends MergeIncomingReques
   resolutions: MergeConflictResolution[];
 }
 
+/**
+ * A clean merge pinned to the token from `preflightMergeIncoming` or
+ * `preflightMergeBase`. Refused with `remote_race` or `local_state_changed`
+ * when either head moved since that preview.
+ */
+export interface MergeIncomingWithTokenRequest extends RemoteRequest {
+  label: string;
+  token: MergeIncomingToken;
+}
+
 /** Merge another local variation into the current one. */
 export interface PreflightMergeVariationRequest extends WorkspaceRequest {
   source_variation_id: string;
@@ -1548,6 +1560,11 @@ export interface DraftlineHostFacade {
     label: string,
     token: MergeIncomingToken,
     resolutions: MergeConflictResolution[],
+    remote?: string,
+  ): Promise<MergeIncomingCommandResult>;
+  mergeIncomingWithToken(
+    label: string,
+    token: MergeIncomingToken,
     remote?: string,
   ): Promise<MergeIncomingCommandResult>;
   preflightMergeVariation(sourceVariationId: string): Promise<MergeIncomingReport>;
@@ -1717,6 +1734,8 @@ export function createDraftlineHostFacade({
         resolutions,
         token,
       }),
+    mergeIncomingWithToken: (label, token, remote) =>
+      client.mergeIncomingWithToken({ ...remoteRequest(remote), label, token }),
     preflightMergeVariation: (sourceVariationId) =>
       client.preflightMergeVariation({
         ...workspaceRequest(),
@@ -2168,6 +2187,12 @@ export async function mergeIncomingWithResolutions(
   request: MergeIncomingWithResolutionsRequest,
 ): Promise<MergeIncomingCommandResult> {
   return createDraftlineClient().mergeIncomingWithResolutions(request);
+}
+
+export async function mergeIncomingWithToken(
+  request: MergeIncomingWithTokenRequest,
+): Promise<MergeIncomingCommandResult> {
+  return createDraftlineClient().mergeIncomingWithToken(request);
 }
 
 export async function preflightMergeVariation(

@@ -3372,6 +3372,90 @@ fn incoming_merge_keeps_executable_and_symlink_modes() {
 }
 
 #[test]
+fn pinned_base_merge_refuses_when_main_moves_after_the_preview() {
+    use draftline::tauri_contract::{
+        into_tauri_result, merge_incoming_with_token_with_context, DraftlineCommandContext,
+        MergeIncomingWithTokenRequest,
+    };
+    let (temp, repo) = code_repo();
+    let (bare, other_dir, other) = with_remote(&repo);
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "pitch\n");
+    workspace.save_version("Pitch").unwrap();
+    workspace
+        .send(
+            "origin",
+            &send_request("Pitch"),
+            &mut FakeHost::default(),
+            &mut RemoteOptions::new(),
+        )
+        .unwrap();
+    write_file(other_dir.path(), "cutready/outro.sk", "outro\n");
+    commit_all(&other, "Teammate on main");
+    push_main(&other);
+    workspace.fetch_remote("origin").unwrap();
+    let token = workspace
+        .preflight_merge_base("origin")
+        .unwrap()
+        .token
+        .unwrap();
+    assert_eq!(token.source.as_deref(), Some("main"));
+
+    write_file(other_dir.path(), "src/late.rs", "// not previewed\n");
+    commit_all(&other, "Late on main");
+    push_main(&other);
+
+    let mut context = DraftlineCommandContext::new()
+        .with_content_policy(cutready_policy())
+        .with_variation_namespace("cutready/")
+        .unwrap();
+    let mut merge = |token| {
+        into_tauri_result(merge_incoming_with_token_with_context(
+            &mut context,
+            MergeIncomingWithTokenRequest {
+                workspace_path: temp.path().join("cutready"),
+                remote: "origin".to_string(),
+                label: "Bring in main".to_string(),
+                token,
+            },
+        ))
+    };
+    let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+    let error = merge(token).unwrap_err();
+    assert_eq!(error.code, "remote_race");
+    assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), head);
+    assert!(!temp.path().join("src/late.rs").exists());
+
+    let fresh = workspace
+        .preflight_merge_base("origin")
+        .unwrap()
+        .token
+        .unwrap();
+    // The token pins `main`, even if the remote's default branch changes.
+    let remote = git2::Repository::open_bare(bare.path()).unwrap();
+    let first = remote
+        .revparse_single("refs/heads/main~1")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    remote
+        .reference("refs/heads/trunk", first, true, "trunk")
+        .unwrap();
+    remote.set_head("refs/heads/trunk").unwrap();
+    workspace.fetch_remote("origin").unwrap();
+    assert_eq!(workspace.base_status("origin").unwrap().variation, "trunk");
+    merge(fresh).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(
+        head.parent_id(1).unwrap(),
+        remote_branch(bare.path(), "main").unwrap()
+    );
+    assert_eq!(read(temp.path(), "src/late.rs"), "// not previewed\n");
+    assert_eq!(workspace.current_variation().unwrap(), "cutready/pitch");
+}
+
+#[test]
 fn preflighting_the_base_from_the_base_itself_is_an_ordinary_merge() {
     let (temp, repo) = code_repo();
     let (_bare, other_dir, other) = with_remote(&repo);

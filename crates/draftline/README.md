@@ -102,6 +102,19 @@ remote content. Whole-file choices support `use_ours`, `use_theirs`, `use_base`,
 `delete`, or `use_content`; semantic `field_path` conflicts currently require a
 host-produced `use_content` result for the resolved file.
 
+`merge_incoming` (and its `from_base: true` form) re-previews and merges whatever
+is current, so a host that shows a preview and then asks the user to name the
+merge should call `merge_incoming_with_token` instead, passing the clean token
+from `preflight_merge_incoming` or `preflight_merge_base`. It refuses with
+`remote_race` if the incoming head moved since that preview, and
+`local_state_changed` if the current variation did. Conflicts still go through
+`merge_incoming_with_resolutions`, which now reports the same two codes. For
+local merges, `merge_variation_with_resolutions` with empty `resolutions` is the
+token-pinned clean path.
+
+`sync_status.ahead` counts only versions no remote-tracking branch already has
+when the variation has no upstream yet (`no_remote_version`).
+
 Merging one local variation into the current one follows the same shape without
 a remote: `preflight_merge_variation` (read-only; `source_variation_id`) returns a
 `MergeIncomingReport` whose `sync_status.variation` is the source and whose token

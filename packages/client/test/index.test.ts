@@ -745,6 +745,31 @@ describe('createDraftlineClient', () => {
     });
   });
 
+  it('routes previewed clean merges to merge_incoming_with_token', async () => {
+    const invoke = vi.fn<DraftlineInvoke>(async () => ({ ok: true }) as never);
+    const client = createDraftlineClient({ invoke });
+    const facade = createDraftlineHostFacade({ client, workspacePath: 'C:\\repo' });
+    const token = {
+      remote: 'origin',
+      variation: 'cutready/draft',
+      local_oid: 'local',
+      remote_oid: 'remote',
+      merge_base_oid: 'base',
+      source: 'main',
+    };
+
+    await facade.mergeIncomingWithToken('Bring in main\n\nAs previewed', token);
+
+    expect(invoke).toHaveBeenCalledWith('merge_incoming_with_token', {
+      request: {
+        workspace_path: 'C:\\repo',
+        remote: 'origin',
+        label: 'Bring in main\n\nAs previewed',
+        token,
+      },
+    });
+  });
+
   it('passes a multi-line label through so its body becomes the version comment', async () => {
     const saved: Version = {
       id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
