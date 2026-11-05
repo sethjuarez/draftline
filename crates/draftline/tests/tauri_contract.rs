@@ -581,6 +581,10 @@ fn tauri_contract_smokes_selected_file_operations() {
     .unwrap();
     let save_json = serde_json::to_value(&save).unwrap();
     assert_eq!(save_json["version"]["label"], "Save one");
+    assert_eq!(
+        save_json["version"]["author_time_seconds"],
+        save_json["version"]["time_seconds"]
+    );
     assert_eq!(save.preflight.dirty_files.len(), 1);
     assert_eq!(save.version.label, "Save one");
     let remaining = save.postconditions.remaining_changes.as_ref().unwrap();

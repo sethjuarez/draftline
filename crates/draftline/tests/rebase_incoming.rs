@@ -493,3 +493,40 @@ fn an_originally_empty_local_commit_is_kept_not_dropped() {
     assert_eq!(new_head.message().unwrap(), "Trigger CI");
     assert_eq!(new_head.tree_id(), new_head.parent(0).unwrap().tree_id());
 }
+
+#[test]
+fn a_replayed_version_keeps_its_original_save_time() {
+    let team = team();
+    write_file(team.author.root(), "author.md", "mine\n");
+    let repo = repo(&team.author);
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("author.md")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    let saved_at = head.time().seconds() - 3600;
+    let author = git2::Signature::new(
+        "Author",
+        "author@example.test",
+        &git2::Time::new(saved_at, 0),
+    )
+    .unwrap();
+    repo.commit(Some("HEAD"), &author, &author, "Old save", &tree, &[&head])
+        .unwrap();
+    let before = &team.author.versions().unwrap()[0];
+    assert_eq!(before.time_seconds, saved_at);
+    assert_eq!(before.author_time_seconds, saved_at);
+    teammate_publishes(&team, "teammate.md", "theirs\n", "Teammate");
+
+    let outcome = rebase(&team.author).unwrap();
+
+    assert!(outcome.incoming[0].author_time_seconds > 0);
+    assert_eq!(
+        outcome.incoming[0].author_time_seconds,
+        outcome.incoming[0].time_seconds
+    );
+    let replayed = &team.author.versions().unwrap()[0];
+    assert_eq!(replayed.id(), &outcome.rewritten[0].to);
+    assert_eq!(replayed.author_time_seconds, saved_at);
+    assert!(replayed.time_seconds > saved_at, "committer time moves on");
+}
