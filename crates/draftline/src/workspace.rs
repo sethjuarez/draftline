@@ -1624,6 +1624,21 @@ pub struct ShelfApplyReport {
     pub overlapping_files: Vec<ChangedFile>,
 }
 
+/// How [`Workspace::rebase_onto_incoming`] would replay local versions.
+struct RebasePlan {
+    /// Versions only on the local side, oldest first.
+    local: Vec<Oid>,
+    /// Of those, the ones some fetched remote branch has.
+    shared: Vec<Oid>,
+    /// Each replayed version and its new tree; `None` when the incoming
+    /// side already had the change.
+    steps: Vec<(Oid, Option<Oid>)>,
+    conflicts: Vec<PathBuf>,
+    unsupported: Option<String>,
+    /// The final tree, when every version replayed.
+    tree: Option<Oid>,
+}
+
 /// Read-only merge-incoming preflight report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1660,6 +1675,58 @@ pub struct MergeIncomingToken {
     /// [`Workspace::merge_variation`] and friends accept these tokens.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local: bool,
+}
+
+/// Read-only preflight for [`Workspace::rebase_onto_incoming`], against the
+/// remote as last fetched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RebaseIncomingReport {
+    /// `incoming` lists the versions the rebase would bring in.
+    pub sync_status: SyncStatus,
+    pub dirty_files: Vec<ChangedFile>,
+    /// Versions only this checkout has, oldest first: what gets replayed.
+    pub local_versions: Vec<RemoteVersionSummary>,
+    /// Ids of local versions some fetched remote branch already has. They
+    /// are published, so the rebase refuses rather than rewrite them.
+    pub shared_versions: Vec<VersionId>,
+    /// Paths where replaying a local version conflicts with incoming work.
+    pub conflicts: Vec<PathBuf>,
+    pub file_hazards: Vec<FileHazard>,
+    /// Why this history can't be rebased (a local merge version, or the
+    /// folder moved); the merge flow handles these.
+    pub unsupported: Option<String>,
+    /// Whether [`Workspace::rebase_onto_incoming`] would rebase (or
+    /// fast-forward) cleanly. `false` with nothing blocking when there's
+    /// nothing incoming.
+    pub can_rebase: bool,
+}
+
+/// One local version replayed by [`Workspace::rebase_onto_incoming`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RebasedVersion {
+    pub from: VersionId,
+    pub to: VersionId,
+}
+
+/// What [`Workspace::rebase_onto_incoming`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RebaseOutcome {
+    /// Old to new id for each replayed local version, oldest first.
+    pub rewritten: Vec<RebasedVersion>,
+    /// Local versions left out because the incoming work already made the
+    /// same change.
+    pub dropped: Vec<VersionId>,
+    /// The incoming versions now in this variation, newest first.
+    pub incoming: Vec<RemoteVersionSummary>,
+    pub previous_head: VersionId,
+    pub head: VersionId,
+    /// Sync status afterwards (against the fetch the rebase made).
+    pub sync_status: SyncStatus,
+    /// Whether anything changed; `false` when nothing was incoming.
+    pub changed_workspace: bool,
 }
 
 /// Explicit user choice for resolving one merge conflict.
@@ -4403,6 +4470,31 @@ impl Workspace {
                 self.repo.set_head(&branch_ref)?;
                 self.complete_recovery(state, true)
             }
+            RecoveryOperation::RebaseIncoming => {
+                let (Some(variation), Some((old, new))) = (
+                    state.original_variation.as_deref(),
+                    state.target.as_deref().and_then(|t| t.split_once(" -> ")),
+                ) else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let (Ok(old), Ok(new)) = (Oid::from_str(old), Oid::from_str(new)) else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let branch_ref = format!("refs/heads/{}", validate_variation_name(variation)?);
+                let current = self.repo.refname_to_id(&branch_ref).ok();
+                if current == Some(new) {
+                    return self.complete_recovery(state, false);
+                } else if current != Some(old) {
+                    return Ok(self.recovery_unavailable(state));
+                }
+                // Interrupted mid-checkout from the old head: rerunning the
+                // safe checkout is idempotent and never clobbers local edits.
+                self.checkout_tree_safely(&self.repo.find_commit(new)?.tree()?)?;
+                self.repo
+                    .reference_matching(&branch_ref, new, true, old, "repair rebase")?;
+                self.repo.set_head(&branch_ref)?;
+                self.complete_recovery(state, true)
+            }
             RecoveryOperation::DiscardChanges => {
                 let changed_files = self.changed_files_unchecked()?;
                 let changed_workspace = !changed_files.is_empty();
@@ -4569,6 +4661,7 @@ impl Workspace {
             }
             RecoveryOperation::MoveFolder => self.settle_folder_move(state),
             RecoveryOperation::ApplyIncoming
+            | RecoveryOperation::RebaseIncoming
             | RecoveryOperation::DeleteRemoteVariation
             | RecoveryOperation::ExpireSupportRefs
             | RecoveryOperation::MergeIncoming
@@ -9996,6 +10089,225 @@ impl Workspace {
         Ok(ApplyIncomingResult { applied_count })
     }
 
+    /// Preflights [`Self::rebase_onto_incoming`] against the remote as last
+    /// fetched, without changing anything.
+    pub fn preflight_rebase_incoming(
+        &self,
+        remote: impl AsRef<str>,
+    ) -> Result<RebaseIncomingReport> {
+        self.ensure_no_pending_recovery()?;
+        self.ensure_on_branch()?;
+        let sync_status = self.sync_status(remote)?;
+        let dirty_files = self.changed_files_unchecked()?;
+        let local = self.repo.head()?.peel_to_commit()?.id();
+        let mut report = RebaseIncomingReport {
+            sync_status,
+            dirty_files,
+            local_versions: Vec::new(),
+            shared_versions: Vec::new(),
+            conflicts: Vec::new(),
+            file_hazards: Vec::new(),
+            unsupported: None,
+            can_rebase: false,
+        };
+        let Some(remote_oid) = remote_tracking_oid(
+            &self.repo,
+            &report.sync_status.remote,
+            &report.sync_status.variation,
+        )
+        .and_then(|oid| Oid::from_str(&oid).ok()) else {
+            return Ok(report);
+        };
+        if report.sync_status.behind == 0 {
+            return Ok(report);
+        }
+        let plan = self.plan_rebase(local, remote_oid)?;
+        report.local_versions = plan
+            .local
+            .iter()
+            .map(|oid| Ok(remote_summary_from_commit(&self.repo.find_commit(*oid)?)))
+            .collect::<Result<_>>()?;
+        report.shared_versions = plan.shared.iter().copied().map(VersionId::from).collect();
+        report.unsupported = plan.unsupported;
+        report.conflicts = plan.conflicts;
+        if let Some(tree) = plan.tree {
+            report.file_hazards = self.target_tree_hazards(&self.repo.find_tree(tree)?)?;
+        }
+        report.can_rebase = report.dirty_files.is_empty()
+            && report.shared_versions.is_empty()
+            && report.unsupported.is_none()
+            && report.conflicts.is_empty()
+            && report.file_hazards.is_empty();
+        Ok(report)
+    }
+
+    /// Brings incoming versions of the current variation in without a merge
+    /// version: fetches `remote`, then replays the versions only this
+    /// checkout has on top of the incoming ones, like `git pull --rebase`.
+    ///
+    /// Each replayed version keeps its message (label and comment), author
+    /// and saved-by; only the save time and id change. When the local and
+    /// incoming versions touch different files, only the incoming files
+    /// change on disk. Overlapping edits that combine cleanly (including
+    /// through merge resolvers) are fine too. With nothing local to replay
+    /// this is a fast-forward; with nothing incoming, nothing happens.
+    ///
+    /// Everything is worked out before anything is written, so a refusal
+    /// leaves the repository exactly as it was. Refuses unsaved changes
+    /// ([`DraftlineError::PreflightFailed`]), conflicts
+    /// ([`DraftlineError::IncomingConflicts`]; use the merge flow instead),
+    /// local versions a fetched remote branch already has
+    /// ([`DraftlineError::VersionsAlreadyShared`]; published history is never
+    /// rewritten), and histories it can't replay
+    /// ([`DraftlineError::RebaseUnsupported`]).
+    pub fn rebase_onto_incoming(
+        &self,
+        remote: impl AsRef<str>,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<RebaseOutcome> {
+        const OPERATION: &str = "rebase_onto_incoming";
+        self.ensure_no_pending_recovery()?;
+        let _lock = self.acquire_for_index(OPERATION)?;
+        self.ensure_on_branch()?;
+        let dirty_files = self.changed_files_unchecked()?;
+        if !dirty_files.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                OPERATION,
+                true,
+                dirty_files,
+                Vec::new(),
+                None,
+            ))));
+        }
+
+        let variation = self.current_variation_unchecked()?;
+        let local_oid = self.repo.head()?.peel_to_commit()?.id();
+        let remote_name = remote.as_ref().to_string();
+        self.fetch_remote_unchecked(&remote_name, options)?;
+        self.fetch_support_refs_with_options(&remote_name, options)?;
+        self.ensure_head_unchanged(&variation, local_oid)?;
+
+        let unchanged = |this: &Self| -> Result<RebaseOutcome> {
+            Ok(RebaseOutcome {
+                rewritten: Vec::new(),
+                dropped: Vec::new(),
+                incoming: Vec::new(),
+                previous_head: local_oid.into(),
+                head: local_oid.into(),
+                sync_status: this.sync_status(&remote_name)?,
+                changed_workspace: false,
+            })
+        };
+        let Some(remote_oid) = remote_tracking_oid(&self.repo, &remote_name, &variation)
+            .and_then(|oid| Oid::from_str(&oid).ok())
+        else {
+            return unchanged(self);
+        };
+        if remote_oid == local_oid || self.repo.graph_descendant_of(local_oid, remote_oid)? {
+            return unchanged(self);
+        }
+
+        let plan = self.plan_rebase(local_oid, remote_oid)?;
+        if !plan.shared.is_empty() {
+            return Err(DraftlineError::VersionsAlreadyShared(
+                plan.shared.into_iter().map(VersionId::from).collect(),
+            ));
+        }
+        if let Some(reason) = plan.unsupported {
+            return Err(DraftlineError::RebaseUnsupported(reason));
+        }
+        if !plan.conflicts.is_empty() {
+            return Err(DraftlineError::IncomingConflicts(plan.conflicts));
+        }
+        let Some(final_tree) = plan.tree else {
+            return Err(DraftlineError::RebaseUnsupported(
+                "nothing to replay onto".to_string(),
+            ));
+        };
+        let tree = self.repo.find_tree(final_tree)?;
+        let file_hazards = self.target_tree_hazards(&tree)?;
+        if !file_hazards.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                OPERATION,
+                true,
+                Vec::new(),
+                file_hazards,
+                None,
+            ))));
+        }
+
+        // New commits are unreferenced objects until the branch moves, so
+        // nothing below is visible if a later step fails.
+        let mut head = self.repo.find_commit(remote_oid)?;
+        let mut rewritten = Vec::new();
+        let mut dropped = Vec::new();
+        for (old, tree) in &plan.steps {
+            let Some(tree) = tree else {
+                dropped.push(VersionId::from(*old));
+                continue;
+            };
+            let original = self.repo.find_commit(*old)?;
+            let saved_by = original.committer();
+            let committer = Signature::now(
+                &String::from_utf8_lossy(saved_by.name_bytes()),
+                &String::from_utf8_lossy(saved_by.email_bytes()),
+            )?;
+            let message = String::from_utf8_lossy(original.message_raw_bytes()).into_owned();
+            let oid = self.repo.commit(
+                None,
+                &original.author(),
+                &committer,
+                &message,
+                &self.repo.find_tree(*tree)?,
+                &[&head],
+            )?;
+            rewritten.push(RebasedVersion {
+                from: VersionId::from(*old),
+                to: VersionId::from(oid),
+            });
+            head = self.repo.find_commit(oid)?;
+        }
+        let new_head = head.id();
+        let incoming = self.incoming_versions(local_oid, remote_oid)?;
+        let branch_ref = format!("refs/heads/{variation}");
+
+        // Git has no lock against an external commit or `git switch`; check
+        // before recording the operation so a refusal leaves nothing behind.
+        self.ensure_head_unchanged(&variation, local_oid)?;
+        let operation_id = new_operation_id();
+        let target = format!("{local_oid} -> {new_head}");
+        self.write_recovery_state(&RecoveryState {
+            operation_id: operation_id.clone(),
+            operation: RecoveryOperation::RebaseIncoming,
+            original_variation: Some(variation.clone()),
+            target: Some(target.clone()),
+            completed: false,
+        })?;
+        // Like a fast-forward: files move from HEAD to the rebased tree
+        // without overwriting local edits, before the branch moves.
+        self.checkout_or_keep_recovery(&tree)?;
+        self.repo
+            .reference_matching(&branch_ref, new_head, true, local_oid, OPERATION)?;
+        self.repo.set_head(&branch_ref)?;
+        self.write_recovery_state(&RecoveryState {
+            operation_id,
+            operation: RecoveryOperation::RebaseIncoming,
+            original_variation: None,
+            target: Some(target),
+            completed: true,
+        })?;
+
+        Ok(RebaseOutcome {
+            rewritten,
+            dropped,
+            incoming,
+            previous_head: local_oid.into(),
+            head: new_head.into(),
+            sync_status: self.sync_status(&remote_name)?,
+            changed_workspace: true,
+        })
+    }
+
     /// Returns a diff between two specific versions.
     ///
     /// The patch field contains a unified diff suitable for display.  When both
@@ -14245,6 +14557,91 @@ impl Workspace {
             return Ok(Err(developer_conflicts.into_iter().collect()));
         }
         Ok(Ok(update.create_updated(&self.repo, &merged)?))
+    }
+
+    /// Works out, in memory, how the versions on `local` that `remote` lacks
+    /// would replay onto `remote`. Stops at the first conflict.
+    fn plan_rebase(&self, local: Oid, remote: Oid) -> Result<RebasePlan> {
+        let mut walk = self.repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+        walk.push(local)?;
+        walk.hide(remote)?;
+        let local_versions = walk.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut unshared = self.repo.revwalk()?;
+        unshared.push(local)?;
+        unshared.hide(remote)?;
+        unshared.hide_glob("refs/remotes/*")?;
+        let unshared = unshared.collect::<std::result::Result<HashSet<_>, _>>()?;
+        let mut plan = RebasePlan {
+            shared: local_versions
+                .iter()
+                .copied()
+                .filter(|oid| !unshared.contains(oid))
+                .collect(),
+            local: local_versions,
+            steps: Vec::new(),
+            conflicts: Vec::new(),
+            unsupported: None,
+            tree: None,
+        };
+
+        let mut folders = FolderChanges::new(&self.repo, self.scope());
+        let onto = self.repo.find_commit(remote)?;
+        let folder = folders.folder_at(&onto)?;
+        let base = match self.repo.merge_base(local, remote) {
+            Ok(base) => self.repo.find_commit(base)?,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                plan.unsupported = Some("the histories share no version".to_string());
+                return Ok(plan);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut commits = Vec::new();
+        for oid in std::iter::once(base.id()).chain(plan.local.iter().copied()) {
+            let commit = self.repo.find_commit(oid)?;
+            if folders.folder_at(&commit)? != folder {
+                plan.unsupported = Some("the project folder moved".to_string());
+                return Ok(plan);
+            }
+            if oid != base.id() {
+                if commit.parent_count() != 1 {
+                    plan.unsupported = Some(format!("local version {oid} is a merge"));
+                    return Ok(plan);
+                }
+                commits.push(commit);
+            }
+        }
+
+        let mut onto_tree = onto.tree()?;
+        for commit in &commits {
+            let trees = [commit.parent(0)?.tree()?, onto_tree.clone(), commit.tree()?];
+            let merge = self.plan_clean_merge(&trees[0], &trees[1], &trees[2])?;
+            let mut conflicts = merge
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.path.clone())
+                .collect::<BTreeSet<_>>();
+            if conflicts.is_empty() {
+                match self.merged_tree(&trees, &merge.files)? {
+                    Ok(tree) => {
+                        // A change the incoming work already has replays to
+                        // nothing and is dropped; a commit that was empty to
+                        // begin with is kept.
+                        let empty = trees[0].id() == trees[2].id();
+                        let replayed = (empty || tree != onto_tree.id()).then_some(tree);
+                        plan.steps.push((commit.id(), replayed));
+                        onto_tree = self.repo.find_tree(tree)?;
+                        continue;
+                    }
+                    Err(paths) => conflicts.extend(paths),
+                }
+            }
+            plan.conflicts = conflicts.into_iter().collect();
+            return Ok(plan);
+        }
+        plan.tree = Some(onto_tree.id());
+        Ok(plan)
     }
 
     #[allow(clippy::too_many_arguments)]

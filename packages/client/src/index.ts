@@ -137,6 +137,8 @@ export interface DraftlineClient {
   fetchRemote(request: RemoteRequest): Promise<FetchRemoteResult>;
   preflightApplyIncoming(request: RemoteRequest): Promise<ApplyIncomingReport>;
   applyIncoming(request: RemoteRequest): Promise<ApplyIncomingCommandResult>;
+  preflightRebaseIncoming(request: RemoteRequest): Promise<RebaseIncomingReport>;
+  rebaseIncoming(request: RemoteRequest): Promise<RebaseIncomingCommandResult>;
   preflightMergeIncoming(request: RemoteRequest): Promise<MergeIncomingReport>;
   baseStatus(request: RemoteRequest): Promise<SyncStatus>;
   preflightMergeBase(request: RemoteRequest): Promise<MergeIncomingReport>;
@@ -337,6 +339,8 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     fetchRemote: (request) => run('fetch_remote', { request }),
     preflightApplyIncoming: (request) => run('preflight_apply_incoming', { request }),
     applyIncoming: (request) => run('apply_incoming', { request }),
+    preflightRebaseIncoming: (request) => run('preflight_rebase_incoming', { request }),
+    rebaseIncoming: (request) => run('rebase_incoming', { request }),
     preflightMergeIncoming: (request) => run('preflight_merge_incoming', { request }),
     baseStatus: (request) => run('base_status', { request }),
     preflightMergeBase: (request) => run('preflight_merge_base', { request }),
@@ -1255,6 +1259,44 @@ export interface ApplyIncomingCommandResult {
   postconditions: CommandPostconditions;
 }
 
+/** Read-only preflight for `rebaseIncoming`, against the last fetch. */
+export interface RebaseIncomingReport {
+  sync_status: SyncStatus;
+  dirty_files: ChangedFile[];
+  /** Versions only this checkout has, oldest first: what gets replayed. */
+  local_versions: RemoteVersionSummary[];
+  /** Local versions a fetched remote branch already has; the rebase refuses. */
+  shared_versions: string[];
+  conflicts: string[];
+  file_hazards: FileHazard[];
+  /** Why the history can't be rebased (merge instead). */
+  unsupported: string | null;
+  can_rebase: boolean;
+}
+
+export interface RebasedVersion {
+  from: string;
+  to: string;
+}
+
+export interface RebaseOutcome {
+  /** Old to new id for each replayed local version, oldest first. */
+  rewritten: RebasedVersion[];
+  /** Local versions the incoming work already contained. */
+  dropped: string[];
+  /** Incoming versions brought in, newest first. */
+  incoming: RemoteVersionSummary[];
+  previous_head: string;
+  head: string;
+  sync_status: SyncStatus;
+  changed_workspace: boolean;
+}
+
+export interface RebaseIncomingCommandResult {
+  rebase: RebaseOutcome;
+  postconditions: CommandPostconditions;
+}
+
 export interface MergeConflict {
   path: string;
   field_path?: string | null;
@@ -1793,6 +1835,8 @@ export interface DraftlineHostFacade {
   publishCurrentVariation(remote?: string): Promise<PublishCurrentVariationResult>;
   preflightApplyIncoming(remote?: string): Promise<ApplyIncomingReport>;
   applyIncoming(remote?: string): Promise<ApplyIncomingCommandResult>;
+  preflightRebaseIncoming(remote?: string): Promise<RebaseIncomingReport>;
+  rebaseIncoming(remote?: string): Promise<RebaseIncomingCommandResult>;
   preflightMergeIncoming(remote?: string): Promise<MergeIncomingReport>;
   baseStatus(remote?: string): Promise<SyncStatus>;
   preflightMergeBase(remote?: string): Promise<MergeIncomingReport>;
@@ -1972,6 +2016,8 @@ export function createDraftlineHostFacade({
     publishCurrentVariation: (remote) => client.publishCurrentVariation(remoteRequest(remote)),
     preflightApplyIncoming: (remote) => client.preflightApplyIncoming(remoteRequest(remote)),
     applyIncoming: (remote) => client.applyIncoming(remoteRequest(remote)),
+    preflightRebaseIncoming: (remote) => client.preflightRebaseIncoming(remoteRequest(remote)),
+    rebaseIncoming: (remote) => client.rebaseIncoming(remoteRequest(remote)),
     preflightMergeIncoming: (remote) => client.preflightMergeIncoming(remoteRequest(remote)),
     baseStatus: (remote) => client.baseStatus(remoteRequest(remote)),
     preflightMergeBase: (remote) => client.preflightMergeBase(remoteRequest(remote)),
@@ -2476,6 +2522,16 @@ export async function applyIncoming(
   request: RemoteRequest,
 ): Promise<ApplyIncomingCommandResult> {
   return createDraftlineClient().applyIncoming(request);
+}
+
+export async function preflightRebaseIncoming(
+  request: RemoteRequest,
+): Promise<RebaseIncomingReport> {
+  return createDraftlineClient().preflightRebaseIncoming(request);
+}
+
+export async function rebaseIncoming(request: RemoteRequest): Promise<RebaseIncomingCommandResult> {
+  return createDraftlineClient().rebaseIncoming(request);
 }
 
 export async function preflightMergeIncoming(request: RemoteRequest): Promise<MergeIncomingReport> {

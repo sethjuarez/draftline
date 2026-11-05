@@ -564,6 +564,81 @@ fn apply_incoming_keeps_unrelated_local_code_edits_and_refuses_overlaps() {
 }
 
 #[test]
+fn rebase_onto_incoming_brings_teammate_code_in_without_a_merge() {
+    let (temp, repo) = code_repo();
+    let (_bare, other_dir, other) = with_remote(&repo);
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+
+    write_file(
+        other_dir.path(),
+        "src/main.rs",
+        "fn main() { teammate(); }\n",
+    );
+    commit_all(&other, "Teammate code");
+    push_main(&other);
+    write_file(temp.path(), "cutready/intro.sk", "scene one, by BU\n");
+    let saved = workspace
+        .save_version("BU revise\n\nTighter intro")
+        .unwrap();
+    // A developer's unrelated, unsaved code edit is left alone.
+    write_file(temp.path(), "README.md", "# app, locally\n");
+
+    let preflight = {
+        workspace.fetch_remote("origin").unwrap();
+        workspace.preflight_rebase_incoming("origin").unwrap()
+    };
+    assert!(preflight.can_rebase, "{preflight:?}");
+    let outcome = workspace
+        .rebase_onto_incoming("origin", &mut RemoteOptions::new())
+        .unwrap();
+
+    assert_eq!(outcome.rewritten.len(), 1);
+    assert_eq!(&outcome.rewritten[0].from, saved.id());
+    assert_eq!(outcome.incoming.len(), 1);
+    assert_eq!(outcome.incoming[0].label, "Teammate code");
+    assert_eq!(outcome.sync_status.ahead, 1);
+    assert_eq!(outcome.sync_status.behind, 0);
+    assert_eq!(
+        read(temp.path(), "src/main.rs"),
+        "fn main() { teammate(); }\n"
+    );
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one, by BU\n");
+    assert_eq!(read(temp.path(), "README.md"), "# app, locally\n");
+    let head = repo.find_commit(head_id(&repo)).unwrap();
+    assert_eq!(head.parent_count(), 1);
+    assert_eq!(head.message().unwrap(), saved_message(&repo, saved.id()));
+    assert_eq!(workspace.versions().unwrap()[0].label, "BU revise");
+    assert_eq!(status(&repo, "src/main.rs"), git2::Status::CURRENT);
+
+    // An incoming edit to the file the developer is editing is refused
+    // before anything changes, like apply_incoming.
+    write_file(other_dir.path(), "README.md", "# from teammate\n");
+    commit_all(&other, "Teammate readme");
+    push_main(&other);
+    write_file(temp.path(), "cutready/intro.sk", "scene one, again\n");
+    workspace.save_version("BU again").unwrap();
+    let before = head_id(&repo);
+    let error = workspace
+        .rebase_onto_incoming("origin", &mut RemoteOptions::new())
+        .unwrap_err();
+    assert_eq!(
+        hazard_kinds(error),
+        vec![(PathBuf::from("README.md"), FileHazardKind::LocalChanges)]
+    );
+    assert_eq!(head_id(&repo), before);
+    assert_eq!(read(temp.path(), "README.md"), "# app, locally\n");
+}
+
+fn saved_message(repo: &git2::Repository, id: &draftline::VersionId) -> String {
+    let oid = git2::Oid::from_str(&id.to_string()).unwrap();
+    repo.find_commit(oid)
+        .unwrap()
+        .message()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
 fn save_refuses_content_that_needs_a_git_filter() {
     let (temp, repo) = code_repo();
     write_file(

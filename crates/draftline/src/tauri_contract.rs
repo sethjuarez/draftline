@@ -22,17 +22,17 @@ use crate::{
     MergeConflictResolution, MergeIncomingReport, MergeIncomingResult, MergeIncomingToken,
     MergeResolutionChoice, OperationLockInspection, PathHistory, PathHistoryOptions,
     PreflightReport, PreviewFile, ProjectSettings, ProjectSettingsUpdate, PublishPreflight,
-    PublishResult, RecoveryRepairResult, RecoveryState, RemoteCredential, RemoteCredentialRequest,
-    RemoteEndpoint, RemoteOptions, RemoteVariation, RemoteVariationDiagnostics,
-    RepositoryInspection, RestoreVersionTarget, Result, Shelf, ShelfApplyReport, SupportRef,
-    SupportRefScope, SwitchPolicy, SyncState, SyncStatus, Variation, VariationCreatePreflight,
-    VariationCreateToken, VariationId, VariationMetadata, VariationRenamePreflight,
-    VariationRenameToken, VariationSummary, Version, VersionDiff, VersionId, VersionPreview,
-    Workspace, WorkspaceDiagnostic, WorkspaceGraph, WorkspaceGraphAgentSummary,
-    WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary, WorkspaceGraphNodeDetail,
-    WorkspaceGraphOptions, WorkspaceGraphOverviewOptions, WorkspaceGraphPath, WorkspaceGraphRefs,
-    WorkspaceGraphSearchResult, WorkspaceGraphSummary, WorkspaceId, WorkspaceInspection,
-    WorkspaceSummary, WorkspaceVerification,
+    PublishResult, RebaseIncomingReport, RebaseOutcome, RecoveryRepairResult, RecoveryState,
+    RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVariation,
+    RemoteVariationDiagnostics, RepositoryInspection, RestoreVersionTarget, Result, Shelf,
+    ShelfApplyReport, SupportRef, SupportRefScope, SwitchPolicy, SyncState, SyncStatus, Variation,
+    VariationCreatePreflight, VariationCreateToken, VariationId, VariationMetadata,
+    VariationRenamePreflight, VariationRenameToken, VariationSummary, Version, VersionDiff,
+    VersionId, VersionPreview, Workspace, WorkspaceDiagnostic, WorkspaceGraph,
+    WorkspaceGraphAgentSummary, WorkspaceGraphCommonAncestor, WorkspaceGraphCompareSummary,
+    WorkspaceGraphNodeDetail, WorkspaceGraphOptions, WorkspaceGraphOverviewOptions,
+    WorkspaceGraphPath, WorkspaceGraphRefs, WorkspaceGraphSearchResult, WorkspaceGraphSummary,
+    WorkspaceId, WorkspaceInspection, WorkspaceSummary, WorkspaceVerification,
 };
 
 type CredentialProvider<'callbacks> =
@@ -874,6 +874,13 @@ pub struct FetchRemoteResult {
 pub struct ApplyIncomingCommandResult {
     pub preflight: ApplyIncomingReport,
     pub apply: ApplyIncomingResult,
+    pub postconditions: CommandPostconditions,
+}
+
+/// Result of [`rebase_incoming`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebaseIncomingCommandResult {
+    pub rebase: RebaseOutcome,
     pub postconditions: CommandPostconditions,
 }
 
@@ -3426,6 +3433,64 @@ pub fn apply_incoming_with_context(
     })
 }
 
+/// Fetches, then preflights [`rebase_incoming`] without changing anything.
+pub fn preflight_rebase_incoming(request: RemoteRequest) -> Result<RebaseIncomingReport> {
+    preflight_rebase_incoming_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Preflights a rebase onto incoming work using a configured host context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn preflight_rebase_incoming_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: RemoteRequest,
+) -> Result<RebaseIncomingReport> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let mut options = context.remote_options();
+    workspace.fetch_remote_with_options(&request.remote, &mut options)?;
+    workspace.preflight_rebase_incoming(&request.remote)
+}
+
+/// Brings incoming versions in by replaying local, unshared versions on top
+/// of them (no merge version). Refuses with `incoming_conflicts`,
+/// `versions_already_shared`, `rebase_unsupported` or `preflight_failed`,
+/// changing nothing, so the host can fall back to the merge flow.
+pub fn rebase_incoming(request: RemoteRequest) -> Result<RebaseIncomingCommandResult> {
+    rebase_incoming_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Rebases onto incoming work using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn rebase_incoming_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: RemoteRequest,
+) -> Result<RebaseIncomingCommandResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let rebase = {
+        let mut options = context.remote_options();
+        workspace.rebase_onto_incoming(&request.remote, &mut options)?
+    };
+    // The fetch alone can change the sync status, so hosts hear about it
+    // even when nothing local moved.
+    let kind = if rebase.changed_workspace {
+        DraftlineEventKind::HistoryChanged
+    } else {
+        DraftlineEventKind::SyncChanged
+    };
+    context.emit(&workspace, kind, Some(rebase.sync_status.clone()));
+    Ok(RebaseIncomingCommandResult {
+        rebase,
+        postconditions: collect_postconditions(&workspace, true),
+    })
+}
+
 /// Preflights an incoming merge without mutating workspace state.
 #[tracing::instrument(
     err,
@@ -4115,6 +4180,9 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::OwnedWorktreeHasChanges(_) => "owned_worktree_has_changes",
         DraftlineError::ShelfOverlapsUnsavedChanges { .. } => "shelf_overlaps_unsaved_changes",
         DraftlineError::FileTooLarge { .. } => "file_too_large",
+        DraftlineError::IncomingConflicts(_) => "incoming_conflicts",
+        DraftlineError::VersionsAlreadyShared(_) => "versions_already_shared",
+        DraftlineError::RebaseUnsupported(_) => "rebase_unsupported",
     }
 }
 
@@ -4149,12 +4217,17 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
             Some(serde_json::json!({ "folder": folder }))
         }
         DraftlineError::MergeNeedsDeveloper(paths)
+        | DraftlineError::IncomingConflicts(paths)
         | DraftlineError::OwnedWorktreeHasChanges(paths) => {
             Some(serde_json::json!({ "paths": paths }))
         }
         DraftlineError::BaseRenamed { from, to } => {
             Some(serde_json::json!({ "from": from, "to": to }))
         }
+        DraftlineError::VersionsAlreadyShared(versions) => {
+            Some(serde_json::json!({ "versions": versions }))
+        }
+        DraftlineError::RebaseUnsupported(reason) => Some(serde_json::json!({ "reason": reason })),
         DraftlineError::ShelfOverlapsUnsavedChanges { shelf, paths } => {
             Some(serde_json::json!({ "shelf": shelf, "paths": paths }))
         }
