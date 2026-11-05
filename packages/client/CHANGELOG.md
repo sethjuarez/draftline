@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/sethjuarez/draftline/compare/client-v0.9.0...client-v0.10.0) (2026-11-05)
+
+
+### Features
+
+* **workspace:** rebase local versions onto incoming ones ([#83](https://github.com/sethjuarez/draftline/issues/83)) ([e092d67](https://github.com/sethjuarez/draftline/commit/e092d6760aa62190ccc274bfe04d86fe70ccde2a))
+
 ## [0.9.0](https://github.com/sethjuarez/draftline/compare/client-v0.8.0...client-v0.9.0) (2026-11-05)
 
 
