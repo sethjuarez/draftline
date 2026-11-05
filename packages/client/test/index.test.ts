@@ -863,6 +863,49 @@ describe('createDraftlineClient', () => {
     );
     expect(unlisten).toHaveBeenCalled();
   });
+
+  it('reports only its own clone progress and stops listening when the clone settles', async () => {
+    const unlisten = vi.fn();
+    let deliver: ((event: { payload: unknown }) => void) | undefined;
+    const listen = vi.fn(async (_event: string, handler: (event: { payload: unknown }) => void) => {
+      deliver = handler;
+      return unlisten;
+    });
+    const invoke = vi.fn<DraftlineInvoke>(async (_command, args) => {
+      const request = (args as { request: { progress_id: string } }).request;
+      const base = { workspace_path: 'C:\\clone', total: 3, received_bytes: 10 };
+      deliver?.({ payload: { ...base, progress_id: 'other', stage: 'receiving', completed: 1 } });
+      deliver?.({
+        payload: { ...base, progress_id: request.progress_id, stage: 'checking_out', completed: 3 },
+      });
+      return fixtureDiagnostics as never;
+    });
+    const client = createDraftlineClient({ invoke, listen });
+    const onProgress = vi.fn();
+
+    await client.cloneWorkspaceWithOptions(
+      { remote_url: 'https://example.test/repo.git', workspace_path: 'C:\\clone', branch: 'main' },
+      onProgress,
+    );
+
+    expect(listen).toHaveBeenCalledWith('draftline://clone_progress', expect.any(Function));
+    expect(invoke).toHaveBeenCalledWith('clone_workspace_with_options', {
+      request: expect.objectContaining({ branch: 'main', progress_id: expect.any(String) }),
+    });
+    expect(onProgress).toHaveBeenCalledTimes(1);
+    expect(onProgress).toHaveBeenCalledWith(expect.objectContaining({ stage: 'checking_out' }));
+    expect(unlisten).toHaveBeenCalled();
+
+    const plain = vi.fn<DraftlineInvoke>(async () => fixtureDiagnostics as never);
+    await createDraftlineClient({ invoke: plain, listen }).cloneWorkspaceWithOptions({
+      remote_url: 'https://example.test/repo.git',
+      workspace_path: 'C:\\clone',
+    });
+    expect(plain).toHaveBeenCalledWith('clone_workspace_with_options', {
+      request: { remote_url: 'https://example.test/repo.git', workspace_path: 'C:\\clone' },
+    });
+    expect(listen).toHaveBeenCalledTimes(1);
+  });
 });
 
 const fixtureDiagnostics: WorkspaceDiagnostics = {

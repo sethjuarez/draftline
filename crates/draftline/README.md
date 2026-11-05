@@ -6,6 +6,8 @@ Draftline lets apps manage one part of a repo (the whole repo or a folder in it)
 
 The marker can also record project settings: a stable project `id` that survives `move_folder`, a `base_branch`, and a `commit_template` such as `docs(demo): {subject}` that Draftline applies to the first line of every commit it writes on a branch (saves, restores, merges, folder moves), so repos that lint commit messages accept them. Read them with `Workspace::project_settings` and change them with `Workspace::update_project_settings`, which saves only `.draftline`. `Workspace::init_project_in_repository` creates a new project folder (named by `Workspace::project_folder_name`) inside an existing repository with those settings, refusing when the repository already manages another folder.
 
+To clone a particular branch or show progress, use `Workspace::clone_workspace_with` with `CloneOptions::with_branch` and `RemoteOptions::with_progress`, which reports `CloneProgress` through the receiving, resolving and checking-out stages, throttled to about ten reports a second. Clones are always full, so later updates can find a merge base. Tauri hosts register `clone_workspace_with_options` and forward the context's clone progress sink as `draftline://clone_progress`; `cloneWorkspaceWithOptions(request, onProgress)` in `@draftline/client` listens for them.
+
 Draftline is a Rust library for apps that need safe version history for folders full of creative content. It exposes business-friendly concepts like workspaces, versions, variations, change sets, preflight reports, and recovery state while keeping Git as a storage implementation detail.
 
 ## Content policy

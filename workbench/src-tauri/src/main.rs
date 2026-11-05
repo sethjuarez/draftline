@@ -1,7 +1,8 @@
 use draftline::tauri_contract as contract;
 use draftline::tauri_contract::{
     AdoptRemoteVariationResult, AdoptWorkspaceResult, ApplyIncomingCommandResult,
-    ApplyShelfCommandResult, CloneWorkspaceRequest, CommandPostconditions,
+    ApplyShelfCommandResult, CloneWorkspaceRequest, CloneWorkspaceWithOptionsRequest,
+    CommandPostconditions,
     CreateVariationFromVersionRequest, CreateVariationFromVersionResult, CurrentFileRequest,
     DeleteShelfResult, DiffVersionsRequest, FetchRemoteResult, FilteredFilesRequest,
     GuardedCreateVariationFromVersionRequest, GuardedCreateVariationFromVersionResult,
@@ -72,6 +73,18 @@ fn clone_workspace(
 ) -> TauriCommandResult<WorkspaceOpenResult> {
     let mut context = lock_context(state.inner())?;
     contract::into_tauri_result(contract::clone_workspace_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn clone_workspace_with_options(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: CloneWorkspaceWithOptionsRequest,
+) -> TauriCommandResult<WorkspaceOpenResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::clone_workspace_with_options_with_context(
         &mut context,
         request,
     ))
@@ -888,18 +901,28 @@ fn main() {    let _ = tracing_subscriber::registry()
         )
         .setup(|app| {
             let app_handle = app.handle().clone();
+            let progress_handle = app.handle().clone();
             app.manage(Mutex::new(
-                contract::DraftlineCommandContext::new().with_event_sink(move |event| {
-                    if let Err(error) = app_handle.emit("draftline://workspace_event", event) {
-                        tracing::warn!(?error, "failed to emit Draftline workspace event");
-                    }
-                }),
+                contract::DraftlineCommandContext::new()
+                    .with_event_sink(move |event| {
+                        if let Err(error) = app_handle.emit("draftline://workspace_event", event) {
+                            tracing::warn!(?error, "failed to emit Draftline workspace event");
+                        }
+                    })
+                    .with_clone_progress_sink(move |progress| {
+                        if let Err(error) =
+                            progress_handle.emit(contract::CLONE_PROGRESS_EVENT, progress)
+                        {
+                            tracing::warn!(?error, "failed to emit Draftline clone progress");
+                        }
+                    }),
             ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             open_workspace,
             clone_workspace,
+            clone_workspace_with_options,
             adopt_workspace,
             inspect_workspace,
             verify_workspace,
