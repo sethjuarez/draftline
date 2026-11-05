@@ -27,6 +27,9 @@ pub enum RecoveryOperation {
     RenameVariation,
     /// Moving the folder Draftline manages to another path.
     MoveFolder,
+    /// Replaying local versions onto incoming ones; `target` is
+    /// `"<old head> -> <new head>"`.
+    RebaseIncoming,
     /// Recorded by older versions for features that no longer exist. Still
     /// read so those workspaces open; repair reports them unavailable.
     MilestoneMerge,

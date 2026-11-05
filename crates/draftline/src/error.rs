@@ -159,6 +159,21 @@ pub enum DraftlineError {
         max_bytes: u64,
     },
 
+    /// Replaying local versions onto incoming ones conflicts at these paths;
+    /// nothing changed. Merge instead.
+    #[error("local and incoming versions conflict at {}", join_paths(.0))]
+    IncomingConflicts(Vec<PathBuf>),
+
+    /// These local versions are already on a remote branch, so rebasing would
+    /// rewrite published history; nothing changed. Merge instead.
+    #[error("{} local version(s) are already shared; merge instead", .0.len())]
+    VersionsAlreadyShared(Vec<crate::VersionId>),
+
+    /// This history can't be replayed (for example a local merge version);
+    /// nothing changed. Merge instead.
+    #[error("cannot rebase: {0}; merge instead")]
+    RebaseUnsupported(String),
+
     #[error("cannot tell which branch to send to; pass a base branch")]
     SendBaseUnknown,
 

@@ -15,11 +15,11 @@ use draftline::tauri_contract::{
     list_support_refs, list_variations, merge_conflict_view_model, merge_incoming,
     merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
     merge_incoming_with_token, open_workspace, preflight_apply_incoming, preflight_apply_shelf,
-    preflight_create_variation_from_version, preflight_merge_incoming, preflight_rename_variation,
-    preflight_switch_variation, preview_shelf, preview_version, preview_version_file,
-    preview_workspace_file, publish_current_variation, read_version_file_bytes,
-    read_version_file_bytes_with_context, rename_variation, restore_version_as_new_save,
-    restore_version_as_new_save_to_variation,
+    preflight_create_variation_from_version, preflight_merge_incoming, preflight_rebase_incoming,
+    preflight_rename_variation, preflight_switch_variation, preview_shelf, preview_version,
+    preview_version_file, preview_workspace_file, publish_current_variation,
+    read_version_file_bytes, read_version_file_bytes_with_context, rebase_incoming,
+    rename_variation, restore_version_as_new_save, restore_version_as_new_save_to_variation,
     restore_version_as_new_save_to_variation_with_context,
     restore_version_as_new_save_with_context, restore_version_paths_as_new_save, save,
     search_workspace_graph, selected_discard, selected_save, selected_save_with_context,
@@ -1078,6 +1078,67 @@ fn tauri_contract_smokes_publish_current_variation() {
         .target()
         .unwrap();
     assert_eq!(remote_oid, local_oid);
+}
+
+#[test]
+fn tauri_contract_rebases_incoming_and_reports_conflicts_by_code() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    init_bare_remote(remote_dir.path());
+    let author_dir = tempfile::tempdir().unwrap();
+    let author = Workspace::init(author_dir.path()).unwrap();
+    configure_identity(author.root());
+    write_file(author.root(), "shared.md", b"base");
+    author.save_version("Base").unwrap();
+    author
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    author.publish_changes("origin").unwrap();
+    let teammate_dir = tempfile::tempdir().unwrap();
+    let teammate =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), teammate_dir.path())
+            .unwrap();
+    configure_identity(teammate.root());
+    let request = RemoteRequest {
+        workspace_path: author_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+    };
+
+    write_file(author.root(), "author.md", b"mine");
+    let local = author.save_version("Author notes").unwrap();
+    write_file(teammate.root(), "teammate.md", b"theirs");
+    teammate.save_version("Teammate notes").unwrap();
+    teammate.publish_changes("origin").unwrap();
+
+    let preflight = preflight_rebase_incoming(request.clone()).unwrap();
+    assert!(preflight.can_rebase);
+    assert_eq!(preflight.sync_status.state, SyncState::NeedsMerge);
+    assert_eq!(preflight.local_versions[0].id, local.id().to_string());
+    let rebased = rebase_incoming(request.clone()).unwrap();
+    assert!(rebased.postconditions.errors.is_empty());
+    let json = serde_json::to_value(&rebased).unwrap();
+    assert_eq!(
+        json["rebase"]["rewritten"][0]["from"],
+        local.id().to_string()
+    );
+    assert_eq!(json["rebase"]["incoming"][0]["label"], "Teammate notes");
+    assert_eq!(json["rebase"]["sync_status"]["ahead"], 1);
+    assert_eq!(json["rebase"]["changed_workspace"], true);
+    assert_eq!(read_file(author.root(), "teammate.md"), "theirs");
+
+    write_file(author.root(), "shared.md", b"author edit");
+    author.save_version("Author edit").unwrap();
+    write_file(teammate.root(), "shared.md", b"teammate edit");
+    teammate.save_version("Teammate edit").unwrap();
+    teammate.publish_changes("origin").unwrap();
+    let preflight = preflight_rebase_incoming(request.clone()).unwrap();
+    assert!(!preflight.can_rebase);
+    assert_eq!(preflight.conflicts, [PathBuf::from("shared.md")]);
+    let conflict = into_tauri_result(rebase_incoming(request)).unwrap_err();
+    assert_eq!(conflict.code, "incoming_conflicts");
+    assert_eq!(
+        conflict.details.expect("conflict details")["paths"],
+        serde_json::json!(["shared.md"])
+    );
 }
 
 #[test]

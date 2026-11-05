@@ -778,6 +778,26 @@ describe('createDraftlineClient', () => {
     });
   });
 
+  it('routes incoming rebases to the rebase_incoming commands', async () => {
+    const invoke = vi.fn<DraftlineInvoke>(async () => ({ ok: true }) as never);
+    const client = createDraftlineClient({ invoke });
+    const facade = createDraftlineHostFacade({ client, workspacePath: 'C:\\repo' });
+
+    await facade.preflightRebaseIncoming('upstream');
+    await facade.rebaseIncoming('upstream');
+    await client.rebaseIncoming({ workspace_path: 'C:\\other', remote: 'origin' });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'preflight_rebase_incoming', {
+      request: { workspace_path: 'C:\\repo', remote: 'upstream' },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, 'rebase_incoming', {
+      request: { workspace_path: 'C:\\repo', remote: 'upstream' },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, 'rebase_incoming', {
+      request: { workspace_path: 'C:\\other', remote: 'origin' },
+    });
+  });
+
   it('routes previewed clean merges to merge_incoming_with_token', async () => {
     const invoke = vi.fn<DraftlineInvoke>(async () => ({ ok: true }) as never);
     const client = createDraftlineClient({ invoke });

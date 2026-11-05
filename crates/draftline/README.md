@@ -122,6 +122,21 @@ from `preflight_merge_incoming` or `preflight_merge_base`. It refuses with
 local merges, `merge_variation_with_resolutions` with empty `resolutions` is the
 token-pinned clean path.
 
+To bring incoming versions in without a merge version (no second name to ask
+for), call `rebase_incoming` (`Workspace::rebase_onto_incoming`): it fetches, then
+replays the versions only this checkout has on top of the incoming ones, like
+`git pull --rebase`. Each replayed version keeps its message, author and saved-by;
+the outcome maps old ids to new ones (`rewritten`), lists `incoming` and `dropped`
+(local changes the incoming work already had) versions, and reports the new
+`head` and `sync_status`. When local and incoming versions touch different files
+only the incoming files change on disk. `preflight_rebase_incoming` previews it
+read-only. It refuses, changing nothing, with `incoming_conflicts` (`{paths}`;
+fall back to the merge flow), `versions_already_shared` (`{versions}`: a fetched
+remote branch already has them, and published history is never rewritten),
+`rebase_unsupported` (`{reason}`: a local merge version, a moved project folder,
+or unrelated histories), `preflight_failed` (unsaved changes or hazards) and
+`workspace_locked`. It rebases onto the variation's own remote branch only.
+
 `sync_status.ahead` counts only versions no remote-tracking branch already has
 when the variation has no upstream yet (`no_remote_version`).
 

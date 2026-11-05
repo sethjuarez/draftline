@@ -840,6 +840,27 @@ fn preflight_apply_incoming(
 }
 
 #[tauri::command]
+fn preflight_rebase_incoming(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: RemoteRequest,
+) -> TauriCommandResult<draftline::RebaseIncomingReport> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::preflight_rebase_incoming_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
+fn rebase_incoming(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: RemoteRequest,
+) -> TauriCommandResult<contract::RebaseIncomingCommandResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::rebase_incoming_with_context(&mut context, request))
+}
+
+#[tauri::command]
 fn apply_incoming(
     state: tauri::State<'_, DraftlineContextState>,
     request: RemoteRequest,
@@ -1035,6 +1056,8 @@ fn main() {    let _ = tracing_subscriber::registry()
             fetch_remote,
             preflight_apply_incoming,
             apply_incoming,
+            preflight_rebase_incoming,
+            rebase_incoming,
             preflight_merge_incoming,
             merge_incoming,
             merge_incoming_with_resolutions,
