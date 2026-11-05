@@ -77,6 +77,8 @@ pub mod content_policy;
 pub mod error;
 pub mod fault;
 mod git_cli;
+#[cfg(feature = "github")]
+pub mod github;
 pub mod merge;
 pub mod mobile_ffi;
 pub mod path;

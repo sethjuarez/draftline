@@ -231,6 +231,18 @@ pub enum DraftlineError {
     #[error("pull request provider failed: {0}")]
     PullRequest(String),
 
+    /// GitHub didn't accept the token (or there was none): sign in again.
+    #[error("GitHub sign-in failed: {0}")]
+    GitHubUnauthorized(String),
+
+    /// The token can't push to (or open pull requests on) `repository`.
+    #[error("no push access to GitHub repository `{repository}`: {message}")]
+    GitHubNoPushAccess { repository: String, message: String },
+
+    /// GitHub has no such repository, or hides it from this token.
+    #[error("GitHub repository `{0}` was not found, or this sign-in can't see it")]
+    GitHubRepositoryNotFound(String),
+
     /// A configured Git filter driver, such as Git LFS, failed, or `git`
     /// couldn't run it. `action` says what Draftline was doing (for example
     /// "uploading Git LFS content to `origin`"); `output` is Git's own

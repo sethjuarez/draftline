@@ -65,10 +65,17 @@ jobs:
           DRAFTLINE_REQUIRE_GIT_LFS: "1"
         run: cargo test -p draftline --features fault-injection --test fault_injection
 
+      - name: GitHub provider tests
+        run: |
+          cargo test -p draftline --features github --test github_provider
+          cargo test -p draftline --features github --lib github::
+
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p draftline --all-targets --features github -- -D warnings
 
       - name: Docs
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --features draftline/github

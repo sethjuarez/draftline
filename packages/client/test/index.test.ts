@@ -906,6 +906,25 @@ describe('createDraftlineClient', () => {
     });
     expect(listen).toHaveBeenCalledTimes(1);
   });
+
+  it('reads GitHub repository access with the host token', async () => {
+    const access = {
+      repository: { owner: 'contoso', repo: 'app' },
+      default_branch: 'main',
+      can_push: true,
+      private: false,
+      fork_parent: null,
+    };
+    const invoke = vi.fn<DraftlineInvoke>(async () => access as never);
+    const client = createDraftlineClient({ invoke });
+
+    await expect(
+      client.githubRepoAccess({ remote_url: 'https://github.com/contoso/app', token: 't' }),
+    ).resolves.toEqual(access);
+    expect(invoke).toHaveBeenCalledWith('github_repo_access', {
+      request: { remote_url: 'https://github.com/contoso/app', token: 't' },
+    });
+  });
 });
 
 const fixtureDiagnostics: WorkspaceDiagnostics = {
