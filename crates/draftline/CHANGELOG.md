@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.14.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.13.0...draftline-v0.14.0) (2026-11-05)
+
+
+### Features
+
+* **workspace:** clone without file contents through git (opt-in blobless clone) ([#79](https://github.com/sethjuarez/draftline/issues/79)) ([d010d31](https://github.com/sethjuarez/draftline/commit/d010d31b1a415c46ef973bfcb13f58f7d99adaec))
+* **workspace:** create a project folder inside an existing repository ([#77](https://github.com/sethjuarez/draftline/issues/77)) ([f7fe72d](https://github.com/sethjuarez/draftline/commit/f7fe72dca7f4201dc34ab09f81e7c773e55df159))
+* **workspace:** inspect a repository before adding a project ([#81](https://github.com/sethjuarez/draftline/issues/81)) ([ac021fd](https://github.com/sethjuarez/draftline/commit/ac021fda899c03f0d789bb3fe37bc2f2cc96b5de))
+* **workspace:** open GitHub pull requests through an optional github feature ([#80](https://github.com/sethjuarez/draftline/issues/80)) ([327826f](https://github.com/sethjuarez/draftline/commit/327826f108f883ca5851f467f1f5ae13709cbfe9))
+* **workspace:** record project id, base branch and commit template in the marker ([#75](https://github.com/sethjuarez/draftline/issues/75)) ([9485380](https://github.com/sethjuarez/draftline/commit/94853804d4191dd46ce9035016686392f17924de))
+* **workspace:** report clone progress and clone a chosen branch ([#78](https://github.com/sethjuarez/draftline/issues/78)) ([b219312](https://github.com/sethjuarez/draftline/commit/b219312d827859da089e2d592a82923a53195adf))
+
+
+### Bug Fixes
+
+* **workspace:** clone a repository without claiming a project folder ([#82](https://github.com/sethjuarez/draftline/issues/82)) ([4d2afd1](https://github.com/sethjuarez/draftline/commit/4d2afd1b4935b784e54e6e2dadd1154805cb91d0))
+
 ## [0.13.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.12.0...draftline-v0.13.0) (2026-11-05)
 
 
