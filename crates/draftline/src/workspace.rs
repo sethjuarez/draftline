@@ -16134,6 +16134,28 @@ impl OperationLock {
     }
 }
 
+impl Workspace {
+    /// True while a live operation on another thread or process holds this
+    /// checkout's operation lock (a stale lock or this thread's own doesn't
+    /// count), so its files may be mid-write.
+    pub(crate) fn another_operation_running(&self) -> bool {
+        let path = self.lock_path();
+        if OperationLock::held_by_this_thread(&path) {
+            return false;
+        }
+        matches!(
+            self.inspect_operation_lock(),
+            Ok(inspection) if inspection.state == OperationLockState::Locked && !inspection.is_stale
+        )
+    }
+
+    /// Holds the operation lock, as a running operation would.
+    #[cfg(test)]
+    pub(crate) fn hold_operation_lock_for_test(&self) -> impl Sized {
+        self.acquire_operation_lock("test").unwrap()
+    }
+}
+
 impl Drop for OperationLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);

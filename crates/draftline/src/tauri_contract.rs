@@ -4,7 +4,13 @@
 //! expose them behind `#[tauri::command]` wrappers while preserving Draftline's
 //! existing preflight, recovery, and verification semantics.
 
-use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Mutex};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +49,46 @@ pub struct DraftlineCommandContext<'callbacks> {
     event_sink: Option<Box<EventSink<'callbacks>>>,
     next_event_sequence: u64,
     variation_namespace: Option<String>,
+    event_defer_timeout: Duration,
+}
+
+/// How long an event waits by default for another running operation to
+/// finish before it is emitted anyway.
+pub const DEFAULT_EVENT_DEFER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a deferred event checks whether the running operation finished.
+const EVENT_DEFER_POLL: Duration = Duration::from_millis(25);
+
+/// After a deferred event's wait ends, how long it gives the operation that
+/// held the lock to emit its own event, which then stands in for this one.
+const EVENT_COALESCE_GRACE: Duration = Duration::from_millis(100);
+
+/// Events emitted per workspace root and kind in this process, shared by
+/// every context, so a deferred event can tell that a newer one of the same
+/// kind already went out.
+type EventKey = (PathBuf, String);
+
+fn event_generations() -> &'static Mutex<HashMap<EventKey, u64>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<EventKey, u64>>> = OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn event_key(root: &Path, kind: &DraftlineEventKind) -> EventKey {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    (root, format!("{kind:?}"))
+}
+
+fn event_generation(key: &EventKey) -> u64 {
+    event_generations()
+        .lock()
+        .map(|generations| generations.get(key).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+fn bump_event_generation(key: EventKey) {
+    if let Ok(mut generations) = event_generations().lock() {
+        *generations.entry(key).or_insert(0) += 1;
+    }
 }
 
 impl fmt::Debug for DraftlineCommandContext<'_> {
@@ -58,6 +104,7 @@ impl fmt::Debug for DraftlineCommandContext<'_> {
             .field("has_event_sink", &self.event_sink.is_some())
             .field("next_event_sequence", &self.next_event_sequence)
             .field("variation_namespace", &self.variation_namespace)
+            .field("event_defer_timeout", &self.event_defer_timeout)
             .finish()
     }
 }
@@ -71,6 +118,7 @@ impl<'callbacks> Default for DraftlineCommandContext<'callbacks> {
             event_sink: None,
             next_event_sequence: 1,
             variation_namespace: None,
+            event_defer_timeout: DEFAULT_EVENT_DEFER_TIMEOUT,
         }
     }
 }
@@ -102,6 +150,15 @@ impl<'callbacks> DraftlineCommandContext<'callbacks> {
 
     pub fn with_event_sink(mut self, sink: impl FnMut(DraftlineEvent) + Send + 'callbacks) -> Self {
         self.event_sink = Some(Box::new(sink));
+        self
+    }
+
+    /// Caps how long an event waits for another running Draftline operation
+    /// on the same checkout (one holding its operation lock) to finish before
+    /// it is emitted anyway. Defaults to [`DEFAULT_EVENT_DEFER_TIMEOUT`];
+    /// `Duration::ZERO` emits immediately.
+    pub fn with_event_defer_timeout(mut self, timeout: Duration) -> Self {
+        self.event_defer_timeout = timeout;
         self
     }
 
@@ -149,14 +206,54 @@ impl<'callbacks> DraftlineCommandContext<'callbacks> {
         kind: DraftlineEventKind,
         sync_status: Option<SyncStatus>,
     ) {
+        if self.event_sink.is_none() {
+            return;
+        }
+
+        // Another operation still writing files would make the event's
+        // snapshot (and any refresh the host runs on it) see a half-written
+        // workspace. Wait for it, then let its own event of the same kind
+        // stand in for ours. An event carrying a sync status always goes out.
+        let key = event_key(workspace.root(), &kind);
+        let generation = event_generation(&key);
+        if wait_for_running_operation(workspace, self.event_defer_timeout)
+            && sync_status.is_none()
+            && event_generation(&key) != generation
+        {
+            return;
+        }
+
         let Some(sink) = self.event_sink.as_mut() else {
             return;
         };
-
         let event =
             DraftlineEvent::from_workspace(workspace, kind, self.next_event_sequence, sync_status);
         self.next_event_sequence += 1;
+        bump_event_generation(key);
         sink(event);
+    }
+}
+
+/// Waits, up to `timeout`, while another live operation holds the checkout's
+/// operation lock. Once it is released, waits a short grace for that
+/// operation to emit its own event, and keeps waiting if another operation
+/// took the lock meanwhile. True when it had to wait.
+fn wait_for_running_operation(workspace: &Workspace, timeout: Duration) -> bool {
+    if timeout.is_zero() || !workspace.another_operation_running() {
+        return false;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        while Instant::now() < deadline && workspace.another_operation_running() {
+            std::thread::sleep(EVENT_DEFER_POLL);
+        }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(EVENT_COALESCE_GRACE.min(deadline - Instant::now()));
+        if Instant::now() >= deadline || !workspace.another_operation_running() {
+            return true;
+        }
     }
 }
 
@@ -3347,5 +3444,141 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
             })),
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{mpsc, Arc};
+
+    type Recorded = Arc<Mutex<Vec<(DraftlineEventKind, Instant)>>>;
+
+    fn recording_context(events: Recorded) -> DraftlineCommandContext<'static> {
+        DraftlineCommandContext::new().with_event_sink(move |event| {
+            events.lock().unwrap().push((event.kind, Instant::now()));
+        })
+    }
+
+    /// Holds the operation lock on another thread for `hold`, then optionally
+    /// emits that operation's own event, the way a contract command does.
+    fn run_operation(
+        root: PathBuf,
+        hold: Duration,
+        emit_after: Option<(Recorded, DraftlineEventKind)>,
+    ) -> (mpsc::Receiver<()>, std::thread::JoinHandle<Instant>) {
+        let (locked, ready) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let workspace = Workspace::open(&root).unwrap();
+            let lock = workspace.hold_operation_lock_for_test();
+            locked.send(()).unwrap();
+            std::thread::sleep(hold);
+            drop(lock);
+            let released = Instant::now();
+            if let Some((events, kind)) = emit_after {
+                recording_context(events).emit(&workspace, kind, None);
+            }
+            released
+        });
+        (ready, handle)
+    }
+
+    #[test]
+    fn an_event_during_another_operation_waits_and_coalesces_into_its_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (ready, operation) = run_operation(
+            workspace.root().to_path_buf(),
+            Duration::from_millis(300),
+            Some((events.clone(), DraftlineEventKind::DirtyChanged)),
+        );
+        ready.recv().unwrap();
+
+        recording_context(events.clone()).emit(&workspace, DraftlineEventKind::DirtyChanged, None);
+        let released = operation.join().unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "one event after the operation");
+        assert!(events[0].1 >= released);
+    }
+
+    #[test]
+    fn a_deferred_event_of_another_kind_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (ready, operation) = run_operation(
+            workspace.root().to_path_buf(),
+            Duration::from_millis(300),
+            Some((events.clone(), DraftlineEventKind::HistoryChanged)),
+        );
+        ready.recv().unwrap();
+
+        recording_context(events.clone()).emit(&workspace, DraftlineEventKind::DirtyChanged, None);
+        let released = operation.join().unwrap();
+
+        let events = events.lock().unwrap();
+        let kinds = events
+            .iter()
+            .map(|(kind, _)| kind.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds.len(), 2);
+        assert!(kinds.contains(&DraftlineEventKind::DirtyChanged));
+        assert!(kinds.contains(&DraftlineEventKind::HistoryChanged));
+        assert!(events.iter().all(|(_, at)| *at >= released));
+    }
+
+    #[test]
+    fn an_event_waits_for_an_operation_that_emits_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (ready, operation) = run_operation(
+            workspace.root().to_path_buf(),
+            Duration::from_millis(200),
+            None,
+        );
+        ready.recv().unwrap();
+
+        recording_context(events.clone()).emit(&workspace, DraftlineEventKind::DirtyChanged, None);
+        let released = operation.join().unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, DraftlineEventKind::DirtyChanged);
+        assert!(
+            events[0].1 >= released,
+            "emitted only after the lock was released"
+        );
+    }
+
+    #[test]
+    fn an_event_is_emitted_anyway_once_the_defer_timeout_passes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (ready, operation) =
+            run_operation(workspace.root().to_path_buf(), Duration::from_secs(2), None);
+        ready.recv().unwrap();
+
+        let started = Instant::now();
+        recording_context(events.clone())
+            .with_event_defer_timeout(Duration::from_millis(100))
+            .emit(&workspace, DraftlineEventKind::DirtyChanged, None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(events.lock().unwrap().len(), 1);
+        operation.join().unwrap();
+    }
+
+    #[test]
+    fn an_event_with_no_running_operation_is_emitted_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started = Instant::now();
+        recording_context(events.clone()).emit(&workspace, DraftlineEventKind::DirtyChanged, None);
+        assert!(started.elapsed() < EVENT_COALESCE_GRACE);
+        assert_eq!(events.lock().unwrap().len(), 1);
     }
 }

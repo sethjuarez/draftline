@@ -175,6 +175,15 @@ let _ = selected_save_with_context(&mut context, request);
 # Ok::<(), draftline::DraftlineError>(())
 ```
 
+Events never fire while another Draftline operation on the same checkout holds
+its operation lock (for example a merge, shelf apply, or switch still writing
+files on another thread or process). The event waits for that operation to
+finish, up to `with_event_defer_timeout` (default
+`DEFAULT_EVENT_DEFER_TIMEOUT`, 30 seconds; after that it is emitted anyway).
+If that operation emits its own event of the same kind in the same process,
+the waiting event is dropped (unless it carries a sync status), so the host
+sees one event, after the files are written.
+
 Treat `ContributorProfile` as product identity and service attribution, not as a
 Git configuration screen. The host should derive `author` from the signed-in
 product user, `saved_by` from the actor that initiated the save, and optional
