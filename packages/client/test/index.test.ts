@@ -525,6 +525,14 @@ describe('createDraftlineClient', () => {
     await facade.probeFolder();
     await facade.applyFolderFix({ action: 'manage_here' });
     await facade.moveFolder('decks');
+    await facade.projectSettings();
+    await facade.updateProjectSettings({ commit_template: 'docs: {subject}' });
+    expect(invoke).toHaveBeenCalledWith('project_settings', {
+      request: { workspace_path: 'C:\\repo' },
+    });
+    expect(invoke).toHaveBeenCalledWith('update_project_settings', {
+      request: { workspace_path: 'C:\\repo', commit_template: 'docs: {subject}' },
+    });
     expect(invoke).toHaveBeenCalledWith('probe_folder', {
       request: { workspace_path: 'C:\\repo' },
     });

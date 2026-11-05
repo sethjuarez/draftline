@@ -4,6 +4,8 @@ Git-native versioning for creative content workflows.
 
 Draftline lets apps manage one part of a repo (the whole repo or a folder in it) for business users, without exposing Git. A committed root `.draftline` file names that folder.
 
+The marker can also record project settings: a stable project `id` that survives `move_folder`, a `base_branch`, and a `commit_template` such as `docs(demo): {subject}` that Draftline applies to the first line of every commit it writes on a branch (saves, restores, merges, folder moves), so repos that lint commit messages accept them. Read them with `Workspace::project_settings` and change them with `Workspace::update_project_settings`, which saves only `.draftline`.
+
 Draftline is a Rust library for apps that need safe version history for folders full of creative content: posts, docs, demo plans, AI writing workspaces, prompt files, assets, and other project-shaped content.
 
 It is not a Git wrapper for end users. Git is the storage layer. Draftline's public model is meant to feel closer to how a business or creative user thinks:
