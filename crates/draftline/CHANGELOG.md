@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.11.0...draftline-v0.12.0) (2026-11-05)
+
+
+### Features
+
+* **workspace:** local variation merge and CutReady follow-ups ([#70](https://github.com/sethjuarez/draftline/issues/70)) ([077e42b](https://github.com/sethjuarez/draftline/commit/077e42b76a628dde2a58275072e7bf4948ddb3f0))
+* **workspace:** pin clean incoming merges to the previewed heads ([#72](https://github.com/sethjuarez/draftline/issues/72)) ([77501f5](https://github.com/sethjuarez/draftline/commit/77501f52edd61da9d8edd9e5c1b18cfdb336ad85))
+
 ## [0.11.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.10.2...draftline-v0.11.0) (2026-11-04)
 
 

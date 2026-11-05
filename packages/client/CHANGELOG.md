@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/sethjuarez/draftline/compare/client-v0.6.0...client-v0.7.0) (2026-11-05)
+
+
+### Features
+
+* **workspace:** local variation merge and CutReady follow-ups ([#70](https://github.com/sethjuarez/draftline/issues/70)) ([077e42b](https://github.com/sethjuarez/draftline/commit/077e42b76a628dde2a58275072e7bf4948ddb3f0))
+* **workspace:** pin clean incoming merges to the previewed heads ([#72](https://github.com/sethjuarez/draftline/issues/72)) ([77501f5](https://github.com/sethjuarez/draftline/commit/77501f52edd61da9d8edd9e5c1b18cfdb336ad85))
+
 ## [0.6.0](https://github.com/sethjuarez/draftline/compare/client-v0.5.0...client-v0.6.0) (2026-11-04)
 
 

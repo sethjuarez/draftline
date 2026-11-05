@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/sethjuarez/draftline/compare/site-v0.5.2...site-v0.6.0) (2026-11-05)
+
+
+### Features
+
+* **workspace:** local variation merge and CutReady follow-ups ([#70](https://github.com/sethjuarez/draftline/issues/70)) ([077e42b](https://github.com/sethjuarez/draftline/commit/077e42b76a628dde2a58275072e7bf4948ddb3f0))
+
 ## [0.5.2](https://github.com/sethjuarez/draftline/compare/site-v0.5.1...site-v0.5.2) (2026-10-30)
 
 
