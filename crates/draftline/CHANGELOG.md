@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.12.0...draftline-v0.13.0) (2026-11-05)
+
+
+### Features
+
+* **workspace:** read raw file bytes from a version ([#73](https://github.com/sethjuarez/draftline/issues/73)) ([d9b2e1c](https://github.com/sethjuarez/draftline/commit/d9b2e1c29fd5d76f9313f4ec441632d4a70c4258))
+
 ## [0.12.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.11.0...draftline-v0.12.0) (2026-11-05)
 
 
