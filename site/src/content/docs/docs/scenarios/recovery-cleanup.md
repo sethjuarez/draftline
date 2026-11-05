@@ -28,7 +28,7 @@ flowchart TD
 |---|---|
 | Covered today? | Yes for all-work shelf list, preview, clean apply, and delete. No for selected-file shelves or conflict-resolution apply. |
 | Current support | `shelve_changes`, `list_shelves`, `preview_shelf`, `preflight_apply_shelf`, `apply_shelf`, and `delete_shelf` are public. Switch-with-shelve also creates shelf refs. |
-| Safety behavior | Shelf application is treated as a file-writing operation with dirty-work and target-tree collision preflight. It preserves the shelf until the user explicitly deletes it. |
+| Safety behavior | Shelf application is a file-writing operation. Unsaved changes only block when they sit at a path the shelf writes (`overlapping_files`; `apply_shelf` refuses with `shelf_overlaps_unsaved_changes`); edits elsewhere are kept. Target-tree collisions still block. It preserves the shelf until the user explicitly deletes it. |
 | Edge cases | Shelf names must be unique/create-only. Applying a shelf can conflict with current tracked work or collide with untracked/ignored/excluded files. Conflict-resolution apply and selected-file shelves remain future work. |
 | Gap | Need selected-file shelves and semantic conflict-resolution apply for shelves that cannot be applied cleanly. |
 

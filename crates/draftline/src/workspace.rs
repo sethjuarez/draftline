@@ -1438,9 +1438,14 @@ pub struct Shelf {
 #[non_exhaustive]
 pub struct ShelfApplyReport {
     pub shelf: Shelf,
+    /// Every unsaved change in the folder. Only `overlapping_files` block.
     pub dirty_files: Vec<ChangedFile>,
     pub file_hazards: Vec<FileHazard>,
     pub can_proceed: bool,
+    /// Unsaved changes at paths the shelf would write. Applying refuses
+    /// with `ShelfOverlapsUnsavedChanges` while this is non-empty.
+    #[serde(default)]
+    pub overlapping_files: Vec<ChangedFile>,
 }
 
 /// Read-only merge-incoming preflight report.
@@ -3665,7 +3670,17 @@ impl Workspace {
                 }
             }
             RecoveryOperation::ApplyShelf => {
-                let changed_files = self.changed_files_unchecked()?;
+                // Apply refuses when unsaved edits sit at the shelf's paths,
+                // so only those paths can hold its half-written content;
+                // edits elsewhere predate the apply and are kept.
+                let Some(target) = state.target.as_deref() else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let Ok((_id, commit)) = self.find_shelf_commit(target) else {
+                    return Ok(self.recovery_unavailable(state));
+                };
+                let (_tree, paths) = self.shelf_target_tree(&commit)?;
+                let changed_files = self.changed_files_at(&paths)?;
                 let changed_workspace = !changed_files.is_empty();
                 if changed_workspace {
                     self.discard_changed_files(&changed_files)?;
@@ -5714,15 +5729,34 @@ impl Workspace {
         })
     }
 
-    /// Preflights applying a shelf into the current workspace.
+    /// Preflights applying a shelf into the current workspace. Unsaved
+    /// changes only block when they sit at a path the shelf writes (see
+    /// [`ShelfApplyReport::overlapping_files`]); other edits are left alone.
     pub fn preflight_apply_shelf(&self, id: impl AsRef<str>) -> Result<ShelfApplyReport> {
         self.ensure_no_pending_recovery()?;
         let (safe_name, commit) = self.find_shelf_commit(id.as_ref())?;
-        let (tree_id, _paths) = self.shelf_target_tree(&commit)?;
+        let (tree_id, paths) = self.shelf_target_tree(&commit)?;
         let tree = self.repo.find_tree(tree_id)?;
         let dirty_files = self.changed_files_unchecked()?;
+        let mut overlapping_files = self.changed_files_at(&paths)?;
+        // A dirty file at a parent or child path of a shelf path (a file
+        // where the shelf needs a folder, or the reverse), or at a case alias,
+        // would be overwritten or block checkout just the same.
+        let shelf_keys = paths.iter().map(|path| path_key(path)).collect::<Vec<_>>();
+        for file in &dirty_files {
+            let key = path_key(&file.path);
+            let related = shelf_keys.iter().any(|shelf| {
+                *shelf == key
+                    || shelf.starts_with(&format!("{key}/"))
+                    || key.starts_with(&format!("{shelf}/"))
+            });
+            if related && !overlapping_files.iter().any(|f| f.path == file.path) {
+                overlapping_files.push(file.clone());
+            }
+        }
+        overlapping_files.sort_by(|left, right| left.path.cmp(&right.path));
         let file_hazards = self.target_tree_hazards(&tree)?;
-        let can_proceed = dirty_files.is_empty() && file_hazards.is_empty();
+        let can_proceed = overlapping_files.is_empty() && file_hazards.is_empty();
 
         Ok(ShelfApplyReport {
             shelf: Shelf {
@@ -5732,15 +5766,75 @@ impl Workspace {
             dirty_files,
             file_hazards,
             can_proceed,
+            overlapping_files,
         })
     }
 
+    /// Unsaved changes at exactly `paths` (repository-relative). Rename
+    /// detection is off, so a renamed file shows at both its old and new path.
+    fn changed_files_at(&self, paths: &[PathBuf]) -> Result<Vec<ChangedFile>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut options = StatusOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .disable_pathspec_match(true);
+        for path in paths {
+            options.pathspec(path.to_string_lossy().replace('\\', "/"));
+        }
+        let statuses = self.repo.statuses(Some(&mut options))?;
+        let filter_clean = self.filter_clean_in_index(&statuses)?;
+        let mut changed = Vec::new();
+        for entry in statuses.iter() {
+            let Ok(path) = entry.path() else {
+                continue;
+            };
+            if entry.status().is_ignored()
+                || path == FOLDER_MARKER
+                || !self.content_policy.tracks(path)?
+                || filter_clean.contains(Path::new(path))
+            {
+                continue;
+            }
+            let relative = PathBuf::from(path);
+            let full_path = self.root.join(&relative);
+            changed.push(ChangedFile {
+                path: relative,
+                kind: status_to_change_kind(entry.status()),
+                is_binary: file_is_binary(&full_path)?,
+                is_large: file_is_large(
+                    &full_path,
+                    self.content_policy.large_file_threshold_bytes(),
+                )?,
+            });
+        }
+        changed.sort_by(|left, right| left.path.cmp(&right.path));
+        changed.dedup_by(|left, right| left.path == right.path);
+        Ok(changed)
+    }
+
     /// Applies a shelf as working-tree content and preserves the shelf.
+    ///
+    /// Unsaved changes elsewhere in the folder are kept. If any sit at a path
+    /// the shelf writes, this refuses with
+    /// [`DraftlineError::ShelfOverlapsUnsavedChanges`] and changes nothing.
     pub fn apply_shelf(&self, id: impl AsRef<str>) -> Result<Shelf> {
         self.ensure_no_pending_recovery()?;
         let safe_name = validate_variation_name(id.as_ref())?;
         let _lock = self.acquire_for_index("apply_shelf")?;
         let report = self.preflight_apply_shelf(&safe_name)?;
+        if !report.overlapping_files.is_empty() {
+            return Err(DraftlineError::ShelfOverlapsUnsavedChanges {
+                shelf: safe_name,
+                paths: report
+                    .overlapping_files
+                    .into_iter()
+                    .map(|file| file.path)
+                    .collect(),
+            });
+        }
         if !report.can_proceed {
             return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
                 "apply_shelf",
@@ -15684,6 +15778,12 @@ fn scope_pathspec(scope: &Path) -> Option<String> {
     Some(scope.to_string_lossy().replace('\\', "/"))
 }
 
+/// Case-folded, `/`-separated form of a repository path, for comparing paths
+/// the way a case-insensitive file system would.
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
 /// Restricts a status scan to the folder so large code repositories
 /// are not walked in full.
 fn limit_status_to_scope(options: &mut StatusOptions, scope: &Path) {
@@ -16152,6 +16252,10 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, content).unwrap();
+    }
+
+    fn read_file(root: &Path, relative: &str) -> String {
+        fs::read_to_string(root.join(relative)).unwrap()
     }
 
     fn stage_file(workspace: &Workspace, relative: &str) {
@@ -20892,10 +20996,116 @@ mod tests {
         let report = workspace.preflight_apply_shelf("draft-shelf").unwrap();
         assert!(!report.can_proceed);
         assert_eq!(report.dirty_files[0].path, PathBuf::from("post.md"));
+        assert_eq!(report.overlapping_files[0].path, PathBuf::from("post.md"));
 
         let err = workspace.apply_shelf("draft-shelf").unwrap_err();
-        assert!(matches!(err, DraftlineError::PreflightFailed(_)));
+        match err {
+            DraftlineError::ShelfOverlapsUnsavedChanges { shelf, paths } => {
+                assert_eq!(shelf, "draft-shelf");
+                assert_eq!(paths, vec![PathBuf::from("post.md")]);
+            }
+            other => panic!("expected overlap error, got {other:?}"),
+        }
         assert_eq!(workspace.list_shelves().unwrap().len(), 1);
+        assert_eq!(read_file(workspace.root(), "post.md"), "dirty");
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_shelf_keeps_unsaved_changes_that_do_not_overlap() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        write_file(workspace.root(), "notes.md", b"notes");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+        workspace.shelve_changes("draft-shelf").unwrap();
+        write_file(workspace.root(), "notes.md", b"unsaved notes");
+        write_file(workspace.root(), "fresh.md", b"untracked");
+
+        let report = workspace.preflight_apply_shelf("draft-shelf").unwrap();
+        assert!(report.can_proceed, "{report:?}");
+        assert!(report.overlapping_files.is_empty());
+        assert_eq!(report.dirty_files.len(), 2);
+
+        workspace.apply_shelf("draft-shelf").unwrap();
+        assert_eq!(read_file(workspace.root(), "post.md"), "shelved");
+        assert_eq!(read_file(workspace.root(), "notes.md"), "unsaved notes");
+        assert_eq!(read_file(workspace.root(), "fresh.md"), "untracked");
+        assert_eq!(workspace.list_shelves().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn apply_shelf_refuses_a_dirty_file_where_the_shelf_needs_a_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "notes/a.md", b"shelved");
+        workspace.shelve_changes("draft-shelf").unwrap();
+        let _ = fs::remove_dir_all(workspace.root().join("notes"));
+        write_file(workspace.root(), "notes", b"a file, not a folder");
+
+        let err = workspace.apply_shelf("draft-shelf").unwrap_err();
+        let DraftlineError::ShelfOverlapsUnsavedChanges { paths, .. } = err else {
+            panic!("expected overlap error, got {err:?}");
+        };
+        assert_eq!(paths, vec![PathBuf::from("notes")]);
+        assert_eq!(read_file(workspace.root(), "notes"), "a file, not a folder");
+        assert!(workspace.recovery_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_shelf_refuses_when_a_renamed_file_overlaps_either_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        write_file(workspace.root(), "notes.md", b"notes");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+        workspace.shelve_changes("draft-shelf").unwrap();
+        fs::rename(
+            workspace.root().join("post.md"),
+            workspace.root().join("renamed.md"),
+        )
+        .unwrap();
+
+        let err = workspace.apply_shelf("draft-shelf").unwrap_err();
+        let DraftlineError::ShelfOverlapsUnsavedChanges { paths, .. } = err else {
+            panic!("expected overlap error, got {err:?}");
+        };
+        assert_eq!(paths, vec![PathBuf::from("post.md")]);
+        assert!(workspace.root().join("renamed.md").exists());
+    }
+
+    #[test]
+    fn apply_shelf_rollback_only_discards_the_shelf_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::init(temp.path()).unwrap();
+        write_file(workspace.root(), "post.md", b"base");
+        write_file(workspace.root(), "notes.md", b"notes");
+        workspace.save_version("Base").unwrap();
+        write_file(workspace.root(), "post.md", b"shelved");
+        workspace.shelve_changes("draft-shelf").unwrap();
+        write_file(workspace.root(), "notes.md", b"unsaved notes");
+
+        // Simulate a crash mid-apply: the shelf content is half written and
+        // recovery state is left incomplete.
+        write_file(workspace.root(), "post.md", b"shelved");
+        workspace
+            .write_recovery_state(&RecoveryState {
+                operation_id: new_operation_id(),
+                operation: RecoveryOperation::ApplyShelf,
+                original_variation: workspace.current_variation_unchecked().ok(),
+                target: Some("draft-shelf".to_string()),
+                completed: false,
+            })
+            .unwrap();
+        let state = workspace.recovery_state().unwrap().unwrap();
+
+        workspace.rollback_recovery(&state.operation_id).unwrap();
+        assert_eq!(read_file(workspace.root(), "post.md"), "base");
+        assert_eq!(read_file(workspace.root(), "notes.md"), "unsaved notes");
     }
 
     #[test]

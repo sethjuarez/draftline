@@ -146,6 +146,11 @@ pub enum DraftlineError {
     #[error("`{0}` has nothing this variation doesn't already have")]
     NothingToMerge(String),
 
+    /// Applying the shelf would overwrite unsaved changes at these paths.
+    /// Save, shelve, or discard them first; changes elsewhere don't block.
+    #[error("applying shelf `{shelf}` would overwrite unsaved changes in {}", join_paths(.paths))]
+    ShelfOverlapsUnsavedChanges { shelf: String, paths: Vec<PathBuf> },
+
     #[error("cannot tell which branch to send to; pass a base branch")]
     SendBaseUnknown,
 
@@ -245,6 +250,14 @@ fn workspace_folder(project: &std::path::Path) -> String {
     } else {
         format!("`{}`", project.display())
     }
+}
+
+fn join_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| format!("`{}`", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn timeout_suffix(timeout_ms: u64) -> String {

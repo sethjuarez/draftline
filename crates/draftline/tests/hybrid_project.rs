@@ -5859,3 +5859,35 @@ fn namespaced_variation_merge_refuses_to_move_a_developer_branch() {
         .unwrap();
     assert_eq!(login.get().target().unwrap(), main.id());
 }
+
+#[test]
+fn shelf_apply_only_blocks_on_overlapping_project_files() {
+    let (temp, _repo) = code_repo();
+    let workspace =
+        Workspace::init_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, shelved\n");
+    workspace.shelve_changes("wip").unwrap();
+
+    // Unsaved edits elsewhere in the project and in code don't block.
+    write_file(temp.path(), "cutready/outro.sk", "the end\n");
+    write_file(temp.path(), "README.md", "# dev edit\n");
+    let report = workspace.preflight_apply_shelf("wip").unwrap();
+    assert!(report.can_proceed, "{report:?}");
+    workspace.apply_shelf("wip").unwrap();
+    assert_eq!(
+        read(temp.path(), "cutready/intro.sk"),
+        "scene one, shelved\n"
+    );
+    assert_eq!(read(temp.path(), "cutready/outro.sk"), "the end\n");
+    assert_eq!(read(temp.path(), "README.md"), "# dev edit\n");
+
+    // An unsaved edit to a file the shelf writes does.
+    write_file(temp.path(), "cutready/intro.sk", "scene one, mine\n");
+    let err = workspace.apply_shelf("wip").unwrap_err();
+    let draftline::DraftlineError::ShelfOverlapsUnsavedChanges { shelf, paths } = err else {
+        panic!("expected overlap error, got {err:?}");
+    };
+    assert_eq!(shelf, "wip");
+    assert_eq!(paths, vec![std::path::PathBuf::from("cutready/intro.sk")]);
+    assert_eq!(read(temp.path(), "cutready/intro.sk"), "scene one, mine\n");
+}

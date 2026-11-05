@@ -986,9 +986,16 @@ export interface Shelf {
 
 export interface ShelfApplyReport {
   shelf: Shelf;
+  /** Every unsaved change in the folder; only `overlapping_files` block. */
   dirty_files: ChangedFile[];
   file_hazards: FileHazard[];
   can_proceed: boolean;
+  /**
+   * Unsaved changes at paths the shelf would write. `applyShelf` rejects
+   * with `shelf_overlaps_unsaved_changes` (details `{ shelf, paths }`) while
+   * this is non-empty.
+   */
+  overlapping_files: ChangedFile[];
 }
 
 export interface RestoreVersionResult {

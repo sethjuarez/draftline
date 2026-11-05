@@ -3290,6 +3290,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::NotOwnedWorktree(_) => "not_owned_worktree",
         DraftlineError::OwnedWorktreeInUse(_) => "owned_worktree_in_use",
         DraftlineError::OwnedWorktreeHasChanges(_) => "owned_worktree_has_changes",
+        DraftlineError::ShelfOverlapsUnsavedChanges { .. } => "shelf_overlaps_unsaved_changes",
     }
 }
 
@@ -3329,6 +3330,9 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         }
         DraftlineError::BaseRenamed { from, to } => {
             Some(serde_json::json!({ "from": from, "to": to }))
+        }
+        DraftlineError::ShelfOverlapsUnsavedChanges { shelf, paths } => {
+            Some(serde_json::json!({ "shelf": shelf, "paths": paths }))
         }
         DraftlineError::GitFilterFailed { action, output } => {
             Some(serde_json::json!({ "action": action, "output": output }))
