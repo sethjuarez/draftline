@@ -128,6 +128,16 @@ preflight), `invalid_merge_token` (a remote token on a local merge or the
 reverse), `merge_needs_developer`, `variation_not_found`, and
 `variation_outside_namespace` when a namespaced host names a branch outside it.
 
+`preview_version_file` returns no content for binary files. To show an image as it
+was in a version, call `read_version_file_bytes` (`version_id`, `path`, optional
+`max_bytes`). It returns `VersionFileBytes { path, size, data_base64 }`: the raw
+blob, with no checkout filters, so an LFS file comes back as its pointer. Like
+`preview_version_file`, it follows moved folders and returns `None` for a missing
+path, a directory, or a path the content policy doesn't track. A file over
+`max_bytes` (default 20 MiB) fails with `file_too_large` and details
+`{path, size, max_bytes}` before any bytes are read. The Rust
+`Workspace::read_version_file_bytes` has no cap.
+
 The Workbench contract keeps credential handling out of frontend DTOs. Hosts route
 commands through `DraftlineCommandContext` to configure content policy,
 host-provided contributor attribution, backend-only remote credentials, and

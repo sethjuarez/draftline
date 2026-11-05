@@ -10,6 +10,7 @@ use draftline::tauri_contract::{
     MergeIncomingWithTokenRequest,
     MergeVariationRequest, MergeVariationWithResolutionsRequest, PreflightMergeVariationRequest,
     PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
+    ReadVersionFileBytesRequest, VersionFileBytes,
     PublishCurrentVariationRequest, PublishCurrentVariationResult, RecoveryRequest, RemoteRequest,
     RemoteVariationRequest, RestoreVersionRequest, RestoreVersionResult, SaveRequest, SaveResult,
     SelectedDiscardRequest, SelectedDiscardResult, SelectedSaveRequest, SelectedSaveResult,
@@ -398,6 +399,17 @@ fn preview_version_file(
 ) -> TauriCommandResult<Option<PreviewFile>> {
     let context = lock_context(state.inner())?;
     contract::into_tauri_result(contract::preview_version_file_with_context(
+        &context, request,
+    ))
+}
+
+#[tauri::command]
+fn read_version_file_bytes(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: ReadVersionFileBytesRequest,
+) -> TauriCommandResult<Option<VersionFileBytes>> {
+    let context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::read_version_file_bytes_with_context(
         &context, request,
     ))
 }
@@ -885,6 +897,7 @@ fn main() {    let _ = tracing_subscriber::registry()
             diff_workspace_file,
             preview_version,
             preview_version_file,
+            read_version_file_bytes,
             preview_workspace_file,
             restore_version_as_new_save,
             restore_version_paths_as_new_save,

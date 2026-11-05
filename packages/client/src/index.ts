@@ -71,6 +71,7 @@ export interface DraftlineClient {
   diffWorkspaceFile(request: CurrentFileRequest): Promise<CurrentFileDiff | null>;
   previewVersion(request: VersionRequest): Promise<VersionPreview>;
   previewVersionFile(request: PreviewVersionFileRequest): Promise<PreviewFile | null>;
+  readVersionFileBytes(request: ReadVersionFileBytesRequest): Promise<VersionFileBytes | null>;
   previewWorkspaceFile(request: CurrentFileRequest): Promise<CurrentFilePreview | null>;
   restoreVersionAsNewSave(request: RestoreVersionRequest): Promise<RestoreVersionResult>;
   restoreVersionPathsAsNewSave(request: RestoreVersionPathsRequest): Promise<RestoreVersionResult>;
@@ -232,6 +233,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     diffWorkspaceFile: (request) => run('diff_workspace_file', { request }),
     previewVersion: (request) => run('preview_version', { request }),
     previewVersionFile: (request) => run('preview_version_file', { request }),
+    readVersionFileBytes: (request) => run('read_version_file_bytes', { request }),
     previewWorkspaceFile: (request) => run('preview_workspace_file', { request }),
     restoreVersionAsNewSave: (request) => run('restore_version_as_new_save', { request }),
     restoreVersionPathsAsNewSave: (request) =>
@@ -1291,6 +1293,18 @@ export interface PreviewVersionFileRequest extends VersionRequest {
   path: string;
 }
 
+/** Reads a file's raw bytes from a version. `max_bytes` defaults to 20 MiB. */
+export interface ReadVersionFileBytesRequest extends PreviewVersionFileRequest {
+  max_bytes?: number | null;
+}
+
+/** Raw bytes of a file as it was in a version, base64-encoded. */
+export interface VersionFileBytes {
+  path: string;
+  size: number;
+  data_base64: string;
+}
+
 export interface DiffVersionsRequest extends WorkspaceRequest {
   from_version_id: string;
   to_version_id: string;
@@ -1512,6 +1526,11 @@ export interface DraftlineHostFacade {
   diffWorkspaceFile(path: string): Promise<CurrentFileDiff | null>;
   previewVersion(versionId: string): Promise<VersionPreview>;
   previewVersionFile(versionId: string, path: string): Promise<PreviewFile | null>;
+  readVersionFileBytes(
+    versionId: string,
+    path: string,
+    maxBytes?: number,
+  ): Promise<VersionFileBytes | null>;
   previewWorkspaceFile(path: string): Promise<CurrentFilePreview | null>;
   restoreAsNewSave(versionId: string, label: string): Promise<RestoreVersionResult>;
   restorePathsAsNewSave(
@@ -1691,6 +1710,12 @@ export function createDraftlineHostFacade({
     previewVersion: (versionId) => client.previewVersion(versionRequest(versionId)),
     previewVersionFile: (versionId, path) =>
       client.previewVersionFile({ ...versionRequest(versionId), path }),
+    readVersionFileBytes: (versionId, path, maxBytes) =>
+      client.readVersionFileBytes({
+        ...versionRequest(versionId),
+        path,
+        ...(maxBytes === undefined ? {} : { max_bytes: maxBytes }),
+      }),
     previewWorkspaceFile: (path) => client.previewWorkspaceFile({ ...workspaceRequest(), path }),
     restoreAsNewSave: (versionId, label) =>
       client.restoreVersionAsNewSave({ ...versionRequest(versionId), label }),
@@ -2012,6 +2037,12 @@ export async function previewVersionFile(
   request: PreviewVersionFileRequest,
 ): Promise<PreviewFile | null> {
   return createDraftlineClient().previewVersionFile(request);
+}
+
+export async function readVersionFileBytes(
+  request: ReadVersionFileBytesRequest,
+): Promise<VersionFileBytes | null> {
+  return createDraftlineClient().readVersionFileBytes(request);
 }
 
 export async function previewWorkspaceFile(
