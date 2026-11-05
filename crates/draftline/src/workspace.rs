@@ -8405,6 +8405,42 @@ impl Workspace {
         self.preflight_merge_from(status, source)
     }
 
+    /// The branch a remote merge token merges from: its base, or the
+    /// variation's own upstream.
+    fn token_source(token: &MergeIncomingToken) -> (bool, String) {
+        let from_base = token
+            .source
+            .as_ref()
+            .is_some_and(|source| *source != token.variation);
+        let source = token
+            .source
+            .clone()
+            .unwrap_or_else(|| token.variation.clone());
+        (from_base, source)
+    }
+
+    /// The last-fetched tip of the branch `token` merges from, without fetching.
+    pub(crate) fn token_remote_oid(&self, token: &MergeIncomingToken) -> Option<String> {
+        remote_tracking_oid(&self.repo, &token.remote, &Self::token_source(token).1)
+    }
+
+    /// Re-preflights the merge `token` describes against the last-fetched
+    /// state of its exact source branch, without fetching. Read-only.
+    pub(crate) fn preflight_merge_for_token(
+        &self,
+        token: &MergeIncomingToken,
+    ) -> Result<MergeIncomingReport> {
+        self.ensure_no_pending_recovery()?;
+        let (from_base, source) = Self::token_source(token);
+        if from_base {
+            let status = self.base_status_unchecked(&token.remote, &source)?;
+            self.preflight_merge_from(status, Some(source))
+        } else {
+            let status = self.sync_status(&token.remote)?;
+            self.preflight_merge_from(status, None)
+        }
+    }
+
     fn base_status_unchecked(&self, remote: &str, base: &str) -> Result<SyncStatus> {
         let local = self.repo.head()?.peel_to_commit()?.id();
         let Ok(remote_oid) = self
@@ -8638,14 +8674,7 @@ impl Workspace {
             });
         }
 
-        let from_base = token
-            .source
-            .as_ref()
-            .is_some_and(|source| *source != token.variation);
-        let source = token
-            .source
-            .clone()
-            .unwrap_or_else(|| token.variation.clone());
+        let (from_base, source) = Self::token_source(&token);
         let status = if from_base {
             self.fetch_remote_variation_ref(&token.remote, &source, options)?;
             self.base_status_unchecked(&token.remote, &source)?
@@ -8653,9 +8682,6 @@ impl Workspace {
             self.fetch_remote_unchecked(&token.remote, options)?;
             self.sync_status(&token.remote)?
         };
-        if !Self::mergeable_state(&status.state, from_base) {
-            return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
-        }
         let remote_oid = remote_tracking_oid(&self.repo, &token.remote, &source);
         if remote_oid.as_deref() != Some(token.remote_oid.as_str()) {
             return Err(DraftlineError::RemoteRace {
@@ -8664,6 +8690,9 @@ impl Workspace {
                 expected: Some(token.remote_oid),
                 actual: remote_oid,
             });
+        }
+        if !Self::mergeable_state(&status.state, from_base) {
+            return Err(DraftlineError::SyncNeedsMerge(Box::new(status)));
         }
 
         let merge_input = self.merge_input_for_status(&status)?;
@@ -9160,6 +9189,12 @@ impl Workspace {
             patch: if patch.is_empty() { None } else { Some(patch) },
             preview,
         }))
+    }
+
+    /// The commit `HEAD` points at, if any.
+    pub(crate) fn head_oid(&self) -> Option<String> {
+        let commit = self.repo.head().ok()?.peel_to_commit().ok()?;
+        Some(commit.id().to_string())
     }
 
     /// Returns the current variation name when the workspace is on a normal variation.

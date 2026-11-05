@@ -13,12 +13,12 @@ use draftline::tauri_contract::{
     get_workspace_graph_path, get_workspace_graph_refs, get_workspace_graph_summary,
     inspect_workspace, into_tauri_result, list_remote_variations, list_remotes, list_shelves,
     list_support_refs, list_variations, merge_conflict_view_model, merge_incoming,
-    merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context, open_workspace,
-    preflight_apply_incoming, preflight_apply_shelf, preflight_create_variation_from_version,
-    preflight_merge_incoming, preflight_rename_variation, preflight_switch_variation,
-    preview_shelf, preview_version, preview_version_file, preview_workspace_file,
-    publish_current_variation, rename_variation, restore_version_as_new_save,
-    restore_version_as_new_save_to_variation,
+    merge_incoming_with_resolutions, merge_incoming_with_resolutions_with_context,
+    merge_incoming_with_token, open_workspace, preflight_apply_incoming, preflight_apply_shelf,
+    preflight_create_variation_from_version, preflight_merge_incoming, preflight_rename_variation,
+    preflight_switch_variation, preview_shelf, preview_version, preview_version_file,
+    preview_workspace_file, publish_current_variation, rename_variation,
+    restore_version_as_new_save, restore_version_as_new_save_to_variation,
     restore_version_as_new_save_to_variation_with_context,
     restore_version_as_new_save_with_context, restore_version_paths_as_new_save, save,
     search_workspace_graph, selected_discard, selected_save, selected_save_with_context,
@@ -27,14 +27,14 @@ use draftline::tauri_contract::{
     CreateVariationFromVersionRequest, CurrentFileRequest, DiffVersionsRequest,
     DraftlineCommandContext, DraftlineEventKind, GuardedCreateVariationFromVersionRequest,
     ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
-    PathHistoryRequest, PreflightCreateVariationFromVersionRequest, PreviewVersionFileRequest,
-    PublishCurrentVariationRequest, RemoteRequest, RemoteVariationRequest, RenameVariationRequest,
-    RestoreVersionPathsRequest, RestoreVersionRequest, SaveRequest, SelectedDiscardRequest,
-    SelectedSaveRequest, SelectedShelveRequest, ShelfRequest, SwitchVariationRequest,
-    TargetedRestoreVersionRequest, VersionRequest, WorkspaceGraphAroundVersionRequest,
-    WorkspaceGraphNeighborhoodRequest, WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest,
-    WorkspaceGraphRequest, WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest,
-    WorkspaceRequest,
+    MergeIncomingWithTokenRequest, PathHistoryRequest, PreflightCreateVariationFromVersionRequest,
+    PreviewVersionFileRequest, PublishCurrentVariationRequest, RemoteRequest,
+    RemoteVariationRequest, RenameVariationRequest, RestoreVersionPathsRequest,
+    RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
+    SelectedShelveRequest, ShelfRequest, SwitchVariationRequest, TargetedRestoreVersionRequest,
+    VersionRequest, WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
+    WorkspaceGraphOverviewRequest, WorkspaceGraphPairRequest, WorkspaceGraphRequest,
+    WorkspaceGraphSearchRequest, WorkspaceGraphVariationRequest, WorkspaceRequest,
 };
 use draftline::{
     ContentPolicy, Contributor, ContributorProfile, MergeConflictResolution, MergeResolutionChoice,
@@ -1171,6 +1171,157 @@ fn tauri_contract_smokes_merge_incoming_with_resolutions() {
     assert_eq!(merged.merge.version.saved_by.name, "Profile Service");
     assert_eq!(read_file(author.root(), "shared.md"), "resolved");
     assert!(merged.postconditions.errors.is_empty());
+}
+
+/// An author and a teammate who each saved one version since `Base`, the
+/// teammate's published: author edits `mine.md`, teammate `theirs.md`.
+fn diverged_clean_pair() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Workspace,
+    tempfile::TempDir,
+    Workspace,
+) {
+    let remote_dir = tempfile::tempdir().unwrap();
+    init_bare_remote(remote_dir.path());
+    let author_dir = tempfile::tempdir().unwrap();
+    let author = Workspace::init(author_dir.path()).unwrap();
+    configure_identity(author.root());
+    write_file(author.root(), "shared.md", b"base");
+    author.save_version("Base").unwrap();
+    author
+        .add_remote("origin", remote_dir.path().to_string_lossy())
+        .unwrap();
+    author.publish_changes("origin").unwrap();
+    let teammate_dir = tempfile::tempdir().unwrap();
+    let teammate =
+        Workspace::clone_workspace(remote_dir.path().to_string_lossy(), teammate_dir.path())
+            .unwrap();
+    configure_identity(teammate.root());
+    write_file(author.root(), "mine.md", b"mine");
+    author.save_version("Mine").unwrap();
+    write_file(teammate.root(), "theirs.md", b"theirs");
+    teammate.save_version("Theirs").unwrap();
+    teammate.publish_changes("origin").unwrap();
+    (remote_dir, author_dir, author, teammate_dir, teammate)
+}
+
+fn merge_with_token(
+    author_dir: &tempfile::TempDir,
+    token: draftline::MergeIncomingToken,
+) -> draftline::tauri_contract::TauriCommandResult<
+    draftline::tauri_contract::MergeIncomingCommandResult,
+> {
+    into_tauri_result(merge_incoming_with_token(MergeIncomingWithTokenRequest {
+        workspace_path: author_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+        label: "Bring in theirs\n\nAs previewed".to_string(),
+        token,
+    }))
+}
+
+fn preview(author_dir: &tempfile::TempDir) -> draftline::MergeIncomingReport {
+    preflight_merge_incoming(RemoteRequest {
+        workspace_path: author_dir.path().to_path_buf(),
+        remote: "origin".to_string(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn tauri_contract_merges_incoming_pinned_to_the_previewed_token() {
+    let (_remote, author_dir, author, _teammate_dir, _teammate) = diverged_clean_pair();
+    let report = preview(&author_dir);
+    assert!(report.can_merge_cleanly);
+
+    let merged = merge_with_token(&author_dir, report.token.unwrap()).unwrap();
+    assert_eq!(merged.merge.version.label, "Bring in theirs");
+    assert_eq!(read_file(author.root(), "theirs.md"), "theirs");
+    assert_eq!(read_file(author.root(), "mine.md"), "mine");
+    assert!(merged.postconditions.errors.is_empty());
+}
+
+#[test]
+fn tauri_contract_refuses_a_pinned_merge_after_the_remote_moves() {
+    let (_remote, author_dir, author, _teammate_dir, teammate) = diverged_clean_pair();
+    let token = preview(&author_dir).token.unwrap();
+    let repo = git2::Repository::open(author.root()).unwrap();
+    let head = repo.refname_to_id("HEAD").unwrap();
+
+    write_file(teammate.root(), "late.md", b"late");
+    teammate.save_version("Not previewed").unwrap();
+    teammate.publish_changes("origin").unwrap();
+
+    let error = merge_with_token(&author_dir, token.clone()).unwrap_err();
+    assert_eq!(error.code, "remote_race");
+    assert_eq!(repo.refname_to_id("HEAD").unwrap(), head);
+    assert!(!author.root().join("late.md").exists());
+
+    // Once fetched, the stale token is refused before any fetch.
+    preview(&author_dir);
+    let error = merge_with_token(&author_dir, token).unwrap_err();
+    assert_eq!(error.code, "remote_race");
+    assert_eq!(repo.refname_to_id("HEAD").unwrap(), head);
+}
+
+#[test]
+fn tauri_contract_reports_a_force_pushed_remote_as_a_race() {
+    let (remote_dir, author_dir, author, _teammate_dir, _teammate) = diverged_clean_pair();
+    let token = preview(&author_dir).token.unwrap();
+
+    // Rewind the shared branch to Base: once fetched there's nothing to merge,
+    // but the cause is still that the previewed head moved.
+    let bare = git2::Repository::open_bare(remote_dir.path()).unwrap();
+    let base = git2::Oid::from_str(&token.merge_base_oid).unwrap();
+    bare.reference("refs/heads/main", base, true, "rewind")
+        .unwrap();
+    preview(&author_dir);
+
+    let error = merge_with_token(&author_dir, token).unwrap_err();
+    assert_eq!(error.code, "remote_race");
+    assert!(!author.root().join("theirs.md").exists());
+}
+
+#[test]
+fn tauri_contract_rejects_a_pinned_merge_for_another_remote() {
+    let (_remote, author_dir, _author, _teammate_dir, _teammate) = diverged_clean_pair();
+    let mut token = preview(&author_dir).token.unwrap();
+    token.remote = "upstream".to_string();
+    let error = merge_with_token(&author_dir, token).unwrap_err();
+    assert_eq!(error.code, "invalid_merge_token");
+}
+
+#[test]
+fn tauri_contract_refuses_a_pinned_merge_after_the_variation_moves() {
+    let (_remote, author_dir, author, _teammate_dir, _teammate) = diverged_clean_pair();
+    let token = preview(&author_dir).token.unwrap();
+    write_file(author.root(), "mine.md", b"mine again");
+    author.save_version("Mine again").unwrap();
+
+    let error = merge_with_token(&author_dir, token).unwrap_err();
+    assert_eq!(error.code, "local_state_changed");
+    assert!(!author.root().join("theirs.md").exists());
+}
+
+#[test]
+fn tauri_contract_pinned_merge_refuses_conflicts_and_local_tokens() {
+    let (_remote, author_dir, author, _teammate_dir, teammate) = diverged_clean_pair();
+    write_file(author.root(), "shared.md", b"ours");
+    author.save_version("Ours").unwrap();
+    write_file(teammate.root(), "shared.md", b"theirs");
+    teammate.save_version("Theirs on shared").unwrap();
+    teammate.publish_changes("origin").unwrap();
+    let report = preview(&author_dir);
+    assert!(!report.can_merge_cleanly);
+    let mut token = report.token.unwrap();
+
+    let error = merge_with_token(&author_dir, token.clone()).unwrap_err();
+    assert_eq!(error.code, "preflight_failed");
+    assert_eq!(read_file(author.root(), "shared.md"), "ours");
+
+    token.local = true;
+    let error = merge_with_token(&author_dir, token).unwrap_err();
+    assert_eq!(error.code, "invalid_merge_token");
 }
 
 #[test]

@@ -796,6 +796,19 @@ pub struct MergeIncomingWithResolutionsRequest {
     pub resolutions: Vec<MergeConflictResolution>,
 }
 
+/// Request for writing a clean incoming or base merge pinned to the token the
+/// user previewed (from [`preflight_merge_incoming`] or
+/// [`preflight_merge_base`]). Refuses with `local_state_changed` or
+/// `remote_race` if either head moved since, so the merge never includes
+/// versions the preview didn't show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeIncomingWithTokenRequest {
+    pub workspace_path: PathBuf,
+    pub remote: String,
+    pub label: String,
+    pub token: MergeIncomingToken,
+}
+
 /// Merge result with the preflight and postcondition state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeIncomingCommandResult {
@@ -2985,14 +2998,7 @@ pub fn merge_incoming_with_resolutions_with_context(
     let contributor_profile = context.contributor_profile.clone();
     let (preflight, merge) = {
         let mut options = context.remote_options();
-        let preflight = if request.token.source.is_some() {
-            workspace.preflight_merge_base(&request.remote)?
-        } else {
-            workspace.preflight_merge_incoming(&request.remote)?
-        };
-        if preflight.token.as_ref() != Some(&request.token) {
-            return Err(merge_preflight_error(preflight));
-        }
+        let preflight = preflight_for_token(&workspace, &request.remote, &request.token)?;
         let merge = match contributor_profile.as_ref() {
             Some(profile) => workspace.merge_incoming_with_resolutions_and_profile(
                 request.token,
@@ -3020,6 +3026,130 @@ pub fn merge_incoming_with_resolutions_with_context(
         merge,
         postconditions: collect_postconditions(&workspace, true),
     })
+}
+
+/// Writes a clean incoming or base merge pinned to a previewed token. The
+/// token comes from [`preflight_merge_incoming`] or [`preflight_merge_base`];
+/// `label` is the new version's full message (`"Name\n\nComment"`). Refuses
+/// with `local_state_changed` if the variation moved and `remote_race` if
+/// the incoming head moved since that preview (checked again after a fetch),
+/// and with `preflight_failed` if the merge has conflicts (use
+/// [`merge_incoming_with_resolutions`]).
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn merge_incoming_with_token(
+    request: MergeIncomingWithTokenRequest,
+) -> Result<MergeIncomingCommandResult> {
+    merge_incoming_with_token_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Writes a token-pinned clean merge using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), remote = %request.remote)
+)]
+pub fn merge_incoming_with_token_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: MergeIncomingWithTokenRequest,
+) -> Result<MergeIncomingCommandResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let contributor_profile = context.contributor_profile.clone();
+    let (preflight, merge) = {
+        let mut options = context.remote_options();
+        let preflight = preflight_for_token(&workspace, &request.remote, &request.token)?;
+        let merge = match contributor_profile.as_ref() {
+            Some(profile) => workspace.merge_incoming_with_profile(
+                request.token,
+                request.label,
+                &mut options,
+                profile,
+            )?,
+            None => workspace.merge_incoming(request.token, request.label, &mut options)?,
+        };
+        (preflight, merge)
+    };
+    context.emit(
+        &workspace,
+        DraftlineEventKind::HistoryChanged,
+        Some(preflight.sync_status.clone()),
+    );
+    Ok(MergeIncomingCommandResult {
+        preflight,
+        merge,
+        postconditions: collect_postconditions(&workspace, true),
+    })
+}
+
+/// Re-runs the preflight a remote merge `token` came from (without fetching)
+/// and checks it still matches, naming what moved when it doesn't.
+fn preflight_for_token(
+    workspace: &Workspace,
+    remote: &str,
+    token: &MergeIncomingToken,
+) -> Result<MergeIncomingReport> {
+    if token.local {
+        return Err(DraftlineError::InvalidMergeToken(
+            "this token is for a local variation merge; use merge_variation_with_resolutions"
+                .to_string(),
+        ));
+    }
+    let local_moved = |variation: &str, local_oid: &str| {
+        (variation != token.variation || local_oid != token.local_oid).then(|| {
+            DraftlineError::LocalStateChanged {
+                expected: format!("{}@{}", token.variation, token.local_oid),
+                actual: format!("{variation}@{local_oid}"),
+            }
+        })
+    };
+    if token.remote != remote {
+        return Err(DraftlineError::InvalidMergeToken(format!(
+            "this token is for remote `{}`, not `{remote}`",
+            token.remote
+        )));
+    }
+    // Checked again after re-preflighting, which isn't locked: a moved,
+    // deleted, or force-pushed head may leave nothing mergeable at all, which
+    // would hide the race behind a preflight error.
+    let heads_unchanged = || -> Result<()> {
+        let variation = workspace.current_variation()?;
+        let head = workspace.head_oid().unwrap_or_default();
+        if let Some(error) = local_moved(&variation, &head) {
+            return Err(error);
+        }
+        let remote_oid = workspace.token_remote_oid(token);
+        if remote_oid.as_deref() != Some(token.remote_oid.as_str()) {
+            return Err(DraftlineError::RemoteRace {
+                remote: token.remote.clone(),
+                variation: token
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| token.variation.clone()),
+                expected: Some(token.remote_oid.clone()),
+                actual: remote_oid,
+            });
+        }
+        Ok(())
+    };
+    heads_unchanged()?;
+    let preflight = workspace.preflight_merge_for_token(token);
+    heads_unchanged()?;
+    let preflight = preflight?;
+    let Some(current) = preflight.token.as_ref() else {
+        return Err(merge_preflight_error(preflight));
+    };
+    if let Some(error) = local_moved(&current.variation, &current.local_oid) {
+        return Err(error);
+    }
+    if current != token {
+        return Err(DraftlineError::InvalidMergeToken(
+            "the token doesn't match this merge's preview; preview again".to_string(),
+        ));
+    }
+    Ok(preflight)
 }
 
 /// Preflights merging another local variation into the current one. Read-only.
