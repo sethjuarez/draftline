@@ -44,7 +44,13 @@ pub struct Version {
     pub label: String,
     pub author: Contributor,
     pub saved_by: Contributor,
+    /// When the version was committed (the committer time). A rebase
+    /// updates this; see [`Version::author_time_seconds`] for the original.
     pub time_seconds: i64,
+    /// When the version was originally saved (the author time). It
+    /// survives a rebase, so hosts can show a replayed save's original time.
+    #[serde(default)]
+    pub author_time_seconds: i64,
     /// The save's longer description: the commit message body, without
     /// Draftline's own trailers. `None` when the save has no comment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -16061,6 +16067,7 @@ fn version_from_commit(commit: &Commit<'_>) -> Version {
         author: contributor_from_signature(&commit.author()),
         saved_by: contributor_from_signature(&commit.committer()),
         time_seconds: commit.time().seconds(),
+        author_time_seconds: commit.author().when().seconds(),
         comment: comment_from_body(commit.body().ok().flatten()),
     }
 }
@@ -16675,6 +16682,7 @@ fn remote_summary_from_commit(commit: &Commit<'_>) -> RemoteVersionSummary {
             .to_string(),
         author: contributor_from_signature(&commit.author()),
         time_seconds: commit.time().seconds(),
+        author_time_seconds: commit.author().when().seconds(),
         comment: comment_from_body(commit.body().ok().flatten()),
     }
 }

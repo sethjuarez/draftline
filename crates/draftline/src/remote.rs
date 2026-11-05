@@ -55,7 +55,12 @@ pub struct RemoteVersionSummary {
     pub id: String,
     pub label: String,
     pub author: Contributor,
+    /// Committer time.
     pub time_seconds: i64,
+    /// Author time: when the version was originally saved, as on
+    /// [`crate::Version::author_time_seconds`].
+    #[serde(default)]
+    pub author_time_seconds: i64,
     /// The commit message body, as on [`crate::Version::comment`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,

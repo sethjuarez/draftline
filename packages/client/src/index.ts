@@ -410,7 +410,10 @@ export interface Version {
   label: string;
   author: Contributor;
   saved_by: Contributor;
+  /** When the version was committed (committer time); a rebase updates it. */
   time_seconds: number;
+  /** When the version was originally saved (author time); survives a rebase. Absent from Draftline before 0.16; fall back to `time_seconds`. */
+  author_time_seconds?: number;
   /** The commit message body: the version's longer description. Absent when it has none. */
   comment?: string | null;
 }
@@ -1177,7 +1180,10 @@ export interface RemoteVersionSummary {
   id: string;
   label: string;
   author: Contributor;
+  /** When the version was committed (committer time); a rebase updates it. */
   time_seconds: number;
+  /** When the version was originally saved (author time); survives a rebase. Absent from Draftline before 0.16; fall back to `time_seconds`. */
+  author_time_seconds?: number;
   /** The commit message body, as on `Version.comment`. */
   comment?: string | null;
 }
