@@ -21,10 +21,10 @@ use crate::recovery::RecoveryOperation;
 use crate::remote::{ensure_supported_remote_url, PushRefExpectation};
 use crate::worktree::{OwnedWorktree, WorktreeStart, OWNED_WORKTREE_PREFIX};
 use crate::{
-    path::normalize_workspace_relative, ContentPolicy, Contributor, ContributorProfile,
-    DraftlineError, OutgoingFile, OutgoingFileKind, PublishPreflight, PublishResult, PublishToken,
-    RecoveryState, RemoteEndpoint, RemoteOptions, RemoteVersionSummary, Result, SyncState,
-    SyncStatus,
+    path::normalize_workspace_relative, CloneOptions, ContentPolicy, Contributor,
+    ContributorProfile, DraftlineError, OutgoingFile, OutgoingFileKind, PublishPreflight,
+    PublishResult, PublishToken, RecoveryState, RemoteEndpoint, RemoteOptions,
+    RemoteVersionSummary, Result, SyncState, SyncStatus,
 };
 
 /// A folder-backed content workspace.
@@ -3160,14 +3160,61 @@ impl Workspace {
         content_policy: ContentPolicy,
         options: &mut RemoteOptions<'_>,
     ) -> Result<Self> {
+        Self::clone_workspace_with(
+            remote_url,
+            path,
+            content_policy,
+            &CloneOptions::default(),
+            options,
+        )
+    }
+
+    /// Clones a shared workspace with explicit clone options (such as the
+    /// branch to check out), content policy and remote options. Progress set
+    /// with [`RemoteOptions::with_progress`] is reported while it runs.
+    ///
+    /// Refuses a `branch` that isn't a valid branch name
+    /// ([`DraftlineError::InvalidVariationName`]) or that the remote doesn't
+    /// have ([`DraftlineError::VariationNotFound`]).
+    pub fn clone_workspace_with(
+        remote_url: impl AsRef<str>,
+        path: impl AsRef<Path>,
+        content_policy: ContentPolicy,
+        clone_options: &CloneOptions,
+        options: &mut RemoteOptions<'_>,
+    ) -> Result<Self> {
         ensure_supported_remote_url(remote_url.as_ref())?;
+        let branch = clone_options.branch.as_deref();
+        if let Some(branch) = branch {
+            if !git2::Branch::name_is_valid(branch)? {
+                return Err(DraftlineError::InvalidVariationName(branch.to_string()));
+            }
+        }
         let mut builder = RepoBuilder::new();
+        if let Some(branch) = branch {
+            builder.branch(branch);
+        }
+        if let Some(checkout) = options.clone_checkout() {
+            builder.with_checkout(checkout);
+        }
         let _timeout_guard = options.server_timeout_guard()?;
-        if options.has_network_callbacks() {
+        if options.has_clone_callbacks() {
             let fetch_options = options.clone_fetch_options();
             builder.fetch_options(fetch_options);
         }
-        let repo = builder.clone(remote_url.as_ref(), path.as_ref())?;
+        let repo = match builder.clone(remote_url.as_ref(), path.as_ref()) {
+            Ok(repo) => repo,
+            Err(error)
+                if branch.is_some()
+                    && error.code() == git2::ErrorCode::NotFound
+                    && error.class() == git2::ErrorClass::Reference =>
+            {
+                return Err(DraftlineError::VariationNotFound(
+                    branch.unwrap_or_default().to_string(),
+                ))
+            }
+            Err(error) => return Err(error.into()),
+        };
         // Open the folder the repository's marker names, not its root.
         // The folder may not exist on the cloned branch yet.
         let folder = head_marker_folder(&repo).unwrap_or_default();

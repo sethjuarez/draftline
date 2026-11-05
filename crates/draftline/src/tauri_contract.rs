@@ -16,13 +16,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     merge::MergeConflict, AdoptionPreflightReport, ApplyIncomingReport, ApplyIncomingResult,
-    ChangeSet, ContentPolicy, ContentPolicyAudit, ContributorProfile, CurrentFileDiff,
-    CurrentFilePreview, DirtySummary, DraftlineError, FilteredFile, FolderFix, FolderMove,
-    FolderProbe, HistoryEntry, MergeConflictResolution, MergeIncomingReport, MergeIncomingResult,
-    MergeIncomingToken, MergeResolutionChoice, OperationLockInspection, PathHistory,
-    PathHistoryOptions, PreflightReport, PreviewFile, ProjectSettings, ProjectSettingsUpdate,
-    PublishPreflight, PublishResult, RecoveryRepairResult, RecoveryState, RemoteCredential,
-    RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVariation,
+    ChangeSet, CloneOptions, CloneProgress, ContentPolicy, ContentPolicyAudit, ContributorProfile,
+    CurrentFileDiff, CurrentFilePreview, DirtySummary, DraftlineError, FilteredFile, FolderFix,
+    FolderMove, FolderProbe, HistoryEntry, MergeConflictResolution, MergeIncomingReport,
+    MergeIncomingResult, MergeIncomingToken, MergeResolutionChoice, OperationLockInspection,
+    PathHistory, PathHistoryOptions, PreflightReport, PreviewFile, ProjectSettings,
+    ProjectSettingsUpdate, PublishPreflight, PublishResult, RecoveryRepairResult, RecoveryState,
+    RemoteCredential, RemoteCredentialRequest, RemoteEndpoint, RemoteOptions, RemoteVariation,
     RemoteVariationDiagnostics, RestoreVersionTarget, Result, Shelf, ShelfApplyReport, SupportRef,
     SupportRefScope, SwitchPolicy, SyncState, SyncStatus, Variation, VariationCreatePreflight,
     VariationCreateToken, VariationId, VariationMetadata, VariationRenamePreflight,
@@ -37,6 +37,7 @@ use crate::{
 type CredentialProvider<'callbacks> =
     dyn FnMut(RemoteCredentialRequest<'_>) -> Result<RemoteCredential> + Send + 'callbacks;
 type EventSink<'callbacks> = dyn FnMut(DraftlineEvent) + Send + 'callbacks;
+type CloneProgressSink<'callbacks> = dyn FnMut(CloneProgressEvent) + Send + 'callbacks;
 
 /// Reusable host-side configuration for Draftline command adapters.
 ///
@@ -51,6 +52,7 @@ pub struct DraftlineCommandContext<'callbacks> {
     next_event_sequence: u64,
     variation_namespace: Option<String>,
     event_defer_timeout: Duration,
+    clone_progress_sink: Option<Mutex<Box<CloneProgressSink<'callbacks>>>>,
 }
 
 /// How long an event waits by default for another running operation to
@@ -106,6 +108,10 @@ impl fmt::Debug for DraftlineCommandContext<'_> {
             .field("next_event_sequence", &self.next_event_sequence)
             .field("variation_namespace", &self.variation_namespace)
             .field("event_defer_timeout", &self.event_defer_timeout)
+            .field(
+                "has_clone_progress_sink",
+                &self.clone_progress_sink.is_some(),
+            )
             .finish()
     }
 }
@@ -120,6 +126,7 @@ impl<'callbacks> Default for DraftlineCommandContext<'callbacks> {
             next_event_sequence: 1,
             variation_namespace: None,
             event_defer_timeout: DEFAULT_EVENT_DEFER_TIMEOUT,
+            clone_progress_sink: None,
         }
     }
 }
@@ -151,6 +158,17 @@ impl<'callbacks> DraftlineCommandContext<'callbacks> {
 
     pub fn with_event_sink(mut self, sink: impl FnMut(DraftlineEvent) + Send + 'callbacks) -> Self {
         self.event_sink = Some(Box::new(sink));
+        self
+    }
+
+    /// Receives [`CloneProgressEvent`]s while
+    /// [`clone_workspace_with_options_with_context`] runs. Tauri hosts
+    /// usually emit them as [`CLONE_PROGRESS_EVENT`].
+    pub fn with_clone_progress_sink(
+        mut self,
+        sink: impl FnMut(CloneProgressEvent) + Send + 'callbacks,
+    ) -> Self {
+        self.clone_progress_sink = Some(Mutex::new(Box::new(sink)));
         self
     }
 
@@ -414,6 +432,31 @@ fn default_graph_radius() -> usize {
 pub struct CloneWorkspaceRequest {
     pub remote_url: String,
     pub workspace_path: PathBuf,
+}
+
+/// Request for cloning with options. `progress_id` is echoed in every
+/// [`CloneProgressEvent`] so a frontend can tell its clone's progress apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneWorkspaceWithOptionsRequest {
+    pub remote_url: String,
+    pub workspace_path: PathBuf,
+    /// The branch to check out instead of the remote's default.
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub progress_id: Option<String>,
+}
+
+/// The event name Tauri hosts emit [`CloneProgressEvent`]s under.
+pub const CLONE_PROGRESS_EVENT: &str = "draftline://clone_progress";
+
+/// One clone progress report, for the host to forward to its frontend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneProgressEvent {
+    pub progress_id: Option<String>,
+    pub workspace_path: PathBuf,
+    #[serde(flatten)]
+    pub progress: CloneProgress,
 }
 
 /// Result returned after opening, cloning, or adopting a workspace.
@@ -1223,6 +1266,65 @@ pub fn clone_workspace_with_context(
     Ok(WorkspaceOpenResult {
         diagnostics: workspace_diagnostics(&workspace)?,
     })
+}
+
+/// Clones a workspace with options such as the branch to check out.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn clone_workspace_with_options(
+    request: CloneWorkspaceWithOptionsRequest,
+) -> Result<WorkspaceOpenResult> {
+    clone_workspace_with_options_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Clones a workspace with options, using the context's credentials and
+/// reporting progress to its clone progress sink.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn clone_workspace_with_options_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: CloneWorkspaceWithOptionsRequest,
+) -> Result<WorkspaceOpenResult> {
+    let content_policy = context.content_policy.clone();
+    let mut clone_options = CloneOptions::new();
+    if let Some(branch) = request.branch {
+        clone_options = clone_options.with_branch(branch);
+    }
+    let workspace = {
+        let mut options = context.remote_options();
+        if let Some(sink) = context.clone_progress_sink.as_ref() {
+            let progress_id = request.progress_id.clone();
+            let workspace_path = request.workspace_path.clone();
+            options = options.with_progress(move |progress| {
+                if let Ok(mut sink) = sink.lock() {
+                    sink(CloneProgressEvent {
+                        progress_id: progress_id.clone(),
+                        workspace_path: workspace_path.clone(),
+                        progress: *progress,
+                    });
+                }
+            });
+        }
+        Workspace::clone_workspace_with(
+            request.remote_url,
+            &request.workspace_path,
+            content_policy,
+            &clone_options,
+            &mut options,
+        )?
+    };
+    let workspace = context.namespaced(workspace)?;
+    let result = WorkspaceOpenResult {
+        diagnostics: workspace_diagnostics(&workspace)?,
+    };
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(result)
 }
 
 /// Adopts an existing Git repository as a Draftline workspace.

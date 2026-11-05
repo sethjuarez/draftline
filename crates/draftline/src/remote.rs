@@ -1,5 +1,7 @@
 use std::{
-    path::PathBuf,
+    cell::RefCell,
+    path::{Path, PathBuf},
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, MutexGuard,
@@ -170,6 +172,124 @@ pub struct RemoteOptions<'callbacks> {
     timeout: Option<Duration>,
     lfs_timeout: Option<Duration>,
     timed_out: Arc<AtomicBool>,
+    progress: Option<Rc<RefCell<ProgressReporter<'callbacks>>>>,
+}
+
+/// What to clone, for [`Workspace::clone_workspace_with`]. Network
+/// behavior (credentials, timeouts, progress) stays in [`RemoteOptions`].
+///
+/// A clone is always full, so later updates can find a merge base.
+///
+/// [`Workspace::clone_workspace_with`]: crate::Workspace::clone_workspace_with
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CloneOptions {
+    /// The branch to check out instead of the remote's default.
+    pub branch: Option<String>,
+}
+
+impl CloneOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Checks out `branch` instead of the remote's default branch.
+    pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
+        self.branch = Some(branch.into());
+        self
+    }
+}
+
+/// The stage a clone is in, as [`CloneProgress`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CloneStage {
+    /// Downloading objects: `completed` of `total` objects.
+    Receiving,
+    /// Resolving deltas in what was downloaded: `completed` of `total`.
+    Resolving,
+    /// Writing files into the new folder: `completed` of `total` files.
+    CheckingOut,
+}
+
+/// How far a clone has got, for a progress bar. Reported through
+/// [`RemoteOptions::with_progress`]; `total` can be 0 before the stage
+/// knows its size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CloneProgress {
+    pub stage: CloneStage,
+    pub completed: u64,
+    pub total: u64,
+    /// Bytes downloaded so far, across every stage.
+    pub received_bytes: u64,
+}
+
+type ProgressCallback<'callbacks> = dyn FnMut(&CloneProgress) + 'callbacks;
+
+/// The shortest gap between two reports within the same stage.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Hands progress to the host's callback, at most once per
+/// [`PROGRESS_INTERVAL`] within a stage, but always on a new stage and when
+/// a stage finishes, so a progress bar neither floods nor stalls.
+struct ProgressReporter<'callbacks> {
+    callback: Box<ProgressCallback<'callbacks>>,
+    last: Option<(CloneStage, Instant)>,
+    finished: Option<(CloneStage, u64)>,
+    received_bytes: u64,
+}
+
+impl ProgressReporter<'_> {
+    fn report(&mut self, stage: CloneStage, completed: u64, total: u64) {
+        let done = total > 0 && completed >= total;
+        // A finished stage is reported once, however often libgit2 repeats it.
+        if done && self.finished == Some((stage, total)) {
+            return;
+        }
+        let now = Instant::now();
+        let due = match self.last {
+            Some((last_stage, at)) => {
+                last_stage != stage || done || now.duration_since(at) >= PROGRESS_INTERVAL
+            }
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.last = Some((stage, now));
+        if done {
+            self.finished = Some((stage, total));
+        }
+        (self.callback)(&CloneProgress {
+            stage,
+            completed,
+            total,
+            received_bytes: self.received_bytes,
+        });
+    }
+
+    fn transfer(&mut self, stats: &git2::Progress<'_>) {
+        self.received_bytes = stats.received_bytes() as u64;
+        if stats.total_deltas() > 0 && stats.received_objects() == stats.total_objects() {
+            if matches!(self.last, Some((CloneStage::Receiving, _))) {
+                let total = stats.total_objects() as u64;
+                self.report(CloneStage::Receiving, total, total);
+            }
+            self.report(
+                CloneStage::Resolving,
+                stats.indexed_deltas() as u64,
+                stats.total_deltas() as u64,
+            );
+        } else {
+            self.report(
+                CloneStage::Receiving,
+                stats.received_objects() as u64,
+                stats.total_objects() as u64,
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +374,7 @@ impl Default for RemoteOptions<'_> {
             timeout: None,
             lfs_timeout: None,
             timed_out: Arc::new(AtomicBool::new(false)),
+            progress: None,
         }
     }
 }
@@ -319,6 +440,19 @@ impl<'callbacks> RemoteOptions<'callbacks> {
         self
     }
 
+    /// Reports a clone's progress (downloading, resolving, then writing
+    /// files) to `callback`, throttled to about ten reports a second per
+    /// stage. Only clones report progress; fetch and publish ignore it.
+    pub fn with_progress(mut self, callback: impl FnMut(&CloneProgress) + 'callbacks) -> Self {
+        self.progress = Some(Rc::new(RefCell::new(ProgressReporter {
+            callback: Box::new(callback),
+            last: None,
+            finished: None,
+            received_bytes: 0,
+        })));
+        self
+    }
+
     pub(crate) fn lfs_timeout(&self) -> Option<Duration> {
         self.lfs_timeout
     }
@@ -375,7 +509,28 @@ impl<'callbacks> RemoteOptions<'callbacks> {
     }
 
     pub(crate) fn clone_fetch_options(&mut self) -> git2::FetchOptions<'_> {
-        self.fetch_options("clone_workspace")
+        let progress = self.progress.clone();
+        let mut options = git2::FetchOptions::new();
+        options.remote_callbacks(self.remote_callbacks_with("clone_workspace", progress));
+        options
+    }
+
+    /// Whether a clone should hand libgit2 its fetch options.
+    pub(crate) fn has_clone_callbacks(&self) -> bool {
+        self.has_network_callbacks() || self.progress.is_some()
+    }
+
+    /// A checkout that reports [`CloneStage::CheckingOut`], when progress
+    /// is wanted.
+    pub(crate) fn clone_checkout(&self) -> Option<git2::build::CheckoutBuilder<'callbacks>> {
+        let progress = self.progress.clone()?;
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout.progress(move |_path: Option<&Path>, completed, total| {
+            progress
+                .borrow_mut()
+                .report(CloneStage::CheckingOut, completed as u64, total as u64);
+        });
+        Some(checkout)
     }
 
     pub(crate) fn has_network_callbacks(&self) -> bool {
@@ -433,16 +588,31 @@ impl<'callbacks> RemoteOptions<'callbacks> {
         &mut self,
         operation: &'static str,
     ) -> git2::RemoteCallbacks<'_> {
+        self.remote_callbacks_with(operation, None)
+    }
+
+    fn remote_callbacks_with(
+        &mut self,
+        operation: &'static str,
+        progress: Option<Rc<RefCell<ProgressReporter<'callbacks>>>>,
+    ) -> git2::RemoteCallbacks<'_> {
         let mut callbacks = git2::RemoteCallbacks::new();
         self.timed_out.store(false, Ordering::SeqCst);
         let deadline = self
             .timeout
             .map(|timeout| RemoteTimeoutDeadline::new(operation, timeout));
 
-        if let Some(deadline) = deadline {
+        if deadline.is_some() || progress.is_some() {
             let timed_out = Arc::clone(&self.timed_out);
-            callbacks.transfer_progress(move |_| !deadline.mark_if_expired(&timed_out));
+            callbacks.transfer_progress(move |stats| {
+                if let Some(progress) = &progress {
+                    progress.borrow_mut().transfer(&stats);
+                }
+                deadline.is_none_or(|deadline| !deadline.mark_if_expired(&timed_out))
+            });
+        }
 
+        if let Some(deadline) = deadline {
             let timed_out = Arc::clone(&self.timed_out);
             callbacks.sideband_progress(move |_| !deadline.mark_if_expired(&timed_out));
 

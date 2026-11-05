@@ -13,6 +13,7 @@ export interface DraftlineClientOptions {
   invoke?: DraftlineInvoke;
   listen?: DraftlineListen;
   workspaceEventName?: string;
+  cloneProgressEventName?: string;
   onCommandStart?: (command: string, args?: Record<string, unknown>) => void;
   onCommandSuccess?: (command: string, result: unknown) => void;
   onCommandError?: (command: string, error: unknown) => void;
@@ -29,6 +30,15 @@ export interface DraftlineClient {
     request: InitProjectInRepositoryRequest,
   ): Promise<InitProjectInRepositoryResult>;
   cloneWorkspace(request: CloneWorkspaceRequest): Promise<WorkspaceOpenResult>;
+  /**
+   * Clones with options such as the branch to check out. With `onProgress`,
+   * listens for this clone's `draftline://clone_progress` events (matched by
+   * `progress_id`, generated when absent) until the clone settles.
+   */
+  cloneWorkspaceWithOptions(
+    request: CloneWorkspaceWithOptionsRequest,
+    onProgress?: (progress: CloneProgressEvent) => void,
+  ): Promise<WorkspaceOpenResult>;
   adoptWorkspace(workspacePath: string): Promise<AdoptWorkspaceResult>;
   inspectWorkspace(workspacePath: string): Promise<WorkspaceDiagnostics>;
   verifyWorkspace(workspacePath: string): Promise<WorkspaceVerification>;
@@ -141,6 +151,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
   const invoke = options.invoke ?? invokeDraftline;
   const listen = options.listen ?? tauriListen;
   const workspaceEventName = options.workspaceEventName ?? 'draftline://workspace_event';
+  const cloneProgressEventName = options.cloneProgressEventName ?? CLONE_PROGRESS_EVENT;
 
   async function run<T>(command: string, args?: Record<string, unknown>): Promise<T> {
     options.onCommandStart?.(command, args);
@@ -160,6 +171,24 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
       }),
     cloneWorkspace: (request) => run('clone_workspace', { request }),
+    cloneWorkspaceWithOptions: async (request, onProgress) => {
+      if (!onProgress) {
+        return run('clone_workspace_with_options', { request });
+      }
+      const progressId = request.progress_id ?? newProgressId();
+      const unlisten = await listen<CloneProgressEvent>(cloneProgressEventName, (event) => {
+        if (event.payload.progress_id === progressId) {
+          onProgress(event.payload);
+        }
+      });
+      try {
+        return await run<WorkspaceOpenResult>('clone_workspace_with_options', {
+          request: { ...request, progress_id: progressId },
+        });
+      } finally {
+        unlisten();
+      }
+    },
     adoptWorkspace: (workspacePath) =>
       run('adopt_workspace', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
@@ -1316,6 +1345,33 @@ export interface CloneWorkspaceRequest extends WorkspaceRequest {
   remote_url: string;
 }
 
+export const CLONE_PROGRESS_EVENT = 'draftline://clone_progress';
+
+export interface CloneWorkspaceWithOptionsRequest extends CloneWorkspaceRequest {
+  /** The branch to check out instead of the remote's default. */
+  branch?: string | null;
+  /** Echoed in every progress event for this clone. */
+  progress_id?: string | null;
+}
+
+export type CloneStage = 'receiving' | 'resolving' | 'checking_out';
+
+export interface CloneProgressEvent {
+  progress_id: string | null;
+  workspace_path: string;
+  stage: CloneStage;
+  /** Objects, deltas or files done in this stage. */
+  completed: number;
+  /** 0 until the stage knows its size. */
+  total: number;
+  received_bytes: number;
+}
+
+function newProgressId(): string {
+  const random = globalThis.crypto?.randomUUID?.();
+  return random ?? `clone-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 export interface ListSupportRefsRequest extends WorkspaceRequest {
   scope: SupportRefScope;
 }
@@ -1910,6 +1966,13 @@ export function createWholeFileUseContentResolutions(
 
 export async function openWorkspace(workspacePath: string): Promise<WorkspaceOpenResult> {
   return createDraftlineClient().openWorkspace(workspacePath);
+}
+
+export async function cloneWorkspaceWithOptions(
+  request: CloneWorkspaceWithOptionsRequest,
+  onProgress?: (progress: CloneProgressEvent) => void,
+): Promise<WorkspaceOpenResult> {
+  return createDraftlineClient().cloneWorkspaceWithOptions(request, onProgress);
 }
 
 export async function cloneWorkspace(
