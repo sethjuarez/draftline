@@ -25,6 +25,9 @@ export interface DraftlineClient {
   moveFolder(request: MoveFolderRequest): Promise<MoveFolderResult>;
   projectSettings(request: WorkspaceRequest): Promise<ProjectSettings>;
   updateProjectSettings(request: UpdateProjectSettingsRequest): Promise<ProjectSettings>;
+  initProjectInRepository(
+    request: InitProjectInRepositoryRequest,
+  ): Promise<InitProjectInRepositoryResult>;
   cloneWorkspace(request: CloneWorkspaceRequest): Promise<WorkspaceOpenResult>;
   adoptWorkspace(workspacePath: string): Promise<AdoptWorkspaceResult>;
   inspectWorkspace(workspacePath: string): Promise<WorkspaceDiagnostics>;
@@ -176,6 +179,7 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     moveFolder: (request) => run('move_folder', { request }),
     projectSettings: (request) => run('project_settings', { request }),
     updateProjectSettings: (request) => run('update_project_settings', { request }),
+    initProjectInRepository: (request) => run('init_project_in_repository', { request }),
     verifyWorkspace: (workspacePath) =>
       run('verify_workspace', {
         request: { workspace_path: workspacePath } satisfies WorkspaceRequest,
@@ -955,6 +959,26 @@ export interface ProjectSettings {
    * with `{subject}` standing for the version name, e.g. `docs(demo): {subject}`.
    */
   commit_template: string | null;
+}
+
+/**
+ * Creates a project folder named after `name` (lowercase letters, digits and
+ * hyphens) inside `parent_path`, a folder in an existing repository. Nothing
+ * is committed; the first save commits `.draftline`. Fails with
+ * `not_a_repository`, `folder_is_elsewhere` or `folder_not_empty`.
+ */
+export interface InitProjectInRepositoryRequest {
+  parent_path: string;
+  name: string;
+  base_branch?: string | null;
+  commit_template?: string | null;
+}
+
+export interface InitProjectInRepositoryResult {
+  /** The new project folder; open it with this path from now on. */
+  workspace_path: string;
+  settings: ProjectSettings;
+  diagnostics: WorkspaceDiagnostics;
 }
 
 /** Replaces the recorded settings; `null` or a missing field clears it. */
@@ -2192,6 +2216,12 @@ export async function moveFolder(request: MoveFolderRequest): Promise<MoveFolder
 
 export async function projectSettings(request: WorkspaceRequest): Promise<ProjectSettings> {
   return createDraftlineClient().projectSettings(request);
+}
+
+export async function initProjectInRepository(
+  request: InitProjectInRepositoryRequest,
+): Promise<InitProjectInRepositoryResult> {
+  return createDraftlineClient().initProjectInRepository(request);
 }
 
 export async function updateProjectSettings(

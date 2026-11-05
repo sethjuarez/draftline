@@ -684,6 +684,18 @@ fn project_settings(
 }
 
 #[tauri::command]
+fn init_project_in_repository(
+    state: tauri::State<'_, DraftlineContextState>,
+    request: contract::InitProjectInRepositoryRequest,
+) -> TauriCommandResult<contract::InitProjectInRepositoryResult> {
+    let mut context = lock_context(state.inner())?;
+    contract::into_tauri_result(contract::init_project_in_repository_with_context(
+        &mut context,
+        request,
+    ))
+}
+
+#[tauri::command]
 fn update_project_settings(
     state: tauri::State<'_, DraftlineContextState>,
     request: contract::UpdateProjectSettingsRequest,
@@ -947,6 +959,7 @@ fn main() {    let _ = tracing_subscriber::registry()
             move_folder,
             project_settings,
             update_project_settings,
+            init_project_in_repository,
             dismiss_legacy_history_cleanup,
             selected_save,
             selected_shelve,

@@ -199,6 +199,14 @@ pub enum DraftlineError {
     #[error("cannot move the Draftline folder: {0}")]
     FolderMoveRefused(String),
 
+    /// The folder isn't inside a Git repository with a working tree.
+    #[error("{} is not inside a Git repository", .0.display())]
+    NotARepository(std::path::PathBuf),
+
+    /// A new project's folder already exists and has files in it.
+    #[error("{} already exists and isn't empty; choose another name", workspace_folder(.0))]
+    FolderNotEmpty(std::path::PathBuf),
+
     /// A project setting for `.draftline` isn't valid; the text says why.
     #[error("invalid project settings: {0}")]
     InvalidProjectSettings(String),

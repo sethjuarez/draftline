@@ -288,6 +288,10 @@ describe('createDraftlineClient', () => {
     await client.probeFolder('C:\\repo\\cutready');
     await client.applyFolderFix('C:\\repo\\cutready', { action: 'switch_to_branch', branch: 'main' });
     await client.moveFolder({ workspace_path: 'C:\\repo\\cutready', to: 'demos' });
+    await client.initProjectInRepository({ parent_path: 'C:\\repo', name: 'Q3 Demo' });
+    expect(invoke).toHaveBeenCalledWith('init_project_in_repository', {
+      request: { parent_path: 'C:\\repo', name: 'Q3 Demo' },
+    });
     await client.dismissLegacyHistoryCleanup({ workspace_path: 'C:\\repo', plan_id: 'plan-1' });
     await client.startVariationHere({ workspace_path: 'C:\\repo', name: 'cutready/rescue' });
     await client.filteredFiles({ workspace_path: 'C:\\repo', paths: ['cutready/shot.png'] });
