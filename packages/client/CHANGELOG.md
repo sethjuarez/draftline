@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/sethjuarez/draftline/compare/client-v0.7.0...client-v0.8.0) (2026-11-05)
+
+
+### Features
+
+* **workspace:** read raw file bytes from a version ([#73](https://github.com/sethjuarez/draftline/issues/73)) ([d9b2e1c](https://github.com/sethjuarez/draftline/commit/d9b2e1c29fd5d76f9313f4ec441632d4a70c4258))
+
 ## [0.7.0](https://github.com/sethjuarez/draftline/compare/client-v0.6.0...client-v0.7.0) (2026-11-05)
 
 
