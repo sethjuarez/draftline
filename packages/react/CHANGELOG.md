@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.8](https://github.com/sethjuarez/draftline/compare/react-v0.4.7...react-v0.4.8) (2026-11-05)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @draftline/client bumped from 0.10.0 to 0.11.0
+
 ## [0.4.7](https://github.com/sethjuarez/draftline/compare/react-v0.4.6...react-v0.4.7) (2026-11-05)
 
 

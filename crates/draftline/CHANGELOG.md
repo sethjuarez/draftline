@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.15.0...draftline-v0.16.0) (2026-11-05)
+
+
+### Features
+
+* **workspace:** report each version's original author time ([#85](https://github.com/sethjuarez/draftline/issues/85)) ([22d75c6](https://github.com/sethjuarez/draftline/commit/22d75c6c73bebf932327703411d54e36e8c1e8b2))
+
 ## [0.15.0](https://github.com/sethjuarez/draftline/compare/draftline-v0.14.0...draftline-v0.15.0) (2026-11-05)
 
 
