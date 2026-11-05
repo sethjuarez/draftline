@@ -112,6 +112,9 @@ from `preflight_merge_incoming` or `preflight_merge_base`. It refuses with
 local merges, `merge_variation_with_resolutions` with empty `resolutions` is the
 token-pinned clean path.
 
+`sync_status.ahead` counts only versions no remote-tracking branch already has
+when the variation has no upstream yet (`no_remote_version`).
+
 Merging one local variation into the current one follows the same shape without
 a remote: `preflight_merge_variation` (read-only; `source_variation_id`) returns a
 `MergeIncomingReport` whose `sync_status.variation` is the source and whose token

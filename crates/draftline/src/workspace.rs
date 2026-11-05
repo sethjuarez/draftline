@@ -10070,7 +10070,7 @@ impl Workspace {
         let remote_ref = format!("refs/remotes/{remote}/{variation}");
 
         let Ok(remote_oid) = self.repo.refname_to_id(&remote_ref) else {
-            let ahead = self.local_version_count(local)?;
+            let ahead = self.unshared_version_count(&remote, local)?;
             let base_renamed_from = self
                 .default_branch_on(&remote)
                 .and_then(|base| self.base_renamed_from(&remote, &base))
@@ -13421,9 +13421,12 @@ impl Workspace {
         Ok(Some(self.repo.find_blob(entry.id())?.content().to_vec()))
     }
 
-    fn local_version_count(&self, local: Oid) -> Result<usize> {
+    /// Versions on `local` that no branch fetched from `remote` has: what a
+    /// first send would share. All of history when nothing was fetched.
+    fn unshared_version_count(&self, remote: &str, local: Oid) -> Result<usize> {
         let mut walk = self.repo.revwalk()?;
         walk.push(local)?;
+        walk.hide_glob(&format!("refs/remotes/{remote}/*"))?;
         Ok(walk.count())
     }
 

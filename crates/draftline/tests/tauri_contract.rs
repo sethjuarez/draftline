@@ -1325,6 +1325,22 @@ fn tauri_contract_pinned_merge_refuses_conflicts_and_local_tokens() {
 }
 
 #[test]
+fn sync_status_counts_only_unshared_versions_without_a_tracking_branch() {
+    let (_remote, _author_dir, author, _teammate_dir, _teammate) = diverged_clean_pair();
+    let variation = author.create_variation("draft").unwrap();
+    author
+        .switch_variation(variation.id(), draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    write_file(author.root(), "draft.md", b"draft");
+    author.save_version("Draft").unwrap();
+
+    let status = author.sync_status("origin").unwrap();
+    assert_eq!(status.state, SyncState::NoRemoteVersion);
+    // Base is on origin/main; Mine and Draft are not.
+    assert_eq!(status.ahead, 2);
+}
+
+#[test]
 fn tauri_contract_rejects_stale_merge_resolution_token() {
     let remote_dir = tempfile::tempdir().unwrap();
     init_bare_remote(remote_dir.path());
