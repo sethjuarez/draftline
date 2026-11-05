@@ -184,6 +184,14 @@ If that operation emits its own event of the same kind in the same process,
 the waiting event is dropped (unless it carries a sync status), so the host
 sees one event, after the files are written.
 
+Reads of unsaved work (`changed_files`, `changes`, `diff_version_to_workspace`,
+`diff_workspace_file`) tolerate files that change or vanish mid-scan, as editors
+that save atomically cause. They rescan for up to about 0.6 seconds; the
+rescan reports the file's new state (changed, deleted, or gone). On the last
+attempt a file still changing is left out of the patch text but stays listed.
+Only a file rewritten continuously for longer than that surfaces the Git
+error.
+
 Treat `ContributorProfile` as product identity and service attribution, not as a
 Git configuration screen. The host should derive `author` from the signed-in
 product user, `saved_by` from the actor that initiated the save, and optional
