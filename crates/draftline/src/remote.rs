@@ -178,7 +178,7 @@ pub struct RemoteOptions<'callbacks> {
 /// What to clone, for [`Workspace::clone_workspace_with`]. Network
 /// behavior (credentials, timeouts, progress) stays in [`RemoteOptions`].
 ///
-/// A clone is always full, so later updates can find a merge base.
+/// A clone is never shallow, so later updates can find a merge base.
 ///
 /// [`Workspace::clone_workspace_with`]: crate::Workspace::clone_workspace_with
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -186,6 +186,10 @@ pub struct RemoteOptions<'callbacks> {
 pub struct CloneOptions {
     /// The branch to check out instead of the remote's default.
     pub branch: Option<String>,
+    /// Download file contents only for the checkout, leaving older versions'
+    /// files on the remote (`git clone --filter=blob:none`). See
+    /// [`CloneOptions::with_blobless`].
+    pub blobless: bool,
 }
 
 impl CloneOptions {
@@ -196,6 +200,25 @@ impl CloneOptions {
     /// Checks out `branch` instead of the remote's default branch.
     pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
         self.branch = Some(branch.into());
+        self
+    }
+
+    /// Asks for a blobless clone: all of history (commits and folders), but
+    /// file contents only for what is checked out. It needs the `git`
+    /// executable, which downloads other contents when something reads them.
+    /// The clone is full without `git`, for SSH remotes (which could prompt),
+    /// and when the host's credentials can't be handed to `git` (anything but
+    /// a username and password). `git` never prompts, and the configured
+    /// credential helpers neither read nor store the host's login.
+    ///
+    /// Draftline itself reads repositories through libgit2, which cannot
+    /// download missing contents, so in a blobless clone, reading an older
+    /// version's file that was never checked out fails until `git` has
+    /// fetched it. Check with [`Workspace::is_partial_clone`].
+    ///
+    /// [`Workspace::is_partial_clone`]: crate::Workspace::is_partial_clone
+    pub fn with_blobless(mut self, blobless: bool) -> Self {
+        self.blobless = blobless;
         self
     }
 }
@@ -451,6 +474,52 @@ impl<'callbacks> RemoteOptions<'callbacks> {
             received_bytes: 0,
         })));
         self
+    }
+
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    /// What the host's credential callback (if any) gives for `url`, asked
+    /// up front for a clone run by `git` rather than libgit2. Only a username
+    /// and password can be handed to `git`.
+    pub(crate) fn credentials_for(&mut self, url: &str) -> Option<Result<RemoteCredential>> {
+        let callback = self.credentials.as_mut()?;
+        let authority = url
+            .split_once("://")
+            .map_or("", |(_, rest)| rest.split('/').next().unwrap_or(""));
+        let username_from_url = authority
+            .rsplit_once('@')
+            .map(|(userinfo, _)| userinfo.split(':').next().unwrap_or(userinfo))
+            .filter(|username| !username.is_empty());
+        Some(callback(RemoteCredentialRequest {
+            url,
+            username_from_url,
+            allows_default: false,
+            allows_username_password: true,
+            allows_ssh_key: false,
+        }))
+    }
+
+    pub(crate) fn has_credentials(&self) -> bool {
+        self.credentials.is_some()
+    }
+
+    /// Reports clone progress read from somewhere other than libgit2.
+    pub(crate) fn report_progress(
+        &self,
+        stage: CloneStage,
+        completed: u64,
+        total: u64,
+        received_bytes: Option<u64>,
+    ) {
+        if let Some(progress) = &self.progress {
+            let mut progress = progress.borrow_mut();
+            if let Some(bytes) = received_bytes {
+                progress.received_bytes = bytes;
+            }
+            progress.report(stage, completed, total);
+        }
     }
 
     pub(crate) fn lfs_timeout(&self) -> Option<Duration> {
@@ -725,6 +794,26 @@ fn credential_to_git(credential: RemoteCredential) -> Result<git2::Cred> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_git_clone_asks_for_a_login_with_the_url_username() {
+        for (url, expected) in [
+            ("https://octo:pw@example.test/repo.git", Some("octo")),
+            ("https://octo@example.test/repo.git", Some("octo")),
+            ("https://example.test/a@b/repo.git", None),
+            ("https://example.test/repo.git", None),
+        ] {
+            let mut seen = None;
+            let mut options = RemoteOptions::new().with_credentials(|request| {
+                assert!(!request.allows_default && !request.allows_ssh_key);
+                seen = Some(request.username_from_url.map(str::to_string));
+                Ok(RemoteCredential::Default)
+            });
+            options.credentials_for(url).unwrap().unwrap();
+            drop(options);
+            assert_eq!(seen.unwrap().as_deref(), expected, "{url}");
+        }
+    }
     use git2::{Repository, Signature, Version};
 
     fn commit_file(repo: &Repository, path: &str, content: &[u8], message: &str) -> Oid {

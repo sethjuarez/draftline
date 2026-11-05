@@ -445,6 +445,10 @@ pub struct CloneWorkspaceWithOptionsRequest {
     pub branch: Option<String>,
     #[serde(default)]
     pub progress_id: Option<String>,
+    /// A blobless clone (`git clone --filter=blob:none`), falling back to a
+    /// full clone; see [`CloneOptions::with_blobless`].
+    #[serde(default)]
+    pub blobless: bool,
 }
 
 /// The event name Tauri hosts emit [`CloneProgressEvent`]s under.
@@ -1296,6 +1300,7 @@ pub fn clone_workspace_with_options_with_context(
     if let Some(branch) = request.branch {
         clone_options = clone_options.with_branch(branch);
     }
+    clone_options = clone_options.with_blobless(request.blobless);
     let workspace = {
         let mut options = context.remote_options();
         if let Some(sink) = context.clone_progress_sink.as_ref() {

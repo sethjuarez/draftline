@@ -262,3 +262,202 @@ fn contract_clones_a_branch_and_reports_progress_with_its_id() {
         .unwrap_err();
     assert_eq!(error.code, "variation_not_found");
 }
+/// `source_repo`, with a second version of `src/file0.rs` on `main`, served
+/// so that `git` may filter what it sends.
+fn history_repo() -> (tempfile::TempDir, git2::Oid) {
+    let source = source_repo();
+    let repo = git2::Repository::open(source.path()).unwrap();
+    let old = repo.revparse_single("main:src/file0.rs").unwrap().id();
+    commit_files(
+        &repo,
+        "main",
+        &[("src/file0.rs", "// 0, again\n")],
+        "Change",
+    );
+    repo.config()
+        .unwrap()
+        .set_bool("uploadpack.allowFilter", true)
+        .unwrap();
+    (source, old)
+}
+
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[test]
+fn a_blobless_clone_downloads_only_what_it_checks_out() {
+    if !git_available() {
+        eprintln!("skipped: no git");
+        return;
+    }
+    let (source, old) = history_repo();
+    let target = tempfile::tempdir().unwrap();
+    let path = target.path().join("clone");
+    let reports = Arc::new(Mutex::new(Vec::<CloneProgress>::new()));
+    let seen = Arc::clone(&reports);
+    let mut options =
+        RemoteOptions::new().with_progress(move |progress| seen.lock().unwrap().push(*progress));
+
+    let workspace = Workspace::clone_workspace_with(
+        file_url(source.path()),
+        &path,
+        ContentPolicy::default(),
+        &CloneOptions::new().with_blobless(true),
+        &mut options,
+    )
+    .unwrap();
+
+    assert!(workspace.is_partial_clone());
+    assert_eq!(
+        std::fs::read_to_string(workspace.root().join("src/file0.rs"))
+            .unwrap()
+            .trim_end(),
+        "// 0, again"
+    );
+    let repo = git2::Repository::open(&path).unwrap();
+    assert!(
+        repo.find_blob(old).is_err(),
+        "older contents stay on the remote"
+    );
+    assert_eq!(
+        workspace.history().unwrap().len(),
+        2,
+        "but all of history is here"
+    );
+    let reports = reports.lock().unwrap();
+    assert!(
+        reports
+            .iter()
+            .any(|report| report.stage == CloneStage::Receiving),
+        "{reports:?}"
+    );
+    let last = reports.last().unwrap();
+    assert_eq!(last.stage, CloneStage::CheckingOut, "{reports:?}");
+    assert_eq!(last.completed, last.total);
+
+    // A branch, through git as well.
+    let branch = Workspace::clone_workspace_with(
+        file_url(source.path()),
+        target.path().join("branch"),
+        ContentPolicy::default(),
+        &CloneOptions::new()
+            .with_branch("cutready/review")
+            .with_blobless(true),
+        &mut RemoteOptions::new(),
+    )
+    .unwrap();
+    assert!(branch.is_partial_clone());
+    assert_eq!(branch.scope(), Path::new("cutready"));
+
+    // A full clone is not partial.
+    let full = Workspace::clone_workspace_with(
+        file_url(source.path()),
+        target.path().join("full"),
+        ContentPolicy::default(),
+        &CloneOptions::new(),
+        &mut RemoteOptions::new(),
+    )
+    .unwrap();
+    assert!(!full.is_partial_clone());
+}
+
+#[test]
+fn a_blobless_clone_refuses_a_missing_branch_and_leaves_nothing() {
+    if !git_available() {
+        eprintln!("skipped: no git");
+        return;
+    }
+    let (source, _) = history_repo();
+    let target = tempfile::tempdir().unwrap();
+    let path = target.path().join("missing");
+    let error = Workspace::clone_workspace_with(
+        file_url(source.path()),
+        &path,
+        ContentPolicy::default(),
+        &CloneOptions::new()
+            .with_branch("cutready/nope")
+            .with_blobless(true),
+        &mut RemoteOptions::new(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        matches!(&error, DraftlineError::VariationNotFound(branch) if branch == "cutready/nope"),
+        "{error:?}"
+    );
+    assert!(!path.exists() || std::fs::read_dir(&path).unwrap().next().is_none());
+
+    let error = Workspace::clone_workspace_with(
+        file_url(&target.path().join("no-such-remote")),
+        target.path().join("elsewhere"),
+        ContentPolicy::default(),
+        &CloneOptions::new().with_blobless(true),
+        &mut RemoteOptions::new(),
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(&error, DraftlineError::Git(_)), "{error:?}");
+}
+
+#[test]
+fn a_blobless_clone_of_a_local_remote_needs_no_credentials() {
+    if !git_available() {
+        eprintln!("skipped: no git");
+        return;
+    }
+    let (source, _) = history_repo();
+    let target = tempfile::tempdir().unwrap();
+    // A local remote never needs a login, so the host isn't asked for one;
+    // an SSH remote or credentials git can't use fall back to libgit2.
+    let asked = std::cell::Cell::new(false);
+    let mut options = RemoteOptions::new().with_credentials(|_| {
+        asked.set(true);
+        Ok(draftline::RemoteCredential::SshAgent {
+            username: "git".to_string(),
+        })
+    });
+    let workspace = Workspace::clone_workspace_with(
+        file_url(source.path()),
+        target.path().join("clone"),
+        ContentPolicy::default(),
+        &CloneOptions::new().with_blobless(true),
+        &mut options,
+    )
+    .unwrap();
+    drop(options);
+    assert!(!asked.get());
+    assert!(workspace.is_partial_clone());
+}
+
+#[test]
+fn contract_asks_for_a_blobless_clone() {
+    if !git_available() {
+        eprintln!("skipped: no git");
+        return;
+    }
+    let (source, _) = history_repo();
+    let target = tempfile::tempdir().unwrap();
+    let path = target.path().join("clone");
+    let request: CloneWorkspaceWithOptionsRequest = serde_json::from_value(serde_json::json!({
+        "remote_url": file_url(source.path()),
+        "workspace_path": path,
+        "blobless": true,
+    }))
+    .unwrap();
+    clone_workspace_with_options_with_context(&mut DraftlineCommandContext::new(), request)
+        .unwrap();
+    // history_repo's second commit on main also carries the marker.
+    assert!(Workspace::open(path.join("cutready"))
+        .unwrap()
+        .is_partial_clone());
+    let request: CloneWorkspaceWithOptionsRequest = serde_json::from_value(serde_json::json!({
+        "remote_url": file_url(source.path()),
+        "workspace_path": path,
+    }))
+    .unwrap();
+    assert!(!request.blobless, "blobless is opt-in");
+}
