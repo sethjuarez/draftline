@@ -137,6 +137,15 @@ pub enum DraftlineError {
     #[error("invalid merge resolution: {0}")]
     InvalidMergeResolution(String),
 
+    /// A merge token was passed to the wrong kind of merge: incoming (remote)
+    /// tokens go to `merge_incoming`, local variation tokens to `merge_variation`.
+    #[error("invalid merge token: {0}")]
+    InvalidMergeToken(String),
+
+    /// The variation being merged in has nothing the current one lacks.
+    #[error("`{0}` has nothing this variation doesn't already have")]
+    NothingToMerge(String),
+
     #[error("cannot tell which branch to send to; pass a base branch")]
     SendBaseUnknown,
 

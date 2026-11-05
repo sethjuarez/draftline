@@ -102,6 +102,19 @@ remote content. Whole-file choices support `use_ours`, `use_theirs`, `use_base`,
 `delete`, or `use_content`; semantic `field_path` conflicts currently require a
 host-produced `use_content` result for the resolved file.
 
+Merging one local variation into the current one follows the same shape without
+a remote: `preflight_merge_variation` (read-only; `source_variation_id`) returns a
+`MergeIncomingReport` whose `sync_status.variation` is the source and whose token
+has `local: true`. `merge_variation` writes a clean merge; conflicts go through
+`merge_variation_with_resolutions` with that token. The label is the full
+version message (`"Name\n\nComment"`). The result is always a two-parent version,
+even when a fast-forward was possible, so the merge stays a named step in
+history. Errors: `preflight_failed` (unsaved changes, hazards, or unresolved
+conflicts), `nothing_to_merge`, `local_state_changed` (either branch moved since
+preflight), `invalid_merge_token` (a remote token on a local merge or the
+reverse), `merge_needs_developer`, `variation_not_found`, and
+`variation_outside_namespace` when a namespaced host names a branch outside it.
+
 The Workbench contract keeps credential handling out of frontend DTOs. Hosts route
 commands through `DraftlineCommandContext` to configure content policy,
 host-provided contributor attribution, backend-only remote credentials, and

@@ -5760,3 +5760,102 @@ fn a_folder_can_be_moved_where_the_host_opened_instead() {
     let tree = repo.head().unwrap().peel_to_tree().unwrap();
     assert!(tree.get_path(Path::new("deck/intro.sk")).is_ok());
 }
+
+#[test]
+fn namespaced_variation_merge_brings_in_content_and_leaves_developer_branches_alone() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/login", &head, false).unwrap();
+    let review = workspace.create_variation("cutready/review").unwrap();
+    workspace
+        .switch_variation(review.id(), draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, reviewed\n");
+    workspace.save_version("Review intro").unwrap();
+    workspace
+        .switch_variation(
+            &draftline::VariationId::from("main"),
+            draftline::SwitchPolicy::AbortIfDirty,
+        )
+        .unwrap();
+    write_file(temp.path(), "src/main.rs", "fn main() { login() }\n");
+    let dev_tip = commit_all(&repo, "Dev: login");
+    write_file(
+        temp.path(),
+        "src/main.rs",
+        "fn main() { login(); /* wip */ }\n",
+    );
+
+    let error = workspace
+        .preflight_merge_variation(&draftline::VariationId::from("feature/login"))
+        .unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::VariationOutsideNamespace(_)),
+        "{error:?}"
+    );
+
+    let preflight = workspace
+        .preflight_merge_variation(&draftline::VariationId::from("cutready/review"))
+        .unwrap();
+    assert!(preflight.dirty_files.is_empty(), "code edits are not ours");
+    let merged = workspace
+        .merge_variation(
+            preflight.token.unwrap(),
+            "Merge review\n\nTake the new intro",
+        )
+        .unwrap();
+
+    assert_eq!(merged.version.label, "Merge review");
+    let tip = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(tip.parent_id(0).unwrap(), dev_tip);
+    assert_eq!(tip.parent_count(), 2);
+    assert_eq!(
+        read(temp.path(), "cutready/intro.sk"),
+        "scene one, reviewed\n"
+    );
+    assert_eq!(
+        read(temp.path(), "src/main.rs"),
+        "fn main() { login(); /* wip */ }\n"
+    );
+
+    // The base branch is a legal source from inside the namespace.
+    write_file(temp.path(), "src/main.rs", "fn main() { login() }\n");
+    workspace
+        .switch_variation(review.id(), draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    let back = workspace
+        .preflight_merge_variation(&draftline::VariationId::from("main"))
+        .unwrap();
+    assert!(back.token.is_some(), "{back:?}");
+}
+
+#[test]
+fn namespaced_variation_merge_refuses_to_move_a_developer_branch() {
+    let (temp, repo) = code_repo();
+    let workspace = scoped(&temp).with_variation_namespace("cutready/").unwrap();
+    let review = workspace.create_variation("cutready/review").unwrap();
+    workspace
+        .switch_variation(review.id(), draftline::SwitchPolicy::AbortIfDirty)
+        .unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene one, reviewed\n");
+    workspace.save_version("Review intro").unwrap();
+    let head = repo.find_branch("main", git2::BranchType::Local).unwrap();
+    let main = head.get().peel_to_commit().unwrap();
+    repo.branch("feature/login", &main, false).unwrap();
+    repo.set_head("refs/heads/feature/login").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let error = workspace
+        .preflight_merge_variation(&draftline::VariationId::from("cutready/review"))
+        .unwrap_err();
+    assert!(
+        matches!(error, DraftlineError::VariationOutsideNamespace(_)),
+        "{error:?}"
+    );
+    let login = repo
+        .find_branch("feature/login", git2::BranchType::Local)
+        .unwrap();
+    assert_eq!(login.get().target().unwrap(), main.id());
+}

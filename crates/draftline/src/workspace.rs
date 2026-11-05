@@ -1473,6 +1473,12 @@ pub struct MergeIncomingToken {
     /// branch, from [`Workspace::preflight_merge_base`]).
     #[serde(default)]
     pub source: Option<String>,
+    /// `true` for a merge of another local variation, from
+    /// [`Workspace::preflight_merge_variation`]: `source` names it, `remote`
+    /// is empty and `remote_oid` is its tip. Only
+    /// [`Workspace::merge_variation`] and friends accept these tokens.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
 }
 
 /// Explicit user choice for resolving one merge conflict.
@@ -8336,6 +8342,15 @@ impl Workspace {
         sync_status: SyncStatus,
         source: Option<String>,
     ) -> Result<MergeIncomingReport> {
+        self.preflight_merge_with(sync_status, source, false)
+    }
+
+    fn preflight_merge_with(
+        &self,
+        sync_status: SyncStatus,
+        source: Option<String>,
+        local: bool,
+    ) -> Result<MergeIncomingReport> {
         self.ensure_on_branch()?;
         let dirty_files = self.changed_files_unchecked()?;
         let mut file_hazards = Vec::new();
@@ -8344,7 +8359,12 @@ impl Workspace {
         let mut token = None;
 
         if Self::mergeable_state(&sync_status.state, source.is_some()) {
-            let merge_input = self.merge_input_for_status(&sync_status)?;
+            let merge_input = if local {
+                let head = self.repo.head()?.peel_to_commit()?.id();
+                self.merge_input_between(head, self.variation_tip_oid(&sync_status.variation)?)?
+            } else {
+                self.merge_input_for_status(&sync_status)?
+            };
             let (trees, dropped) = self.merge_trees_for(&merge_input)?;
             let plan = self.plan_clean_merge(&trees[0], &trees[1], &trees[2])?;
             if !dropped.is_empty() {
@@ -8366,6 +8386,7 @@ impl Workspace {
                     remote_oid: merge_input.remote_commit.id().to_string(),
                     merge_base_oid: merge_input.base_commit.id().to_string(),
                     source,
+                    local,
                 });
             }
         }
@@ -8484,6 +8505,11 @@ impl Workspace {
         profile: Option<&ContributorProfile>,
     ) -> Result<MergeIncomingResult> {
         self.ensure_no_pending_recovery()?;
+        if token.local {
+            return Err(DraftlineError::InvalidMergeToken(
+                "this token is for a local variation merge; use merge_variation".to_string(),
+            ));
+        }
         let _lock = self.acquire_for_index(operation)?;
         self.ensure_on_branch()?;
         let dirty_files = self.changed_files_unchecked()?;
@@ -8542,7 +8568,29 @@ impl Workspace {
             });
         }
 
-        let (trees, dropped) = self.merge_trees_for(&merge_input)?;
+        self.finish_merge(
+            operation,
+            variation,
+            &merge_input,
+            label,
+            resolutions,
+            profile,
+        )
+    }
+
+    /// Plans, resolves, and writes a preflighted merge of `merge_input` as a
+    /// two-parent version on `variation`. The caller holds the operation lock
+    /// and has checked the token against the live refs.
+    fn finish_merge(
+        &self,
+        operation: &str,
+        variation: String,
+        merge_input: &IncomingMergeInput<'_>,
+        label: &str,
+        resolutions: Option<Vec<MergeConflictResolution>>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<MergeIncomingResult> {
+        let (trees, dropped) = self.merge_trees_for(merge_input)?;
         if !dropped.is_empty() {
             return Err(DraftlineError::MergeNeedsDeveloper(dropped));
         }
@@ -8575,7 +8623,197 @@ impl Workspace {
             ))));
         }
 
-        self.write_incoming_merge_version(variation, &merge_input, label, &tree, files, profile)
+        self.write_incoming_merge_version(
+            operation,
+            variation,
+            merge_input,
+            label,
+            &tree,
+            files,
+            profile,
+        )
+    }
+
+    /// Preflights merging another local variation into the current one,
+    /// without fetching or changing anything. `source` is a branch name; with
+    /// a variation namespace it must be inside it or be the base branch.
+    ///
+    /// The report has the same shape as [`Self::preflight_merge_incoming`]'s:
+    /// `sync_status.variation` names `source`, `sync_status.remote` is empty,
+    /// and `incoming` lists `source`'s versions this variation lacks. A token
+    /// is issued only when `source` has something to bring in and the
+    /// workspace is clean; pass it to [`Self::merge_variation`] or
+    /// [`Self::merge_variation_with_resolutions`].
+    pub fn preflight_merge_variation(&self, source: &VariationId) -> Result<MergeIncomingReport> {
+        self.ensure_no_pending_recovery()?;
+        self.ensure_on_branch()?;
+        self.ensure_variation_switchable(&self.current_variation_unchecked()?)?;
+        let status = self.local_merge_status(source.as_str())?;
+        self.preflight_merge_with(status, Some(source.as_str().to_string()), true)
+    }
+
+    /// Merges a preflighted local variation into the current one as a new
+    /// version labelled `label` (the full message, `"Name\n\nComment"`).
+    ///
+    /// Like [`Self::preflight_merge_base`]'s merges, this always writes a
+    /// two-parent version, even when the current variation has nothing of its
+    /// own and could fast-forward (`git merge --no-ff`), so the merge is a
+    /// named, revertible step in history. Refuses unsaved changes, conflicts
+    /// without resolutions, and tokens the live branches no longer match.
+    pub fn merge_variation(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_variation_core("merge_variation", token, label.as_ref(), None, None)
+    }
+
+    /// [`Self::merge_variation`] with host-supplied attribution.
+    pub fn merge_variation_with_profile(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        profile: &ContributorProfile,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_variation_core(
+            "merge_variation",
+            token,
+            label.as_ref(),
+            None,
+            Some(profile),
+        )
+    }
+
+    /// [`Self::merge_variation`] with explicit conflict resolutions.
+    pub fn merge_variation_with_resolutions(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        resolutions: impl IntoIterator<Item = MergeConflictResolution>,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_variation_core(
+            "merge_variation_with_resolutions",
+            token,
+            label.as_ref(),
+            Some(resolutions.into_iter().collect()),
+            None,
+        )
+    }
+
+    /// [`Self::merge_variation_with_resolutions`] with host-supplied attribution.
+    pub fn merge_variation_with_resolutions_and_profile(
+        &self,
+        token: MergeIncomingToken,
+        label: impl AsRef<str>,
+        resolutions: impl IntoIterator<Item = MergeConflictResolution>,
+        profile: &ContributorProfile,
+    ) -> Result<MergeIncomingResult> {
+        self.merge_variation_core(
+            "merge_variation_with_resolutions",
+            token,
+            label.as_ref(),
+            Some(resolutions.into_iter().collect()),
+            Some(profile),
+        )
+    }
+
+    fn merge_variation_core(
+        &self,
+        operation: &str,
+        token: MergeIncomingToken,
+        label: &str,
+        resolutions: Option<Vec<MergeConflictResolution>>,
+        profile: Option<&ContributorProfile>,
+    ) -> Result<MergeIncomingResult> {
+        self.ensure_no_pending_recovery()?;
+        let Some(source) = token.source.clone().filter(|_| token.local) else {
+            return Err(DraftlineError::InvalidMergeToken(
+                "this token is for an incoming merge; use merge_incoming".to_string(),
+            ));
+        };
+        let _lock = self.acquire_for_index(operation)?;
+        self.ensure_on_branch()?;
+        let dirty_files = self.changed_files_unchecked()?;
+        if !dirty_files.is_empty() {
+            return Err(DraftlineError::PreflightFailed(Box::new(preflight_report(
+                operation,
+                true,
+                dirty_files,
+                Vec::new(),
+                None,
+            ))));
+        }
+
+        let variation = self.current_variation_unchecked()?;
+        self.ensure_variation_switchable(&variation)?;
+        let local_oid = self.repo.head()?.peel_to_commit()?.id();
+        if variation != token.variation || local_oid.to_string() != token.local_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{}", token.variation, token.local_oid),
+                actual: format!("{variation}@{local_oid}"),
+            });
+        }
+        self.ensure_variation_switchable(&source)?;
+        let source_oid = self.variation_tip_oid(&source)?;
+        if source_oid.to_string() != token.remote_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{source}@{}", token.remote_oid),
+                actual: format!("{source}@{source_oid}"),
+            });
+        }
+        let merge_input = self.merge_input_between(local_oid, source_oid)?;
+        if merge_input.base_commit.id().to_string() != token.merge_base_oid {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: token.merge_base_oid,
+                actual: merge_input.base_commit.id().to_string(),
+            });
+        }
+        if merge_input.base_commit.id() == source_oid {
+            return Err(DraftlineError::NothingToMerge(source));
+        }
+
+        self.finish_merge(
+            operation,
+            variation,
+            &merge_input,
+            label,
+            resolutions,
+            profile,
+        )
+    }
+
+    /// How the current variation compares with local `source`, shaped like a
+    /// [`SyncStatus`] with an empty `remote`.
+    fn local_merge_status(&self, source: &str) -> Result<SyncStatus> {
+        self.ensure_variation_switchable(source)?;
+        let source_oid = self.variation_tip_oid(source)?;
+        let local = self.repo.head()?.peel_to_commit()?.id();
+        let (ahead, behind) = self.repo.graph_ahead_behind(local, source_oid)?;
+        let state = match (ahead, behind) {
+            (0, 0) => SyncState::UpToDate,
+            (_, 0) => SyncState::LocalAhead,
+            (0, _) => SyncState::IncomingAvailable,
+            _ => SyncState::NeedsMerge,
+        };
+        Ok(SyncStatus {
+            remote: String::new(),
+            variation: source.to_string(),
+            ahead,
+            behind,
+            state,
+            incoming: self.incoming_versions(local, source_oid)?,
+            base_renamed_from: None,
+        })
+    }
+
+    fn variation_tip_oid(&self, name: &str) -> Result<Oid> {
+        match self.repo.find_branch(name, BranchType::Local) {
+            Ok(branch) => Ok(branch.get().peel_to_commit()?.id()),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                Err(DraftlineError::VariationNotFound(name.to_string()))
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn ensure_head_unchanged(&self, variation: &str, oid: git2::Oid) -> Result<()> {
@@ -12685,6 +12923,14 @@ impl Workspace {
         let local_oid = self.repo.head()?.peel_to_commit()?.id();
         let remote_ref = format!("refs/remotes/{}/{}", status.remote, status.variation);
         let remote_oid = self.repo.refname_to_id(&remote_ref)?;
+        self.merge_input_between(local_oid, remote_oid)
+    }
+
+    fn merge_input_between(
+        &self,
+        local_oid: Oid,
+        remote_oid: Oid,
+    ) -> Result<IncomingMergeInput<'_>> {
         let base_oid = self.repo.merge_base(local_oid, remote_oid)?;
 
         Ok(IncomingMergeInput {
@@ -12951,6 +13197,7 @@ impl Workspace {
     #[allow(clippy::too_many_arguments)]
     fn write_incoming_merge_version(
         &self,
+        operation: &str,
         variation: String,
         merge_input: &IncomingMergeInput<'_>,
         label: &str,
@@ -12979,12 +13226,8 @@ impl Workspace {
         // Like `git merge`: files move from HEAD to the merged tree without
         // overwriting local edits, before the branch moves.
         self.checkout_or_keep_recovery(tree)?;
-        self.repo.reference(
-            &format!("refs/heads/{variation}"),
-            oid,
-            true,
-            "merge_incoming",
-        )?;
+        self.repo
+            .reference(&format!("refs/heads/{variation}"), oid, true, operation)?;
 
         self.write_recovery_state(&RecoveryState {
             operation_id,

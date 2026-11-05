@@ -116,6 +116,11 @@ export interface DraftlineClient {
   mergeIncomingWithResolutions(
     request: MergeIncomingWithResolutionsRequest,
   ): Promise<MergeIncomingCommandResult>;
+  preflightMergeVariation(request: PreflightMergeVariationRequest): Promise<MergeIncomingReport>;
+  mergeVariation(request: MergeVariationRequest): Promise<MergeIncomingCommandResult>;
+  mergeVariationWithResolutions(
+    request: MergeVariationWithResolutionsRequest,
+  ): Promise<MergeIncomingCommandResult>;
   subscribeWorkspaceEvents(handler: DraftlineEventHandler): Promise<DraftlineUnlisten>;
 }
 
@@ -277,6 +282,10 @@ export function createDraftlineClient(options: DraftlineClientOptions = {}): Dra
     mergeIncoming: (request) => run('merge_incoming', { request }),
     mergeIncomingWithResolutions: (request) =>
       run('merge_incoming_with_resolutions', { request }),
+    preflightMergeVariation: (request) => run('preflight_merge_variation', { request }),
+    mergeVariation: (request) => run('merge_variation', { request }),
+    mergeVariationWithResolutions: (request) =>
+      run('merge_variation_with_resolutions', { request }),
     subscribeWorkspaceEvents: (handler) =>
       listen<DraftlineEvent>(workspaceEventName, (event) => handler(event.payload)),
   };
@@ -1167,6 +1176,11 @@ export interface MergeIncomingToken {
   merge_base_oid: string;
   /** Branch merged in when it is not the variation's own upstream (the base branch). */
   source?: string | null;
+  /**
+   * True for a local variation merge (`preflightMergeVariation`). `remote` is then empty,
+   * `remote_oid` is the source variation's tip, and `variation` is the current variation.
+   */
+  local?: boolean;
 }
 
 export interface MergeIncomingReport {
@@ -1376,6 +1390,23 @@ export interface MergeIncomingWithResolutionsRequest extends MergeIncomingReques
   resolutions: MergeConflictResolution[];
 }
 
+/** Merge another local variation into the current one. */
+export interface PreflightMergeVariationRequest extends WorkspaceRequest {
+  source_variation_id: string;
+}
+
+export interface MergeVariationRequest extends PreflightMergeVariationRequest {
+  /** Full version message: `"Name\n\nComment"`. */
+  label: string;
+}
+
+export interface MergeVariationWithResolutionsRequest extends WorkspaceRequest {
+  label: string;
+  /** Token from `preflightMergeVariation`; it names the source variation. */
+  token: MergeIncomingToken;
+  resolutions: MergeConflictResolution[];
+}
+
 export interface DraftlineHostFacadeOptions {
   client?: DraftlineClient;
   defaultRemote?: string;
@@ -1511,6 +1542,13 @@ export interface DraftlineHostFacade {
     token: MergeIncomingToken,
     resolutions: MergeConflictResolution[],
     remote?: string,
+  ): Promise<MergeIncomingCommandResult>;
+  preflightMergeVariation(sourceVariationId: string): Promise<MergeIncomingReport>;
+  mergeVariation(sourceVariationId: string, label: string): Promise<MergeIncomingCommandResult>;
+  mergeVariationWithResolutions(
+    label: string,
+    token: MergeIncomingToken,
+    resolutions: MergeConflictResolution[],
   ): Promise<MergeIncomingCommandResult>;
   remoteVariations(remote?: string): Promise<RemoteVariation[]>;
   remoteVariationDiagnostics(remote?: string): Promise<RemoteVariationDiagnostics>;
@@ -1672,6 +1710,19 @@ export function createDraftlineHostFacade({
         resolutions,
         token,
       }),
+    preflightMergeVariation: (sourceVariationId) =>
+      client.preflightMergeVariation({
+        ...workspaceRequest(),
+        source_variation_id: sourceVariationId,
+      }),
+    mergeVariation: (sourceVariationId, label) =>
+      client.mergeVariation({
+        ...workspaceRequest(),
+        source_variation_id: sourceVariationId,
+        label,
+      }),
+    mergeVariationWithResolutions: (label, token, resolutions) =>
+      client.mergeVariationWithResolutions({ ...workspaceRequest(), label, token, resolutions }),
     remoteVariations: (remote) => client.listRemoteVariations(remoteRequest(remote)),
     remoteVariationDiagnostics: (remote) => client.remoteVariationDiagnostics(remoteRequest(remote)),
     adoptRemoteVariation: (variationId, remote) =>
@@ -2110,4 +2161,22 @@ export async function mergeIncomingWithResolutions(
   request: MergeIncomingWithResolutionsRequest,
 ): Promise<MergeIncomingCommandResult> {
   return createDraftlineClient().mergeIncomingWithResolutions(request);
+}
+
+export async function preflightMergeVariation(
+  request: PreflightMergeVariationRequest,
+): Promise<MergeIncomingReport> {
+  return createDraftlineClient().preflightMergeVariation(request);
+}
+
+export async function mergeVariation(
+  request: MergeVariationRequest,
+): Promise<MergeIncomingCommandResult> {
+  return createDraftlineClient().mergeVariation(request);
+}
+
+export async function mergeVariationWithResolutions(
+  request: MergeVariationWithResolutionsRequest,
+): Promise<MergeIncomingCommandResult> {
+  return createDraftlineClient().mergeVariationWithResolutions(request);
 }

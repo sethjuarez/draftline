@@ -707,6 +707,32 @@ pub struct MergeIncomingCommandResult {
     pub postconditions: CommandPostconditions,
 }
 
+/// Request to preflight merging another local variation into the current one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreflightMergeVariationRequest {
+    pub workspace_path: PathBuf,
+    pub source_variation_id: String,
+}
+
+/// Request to merge another local variation into the current one. `label` is
+/// the new version's full message (`"Name\n\nComment"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeVariationRequest {
+    pub workspace_path: PathBuf,
+    pub source_variation_id: String,
+    pub label: String,
+}
+
+/// Request to merge a local variation after explicit conflict resolution;
+/// the token (from [`preflight_merge_variation`]) names the source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeVariationWithResolutionsRequest {
+    pub workspace_path: PathBuf,
+    pub label: String,
+    pub token: MergeIncomingToken,
+    pub resolutions: Vec<MergeConflictResolution>,
+}
+
 /// UI-friendly conflict model grouped by file and semantic field path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeConflictViewModel {
@@ -2853,6 +2879,12 @@ pub fn merge_incoming_with_resolutions_with_context(
     request: MergeIncomingWithResolutionsRequest,
 ) -> Result<MergeIncomingCommandResult> {
     let workspace = context.open_workspace(&request.workspace_path)?;
+    if request.token.local {
+        return Err(DraftlineError::InvalidMergeToken(
+            "this token is for a local variation merge; use merge_variation_with_resolutions"
+                .to_string(),
+        ));
+    }
     let contributor_profile = context.contributor_profile.clone();
     let (preflight, merge) = {
         let mut options = context.remote_options();
@@ -2886,6 +2918,124 @@ pub fn merge_incoming_with_resolutions_with_context(
         DraftlineEventKind::HistoryChanged,
         Some(preflight.sync_status.clone()),
     );
+    Ok(MergeIncomingCommandResult {
+        preflight,
+        merge,
+        postconditions: collect_postconditions(&workspace, true),
+    })
+}
+
+/// Preflights merging another local variation into the current one. Read-only.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preflight_merge_variation(
+    request: PreflightMergeVariationRequest,
+) -> Result<MergeIncomingReport> {
+    preflight_merge_variation_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Preflights a local variation merge using a configured host context.
+#[tracing::instrument(err, skip_all, fields(workspace_path = %request.workspace_path.display()))]
+pub fn preflight_merge_variation_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: PreflightMergeVariationRequest,
+) -> Result<MergeIncomingReport> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    workspace.preflight_merge_variation(&VariationId::from(request.source_variation_id))
+}
+
+/// Merges another local variation into the current one as a new two-parent
+/// version. Refuses with `merge_needs_developer`, `preflight_failed` (unsaved
+/// changes, hazards, or conflicts needing resolutions) or `nothing_to_merge`.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn merge_variation(request: MergeVariationRequest) -> Result<MergeIncomingCommandResult> {
+    merge_variation_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Merges a local variation using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn merge_variation_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: MergeVariationRequest,
+) -> Result<MergeIncomingCommandResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let preflight =
+        workspace.preflight_merge_variation(&VariationId::from(request.source_variation_id))?;
+    let Some(token) = preflight.token.clone() else {
+        return Err(merge_variation_preflight_error(preflight));
+    };
+    let merge = match context.contributor_profile.as_ref() {
+        Some(profile) => workspace.merge_variation_with_profile(token, request.label, profile)?,
+        None => workspace.merge_variation(token, request.label)?,
+    };
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
+    Ok(MergeIncomingCommandResult {
+        preflight,
+        merge,
+        postconditions: collect_postconditions(&workspace, true),
+    })
+}
+
+/// Merges a local variation using explicit user-provided conflict resolutions.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn merge_variation_with_resolutions(
+    request: MergeVariationWithResolutionsRequest,
+) -> Result<MergeIncomingCommandResult> {
+    merge_variation_with_resolutions_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Merges a local variation with resolutions using a configured host context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display())
+)]
+pub fn merge_variation_with_resolutions_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: MergeVariationWithResolutionsRequest,
+) -> Result<MergeIncomingCommandResult> {
+    let workspace = context.open_workspace(&request.workspace_path)?;
+    let Some(source) = request.token.source.clone().filter(|_| request.token.local) else {
+        return Err(DraftlineError::InvalidMergeToken(
+            "this token is for an incoming merge; use merge_incoming_with_resolutions".to_string(),
+        ));
+    };
+    let preflight = workspace.preflight_merge_variation(&VariationId::from(source))?;
+    match &preflight.token {
+        None => return Err(merge_variation_preflight_error(preflight)),
+        Some(token) if *token != request.token => {
+            return Err(DraftlineError::LocalStateChanged {
+                expected: format!("{}@{}", request.token.variation, request.token.local_oid),
+                actual: format!("{}@{}", token.variation, token.local_oid),
+            })
+        }
+        Some(_) => {}
+    }
+    let merge = match context.contributor_profile.as_ref() {
+        Some(profile) => workspace.merge_variation_with_resolutions_and_profile(
+            request.token,
+            request.label,
+            request.resolutions,
+            profile,
+        )?,
+        None => workspace.merge_variation_with_resolutions(
+            request.token,
+            request.label,
+            request.resolutions,
+        )?,
+    };
+    context.emit(&workspace, DraftlineEventKind::HistoryChanged, None);
     Ok(MergeIncomingCommandResult {
         preflight,
         merge,
@@ -3005,6 +3155,31 @@ fn merge_preflight_error(preflight: MergeIncomingReport) -> DraftlineError {
     DraftlineError::SyncNeedsMerge(Box::new(preflight.sync_status))
 }
 
+fn merge_variation_preflight_error(preflight: MergeIncomingReport) -> DraftlineError {
+    if !preflight.developer_conflicts.is_empty() {
+        return DraftlineError::MergeNeedsDeveloper(preflight.developer_conflicts);
+    }
+    if preflight.sync_status.behind == 0 {
+        return DraftlineError::NothingToMerge(preflight.sync_status.variation);
+    }
+    DraftlineError::PreflightFailed(Box::new(PreflightReport {
+        operation: "merge_variation".to_string(),
+        will_write_files: true,
+        dirty_files: preflight.dirty_files,
+        file_hazards: preflight.file_hazards,
+        untracked_assets: Vec::new(),
+        unresolved_conflicts: preflight
+            .conflicts
+            .into_iter()
+            .map(|conflict| conflict.path)
+            .collect(),
+        large_files: Vec::new(),
+        binary_files: Vec::new(),
+        variation_divergence: Some("variation merge is blocked".to_string()),
+        can_proceed: false,
+    }))
+}
+
 /// Converts a Draftline result into a Tauri-serializable result.
 pub fn into_tauri_result<T>(result: Result<T>) -> TauriCommandResult<T> {
     result.map_err(TauriCommandError::from)
@@ -3095,6 +3270,8 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidContributorIdentity(_) => "invalid_contributor_identity",
         DraftlineError::RemoteOperationTimedOut { .. } => "remote_operation_timed_out",
         DraftlineError::InvalidMergeResolution(_) => "invalid_merge_resolution",
+        DraftlineError::InvalidMergeToken(_) => "invalid_merge_token",
+        DraftlineError::NothingToMerge(_) => "nothing_to_merge",
         DraftlineError::SendBaseUnknown => "send_base_unknown",
         DraftlineError::SendBaseNotOnRemote(_) => "send_base_not_on_remote",
         DraftlineError::FolderIsElsewhere(_) => "folder_is_elsewhere",
@@ -3157,9 +3334,8 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
             Some(serde_json::json!({ "action": action, "output": output }))
         }
         DraftlineError::SendOutsideNamespace(branch)
-        | DraftlineError::VariationOutsideNamespace(branch) => {
-            Some(serde_json::json!({ "branch": branch }))
-        }
+        | DraftlineError::VariationOutsideNamespace(branch)
+        | DraftlineError::NothingToMerge(branch) => Some(serde_json::json!({ "branch": branch })),
         DraftlineError::SyncNeedsMerge(status) => match serde_json::to_value(status.as_ref()) {
             Ok(value) => Some(value),
             Err(error) => Some(serde_json::json!({
