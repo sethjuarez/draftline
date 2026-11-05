@@ -491,6 +491,32 @@ pub struct PreviewVersionFileRequest {
     pub path: PathBuf,
 }
 
+/// The largest file [`read_version_file_bytes`] returns when the request sets
+/// no `max_bytes`: enough for screenshots, small enough to keep video off IPC.
+pub const DEFAULT_VERSION_FILE_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Request for one file's raw bytes from a version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadVersionFileBytesRequest {
+    pub workspace_path: PathBuf,
+    pub version_id: String,
+    pub path: PathBuf,
+    /// Refuse files bigger than this with `file_too_large`; defaults to
+    /// [`DEFAULT_VERSION_FILE_MAX_BYTES`].
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+/// One file's bytes from a version, base64-encoded (standard alphabet,
+/// padded) for IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionFileBytes {
+    /// Workspace-relative, `/`-separated.
+    pub path: String,
+    pub size: u64,
+    pub data_base64: String,
+}
+
 /// Request for comparing two saved versions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffVersionsRequest {
@@ -1776,6 +1802,73 @@ pub fn preview_version_file_with_context(
     context
         .open_workspace(&request.workspace_path)?
         .preview_version_file(&version, request.path)
+}
+
+/// Reads one file's raw bytes from a saved version, for showing images and
+/// other binaries as they were. `None` when the version has no such file or
+/// the content policy doesn't track it; `file_too_large` over `max_bytes`.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), path = %request.path.display())
+)]
+pub fn read_version_file_bytes(
+    request: ReadVersionFileBytesRequest,
+) -> Result<Option<VersionFileBytes>> {
+    read_version_file_bytes_with_context(&DraftlineCommandContext::new(), request)
+}
+
+/// Reads one file's raw bytes from a saved version using a configured host
+/// context.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(workspace_path = %request.workspace_path.display(), path = %request.path.display())
+)]
+pub fn read_version_file_bytes_with_context(
+    context: &DraftlineCommandContext<'_>,
+    request: ReadVersionFileBytesRequest,
+) -> Result<Option<VersionFileBytes>> {
+    let version = parse_version_id(request.version_id)?;
+    let max_bytes = request.max_bytes.unwrap_or(DEFAULT_VERSION_FILE_MAX_BYTES);
+    let Some((path, bytes)) = context
+        .open_workspace(&request.workspace_path)?
+        .read_version_file_bytes_capped(&version, request.path, max_bytes)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(VersionFileBytes {
+        path: slash_path(&path),
+        size: bytes.len() as u64,
+        data_base64: encode_base64(&bytes),
+    }))
+}
+
+fn slash_path(path: &Path) -> String {
+    path.iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Standard, padded base64 (RFC 4648 section 4).
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, byte)| n | u32::from(*byte) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// Diffs one current workspace file against the current variation head.
@@ -3518,6 +3611,7 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::OwnedWorktreeInUse(_) => "owned_worktree_in_use",
         DraftlineError::OwnedWorktreeHasChanges(_) => "owned_worktree_has_changes",
         DraftlineError::ShelfOverlapsUnsavedChanges { .. } => "shelf_overlaps_unsaved_changes",
+        DraftlineError::FileTooLarge { .. } => "file_too_large",
     }
 }
 
@@ -3561,6 +3655,15 @@ fn draftline_error_details(error: &DraftlineError) -> Option<serde_json::Value> 
         DraftlineError::ShelfOverlapsUnsavedChanges { shelf, paths } => {
             Some(serde_json::json!({ "shelf": shelf, "paths": paths }))
         }
+        DraftlineError::FileTooLarge {
+            path,
+            size,
+            max_bytes,
+        } => Some(serde_json::json!({
+            "path": slash_path(path),
+            "size": size,
+            "max_bytes": max_bytes,
+        })),
         DraftlineError::GitFilterFailed { action, output } => {
             Some(serde_json::json!({ "action": action, "output": output }))
         }
@@ -3583,6 +3686,22 @@ mod tests {
     use std::sync::{mpsc, Arc};
 
     type Recorded = Arc<Mutex<Vec<(DraftlineEventKind, Instant)>>>;
+
+    #[test]
+    fn encodes_base64_per_rfc_4648() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(encode_base64(input.as_bytes()), expected);
+        }
+        assert_eq!(encode_base64(&[0xfb, 0xff, 0x00]), "+/8A");
+    }
 
     fn recording_context(events: Recorded) -> DraftlineCommandContext<'static> {
         DraftlineCommandContext::new().with_event_sink(move |event| {

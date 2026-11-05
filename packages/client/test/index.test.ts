@@ -706,6 +706,27 @@ describe('createDraftlineClient', () => {
     });
   });
 
+  it('routes version file bytes to read_version_file_bytes', async () => {
+    const invoke = vi.fn<DraftlineInvoke>(async () => null as never);
+    const client = createDraftlineClient({ invoke });
+    const facade = createDraftlineHostFacade({ client, workspacePath: 'C:\\repo' });
+
+    await facade.readVersionFileBytes('abc', 'media/shot.png');
+    await facade.readVersionFileBytes('abc', 'media/shot.png', 1024);
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'read_version_file_bytes', {
+      request: { workspace_path: 'C:\\repo', version_id: 'abc', path: 'media/shot.png' },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, 'read_version_file_bytes', {
+      request: {
+        workspace_path: 'C:\\repo',
+        version_id: 'abc',
+        path: 'media/shot.png',
+        max_bytes: 1024,
+      },
+    });
+  });
+
   it('routes local variation merges to the merge_variation commands', async () => {
     const invoke = vi.fn<DraftlineInvoke>(async () => ({ ok: true }) as never);
     const client = createDraftlineClient({ invoke });

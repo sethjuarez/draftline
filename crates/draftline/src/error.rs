@@ -151,6 +151,14 @@ pub enum DraftlineError {
     #[error("applying shelf `{shelf}` would overwrite unsaved changes in {}", join_paths(.paths))]
     ShelfOverlapsUnsavedChanges { shelf: String, paths: Vec<PathBuf> },
 
+    /// The file is bigger than the caller's limit, so it wasn't read.
+    #[error("`{}` is {size} bytes, over the {max_bytes}-byte limit", .path.display())]
+    FileTooLarge {
+        path: PathBuf,
+        size: u64,
+        max_bytes: u64,
+    },
+
     #[error("cannot tell which branch to send to; pass a base branch")]
     SendBaseUnknown,
 

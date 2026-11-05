@@ -17,8 +17,9 @@ use draftline::tauri_contract::{
     merge_incoming_with_token, open_workspace, preflight_apply_incoming, preflight_apply_shelf,
     preflight_create_variation_from_version, preflight_merge_incoming, preflight_rename_variation,
     preflight_switch_variation, preview_shelf, preview_version, preview_version_file,
-    preview_workspace_file, publish_current_variation, rename_variation,
-    restore_version_as_new_save, restore_version_as_new_save_to_variation,
+    preview_workspace_file, publish_current_variation, read_version_file_bytes,
+    read_version_file_bytes_with_context, rename_variation, restore_version_as_new_save,
+    restore_version_as_new_save_to_variation,
     restore_version_as_new_save_to_variation_with_context,
     restore_version_as_new_save_with_context, restore_version_paths_as_new_save, save,
     search_workspace_graph, selected_discard, selected_save, selected_save_with_context,
@@ -28,8 +29,8 @@ use draftline::tauri_contract::{
     DraftlineCommandContext, DraftlineEventKind, GuardedCreateVariationFromVersionRequest,
     ListSupportRefsRequest, MergeIncomingRequest, MergeIncomingWithResolutionsRequest,
     MergeIncomingWithTokenRequest, PathHistoryRequest, PreflightCreateVariationFromVersionRequest,
-    PreviewVersionFileRequest, PublishCurrentVariationRequest, RemoteRequest,
-    RemoteVariationRequest, RenameVariationRequest, RestoreVersionPathsRequest,
+    PreviewVersionFileRequest, PublishCurrentVariationRequest, ReadVersionFileBytesRequest,
+    RemoteRequest, RemoteVariationRequest, RenameVariationRequest, RestoreVersionPathsRequest,
     RestoreVersionRequest, SaveRequest, SelectedDiscardRequest, SelectedSaveRequest,
     SelectedShelveRequest, ShelfRequest, SwitchVariationRequest, TargetedRestoreVersionRequest,
     VersionRequest, WorkspaceGraphAroundVersionRequest, WorkspaceGraphNeighborhoodRequest,
@@ -49,6 +50,169 @@ fn write_file(root: &Path, relative: &str, content: &[u8]) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, content).unwrap();
+}
+
+fn decode_base64(text: &str) -> Vec<u8> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => panic!("not base64: {c}"),
+    };
+    let mut out = Vec::new();
+    for chunk in text.as_bytes().chunks(4) {
+        let data: Vec<u8> = chunk.iter().copied().filter(|c| *c != b'=').collect();
+        let n = data
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, c)| n | u32::from(value(*c)) << (18 - 6 * i));
+        for i in 0..data.len().saturating_sub(1) {
+            out.push((n >> (16 - 8 * i)) as u8);
+        }
+    }
+    out
+}
+
+fn bytes_request(
+    root: &Path,
+    version: &draftline::VersionId,
+    path: &str,
+    max_bytes: Option<u64>,
+) -> ReadVersionFileBytesRequest {
+    ReadVersionFileBytesRequest {
+        workspace_path: root.to_path_buf(),
+        version_id: version.as_str().to_string(),
+        path: PathBuf::from(path),
+        max_bytes,
+    }
+}
+
+#[test]
+fn tauri_contract_reads_version_file_bytes_as_they_were() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    let png: Vec<u8> = [
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xfe,
+    ]
+    .into_iter()
+    .chain((0..=255).collect::<Vec<u8>>())
+    .collect();
+    write_file(workspace.root(), "media/shot.png", &png);
+    write_file(workspace.root(), "notes.md", "caf\u{e9}\n".as_bytes());
+    let old = workspace.save_version("Before").unwrap();
+    write_file(workspace.root(), "media/shot.png", b"after");
+    workspace.save_version("After").unwrap();
+
+    let image =
+        read_version_file_bytes(bytes_request(temp.path(), old.id(), "media/shot.png", None))
+            .unwrap()
+            .unwrap();
+    assert_eq!(image.path, "media/shot.png");
+    assert_eq!(image.size, png.len() as u64);
+    assert_eq!(decode_base64(&image.data_base64), png);
+    assert_eq!(
+        workspace
+            .read_version_file_bytes(old.id(), "media/shot.png")
+            .unwrap()
+            .unwrap(),
+        png
+    );
+
+    let text = read_version_file_bytes(bytes_request(temp.path(), old.id(), "notes.md", None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(decode_base64(&text.data_base64), "caf\u{e9}\n".as_bytes());
+    assert_eq!(text.size, 6);
+
+    // Missing paths and directories aren't files in that version.
+    for path in ["missing.png", "media"] {
+        assert_eq!(
+            read_version_file_bytes(bytes_request(temp.path(), old.id(), path, None)).unwrap(),
+            None,
+            "{path}"
+        );
+        assert_eq!(
+            workspace.read_version_file_bytes(old.id(), path).unwrap(),
+            None
+        );
+    }
+    // At the cap is fine; over it is refused with the sizes.
+    let size = png.len() as u64;
+    read_version_file_bytes(bytes_request(
+        temp.path(),
+        old.id(),
+        "media/shot.png",
+        Some(size),
+    ))
+    .unwrap()
+    .unwrap();
+    let error = into_tauri_result(read_version_file_bytes(bytes_request(
+        temp.path(),
+        old.id(),
+        "media/shot.png",
+        Some(size - 1),
+    )))
+    .unwrap_err();
+    assert_eq!(error.code, "file_too_large");
+    let details = error.details.unwrap();
+    assert_eq!(details["size"], size);
+    assert_eq!(details["max_bytes"], size - 1);
+    assert_eq!(details["path"], "media/shot.png");
+}
+
+#[test]
+fn tauri_contract_caps_version_file_bytes_at_twenty_megabytes_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    let limit = draftline::tauri_contract::DEFAULT_VERSION_FILE_MAX_BYTES;
+    assert_eq!(limit, 20 * 1024 * 1024);
+    write_file(workspace.root(), "clip.mp4", &vec![0u8; limit as usize + 1]);
+    let version = workspace.save_version("Clip").unwrap();
+
+    let error = into_tauri_result(read_version_file_bytes(bytes_request(
+        temp.path(),
+        version.id(),
+        "clip.mp4",
+        None,
+    )))
+    .unwrap_err();
+    assert_eq!(error.code, "file_too_large");
+    assert_eq!(error.details.unwrap()["max_bytes"], limit);
+    // The Rust API has no cap.
+    let bytes = workspace
+        .read_version_file_bytes(version.id(), "clip.mp4")
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes.len() as u64, limit + 1);
+}
+
+#[test]
+fn tauri_contract_version_file_bytes_respect_the_content_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(temp.path()).unwrap();
+    configure_identity(workspace.root());
+    write_file(workspace.root(), "post.md", b"post");
+    write_file(workspace.root(), "secret.bin", b"\x00secret");
+    let version = workspace.save_version("Both").unwrap();
+
+    let context = DraftlineCommandContext::new()
+        .with_content_policy(ContentPolicy::new().include_extensions(["md"]).unwrap());
+    let read = |path: &str| {
+        read_version_file_bytes_with_context(
+            &context,
+            bytes_request(temp.path(), version.id(), path, None),
+        )
+        .unwrap()
+    };
+    assert_eq!(read("secret.bin"), None);
+    assert_eq!(
+        decode_base64(&read("post.md").unwrap().data_base64),
+        b"post"
+    );
 }
 
 fn read_file(root: &Path, relative: &str) -> String {

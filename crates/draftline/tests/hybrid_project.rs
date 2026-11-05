@@ -5657,6 +5657,45 @@ fn history_and_restore_follow_the_folder_through_a_move() {
 }
 
 #[test]
+fn version_file_bytes_follow_a_moved_folder() {
+    use draftline::tauri_contract::{
+        read_version_file_bytes_with_context, DraftlineCommandContext, ReadVersionFileBytesRequest,
+    };
+    let (temp, _repo) = code_repo();
+    let mut pitch = scoped(&temp);
+    write_file(temp.path(), "cutready/intro.sk", "intro\n");
+    let intro = pitch.save_version("Intro").unwrap();
+    pitch.move_folder("demos/pitch").unwrap();
+
+    assert_eq!(
+        pitch
+            .read_version_file_bytes(intro.id(), "demos/pitch/intro.sk")
+            .unwrap()
+            .unwrap(),
+        b"intro\n"
+    );
+    let context = DraftlineCommandContext::new().with_content_policy(cutready_policy());
+    let read = |path: &str| {
+        read_version_file_bytes_with_context(
+            &context,
+            ReadVersionFileBytesRequest {
+                workspace_path: temp.path().join("demos/pitch"),
+                version_id: intro.id().as_str().to_string(),
+                path: PathBuf::from(path),
+                max_bytes: None,
+            },
+        )
+        .unwrap()
+    };
+    let file = read("demos/pitch/intro.sk").unwrap();
+    assert_eq!(file.path, "demos/pitch/intro.sk");
+    assert_eq!(file.data_base64, "aW50cm8K");
+    // The old location reads as missing, and code outside the folder as untracked.
+    assert_eq!(read("cutready/intro.sk"), None);
+    assert_eq!(read("src/main.rs"), None);
+}
+
+#[test]
 fn a_move_before_the_first_save_keeps_older_versions() {
     let (temp, repo) = code_repo();
     let initial = repo.head().unwrap().peel_to_commit().unwrap().id();

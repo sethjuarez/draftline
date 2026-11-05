@@ -7123,6 +7123,66 @@ impl Workspace {
         version: &VersionId,
         path: impl AsRef<Path>,
     ) -> Result<Option<PreviewFile>> {
+        let Some((path, oid, _)) = self.version_file_blob(version, path)? else {
+            return Ok(None);
+        };
+        let blob = self.repo.find_blob(oid)?;
+        let content = std::str::from_utf8(blob.content())
+            .ok()
+            .map(ToString::to_string);
+
+        Ok(Some(PreviewFile {
+            path,
+            is_binary: content.is_none(),
+            content,
+        }))
+    }
+
+    /// Reads one file's raw bytes from a version, text or binary, without
+    /// mutating the live workspace: for showing an image or other media as it
+    /// was. Follows [`Self::preview_version_file`]: `None` when the content
+    /// policy doesn't track `path`, or when the version has no file there.
+    /// Bytes are as stored in history, without checkout filters (an LFS file
+    /// reads as its pointer).
+    pub fn read_version_file_bytes(
+        &self,
+        version: &VersionId,
+        path: impl AsRef<Path>,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .read_version_file_bytes_capped(version, path, u64::MAX)?
+            .map(|(_, bytes)| bytes))
+    }
+
+    /// [`Self::read_version_file_bytes`], refusing with
+    /// [`DraftlineError::FileTooLarge`] before reading a file over `max_bytes`.
+    pub(crate) fn read_version_file_bytes_capped(
+        &self,
+        version: &VersionId,
+        path: impl AsRef<Path>,
+        max_bytes: u64,
+    ) -> Result<Option<(PathBuf, Vec<u8>)>> {
+        let Some((path, oid, size)) = self.version_file_blob(version, path)? else {
+            return Ok(None);
+        };
+        if size > max_bytes {
+            return Err(DraftlineError::FileTooLarge {
+                path,
+                size,
+                max_bytes,
+            });
+        }
+        let bytes = self.repo.find_blob(oid)?.content().to_vec();
+        Ok(Some((path, bytes)))
+    }
+
+    /// The blob at `path` in `version` (relocated for a moved folder) and its
+    /// size, read from the object header without loading the content.
+    fn version_file_blob(
+        &self,
+        version: &VersionId,
+        path: impl AsRef<Path>,
+    ) -> Result<Option<(PathBuf, Oid, u64)>> {
         self.ensure_no_pending_recovery()?;
         let path = normalize_workspace_relative(path)?;
         if !self.content_policy.tracks(&path)? {
@@ -7140,17 +7200,8 @@ impl Workspace {
         if entry.kind() != Some(ObjectType::Blob) {
             return Ok(None);
         }
-
-        let blob = self.repo.find_blob(entry.id())?;
-        let content = std::str::from_utf8(blob.content())
-            .ok()
-            .map(ToString::to_string);
-
-        Ok(Some(PreviewFile {
-            path,
-            is_binary: content.is_none(),
-            content,
-        }))
+        let (size, _) = self.repo.odb()?.read_header(entry.id())?;
+        Ok(Some((path, entry.id(), size as u64)))
     }
 
     /// Reads one tracked file from the current workspace without mutating state.
