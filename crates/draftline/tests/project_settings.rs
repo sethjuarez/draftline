@@ -4,8 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use draftline::tauri_contract::{
-    into_tauri_result, project_settings, update_project_settings_with_context,
-    DraftlineCommandContext, UpdateProjectSettingsRequest, WorkspaceRequest,
+    init_project_in_repository, into_tauri_result, project_settings,
+    update_project_settings_with_context, DraftlineCommandContext, InitProjectInRepositoryRequest,
+    UpdateProjectSettingsRequest, WorkspaceRequest,
 };
 use draftline::{
     ContentPolicy, Contributor, ContributorProfile, DraftlineError, ProjectSettingsUpdate,
@@ -405,4 +406,185 @@ fn contract_reads_and_updates_settings_with_attribution() {
     ))
     .unwrap_err();
     assert_eq!(error.code, "invalid_project_settings");
+}
+
+#[test]
+fn project_folder_names_are_slugs() {
+    for (name, slug) in [
+        ("Q3 Demo!", "q3-demo"),
+        ("  Launch -- Plan  ", "launch-plan"),
+        ("Café Tour", "caf-tour"),
+        ("con", "con-project"),
+    ] {
+        assert_eq!(Workspace::project_folder_name(name).unwrap(), slug);
+    }
+    assert!(matches!(
+        Workspace::project_folder_name("!!!").unwrap_err(),
+        DraftlineError::InvalidProjectSettings(_)
+    ));
+    assert_eq!(
+        Workspace::project_folder_name(&"a".repeat(100))
+            .unwrap()
+            .len(),
+        64
+    );
+}
+
+#[test]
+fn a_new_project_in_a_code_repo_records_settings_without_committing() {
+    let temp = code_repo();
+    fs::remove_dir_all(temp.path().join("cutready")).unwrap();
+    let tip = head(temp.path()).id();
+
+    let workspace = Workspace::init_project_in_repository(
+        temp.path(),
+        "Q3 Demo",
+        template("docs(demo): {subject}"),
+        cutready_policy(),
+    )
+    .unwrap();
+
+    assert_eq!(workspace.scope(), Path::new("q3-demo"));
+    assert!(temp.path().join("q3-demo").is_dir());
+    assert!(!temp.path().join("q3-demo/.git").exists());
+    assert_eq!(head(temp.path()).id(), tip);
+    let settings = workspace.project_settings().unwrap();
+    assert_eq!(settings.folder, PathBuf::from("q3-demo"));
+    assert!(settings.id.is_some());
+    assert_eq!(settings.base_branch.as_deref(), Some("main"));
+
+    write_file(temp.path(), "q3-demo/intro.sk", "scene one\n");
+    workspace.save_version("First scene").unwrap();
+    assert_eq!(head_message(temp.path()), "docs(demo): First scene");
+    let mut changed = head_paths_changed(temp.path());
+    changed.sort();
+    assert_eq!(
+        changed,
+        vec![
+            PathBuf::from(".draftline"),
+            PathBuf::from("q3-demo/intro.sk")
+        ]
+    );
+    let reopened = Workspace::open(temp.path().join("q3-demo"))
+        .unwrap()
+        .project_settings()
+        .unwrap();
+    assert_eq!(reopened, settings);
+}
+
+#[test]
+fn a_new_project_is_refused_where_it_cannot_go() {
+    let temp = code_repo();
+    // The folder exists with files in it.
+    let error = Workspace::init_project_in_repository(
+        temp.path(),
+        "CutReady",
+        ProjectSettingsUpdate::default(),
+        cutready_policy(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        matches!(error, DraftlineError::FolderNotEmpty(_)),
+        "{error:?}"
+    );
+
+    // The repository already manages another folder.
+    let workspace =
+        Workspace::init_with_policy(temp.path().join("cutready"), cutready_policy()).unwrap();
+    write_file(temp.path(), "cutready/intro.sk", "scene two\n");
+    workspace.save_version("Claim").unwrap();
+    let error = Workspace::init_project_in_repository(
+        temp.path(),
+        "Another",
+        ProjectSettingsUpdate::default(),
+        cutready_policy(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        matches!(&error, DraftlineError::FolderIsElsewhere(folder) if folder == Path::new("cutready")),
+        "{error:?}"
+    );
+    assert!(!temp.path().join("another").exists());
+
+    // With the working marker gone, the checkout's own claim still holds.
+    std::fs::remove_file(temp.path().join(".draftline")).unwrap();
+    let error = Workspace::init_project_in_repository(
+        temp.path(),
+        "Another",
+        ProjectSettingsUpdate::default(),
+        cutready_policy(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        matches!(&error, DraftlineError::FolderIsElsewhere(folder) if folder == Path::new("cutready")),
+        "{error:?}"
+    );
+    assert!(!temp.path().join(".draftline").exists());
+
+    // Never inside Git's own folder.
+    let error = Workspace::init_project_in_repository(
+        temp.path().join(".git"),
+        "Hidden",
+        ProjectSettingsUpdate::default(),
+        cutready_policy(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        matches!(error, DraftlineError::PathEscapesWorkspace(_)),
+        "{error:?}"
+    );
+    assert!(!temp.path().join(".git").join("hidden").exists());
+
+    // Not a repository at all.
+    let plain = tempfile::tempdir().unwrap();
+    let error = Workspace::init_project_in_repository(
+        plain.path(),
+        "Demo",
+        ProjectSettingsUpdate::default(),
+        cutready_policy(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        matches!(error, DraftlineError::NotARepository(_)),
+        "{error:?}"
+    );
+    assert!(!plain.path().join("demo").exists());
+}
+
+#[test]
+fn contract_creates_a_project_in_a_repository() {
+    let temp = code_repo();
+    let result = init_project_in_repository(InitProjectInRepositoryRequest {
+        parent_path: temp.path().join("demos"),
+        name: "Pitch Deck".to_string(),
+        base_branch: None,
+        commit_template: Some("docs: {subject}".to_string()),
+    })
+    .unwrap();
+    assert_eq!(
+        fs::canonicalize(&result.workspace_path).unwrap(),
+        fs::canonicalize(temp.path().join("demos/pitch-deck")).unwrap()
+    );
+    assert_eq!(
+        result.settings.folder,
+        PathBuf::from("demos").join("pitch-deck")
+    );
+    assert_eq!(
+        result.settings.commit_template.as_deref(),
+        Some("docs: {subject}")
+    );
+
+    let error = into_tauri_result(init_project_in_repository(InitProjectInRepositoryRequest {
+        parent_path: temp.path().to_path_buf(),
+        name: "cutready".to_string(),
+        base_branch: None,
+        commit_template: None,
+    }))
+    .unwrap_err();
+    assert_eq!(error.code, "folder_is_elsewhere");
 }

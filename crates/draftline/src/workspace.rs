@@ -596,6 +596,9 @@ impl MarkerSettings {
     }
 }
 
+/// The longest folder name [`Workspace::project_folder_name`] makes.
+const PROJECT_FOLDER_NAME_LIMIT: usize = 64;
+
 /// The text a commit template puts in place of the version name.
 const COMMIT_TEMPLATE_SUBJECT: &str = "{subject}";
 
@@ -2167,6 +2170,134 @@ impl Workspace {
             }
         }
         self.project_settings()
+    }
+
+    /// The folder name [`Workspace::init_project_in_repository`] gives a
+    /// project called `name`: lowercase ASCII letters and digits, with runs
+    /// of anything else turned into single hyphens.
+    pub fn project_folder_name(name: &str) -> Result<String> {
+        let mut slug = String::new();
+        for character in name.trim().chars() {
+            if character.is_ascii_alphanumeric() {
+                slug.push(character.to_ascii_lowercase());
+            } else if !slug.is_empty() && !slug.ends_with('-') {
+                slug.push('-');
+            }
+        }
+        let mut slug = slug.trim_end_matches('-').to_string();
+        if slug.len() > PROJECT_FOLDER_NAME_LIMIT {
+            slug.truncate(PROJECT_FOLDER_NAME_LIMIT);
+            slug = slug.trim_end_matches('-').to_string();
+        }
+        if slug.is_empty() {
+            return Err(DraftlineError::InvalidProjectSettings(format!(
+                "`{name}` has no letters or digits to name a folder"
+            )));
+        }
+        // Windows refuses these names, with or without an extension.
+        const RESERVED: [&str; 22] = [
+            "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+            "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+        ];
+        if RESERVED.contains(&slug.as_str()) {
+            slug.push_str("-project");
+        }
+        Ok(slug)
+    }
+
+    /// Creates a new project folder named after `name` (see
+    /// [`Workspace::project_folder_name`]) inside `parent`, a folder in an
+    /// existing repository (created if missing), and records a new project id and `settings` in
+    /// `.draftline`. Nothing is committed; the first save commits the marker.
+    ///
+    /// Refuses when `parent` isn't in a repository, when the repository
+    /// already manages another folder, or when the new folder exists and
+    /// isn't empty.
+    pub fn init_project_in_repository(
+        parent: impl AsRef<Path>,
+        name: &str,
+        settings: ProjectSettingsUpdate,
+        content_policy: ContentPolicy,
+    ) -> Result<Self> {
+        let base_branch = validate_base_branch(settings.base_branch)?;
+        let commit_template = validate_commit_template(settings.commit_template)?;
+        let slug = Self::project_folder_name(name)?;
+        let parent = absolute_path(parent.as_ref())?;
+        let not_a_repository = || DraftlineError::NotARepository(parent.clone());
+        // `parent` may not exist yet; it is created inside the repository.
+        let anchor = parent
+            .ancestors()
+            .find(|ancestor| ancestor.exists())
+            .unwrap_or(&parent);
+        if !anchor.is_dir() {
+            return Err(not_a_repository());
+        }
+        let repo = Repository::discover(anchor).map_err(|_| not_a_repository())?;
+        let workdir = repo
+            .workdir()
+            .map(Path::to_path_buf)
+            .ok_or_else(not_a_repository)?;
+        let target = parent.join(&slug);
+        let folder = folder_in(&workdir, &target)?;
+        if folder
+            .components()
+            .next()
+            .is_some_and(|first| first.as_os_str().eq_ignore_ascii_case(".git"))
+        {
+            return Err(DraftlineError::PathEscapesWorkspace(target));
+        }
+        let key = folder_key(&folder);
+        // A handle on the repository root reads the claim the way opening
+        // does, and its operation lock keeps two of these (or a move) from
+        // racing between the checks and the marker write.
+        let root = Self::unclaimed(repo, &workdir, ContentPolicy::default())?;
+        let _lock = OperationLock::acquire(&root.lock_path(), "init_project_in_repository")?;
+        let owner = match root.read_marker()? {
+            Some(folder) => Some(folder),
+            None => match root.claim_owner()? {
+                FolderOwner::Nobody => None,
+                FolderOwner::Folder(folder) => Some(folder),
+                FolderOwner::Invalid(reason) => {
+                    return Err(DraftlineError::InvalidFolderMarker(reason))
+                }
+                FolderOwner::Newer(reason) => {
+                    return Err(DraftlineError::NewerFolderMarker(reason))
+                }
+            },
+        };
+        if let Some(owner) = owner.filter(|owner| *owner != key) {
+            return Err(DraftlineError::FolderIsElsewhere(PathBuf::from(owner)));
+        }
+        if target.exists() && (!target.is_dir() || fs::read_dir(&target)?.next().is_some()) {
+            return Err(DraftlineError::FolderNotEmpty(folder));
+        }
+        // Write the marker first, so opening claims this folder with its
+        // settings in place, and put the old one back if that fails.
+        let marker_path = root.marker_path();
+        let previous = match fs::read(&marker_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let existing = previous
+            .as_deref()
+            .map(MarkerSettings::from_marker)
+            .unwrap_or_default();
+        let settings = MarkerSettings {
+            id: existing.id.or_else(|| Some(new_project_id())),
+            base_branch,
+            commit_template,
+        };
+        write_file_atomically(&marker_path, &marker_bytes(&key, &settings)?)?;
+        Self::init_with_policy(&target, content_policy).inspect_err(|_| {
+            let restored = match &previous {
+                Some(bytes) => write_file_atomically(&marker_path, bytes),
+                None => fs::remove_file(&marker_path).map_err(DraftlineError::from),
+            };
+            if let Err(error) = restored {
+                tracing::warn!(%error, "could not restore .draftline after a failed project init");
+            }
+        })
     }
 
     /// Whether HEAD's committed marker already holds `marker`, so writing it

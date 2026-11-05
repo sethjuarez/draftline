@@ -1125,6 +1125,69 @@ pub fn update_project_settings_with_context(
     Ok(settings)
 }
 
+/// Request to create a new project folder inside an existing repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitProjectInRepositoryRequest {
+    /// A folder in the repository; the project folder is created inside it.
+    pub parent_path: PathBuf,
+    /// The project's name; the folder is named after it.
+    pub name: String,
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    #[serde(default)]
+    pub commit_template: Option<String>,
+}
+
+/// Result of [`init_project_in_repository`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitProjectInRepositoryResult {
+    /// The new project folder; open it with this path from now on.
+    pub workspace_path: PathBuf,
+    pub settings: ProjectSettings,
+    pub diagnostics: WorkspaceDiagnostics,
+}
+
+/// Creates a project folder inside an existing repository and records its
+/// settings in `.draftline` without committing anything.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(parent_path = %request.parent_path.display())
+)]
+pub fn init_project_in_repository(
+    request: InitProjectInRepositoryRequest,
+) -> Result<InitProjectInRepositoryResult> {
+    init_project_in_repository_with_context(&mut DraftlineCommandContext::new(), request)
+}
+
+/// Creates a project folder through the host-configured context.
+#[tracing::instrument(
+    err(level = tracing::Level::WARN),
+    skip_all,
+    fields(parent_path = %request.parent_path.display())
+)]
+pub fn init_project_in_repository_with_context(
+    context: &mut DraftlineCommandContext<'_>,
+    request: InitProjectInRepositoryRequest,
+) -> Result<InitProjectInRepositoryResult> {
+    let workspace = context.namespaced(Workspace::init_project_in_repository(
+        &request.parent_path,
+        &request.name,
+        ProjectSettingsUpdate {
+            base_branch: request.base_branch,
+            commit_template: request.commit_template,
+        },
+        context.content_policy.clone(),
+    )?)?;
+    let result = InitProjectInRepositoryResult {
+        workspace_path: workspace.project_root().to_path_buf(),
+        settings: workspace.project_settings()?,
+        diagnostics: workspace_diagnostics(&workspace)?,
+    };
+    context.emit(&workspace, DraftlineEventKind::WorkspaceChanged, None);
+    Ok(result)
+}
+
 /// Clones a Draftline workspace using backend-only credentials from the context.
 #[tracing::instrument(
     err(level = tracing::Level::WARN),
@@ -3663,6 +3726,8 @@ fn draftline_error_code(error: &DraftlineError) -> &'static str {
         DraftlineError::InvalidFolderMarker(_) => "invalid_folder_marker",
         DraftlineError::NewerFolderMarker(_) => "newer_folder_marker",
         DraftlineError::InvalidProjectSettings(_) => "invalid_project_settings",
+        DraftlineError::NotARepository(_) => "not_a_repository",
+        DraftlineError::FolderNotEmpty(_) => "folder_not_empty",
         DraftlineError::FolderMoveRefused(_) => "folder_move_refused",
         DraftlineError::FolderFixUnavailable(_) => "folder_fix_unavailable",
         DraftlineError::BaseRenamed { .. } => "base_renamed",
